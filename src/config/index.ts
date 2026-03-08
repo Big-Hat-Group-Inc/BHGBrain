@@ -1,0 +1,120 @@
+import { z } from 'zod';
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const ConfigSchema = z.object({
+  data_dir: z.string().optional(),
+  embedding: z.object({
+    provider: z.enum(['openai']).default('openai'),
+    model: z.string().default('text-embedding-3-small'),
+    api_key_env: z.string().default('OPENAI_API_KEY'),
+    dimensions: z.number().int().positive().default(1536),
+  }).default({}),
+  qdrant: z.object({
+    mode: z.enum(['embedded', 'external']).default('embedded'),
+    embedded_path: z.string().default('./qdrant'),
+    external_url: z.string().nullable().default(null),
+    api_key_env: z.string().nullable().default(null),
+  }).default({}),
+  transport: z.object({
+    http: z.object({
+      enabled: z.boolean().default(true),
+      host: z.string().default('127.0.0.1'),
+      port: z.number().int().default(3721),
+      bearer_token_env: z.string().default('BHGBRAIN_TOKEN'),
+    }).default({}),
+    stdio: z.object({
+      enabled: z.boolean().default(true),
+    }).default({}),
+  }).default({}),
+  defaults: z.object({
+    namespace: z.string().default('global'),
+    collection: z.string().default('general'),
+    recall_limit: z.number().int().min(1).max(20).default(5),
+    min_score: z.number().min(0).max(1).default(0.6),
+    auto_inject_limit: z.number().int().min(1).default(10),
+    max_response_chars: z.number().int().positive().default(50000),
+  }).default({}),
+  retention: z.object({
+    decay_after_days: z.number().int().positive().default(180),
+    max_db_size_gb: z.number().positive().default(2),
+    max_memories: z.number().int().positive().default(500000),
+    warn_at_percent: z.number().min(0).max(100).default(80),
+  }).default({}),
+  deduplication: z.object({
+    enabled: z.boolean().default(true),
+    similarity_threshold: z.number().min(0).max(1).default(0.92),
+  }).default({}),
+  search: z.object({
+    hybrid_weights: z.object({
+      semantic: z.number().min(0).max(1).default(0.7),
+      fulltext: z.number().min(0).max(1).default(0.3),
+    }).default({}),
+  }).default({}),
+  security: z.object({
+    require_loopback_http: z.boolean().default(true),
+    allow_unauthenticated_http: z.boolean().default(false),
+    log_redaction: z.boolean().default(true),
+    rate_limit_rpm: z.number().int().positive().default(100),
+    max_request_size_bytes: z.number().int().positive().default(1048576),
+  }).default({}),
+  auto_inject: z.object({
+    max_chars: z.number().int().positive().default(30000),
+    max_tokens: z.number().int().positive().nullable().default(null),
+  }).default({}),
+  observability: z.object({
+    metrics_enabled: z.boolean().default(false),
+    structured_logging: z.boolean().default(true),
+    log_level: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  }).default({}),
+  pipeline: z.object({
+    extraction_enabled: z.boolean().default(true),
+    extraction_model: z.string().default('gpt-4o-mini'),
+    extraction_model_env: z.string().default('BHGBRAIN_EXTRACTION_API_KEY'),
+    fallback_to_threshold_dedup: z.boolean().default(true),
+  }).default({}),
+  auto_summarize: z.boolean().default(true),
+});
+
+export type BrainConfig = z.infer<typeof ConfigSchema>;
+
+export function getDefaultDataDir(): string {
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA ?? join(process.env.USERPROFILE ?? '', 'AppData', 'Local');
+    return join(localAppData, 'BHGBrain');
+  }
+  return join(process.env.HOME ?? '~', '.bhgbrain');
+}
+
+export function getDefaultConfigPath(): string {
+  return join(getDefaultDataDir(), 'config.json');
+}
+
+export function loadConfig(configPath?: string): BrainConfig {
+  const path = configPath ?? getDefaultConfigPath();
+  let raw: Record<string, unknown> = {};
+
+  if (existsSync(path)) {
+    const text = readFileSync(path, 'utf-8');
+    raw = JSON.parse(text);
+  }
+
+  const config = ConfigSchema.parse(raw);
+
+  if (!config.data_dir) {
+    config.data_dir = getDefaultDataDir();
+  }
+
+  return config;
+}
+
+export function ensureDataDir(config: BrainConfig): void {
+  const dir = config.data_dir!;
+  mkdirSync(dir, { recursive: true });
+  mkdirSync(join(dir, 'backups'), { recursive: true });
+
+  const configPath = join(dir, 'config.json');
+  if (!existsSync(configPath)) {
+    writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "name": "bhgbrain-server",
+  "version": "1.0.0",
+  "description": "Persistent, vector-backed memory for MCP clients",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "bhgbrain": "dist/cli/index.js",
+    "bhgbrain-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": ["mcp", "memory", "brain", "vector", "qdrant"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@qdrant/js-client-rest": "^1.13.0",
+    "commander": "^13.1.0",
+    "express": "^5.1.0",
+    "openai": "^4.85.4",
+    "pino": "^9.6.0",
+    "sql.js": "^1.12.0",
+    "uuid": "^11.1.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.13.10",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.8"
+  }
+}
