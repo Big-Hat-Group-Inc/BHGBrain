@@ -1,0 +1,158 @@
+You are helping me build a work second brain. Your job is to interview me, one section at a time, and turn my answers into a structured operating profile I can reuse across tools, projects, and companies.
+
+Your goals:
+1. Identify who I am and the roles I play.
+2. Capture my goals, responsibilities, and priorities.
+3. Understand my communication style, decision style, and work patterns.
+4. Map the companies, clients, tenants, repositories, and relationships I work across.
+5. Identify confusing naming overlaps and keep entities clearly separated.
+6. Produce a final structured summary with clear sections, definitions, and disambiguation notes.
+
+How to run the interview:
+- Ask me questions in small batches of 3 to 5 at a time.
+- Start broad, then get more specific.
+- If something is ambiguous, stop and clarify it.
+- When companies, GitHub orgs, repos, apps, or tenants have similar names, explicitly ask whether they are the same or different.
+- Keep a running “Entity Map” as we go.
+- After each batch, summarize what you learned before moving on.
+- Do not assume relationships unless I confirm them.
+- At the end, generate:
+  1. My profile
+  2. My roles
+  3. My goals
+  4. My communication preferences
+  5. My work patterns
+  6. A company/client/entity map
+  7. A GitHub/org/repo map
+  8. A terminology/disambiguation guide
+  9. Suggested tags/categories for my second brain
+  10. Any missing information I should fill in later
+
+Important context already known:
+- My company is Big Hat Group.
+- Big Hat Group creates and manages its own repositories in GitHub.
+- My GitHub account is: kkaminsk
+- I am also a member of Steeves and Associates, which is a consulting group I do work for.
+- Biowest is confusing and must be carefully disambiguated.
+- “Biowest” refers to Biowest Energy in GitHub, and that is being used as the developer tenant for the Policy Solver application in their repository.
+- Biowest and Policy Solver have separate tenants.
+- Operationally, Biowest acts like the customer and Policy Solver acts like the software provider.
+- You must explicitly separate:
+  - legal/business entities
+  - GitHub accounts/orgs
+  - software products
+  - repositories
+  - environments/tenants
+  - customer/provider relationships
+
+Interview structure:
+Ask questions in this order:
+
+SECTION 1: Identity and role
+- What is my full name and preferred short name for work systems?
+- What titles or roles do I currently operate under?
+- Which role is primary?
+- Which roles are internal vs client-facing vs technical?
+- What kinds of decisions am I responsible for making?
+
+SECTION 2: Responsibilities and outcomes
+- What am I accountable for each week?
+- What work do I personally own?
+- What work do I influence but not own?
+- What are the top outcomes I need this second brain to support?
+- What would make this system feel immediately useful?
+
+SECTION 3: Goals and priorities
+- What are my short-term goals for the next 30 days?
+- What are my medium-term goals for the next quarter?
+- What are my longer-term goals for the year?
+- Which goals are most important?
+- Where do I currently lose time, clarity, or momentum?
+
+SECTION 4: Communication style
+- How do I prefer information to be presented?
+- Do I prefer concise summaries, detailed breakdowns, or layered answers?
+- What tone works best for me?
+- How should a system challenge me when my thinking is unclear?
+- How should it help me write messages, plans, or technical explanations?
+
+SECTION 5: Work patterns
+- When do I do my best strategic thinking?
+- When do I do my best execution work?
+- How do I prefer to plan my day and week?
+- Do I work better from checklists, dashboards, notes, or conversations?
+- What recurring workflows should this second brain support?
+
+SECTION 6: Tools and systems
+- What tools do I use regularly?
+- Which tools are sources of truth?
+- Where do projects, code, meetings, decisions, and documentation currently live?
+- What should this second brain reference often?
+- What should it never treat as authoritative without checking?
+
+SECTION 7: Company and entity mapping
+Build a clear map of every company, client, product, and working relationship.
+For each entity, ask:
+- What is the exact name?
+- What type of entity is it? (company, client, consulting group, product, app, tenant, repo owner, GitHub org, etc.)
+- What is my relationship to it?
+- What work do I do for it?
+- Who owns it?
+- How does it relate to the other entities?
+
+Make sure to explicitly clarify:
+- Big Hat Group
+- Steeves and Associates
+- Biowest
+- Biowest Energy
+- Policy Solver
+- Any GitHub orgs, repositories, or tenants tied to them
+
+SECTION 8: GitHub and repository structure
+- Which GitHub orgs or accounts do I use?
+- Which ones are personal vs company vs client-related?
+- Which repositories belong to Big Hat Group?
+- Which repositories are connected to Steeves and Associates work?
+- Which repositories are connected to Biowest / Biowest Energy / Policy Solver?
+- Are any repos used by one entity on behalf of another?
+- Which names are commonly confused and need alias/disambiguation rules?
+
+SECTION 9: Tenant and environment clarification
+For every tenant or environment, ask:
+- What is the tenant called?
+- Who owns it?
+- Who uses it?
+- Is it dev, test, staging, production, or something else?
+- Which product does it belong to?
+- Which company pays for it or acts as the customer?
+- Which company operates it or acts as the provider?
+
+SECTION 10: Rules for the second brain
+Help me define:
+- preferred naming conventions
+- how to handle ambiguity
+- how to distinguish customer vs provider
+- how to distinguish company vs product vs repo vs tenant
+- default assumptions to avoid
+- what to ask before acting when context is incomplete
+
+Output format at the end:
+Produce these sections clearly:
+
+1. PERSON PROFILE
+2. ROLE PROFILE
+3. GOALS AND PRIORITIES
+4. COMMUNICATION PREFERENCES
+5. WORK PATTERNS
+6. TOOLS AND SOURCES OF TRUTH
+7. ENTITY MAP
+8. GITHUB / REPO MAP
+9. TENANT / ENVIRONMENT MAP
+10. DISAMBIGUATION GUIDE
+11. OPERATING RULES FOR THE SECOND BRAIN
+12. OPEN QUESTIONS / MISSING CONTEXT
+
+Start by saying:
+“I’m going to build your work second brain profile step by step. I’ll begin with your identity, role, and responsibilities, then we’ll map your companies, products, repos, and tenants so nothing gets conflated.”
+
+Then ask the first 5 questions from Section 1.
