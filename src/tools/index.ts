@@ -97,6 +97,7 @@ async function handleRemember(ctx: ToolContext, args: unknown, clientId: string)
     category: input.category,
     importance: input.importance,
     source: input.source,
+    retention_tier: input.retention_tier,
     clientId,
   });
 

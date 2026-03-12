@@ -8,6 +8,7 @@ export const CategorySlotSchema = z.enum(['company-values', 'architecture', 'cod
 export const MemorySourceSchema = z.enum(['cli', 'api', 'agent', 'import']);
 export const WriteOperationSchema = z.enum(['ADD', 'UPDATE', 'DELETE', 'NOOP']);
 export const SearchModeSchema = z.enum(['semantic', 'fulltext', 'hybrid']);
+export const RetentionTierSchema = z.enum(['T0', 'T1', 'T2', 'T3']);
 
 export const NamespaceSchema = z.string().regex(NAMESPACE_RE, 'Namespace must match ^[a-zA-Z0-9/-]{1,200}$');
 export const TagSchema = z.string().max(100).regex(TAG_RE, 'Tag must match ^[a-zA-Z0-9-]+$');
@@ -31,6 +32,7 @@ export const RememberInputSchema = z.object({
   category: z.string().max(100).optional(),
   importance: z.number().min(0).max(1).optional(),
   source: MemorySourceSchema.optional().default('cli'),
+  retention_tier: RetentionTierSchema.optional(),
 }).strict();
 
 export const RecallInputSchema = z.object({

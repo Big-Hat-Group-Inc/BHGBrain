@@ -30,7 +30,7 @@ async function createContext(): Promise<ToolContext> {
   const pipeline = new WritePipeline(config, storage, embedding);
   const searchService = new SearchService(config, storage, embedding);
   const backupService = new BackupService(config, storage, logger);
-  const healthService = new HealthService(storage, embedding);
+  const healthService = new HealthService(storage, embedding, config);
   const metrics = new MetricsCollector(config);
 
   return { config, storage, embedding, pipeline, search: searchService, backup: backupService, health: healthService, metrics, logger };
@@ -223,27 +223,25 @@ serverCmd
 
 program
   .command('gc')
-  .description('Run garbage collection / consolidation')
-  .option('--consolidate', 'Include consolidation pass')
+  .description('Run retention cleanup')
+  .option('--dry-run', 'Report candidates without deleting')
+  .option('--tier <tier>', 'Limit cleanup to a single tier (T1|T2|T3)')
   .action(async (opts) => {
     const ctx = await createContext();
     const retention = new RetentionService(ctx.config, ctx.storage);
-    if (opts.consolidate) {
-      const result = retention.runConsolidation();
-      console.log(`Stale marked: ${result.staleMarked}`);
-      console.log(`Low-importance candidates: ${result.lowImportanceCandidates}`);
-    } else {
-      const stale = retention.markStaleMemories();
-      console.log(`Marked ${stale} memories as stale.`);
-    }
+    const result = await retention.runGc({ dryRun: Boolean(opts.dryRun), tier: opts.tier });
+    console.log(JSON.stringify(result, null, 2));
     ctx.storage.sqlite.close();
   });
 
 program
   .command('stats')
   .description('Show memory statistics')
+  .option('--by-tier', 'Include tier breakdown')
+  .option('--expiring', 'Show memories expiring soon')
   .action(async () => {
     const ctx = await createContext();
+    const retention = new RetentionService(ctx.config, ctx.storage);
     const total = ctx.storage.sqlite.countMemories();
     const collections = ctx.storage.sqlite.listCollections();
     const categories = ctx.storage.sqlite.listCategories();
@@ -259,6 +257,116 @@ program
       console.log(`  ${c.name} (${c.slot}) rev ${c.revision}`);
     }
     console.log(`DB size: ${(dbSize / 1024).toFixed(1)} KB`);
+    const tierStats = retention.getTierStats();
+    console.log(`Archived memories: ${tierStats.archived}`);
+    console.log(`Unsynced vectors: ${tierStats.unsynced_vectors}`);
+    if (process.argv.includes('--by-tier')) {
+      for (const [tier, count] of Object.entries(tierStats.counts)) {
+        console.log(`  ${tier}: ${count}`);
+      }
+    }
+    if (process.argv.includes('--expiring')) {
+      const expiring = retention.listExpiringSoon(20);
+      for (const mem of expiring) {
+        console.log(`  ${mem.id.substring(0, 8)} ${mem.retention_tier} expires ${mem.expires_at} ${mem.summary}`);
+      }
+    }
+    ctx.storage.sqlite.close();
+  });
+
+const tierCmd = program.command('tier').description('Inspect and manage retention tiers');
+
+tierCmd
+  .command('show <id>')
+  .description('Show retention details for a memory')
+  .action(async (id) => {
+    const ctx = await createContext();
+    const memory = ctx.storage.sqlite.getMemoryById(id);
+    if (!memory) {
+      console.error(`Memory ${id} not found.`);
+      process.exitCode = 1;
+    } else {
+      console.log(JSON.stringify({
+        id: memory.id,
+        retention_tier: memory.retention_tier,
+        expires_at: memory.expires_at,
+        decay_eligible: memory.decay_eligible,
+        review_due: memory.review_due,
+      }, null, 2));
+    }
+    ctx.storage.sqlite.close();
+  });
+
+tierCmd
+  .command('set <id> <tier>')
+  .description('Set retention tier for a memory')
+  .action(async (id, tier) => {
+    const ctx = await createContext();
+    const memory = ctx.storage.sqlite.getMemoryById(id);
+    if (!memory) {
+      console.error(`Memory ${id} not found.`);
+      process.exitCode = 1;
+    } else {
+      const retention = new RetentionService(ctx.config, ctx.storage);
+      const metadata = retention.buildMetadataForTier(tier);
+      ctx.storage.sqlite.updateMemory(id, {
+        retention_tier: tier,
+        expires_at: metadata.expires_at,
+        decay_eligible: metadata.decay_eligible,
+        review_due: metadata.review_due,
+        updated_at: new Date().toISOString(),
+      });
+      ctx.storage.sqlite.flushIfDirty();
+      console.log(JSON.stringify({ ok: true, id, tier }, null, 2));
+    }
+    ctx.storage.sqlite.close();
+  });
+
+tierCmd
+  .command('list')
+  .description('List memories by retention tier')
+  .requiredOption('--tier <tier>', 'Tier to list')
+  .action(async (opts) => {
+    const ctx = await createContext();
+    const memories = ctx.storage.sqlite.listMemories('global', 200).filter(mem => mem.retention_tier === opts.tier);
+    console.log(JSON.stringify(memories.map(mem => ({
+      id: mem.id,
+      tier: mem.retention_tier,
+      expires_at: mem.expires_at,
+      summary: mem.summary,
+    })), null, 2));
+    ctx.storage.sqlite.close();
+  });
+
+const archiveCmd = program.command('archive').description('Inspect and restore archived memories');
+
+archiveCmd
+  .command('list')
+  .description('List archived memory summaries')
+  .action(async () => {
+    const ctx = await createContext();
+    const retention = new RetentionService(ctx.config, ctx.storage);
+    console.log(JSON.stringify(retention.listArchive(), null, 2));
+    ctx.storage.sqlite.close();
+  });
+
+archiveCmd
+  .command('search <query>')
+  .description('Search archived memory summaries')
+  .action(async (query) => {
+    const ctx = await createContext();
+    const retention = new RetentionService(ctx.config, ctx.storage);
+    console.log(JSON.stringify(retention.searchArchive(query), null, 2));
+    ctx.storage.sqlite.close();
+  });
+
+archiveCmd
+  .command('restore <id>')
+  .description('Restore an archived summary into active memory')
+  .action(async (id) => {
+    const ctx = await createContext();
+    const retention = new RetentionService(ctx.config, ctx.storage);
+    console.log(JSON.stringify(await retention.restoreArchive(id), null, 2));
     ctx.storage.sqlite.close();
   });
 

@@ -48,6 +48,18 @@ export class QdrantStore {
         field_name: 'type',
         field_schema: 'keyword',
       });
+      await this.client.createPayloadIndex(name, {
+        field_name: 'retention_tier',
+        field_schema: 'keyword',
+      });
+      await this.client.createPayloadIndex(name, {
+        field_name: 'decay_eligible',
+        field_schema: 'bool',
+      });
+      await this.client.createPayloadIndex(name, {
+        field_name: 'expires_at',
+        field_schema: 'integer',
+      });
     }
   }
 
@@ -102,6 +114,13 @@ export class QdrantStore {
     if (filters?.type) {
       must.push({ key: 'type', match: { value: filters.type } });
     }
+    must.push({
+      should: [
+        { key: 'decay_eligible', match: { value: false } },
+        { key: 'expires_at', range: { gte: Math.floor(Date.now() / 1000) } },
+        { is_empty: { key: 'expires_at' } },
+      ],
+    });
 
     const results = await this.client.search(name, {
       vector,

@@ -13,6 +13,7 @@ export const MCP_TOOL_DEFINITIONS = [
         category: { type: 'string', description: 'Category name for persistent policy context', maxLength: 100 },
         importance: { type: 'number', minimum: 0, maximum: 1, description: 'Importance score 0-1' },
         source: { type: 'string', enum: ['cli', 'api', 'agent', 'import'], description: 'Memory source' },
+        retention_tier: { type: 'string', enum: ['T0', 'T1', 'T2', 'T3'], description: 'Optional explicit retention tier' },
       },
       required: ['content'],
       additionalProperties: false,

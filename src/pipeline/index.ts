@@ -2,8 +2,9 @@ import { v4 as uuidv4 } from 'uuid';
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
-import type { MemoryType, MemorySource, WriteOperation, MemoryRecord, WriteResult } from '../domain/types.js';
+import type { MemoryType, MemorySource, WriteOperation, MemoryRecord, WriteResult, RetentionTier } from '../domain/types.js';
 import { normalizeContent, computeChecksum, generateSummary, containsSecret } from '../domain/normalize.js';
+import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { invalidInput, internal } from '../errors/index.js';
 
 interface MemoryCandidate {
@@ -14,11 +15,15 @@ interface MemoryCandidate {
 }
 
 export class WritePipeline {
+  private lifecycle: MemoryLifecycleService;
+
   constructor(
     private config: BrainConfig,
     private storage: StorageManager,
     private embedding: EmbeddingProvider,
-  ) {}
+  ) {
+    this.lifecycle = new MemoryLifecycleService(config);
+  }
 
   async process(input: {
     content: string;
@@ -30,6 +35,7 @@ export class WritePipeline {
     importance?: number;
     source: MemorySource;
     clientId?: string;
+    retention_tier?: RetentionTier;
   }): Promise<WriteResult[]> {
     const normalized = normalizeContent(input.content);
 
@@ -83,10 +89,20 @@ export class WritePipeline {
       category?: string;
       source: MemorySource;
       clientId?: string;
+      retention_tier?: RetentionTier;
     },
   ): Promise<WriteResult> {
     const checksum = computeChecksum(candidate.content);
     const now = new Date().toISOString();
+    const tier = this.lifecycle.assignTier({
+      category: input.category,
+      source: input.source,
+      type: candidate.type,
+      tags: candidate.tags,
+      content: candidate.content,
+      explicitTier: input.retention_tier,
+    });
+    const lifecycleMetadata = this.lifecycle.buildMetadata(tier, new Date(now));
 
     // Step 1: Exact dedup by checksum
     const exactMatch = this.storage.sqlite.getMemoryByChecksum(input.namespace, checksum);
@@ -119,7 +135,7 @@ export class WritePipeline {
       10,
     );
 
-    const operation = this.classifyOperation(similar);
+    const operation = this.classifyOperation(similar, tier);
     const resolvedType = candidate.type ?? 'semantic';
     const summary = generateSummary(candidate.content);
     const importance = candidate.importance ?? 0.5;
@@ -148,6 +164,10 @@ export class WritePipeline {
           tags: mergedTags,
           checksum,
           importance: Math.max(existing.importance, importance),
+          retention_tier: tier,
+          expires_at: lifecycleMetadata.expires_at,
+          decay_eligible: lifecycleMetadata.decay_eligible,
+          review_due: lifecycleMetadata.review_due,
           last_operation: 'UPDATE',
           updated_at: now,
         }, vector);
@@ -179,9 +199,15 @@ export class WritePipeline {
       source: input.source,
       checksum,
       importance,
+      retention_tier: tier,
+      expires_at: lifecycleMetadata.expires_at,
+      decay_eligible: lifecycleMetadata.decay_eligible,
+      review_due: lifecycleMetadata.review_due,
       access_count: 0,
       last_operation: 'ADD',
       merged_from: null,
+      archived: false,
+      vector_synced: true,
       created_at: now,
       updated_at: now,
       last_accessed: now,
@@ -201,16 +227,17 @@ export class WritePipeline {
 
   private classifyOperation(
     similar: Array<{ id: string; score: number }>,
+    tier: RetentionTier,
   ): { op: WriteOperation; targetId?: string } {
     if (similar.length === 0) return { op: 'ADD' };
 
     const top = similar[0]!;
-    const threshold = this.config.deduplication.similarity_threshold;
+    const thresholds = this.lifecycle.dedupThresholdFor(tier, this.config.deduplication.similarity_threshold);
 
-    if (top.score >= 0.98) {
+    if (top.score >= thresholds.noop) {
       return { op: 'NOOP', targetId: top.id };
     }
-    if (top.score >= threshold) {
+    if (top.score >= thresholds.update) {
       return { op: 'UPDATE', targetId: top.id };
     }
     return { op: 'ADD' };
@@ -224,6 +251,7 @@ export class WritePipeline {
       category?: string;
       source: MemorySource;
       clientId?: string;
+      retention_tier?: RetentionTier;
     },
     checksum: string,
     now: string,
@@ -232,6 +260,15 @@ export class WritePipeline {
     const id = uuidv4();
     const resolvedType = candidate.type ?? 'semantic';
     const summary = generateSummary(candidate.content);
+    const tier = this.lifecycle.assignTier({
+      category: input.category,
+      source: input.source,
+      type: candidate.type,
+      tags: candidate.tags,
+      content: candidate.content,
+      explicitTier: input.retention_tier,
+    });
+    const lifecycleMetadata = this.lifecycle.buildMetadata(tier, new Date(now));
 
     const mem: Omit<MemoryRecord, 'embedding'> = {
       id,
@@ -245,9 +282,15 @@ export class WritePipeline {
       source: input.source,
       checksum,
       importance: candidate.importance ?? 0.5,
+      retention_tier: tier,
+      expires_at: lifecycleMetadata.expires_at,
+      decay_eligible: lifecycleMetadata.decay_eligible,
+      review_due: lifecycleMetadata.review_due,
       access_count: 0,
       last_operation: 'ADD',
       merged_from: null,
+      archived: false,
+      vector_synced: false,
       created_at: now,
       updated_at: now,
       last_accessed: now,
