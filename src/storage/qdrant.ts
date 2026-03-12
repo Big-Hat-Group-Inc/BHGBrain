@@ -89,8 +89,27 @@ export class QdrantStore {
         wait: true,
         points: [id],
       });
-    } catch {
-      // Collection may not exist; ignore
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return;
+      }
+      throw err;
+    }
+  }
+
+  async deleteMany(namespace: string, collection: string, ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    const name = this.collectionName(namespace, collection);
+    try {
+      await this.client.delete(name, {
+        wait: true,
+        points: ids,
+      });
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return;
+      }
+      throw err;
     }
   }
 
@@ -182,8 +201,11 @@ export class QdrantStore {
     const name = this.collectionName(namespace, collection);
     try {
       await this.client.deleteCollection(name);
-    } catch {
-      // Ignore if doesn't exist
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return;
+      }
+      throw err;
     }
   }
 
@@ -195,5 +217,14 @@ export class QdrantStore {
     } catch {
       return null;
     }
+  }
+
+  private isNotFoundError(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false;
+    const maybeErr = err as { status?: number; response?: { status?: number }; message?: string };
+    const status = maybeErr.status ?? maybeErr.response?.status;
+    if (status === 404) return true;
+    const message = maybeErr.message?.toLowerCase() ?? '';
+    return message.includes('not found') || message.includes('does not exist');
   }
 }

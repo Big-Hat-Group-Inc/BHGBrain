@@ -24,6 +24,8 @@ describe('BackupService restore activation', () => {
 
     const storage = {
       sqlite: {
+        beginLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 7),
       },
@@ -35,6 +37,8 @@ describe('BackupService restore activation', () => {
 
     const result = await service.restore(backupPath);
     expect(result).toEqual({ memory_count: 7, activated: true });
+    expect(storage.sqlite.beginLifecycleOperation).toHaveBeenCalledWith('restore');
+    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith('restore');
     expect(storage.reloadSqliteFromDisk).toHaveBeenCalledTimes(1);
 
     rmSync(tempDir, { recursive: true, force: true });
@@ -47,6 +51,8 @@ describe('BackupService restore activation', () => {
 
     const storage = {
       sqlite: {
+        beginLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 0),
       },
@@ -58,6 +64,7 @@ describe('BackupService restore activation', () => {
 
     await expect(service.restore(backupPath)).rejects.toThrow('activation failed');
     expect(logger.error).toHaveBeenCalled();
+    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith('restore');
 
     rmSync(tempDir, { recursive: true, force: true });
   });
@@ -70,6 +77,8 @@ describe('BackupService restore activation', () => {
     let resolveReload: (() => void) | null = null;
     const storage = {
       sqlite: {
+        beginLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 1),
       },

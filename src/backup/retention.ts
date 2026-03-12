@@ -56,9 +56,11 @@ export class RetentionService {
         this.storage.sqlite.archiveMemory(memory, nowIso);
         archived++;
       }
-      await this.storage.deleteMemory(memory.id);
-      this.storage.logAudit('FORGET', memory.id, memory.namespace, 'system');
-      deleted++;
+    }
+
+    deleted = await this.storage.deleteMemories(expired, { flush: false });
+    for (const memory of expired) {
+      this.storage.logAudit('FORGET', memory.id, memory.namespace, 'system', { flush: false });
     }
 
     this.storage.sqlite.flushIfDirty();

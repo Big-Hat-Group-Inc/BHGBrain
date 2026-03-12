@@ -19,7 +19,9 @@ describe('SearchService', () => {
         fullTextSearch: vi.fn((_ns: string, _q: string, _limit: number, _col?: string) =>
           opts.fulltextResults ?? [{ id: 'mem-1', rank: -1 }],
         ),
+        getMemoriesByIds: vi.fn((ids: string[]) => ids.map(id => memories.get(id)).filter(Boolean)),
         getMemoryById: vi.fn((id: string) => memories.get(id) ?? null),
+        recordAccessBatch: vi.fn(),
         touchMemory: vi.fn(),
         scheduleDeferredFlush: vi.fn(),
       },
@@ -59,6 +61,13 @@ describe('SearchService', () => {
     const { service, storage } = createSearchService();
     await service.search('hello', 'global', undefined, 'fulltext', 10);
     expect(storage.sqlite.scheduleDeferredFlush).toHaveBeenCalled();
+    expect(storage.sqlite.recordAccessBatch).toHaveBeenCalled();
+  });
+
+  it('hydrates ranked results in bulk when the store supports it', async () => {
+    const { service, storage } = createSearchService();
+    await service.search('hello', 'global', undefined, 'fulltext', 10);
+    expect(storage.sqlite.getMemoriesByIds).toHaveBeenCalledWith(['mem-1']);
   });
 
   it('surfaces Qdrant failures as errors in semantic search', async () => {

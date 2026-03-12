@@ -120,14 +120,60 @@ export class ResourceHandler {
     const maxChars = this.config.auto_inject.max_chars;
     const parts: string[] = [];
     let totalChars = 0;
+    let truncated = false;
+    const appendBlock = (block: string): boolean => {
+      if (totalChars >= maxChars) {
+        truncated = true;
+        return false;
+      }
+      const remaining = maxChars - totalChars;
+      if (block.length <= remaining) {
+        parts.push(block);
+        totalChars += block.length;
+        return true;
+      }
+      parts.push(block.slice(0, remaining));
+      totalChars = maxChars;
+      truncated = true;
+      return false;
+    };
 
     // 1. All category content (full)
-    const categories = this.storage.sqlite.listCategories();
+    const categoryHeaders = typeof (this.storage.sqlite as any).listCategoryHeaders === 'function'
+      ? this.storage.sqlite.listCategoryHeaders()
+      : this.storage.sqlite.listCategories().map((cat: any) => ({
+        name: cat.name,
+        slot: cat.slot,
+        revision: cat.revision,
+        updated_at: cat.updated_at,
+        content_length: cat.content.length,
+        content: cat.content,
+      }));
     let categoriesCount = 0;
-    for (const cat of categories) {
-      const block = `## ${cat.name} (${cat.slot})\n${cat.content}\n\n`;
-      parts.push(block);
-      totalChars += block.length;
+    for (const cat of categoryHeaders) {
+      if (totalChars >= maxChars) {
+        truncated = true;
+        break;
+      }
+
+      const prefix = `## ${cat.name} (${cat.slot})\n`;
+      if (!appendBlock(prefix)) break;
+
+      const remainingForContent = maxChars - totalChars - 2;
+      if (remainingForContent <= 0) {
+        truncated = true;
+        break;
+      }
+
+      const content = 'content' in cat
+        ? cat.content.slice(0, remainingForContent)
+        : this.storage.sqlite.getCategoryContentSlice(cat.name, remainingForContent) ?? '';
+      const fullyIncluded = content.length >= (cat.content_length ?? content.length);
+      if (!appendBlock(`${content}\n\n`)) break;
+      if (!fullyIncluded) {
+        truncated = true;
+        break;
+      }
       categoriesCount++;
     }
 
@@ -140,25 +186,21 @@ export class ResourceHandler {
       if (totalChars >= maxChars) break;
 
       const remaining = maxChars - totalChars;
-      if (mem.content.length + 50 <= remaining) {
-        const block = `- [${mem.type}] ${mem.content}\n`;
-        parts.push(block);
-        totalChars += block.length;
+      const contentBlock = mem.content.length + 50 <= remaining
+        ? `- [${mem.type}] ${mem.content}\n`
+        : `- [${mem.type}] ${mem.summary}\n`;
+      if (appendBlock(contentBlock)) {
         memoriesCount++;
       } else {
-        // Use summary as fallback
-        const block = `- [${mem.type}] ${mem.summary}\n`;
-        parts.push(block);
-        totalChars += block.length;
-        memoriesCount++;
+        break;
       }
     }
 
     const content = parts.join('');
-    const truncated = totalChars > maxChars || memories.length > memoriesCount;
+    truncated = truncated || memories.length > memoriesCount;
 
     return {
-      content: content.substring(0, maxChars),
+      content,
       truncated,
       total_results: this.storage.sqlite.countMemories(namespace),
       categories_count: categoriesCount,

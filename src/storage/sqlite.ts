@@ -129,6 +129,7 @@ export class SqliteStore {
   private dbPath: string;
   private dirty = false;
   private deferredFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private lifecycleOperation: string | null = null;
   private static readonly DEFERRED_FLUSH_MS = 5_000;
 
   constructor(private dataDir: string) {
@@ -150,6 +151,8 @@ export class SqliteStore {
 
   async reloadFromDisk(): Promise<void> {
     const SQL = await initSqlJs();
+    this.cancelDeferredFlush();
+    this.dirty = false;
     if (this.db) {
       this.db.close();
     }
@@ -178,6 +181,7 @@ export class SqliteStore {
   }
 
   scheduleDeferredFlush(): void {
+    if (this.lifecycleOperation) return;
     if (this.deferredFlushTimer) return;
     this.deferredFlushTimer = setTimeout(() => {
       this.deferredFlushTimer = null;
@@ -193,6 +197,7 @@ export class SqliteStore {
   }
 
   insertMemory(mem: Omit<MemoryRecord, 'embedding'>): void {
+    this.assertMutableAllowed();
     const retentionTier = mem.retention_tier ?? 'T2';
     const expiresAt = mem.expires_at ?? null;
     const decayEligible = mem.decay_eligible ?? true;
@@ -240,6 +245,7 @@ export class SqliteStore {
   }
 
   updateMemory(id: string, fields: Partial<Omit<MemoryRecord, 'embedding'>>): void {
+    this.assertMutableAllowed();
     const sets: string[] = [];
     const vals: unknown[] = [];
     for (const [key, val] of Object.entries(fields)) {
@@ -272,6 +278,7 @@ export class SqliteStore {
   }
 
   deleteMemory(id: string): boolean {
+    this.assertMutableAllowed();
     const mem = this.getMemoryById(id, true);
     if (!mem) return false;
     this.db.run(`DELETE FROM memories WHERE id = ?`, [id]);
@@ -409,6 +416,7 @@ export class SqliteStore {
   }
 
   touchMemory(id: string): void {
+    if (this.lifecycleOperation) return;
     const now = new Date().toISOString();
     this.db.run(
       `UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?`,
@@ -425,6 +433,7 @@ export class SqliteStore {
     retentionTier?: RetentionTier,
     reviewDue?: string | null,
   ): void {
+    if (this.lifecycleOperation) return;
     const sets = ['access_count = ?', 'last_accessed = ?'];
     const params: unknown[] = [accessCount, lastAccessed];
     if (expiresAt !== undefined) {
@@ -445,7 +454,40 @@ export class SqliteStore {
   }
 
   markVectorSync(id: string, synced: boolean): void {
+    this.assertMutableAllowed();
     this.db.run(`UPDATE memories SET vector_synced = ? WHERE id = ?`, [synced ? 1 : 0, id]);
+    this.markDirty();
+  }
+
+  recordAccessBatch(
+    updates: Array<{
+      id: string;
+      access_count: number;
+      last_accessed: string;
+      expires_at?: string | null;
+      retention_tier?: RetentionTier;
+      review_due?: string | null;
+    }>,
+  ): void {
+    if (this.lifecycleOperation || updates.length === 0) return;
+    for (const update of updates) {
+      const sets = ['access_count = ?', 'last_accessed = ?'];
+      const params: unknown[] = [update.access_count, update.last_accessed];
+      if (update.expires_at !== undefined) {
+        sets.push('expires_at = ?');
+        params.push(update.expires_at);
+      }
+      if (update.retention_tier) {
+        sets.push('retention_tier = ?');
+        params.push(update.retention_tier);
+      }
+      if (update.review_due !== undefined) {
+        sets.push('review_due = ?');
+        params.push(update.review_due);
+      }
+      params.push(update.id);
+      this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, params as any[]);
+    }
     this.markDirty();
   }
 
@@ -565,11 +607,13 @@ export class SqliteStore {
   }
 
   deleteArchive(memoryId: string): void {
+    this.assertMutableAllowed();
     this.db.run(`DELETE FROM memory_archive WHERE memory_id = ?`, [memoryId]);
     this.markDirty();
   }
 
   insertRevision(memoryId: string, revision: number, content: string, updatedAt: string, updatedBy?: string): void {
+    this.assertMutableAllowed();
     this.db.run(
       `INSERT INTO memory_revisions (memory_id, revision, content, updated_at, updated_by) VALUES (?, ?, ?, ?, ?)`,
       [memoryId, revision, content, updatedAt, updatedBy ?? null],
@@ -605,6 +649,7 @@ export class SqliteStore {
   }
 
   setCategory(name: string, slot: string, content: string): CategoryRecord {
+    this.assertMutableAllowed();
     const now = new Date().toISOString();
     const existing = this.getCategory(name);
     if (existing) {
@@ -646,6 +691,7 @@ export class SqliteStore {
   }
 
   deleteCategory(name: string): boolean {
+    this.assertMutableAllowed();
     const exists = this.getCategory(name);
     if (!exists) return false;
     this.db.run(`DELETE FROM categories WHERE name = ?`, [name]);
@@ -654,6 +700,7 @@ export class SqliteStore {
   }
 
   createCollection(namespace: string, name: string, embeddingModel: string, embeddingDimensions: number): void {
+    this.assertMutableAllowed();
     const now = new Date().toISOString();
     this.db.run(
       `INSERT OR IGNORE INTO collections (name, namespace, embedding_model, embedding_dimensions, created_at) VALUES (?, ?, ?, ?, ?)`,
@@ -691,6 +738,7 @@ export class SqliteStore {
   }
 
   deleteCollection(namespace: string, name: string): boolean {
+    this.assertMutableAllowed();
     const stmt = this.db.prepare(`SELECT 1 FROM collections WHERE namespace = ? AND name = ?`);
     stmt.bind([namespace, name]);
     const exists = stmt.step();
@@ -702,6 +750,7 @@ export class SqliteStore {
   }
 
   deleteMemoriesInCollection(namespace: string, collection: string): { deleted: number; ids: string[] } {
+    this.assertMutableAllowed();
     const select = this.db.prepare(`SELECT id FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`);
     select.bind([namespace, collection]);
     const ids: string[] = [];
@@ -727,6 +776,7 @@ export class SqliteStore {
   }
 
   insertAudit(entry: AuditEntry): void {
+    this.assertMutableAllowed();
     this.db.run(
       `INSERT INTO audit_log (id, timestamp, namespace, operation, memory_id, client_id, details) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [entry.id, entry.timestamp, entry.namespace, entry.operation, entry.memory_id, entry.client_id, entry.details ?? null],
@@ -755,6 +805,7 @@ export class SqliteStore {
   }
 
   insertBackupMeta(path: string, sizeBytes: number, memoryCount: number, checksum: string): void {
+    this.assertMutableAllowed();
     this.db.run(
       `INSERT INTO backup_metadata (path, size_bytes, memory_count, checksum, created_at) VALUES (?, ?, ?, ?, ?)`,
       [path, sizeBytes, memoryCount, checksum, new Date().toISOString()],
@@ -796,6 +847,75 @@ export class SqliteStore {
     this.cancelDeferredFlush();
     this.flushIfDirty();
     this.db.close();
+  }
+
+  beginLifecycleOperation(reason: string): void {
+    if (this.lifecycleOperation) {
+      throw new Error(`Storage lifecycle operation already in progress: ${this.lifecycleOperation}`);
+    }
+    this.cancelDeferredFlush();
+    this.lifecycleOperation = reason;
+  }
+
+  endLifecycleOperation(reason?: string): void {
+    if (reason && this.lifecycleOperation !== reason) {
+      throw new Error(`Mismatched lifecycle operation end: expected ${this.lifecycleOperation ?? 'none'}, got ${reason}`);
+    }
+    this.lifecycleOperation = null;
+  }
+
+  isLifecycleOperationInProgress(): boolean {
+    return this.lifecycleOperation !== null;
+  }
+
+  getMemoriesByIds(ids: string[]): Array<Omit<MemoryRecord, 'embedding'>> {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(', ');
+    return this.queryMemories(
+      `SELECT * FROM memories WHERE archived = 0 AND id IN (${placeholders})`,
+      ids,
+    );
+  }
+
+  listMemoryIdsInCollection(namespace: string, collection: string): string[] {
+    const stmt = this.db.prepare(`SELECT id FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`);
+    stmt.bind([namespace, collection]);
+    const ids: string[] = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject() as { id: string };
+      ids.push(row.id);
+    }
+    stmt.free();
+    return ids;
+  }
+
+  listCategoryHeaders(): Array<{ name: string; slot: string; updated_at: string; revision: number; content_length: number }> {
+    const stmt = this.db.prepare(`SELECT name, slot, updated_at, revision, LENGTH(content) as content_length FROM categories ORDER BY name`);
+    const results: Array<{ name: string; slot: string; updated_at: string; revision: number; content_length: number }> = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject() as any;
+      results.push({
+        name: row.name,
+        slot: row.slot,
+        updated_at: row.updated_at,
+        revision: row.revision,
+        content_length: row.content_length,
+      });
+    }
+    stmt.free();
+    return results;
+  }
+
+  getCategoryContentSlice(name: string, maxChars: number): string | null {
+    const stmt = this.db.prepare(`SELECT substr(content, 1, ?) as content FROM categories WHERE name = ?`);
+    stmt.bind([maxChars, name]);
+    if (!stmt.step()) {
+      stmt.free();
+      return null;
+    }
+    const row = stmt.getAsObject() as { content: string };
+    stmt.free();
+    return row.content ?? '';
   }
 
   private queryMemories(sql: string, params: unknown[]): Array<Omit<MemoryRecord, 'embedding'>> {
@@ -873,6 +993,12 @@ export class SqliteStore {
       if (!existingColumns.has(column.name)) {
         this.db.run(column.sql);
       }
+    }
+  }
+
+  private assertMutableAllowed(): void {
+    if (this.lifecycleOperation) {
+      throw new Error(`Storage lifecycle operation in progress: ${this.lifecycleOperation}`);
     }
   }
 }
