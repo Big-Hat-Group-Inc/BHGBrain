@@ -297,8 +297,7 @@ export class WritePipeline {
     };
 
     // Store in SQLite only (no vector without embedding)
-    this.storage.sqlite.insertMemory(mem);
-    this.storage.sqlite.flushIfDirty();
+    this.storage.writeMemoryWithoutVector(mem);
     this.storage.logAudit('ADD', id, input.namespace, input.clientId);
 
     return {

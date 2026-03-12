@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { SqliteStore } from '../storage/sqlite.js';
 import { RetentionService } from './retention.js';
+import { vi } from 'vitest';
 
 describe('RetentionService', () => {
   let sqlite: SqliteStore;
@@ -55,5 +56,37 @@ describe('RetentionService', () => {
     const stale = sqlite.getStaleMemories(1, 10);
     expect(stale.map(s => s.id)).toContain('old-1');
     expect(stale.map(s => s.id)).not.toContain('cat-1');
+  });
+
+  it('batches GC persistence work and audits after batched delete', async () => {
+    const expired = [{
+      ...memory('old-2', '2025-01-01T00:00:00.000Z'),
+      retention_tier: 'T2' as const,
+      expires_at: '2025-02-01T00:00:00.000Z',
+      decay_eligible: true,
+      namespace: 'global',
+      collection: 'general',
+    }];
+
+    const storage = {
+      sqlite: {
+        listExpiredMemories: vi.fn(() => expired),
+        archiveMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+      },
+      deleteMemories: vi.fn(async () => 1),
+      logAudit: vi.fn(),
+    } as any;
+
+    const retention = new RetentionService({
+      retention: { archive_before_delete: true, pre_expiry_warning_days: 7 },
+    } as any, storage);
+
+    const result = await retention.runGc();
+
+    expect(result.deleted).toBe(1);
+    expect(storage.deleteMemories).toHaveBeenCalledTimes(1);
+    expect(storage.logAudit).toHaveBeenCalledWith('FORGET', expired[0]!.id, 'global', 'system', { flush: false });
+    expect(storage.sqlite.flushIfDirty).toHaveBeenCalledTimes(1);
   });
 });

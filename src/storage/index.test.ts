@@ -29,6 +29,7 @@ function createMockSqlite(): SqliteStore {
     insertRevision: vi.fn(),
     getCollection: vi.fn(() => ({ name: 'general', namespace: 'global', embedding_model: 'test', embedding_dimensions: 3 })),
     createCollection: vi.fn(),
+    listMemoryIdsInCollection: vi.fn(() => ['mem-1']),
     flushIfDirty: vi.fn(),
     countMemories: vi.fn(() => memoryStore.size),
   } as unknown as SqliteStore;
@@ -40,6 +41,7 @@ function createMockQdrant(shouldFail = false): QdrantStore {
       ? vi.fn(async () => { throw new Error('Qdrant unavailable'); })
       : vi.fn(async () => {}),
     delete: vi.fn(async () => {}),
+    deleteMany: vi.fn(async () => {}),
     deleteCollection: vi.fn(async () => {}),
   } as unknown as QdrantStore;
 }
@@ -132,6 +134,21 @@ describe('StorageManager cross-store consistency', () => {
 
       await storage.updateMemory('mem-1', { importance: 0.8 });
       expect(qdrant.upsert).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('degraded writes', () => {
+    it('preserves collection metadata and marks vector sync false', () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.getCollection = vi.fn(() => null) as any;
+      storage.writeMemoryWithoutVector(baseMem);
+
+      expect(sqlite.createCollection).toHaveBeenCalledWith('global', 'general', 'test', 3);
+      expect(sqlite.insertMemory).toHaveBeenCalledWith(expect.objectContaining({ vector_synced: false }));
     });
   });
 });

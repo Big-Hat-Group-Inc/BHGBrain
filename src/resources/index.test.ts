@@ -62,6 +62,32 @@ describe('resource pagination bounds', () => {
     expect(result.items).toHaveLength(1);
     expect(result.total_results).toBe(2);
   });
+
+  it('builds inject payload within budget without concatenating all category content', async () => {
+    const handler = new ResourceHandler(
+      { defaults: { namespace: 'global', auto_inject_limit: 5 }, auto_inject: { max_chars: 24 } } as any,
+      {
+        sqlite: {
+          listCategoryHeaders: () => [{ name: 'Policy', slot: 'custom', revision: 1, updated_at: '2026-01-01T00:00:00Z', content_length: 200 }],
+          getCategoryContentSlice: (_name: string, maxChars: number) => 'x'.repeat(maxChars),
+          listMemories: () => [],
+          countMemories: () => 0,
+          getMemoryById: () => null,
+          touchMemory: () => undefined,
+          scheduleDeferredFlush: () => undefined,
+          listCategories: () => [],
+          listCollections: () => [],
+          getCategory: () => null,
+        },
+      } as any,
+      {} as any,
+      { check: async () => ({ status: 'healthy' }) } as any,
+    );
+
+    const result = await handler.handle('memory://inject') as any;
+    expect(result.content.length).toBeLessThanOrEqual(24);
+    expect(result.truncated).toBe(true);
+  });
 });
 
 describe('MCP resource template discovery', () => {

@@ -67,4 +67,20 @@ describe('collections delete semantics', () => {
     expect((ctx.storage as any).deleteCollectionData).not.toHaveBeenCalled();
     expect((ctx.storage as any).sqlite.deleteCollection).toHaveBeenCalledWith('global', 'general');
   });
+
+  it('surfaces collection cleanup failures instead of silently succeeding', async () => {
+    (ctx.storage as any).deleteCollectionData = vi.fn(async () => {
+      throw new Error('qdrant unavailable');
+    });
+
+    const result = await handleTool(ctx, 'collections', {
+      action: 'delete',
+      namespace: 'global',
+      name: 'general',
+      force: true,
+    }, 'c1') as any;
+
+    expect(result.error.code).toBe('INTERNAL');
+    expect((ctx.storage as any).sqlite.deleteCollection).not.toHaveBeenCalled();
+  });
 });

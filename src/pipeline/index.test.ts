@@ -34,6 +34,7 @@ describe('WritePipeline NOOP handling', () => {
       },
       updateMemory: vi.fn(),
       writeMemory: vi.fn(),
+      writeMemoryWithoutVector: vi.fn(),
       logAudit: vi.fn(),
     };
   });
@@ -73,5 +74,22 @@ describe('WritePipeline NOOP handling', () => {
 
     expect(storage.writeMemory).not.toHaveBeenCalled();
     expect(storage.updateMemory).not.toHaveBeenCalled();
+  });
+
+  it('uses metadata-preserving degraded writes when embedding is unavailable', async () => {
+    embedding.embed = vi.fn(async () => { throw new Error('embedding unavailable'); });
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'fallback content',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('ADD');
+    expect(storage.writeMemoryWithoutVector).toHaveBeenCalledTimes(1);
+    expect(storage.writeMemory).not.toHaveBeenCalled();
   });
 });

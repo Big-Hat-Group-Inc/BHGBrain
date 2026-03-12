@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { SqliteStore } from './sqlite.js';
 import { QdrantStore } from './qdrant.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
-import type { MemoryRecord, WriteOperation, AuditEntry, CategoryRecord, CollectionInfo } from '../domain/types.js';
+import type { MemoryRecord, WriteOperation, AuditEntry } from '../domain/types.js';
 import { internal, conflict } from '../errors/index.js';
 
 export class StorageManager {
@@ -20,22 +20,7 @@ export class StorageManager {
     mem: Omit<MemoryRecord, 'embedding'>,
     vector: number[],
   ): Promise<void> {
-    // Check embedding space compatibility
-    const col = this.sqlite.getCollection(mem.namespace, mem.collection);
-    if (col) {
-      if (col.embedding_model !== this.embedding.model || col.embedding_dimensions !== this.embedding.dimensions) {
-        throw conflict(
-          `Collection "${mem.collection}" uses ${col.embedding_model} (${col.embedding_dimensions}d), ` +
-          `but current provider is ${this.embedding.model} (${this.embedding.dimensions}d). ` +
-          `Cannot mix embedding spaces.`,
-        );
-      }
-    } else {
-      this.sqlite.createCollection(
-        mem.namespace, mem.collection,
-        this.embedding.model, this.embedding.dimensions,
-      );
-    }
+    this.ensureCollectionCompatible(mem.namespace, mem.collection);
 
     try {
       this.sqlite.insertMemory(mem);
@@ -65,6 +50,19 @@ export class StorageManager {
     }
 
     this.sqlite.flushIfDirty();
+  }
+
+  writeMemoryWithoutVector(mem: Omit<MemoryRecord, 'embedding'>): void {
+    this.ensureCollectionCompatible(mem.namespace, mem.collection);
+    try {
+      this.sqlite.insertMemory({
+        ...mem,
+        vector_synced: false,
+      });
+      this.sqlite.flushIfDirty();
+    } catch (err) {
+      throw internal(`SQLite degraded write failed: ${(err as Error).message}`);
+    }
   }
 
   async updateMemory(
@@ -120,7 +118,7 @@ export class StorageManager {
     this.sqlite.flushIfDirty();
   }
 
-  async deleteMemory(id: string): Promise<boolean> {
+  async deleteMemory(id: string, options?: { flush?: boolean }): Promise<boolean> {
     const mem = this.sqlite.getMemoryById(id);
     if (!mem) return false;
     try {
@@ -129,7 +127,41 @@ export class StorageManager {
       throw internal(`Qdrant delete failed: ${(err as Error).message}`);
     }
     const deleted = this.sqlite.deleteMemory(id);
-    this.sqlite.flushIfDirty();
+    if (options?.flush !== false) {
+      this.sqlite.flushIfDirty();
+    }
+    return deleted;
+  }
+
+  async deleteMemories(
+    memories: Array<Pick<MemoryRecord, 'id' | 'namespace' | 'collection'>>,
+    options?: { flush?: boolean },
+  ): Promise<number> {
+    if (memories.length === 0) return 0;
+
+    const grouped = new Map<string, string[]>();
+    for (const memory of memories) {
+      const key = `${memory.namespace}|${memory.collection}`;
+      const ids = grouped.get(key) ?? [];
+      ids.push(memory.id);
+      grouped.set(key, ids);
+    }
+
+    for (const [key, ids] of grouped.entries()) {
+      const [namespace, collection] = key.split('|');
+      await this.qdrant.deleteMany(namespace!, collection!, ids);
+    }
+
+    let deleted = 0;
+    for (const memory of memories) {
+      if (this.sqlite.deleteMemory(memory.id)) {
+        deleted++;
+      }
+    }
+
+    if (options?.flush !== false) {
+      this.sqlite.flushIfDirty();
+    }
     return deleted;
   }
 
@@ -138,20 +170,26 @@ export class StorageManager {
   }
 
   async deleteCollectionData(namespace: string, collection: string): Promise<{ deleted: number; ids: string[] }> {
+    const ids = this.sqlite.listMemoryIdsInCollection(namespace, collection);
+    await this.qdrant.deleteCollection(namespace, collection);
     const removed = this.sqlite.deleteMemoriesInCollection(namespace, collection);
     if (removed.deleted > 0) {
       this.sqlite.flushIfDirty();
     }
-
-    await this.qdrant.deleteCollection(namespace, collection);
-    return removed;
+    return ids.length > 0 ? { deleted: removed.deleted, ids } : removed;
   }
 
   async reloadSqliteFromDisk(): Promise<void> {
     await this.sqlite.reloadFromDisk();
   }
 
-  logAudit(operation: WriteOperation | 'FORGET', memoryId: string, namespace: string, clientId = 'unknown'): void {
+  logAudit(
+    operation: WriteOperation | 'FORGET',
+    memoryId: string,
+    namespace: string,
+    clientId = 'unknown',
+    options?: { flush?: boolean },
+  ): void {
     const entry: AuditEntry = {
       id: uuidv4(),
       timestamp: new Date().toISOString(),
@@ -161,7 +199,28 @@ export class StorageManager {
       client_id: clientId,
     };
     this.sqlite.insertAudit(entry);
-    this.sqlite.flushIfDirty();
+    if (options?.flush !== false) {
+      this.sqlite.flushIfDirty();
+    }
+  }
+
+  private ensureCollectionCompatible(namespace: string, collection: string): void {
+    const col = this.sqlite.getCollection(namespace, collection);
+    if (col) {
+      if (col.embedding_model !== this.embedding.model || col.embedding_dimensions !== this.embedding.dimensions) {
+        throw conflict(
+          `Collection "${collection}" uses ${col.embedding_model} (${col.embedding_dimensions}d), ` +
+          `but current provider is ${this.embedding.model} (${this.embedding.dimensions}d). ` +
+          `Cannot mix embedding spaces.`,
+        );
+      }
+      return;
+    }
+
+    this.sqlite.createCollection(
+      namespace, collection,
+      this.embedding.model, this.embedding.dimensions,
+    );
   }
 }
 
