@@ -2,6 +2,7 @@ import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { SearchMode, SearchResult } from '../domain/types.js';
+import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { embeddingUnavailable, internal } from '../errors/index.js';
 
 const RRF_K = 60;
@@ -15,11 +16,15 @@ interface RankedItem {
 }
 
 export class SearchService {
+  private lifecycle: MemoryLifecycleService;
+
   constructor(
     private config: BrainConfig,
     private storage: StorageManager,
     private embedding: EmbeddingProvider,
-  ) {}
+  ) {
+    this.lifecycle = new MemoryLifecycleService(config);
+  }
 
   async search(
     query: string,
@@ -64,7 +69,8 @@ export class SearchService {
     for (const r of results) {
       const mem = this.storage.sqlite.getMemoryById(r.id);
       if (!mem) continue;
-      this.storage.sqlite.touchMemory(r.id);
+      if (this.lifecycle.isExpired(mem.expires_at, new Date())) continue;
+      this.registerAccess(mem);
       searchResults.push({
         id: mem.id,
         content: mem.content,
@@ -73,8 +79,11 @@ export class SearchService {
         tags: mem.tags,
         score: r.score,
         semantic_score: r.score,
+        retention_tier: mem.retention_tier,
+        expires_at: mem.expires_at,
+        expiring_soon: this.lifecycle.isExpiringSoon(mem.expires_at, new Date()),
         created_at: mem.created_at,
-        last_accessed: mem.last_accessed,
+        last_accessed: new Date().toISOString(),
       });
     }
     this.storage.sqlite.scheduleDeferredFlush();
@@ -92,7 +101,8 @@ export class SearchService {
     for (const r of ftsResults) {
       const mem = this.storage.sqlite.getMemoryById(r.id);
       if (!mem) continue;
-      this.storage.sqlite.touchMemory(r.id);
+      if (this.lifecycle.isExpired(mem.expires_at, new Date())) continue;
+      this.registerAccess(mem);
       const normalizedScore = Math.min(1, Math.abs(r.rank) / 10);
       searchResults.push({
         id: mem.id,
@@ -102,8 +112,11 @@ export class SearchService {
         tags: mem.tags,
         score: normalizedScore,
         fulltext_score: normalizedScore,
+        retention_tier: mem.retention_tier,
+        expires_at: mem.expires_at,
+        expiring_soon: this.lifecycle.isExpiringSoon(mem.expires_at, new Date()),
         created_at: mem.created_at,
-        last_accessed: mem.last_accessed,
+        last_accessed: new Date().toISOString(),
       });
     }
     this.storage.sqlite.scheduleDeferredFlush();
@@ -169,21 +182,49 @@ export class SearchService {
     for (const item of scored.slice(0, limit)) {
       const mem = this.storage.sqlite.getMemoryById(item.id);
       if (!mem) continue;
-      this.storage.sqlite.touchMemory(item.id);
+      if (this.lifecycle.isExpired(mem.expires_at, new Date())) continue;
+      let adjustedScore = item.rrfScore;
+      if (mem.retention_tier === 'T0') adjustedScore += 0.1;
+      this.registerAccess(mem);
       searchResults.push({
         id: mem.id,
         content: mem.content,
         summary: mem.summary,
         type: mem.type,
         tags: mem.tags,
-        score: item.rrfScore,
+        score: adjustedScore,
         semantic_score: item.semanticScore,
         fulltext_score: item.fulltextScore,
+        retention_tier: mem.retention_tier,
+        expires_at: mem.expires_at,
+        expiring_soon: this.lifecycle.isExpiringSoon(mem.expires_at, new Date()),
         created_at: mem.created_at,
-        last_accessed: mem.last_accessed,
+        last_accessed: new Date().toISOString(),
       });
     }
     this.storage.sqlite.scheduleDeferredFlush();
     return searchResults;
+  }
+
+  private registerAccess(mem: { id: string; access_count: number; retention_tier: SearchResult['retention_tier']; expires_at: string | null }): void {
+    const now = new Date();
+    const nextAccessCount = mem.access_count + 1;
+    const promotedTier = this.lifecycle.shouldPromote(mem.retention_tier, nextAccessCount) ?? mem.retention_tier;
+    const nextExpiry = this.lifecycle.extendExpiry(promotedTier, now);
+    const nextReviewDue = promotedTier === 'T1'
+      ? this.lifecycle.computeExpiry('T1', now)
+      : undefined;
+    if (typeof (this.storage.sqlite as any).recordAccess === 'function') {
+      this.storage.sqlite.recordAccess(
+        mem.id,
+        nextAccessCount,
+        now.toISOString(),
+        nextExpiry === null ? null : nextExpiry,
+        promotedTier !== mem.retention_tier ? promotedTier : undefined,
+        nextReviewDue,
+      );
+    } else {
+      this.storage.sqlite.touchMemory(mem.id);
+    }
   }
 }

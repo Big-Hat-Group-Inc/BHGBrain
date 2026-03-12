@@ -19,6 +19,14 @@ function createMockSqlite(): SqliteStore {
       }
     }),
     deleteMemory: vi.fn((id: string) => memoryStore.delete(id)),
+    markVectorSync: vi.fn((id: string, synced: boolean) => {
+      const existing = memoryStore.get(id);
+      if (existing) {
+        existing.vector_synced = synced;
+      }
+    }),
+    listRevisions: vi.fn(() => []),
+    insertRevision: vi.fn(),
     getCollection: vi.fn(() => ({ name: 'general', namespace: 'global', embedding_model: 'test', embedding_dimensions: 3 })),
     createCollection: vi.fn(),
     flushIfDirty: vi.fn(),
@@ -59,23 +67,30 @@ describe('StorageManager cross-store consistency', () => {
     source: 'cli' as const,
     checksum: 'chk1',
     importance: 0.5,
+    retention_tier: 'T2' as const,
+    expires_at: new Date(Date.now() + 86400000).toISOString(),
+    decay_eligible: true,
+    review_due: null,
     access_count: 0,
     last_operation: 'ADD' as const,
     merged_from: null,
+    archived: false,
+    vector_synced: true,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     last_accessed: new Date().toISOString(),
   };
 
-  describe('writeMemory rollback', () => {
-    it('rolls back SQLite insert when Qdrant upsert fails', async () => {
+  describe('writeMemory recovery', () => {
+    it('keeps SQLite state and marks vector drift when Qdrant upsert fails', async () => {
       const sqlite = createMockSqlite();
       const qdrant = createMockQdrant(true);
       const embedding = createMockEmbedding();
       const storage = new StorageManager(sqlite, qdrant, embedding);
 
       await expect(storage.writeMemory(baseMem, [1, 2, 3])).rejects.toThrow('Qdrant write failed');
-      expect(sqlite.deleteMemory).toHaveBeenCalledWith('mem-1');
+      expect(sqlite.deleteMemory).not.toHaveBeenCalled();
+      expect(sqlite.markVectorSync).toHaveBeenCalledWith('mem-1', false);
     });
   });
 

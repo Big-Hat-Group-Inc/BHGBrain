@@ -37,7 +37,6 @@ export class StorageManager {
       );
     }
 
-    // Write to both stores
     try {
       this.sqlite.insertMemory(mem);
     } catch (err) {
@@ -50,12 +49,19 @@ export class StorageManager {
         tags: mem.tags,
         collection: mem.collection,
         importance: mem.importance,
+        retention_tier: mem.retention_tier,
+        decay_eligible: mem.decay_eligible,
+        expires_at: mem.expires_at ? Math.floor(Date.parse(mem.expires_at) / 1000) : null,
       });
+      if (typeof (this.sqlite as any).markVectorSync === 'function') {
+        this.sqlite.markVectorSync(mem.id, true);
+      }
     } catch (err) {
-      // Rollback SQLite insert
-      this.sqlite.deleteMemory(mem.id);
+      if (typeof (this.sqlite as any).markVectorSync === 'function') {
+        this.sqlite.markVectorSync(mem.id, false);
+      }
       this.sqlite.flushIfDirty();
-      throw internal(`Qdrant write failed, rolled back SQLite: ${(err as Error).message}`);
+      throw internal(`Qdrant write failed after SQLite persistence: ${(err as Error).message}`);
     }
 
     this.sqlite.flushIfDirty();
@@ -75,6 +81,10 @@ export class StorageManager {
       (rollbackFields as any)[key] = (existing as any)[key];
     }
 
+    if (existing.retention_tier === 'T0' && fields.content && fields.content !== existing.content) {
+      this.sqlite.insertRevision(id, this.sqlite.listRevisions(id).length + 1, existing.content, new Date().toISOString());
+    }
+
     this.sqlite.updateMemory(id, fields);
 
     if (newVector) {
@@ -89,11 +99,19 @@ export class StorageManager {
             tags: fields.tags ?? existing.tags,
             collection: existing.collection,
             importance: fields.importance ?? existing.importance,
+            retention_tier: fields.retention_tier ?? existing.retention_tier,
+            decay_eligible: fields.decay_eligible ?? existing.decay_eligible,
+            expires_at: (fields.expires_at ?? existing.expires_at) ? Math.floor(Date.parse((fields.expires_at ?? existing.expires_at)! as string) / 1000) : null,
           },
         );
+        if (typeof (this.sqlite as any).markVectorSync === 'function') {
+          this.sqlite.markVectorSync(id, true);
+        }
       } catch (err) {
-        // Rollback SQLite to previous state
         this.sqlite.updateMemory(id, rollbackFields);
+        if (typeof (this.sqlite as any).markVectorSync === 'function') {
+          this.sqlite.markVectorSync(id, false);
+        }
         this.sqlite.flushIfDirty();
         throw internal(`Qdrant update failed, rolled back SQLite: ${(err as Error).message}`);
       }
@@ -105,12 +123,13 @@ export class StorageManager {
   async deleteMemory(id: string): Promise<boolean> {
     const mem = this.sqlite.getMemoryById(id);
     if (!mem) return false;
-
-    const deleted = this.sqlite.deleteMemory(id);
-    if (deleted) {
+    try {
       await this.qdrant.delete(mem.namespace, mem.collection, id);
-      this.sqlite.flushIfDirty();
+    } catch (err) {
+      throw internal(`Qdrant delete failed: ${(err as Error).message}`);
     }
+    const deleted = this.sqlite.deleteMemory(id);
+    this.sqlite.flushIfDirty();
     return deleted;
   }
 

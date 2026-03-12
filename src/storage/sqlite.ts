@@ -1,7 +1,15 @@
 import initSqlJs, { type Database } from 'sql.js';
-import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import type { MemoryRecord, CategoryRecord, AuditEntry, WriteOperation } from '../domain/types.js';
+import { readFileSync, writeFileSync, existsSync, renameSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import type {
+  MemoryRecord,
+  CategoryRecord,
+  AuditEntry,
+  ArchiveRecord,
+  MemoryRevisionRecord,
+  RetentionTier,
+  TierStats,
+} from '../domain/types.js';
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS memories (
@@ -16,10 +24,16 @@ CREATE TABLE IF NOT EXISTS memories (
   source TEXT NOT NULL DEFAULT 'cli',
   checksum TEXT NOT NULL,
   importance REAL NOT NULL DEFAULT 0.5,
+  retention_tier TEXT NOT NULL DEFAULT 'T2',
+  expires_at TEXT,
+  decay_eligible INTEGER NOT NULL DEFAULT 1,
+  review_due TEXT,
   access_count INTEGER NOT NULL DEFAULT 0,
   last_operation TEXT NOT NULL DEFAULT 'ADD',
   merged_from TEXT,
   stale INTEGER NOT NULL DEFAULT 0,
+  archived INTEGER NOT NULL DEFAULT 0,
+  vector_synced INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_accessed TEXT NOT NULL
@@ -32,6 +46,11 @@ CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(namespace, type);
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
 CREATE INDEX IF NOT EXISTS idx_memories_stale ON memories(stale, importance);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(namespace, collection, retention_tier);
+CREATE INDEX IF NOT EXISTS idx_memories_expiry ON memories(decay_eligible, expires_at);
+CREATE INDEX IF NOT EXISTS idx_memories_review_due ON memories(retention_tier, review_due);
+CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(archived);
+CREATE INDEX IF NOT EXISTS idx_memories_vector_synced ON memories(vector_synced);
 
 CREATE TABLE IF NOT EXISTS memories_fts (
   id TEXT PRIMARY KEY,
@@ -78,6 +97,31 @@ CREATE TABLE IF NOT EXISTS backup_metadata (
   checksum TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS memory_revisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  memory_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  updated_by TEXT,
+  UNIQUE(memory_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS memory_archive (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  memory_id TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  tier TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expired_at TEXT NOT NULL,
+  access_count INTEGER NOT NULL DEFAULT 0,
+  tags TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_archive_memory_id ON memory_archive(memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_archive_expired_at ON memory_archive(expired_at DESC);
 `;
 
 export class SqliteStore {
@@ -100,6 +144,7 @@ export class SqliteStore {
       this.db = new SQL.Database();
     }
     this.db.run(SCHEMA_SQL);
+    this.ensureMemoryColumns();
     this.flush();
   }
 
@@ -114,6 +159,7 @@ export class SqliteStore {
     const buffer = readFileSync(this.dbPath);
     this.db = new SQL.Database(buffer);
     this.db.run(SCHEMA_SQL);
+    this.ensureMemoryColumns();
     this.dirty = false;
   }
 
@@ -131,13 +177,8 @@ export class SqliteStore {
     if (this.dirty) this.flush();
   }
 
-  /**
-   * Schedule a deferred flush that will persist dirty state within a bounded window.
-   * Used for non-critical writes (e.g., access metadata) to avoid synchronous
-   * full-database exports on read paths.
-   */
   scheduleDeferredFlush(): void {
-    if (this.deferredFlushTimer) return; // already scheduled
+    if (this.deferredFlushTimer) return;
     this.deferredFlushTimer = setTimeout(() => {
       this.deferredFlushTimer = null;
       this.flushIfDirty();
@@ -151,15 +192,45 @@ export class SqliteStore {
     }
   }
 
-  // -- Memory CRUD --
-
   insertMemory(mem: Omit<MemoryRecord, 'embedding'>): void {
+    const retentionTier = mem.retention_tier ?? 'T2';
+    const expiresAt = mem.expires_at ?? null;
+    const decayEligible = mem.decay_eligible ?? true;
+    const reviewDue = mem.review_due ?? null;
+    const archived = mem.archived ?? false;
+    const vectorSynced = mem.vector_synced ?? true;
     this.db.run(
-      `INSERT INTO memories (id, namespace, collection, type, category, content, summary, tags, source, checksum, importance, access_count, last_operation, merged_from, created_at, updated_at, last_accessed)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [mem.id, mem.namespace, mem.collection, mem.type, mem.category, mem.content, mem.summary,
-       JSON.stringify(mem.tags), mem.source, mem.checksum, mem.importance, mem.access_count,
-       mem.last_operation, mem.merged_from, mem.created_at, mem.updated_at, mem.last_accessed],
+      `INSERT INTO memories (
+        id, namespace, collection, type, category, content, summary, tags, source, checksum,
+        importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
+        last_operation, merged_from, stale, archived, vector_synced, created_at, updated_at, last_accessed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        mem.id,
+        mem.namespace,
+        mem.collection,
+        mem.type,
+        mem.category,
+        mem.content,
+        mem.summary,
+        JSON.stringify(mem.tags),
+        mem.source,
+        mem.checksum,
+        mem.importance,
+        retentionTier,
+        expiresAt,
+        decayEligible ? 1 : 0,
+        reviewDue,
+        mem.access_count,
+        mem.last_operation,
+        mem.merged_from,
+        0,
+        archived ? 1 : 0,
+        vectorSynced ? 1 : 0,
+        mem.created_at,
+        mem.updated_at,
+        mem.last_accessed,
+      ],
     );
     this.db.run(
       `INSERT INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
@@ -175,6 +246,9 @@ export class SqliteStore {
       if (key === 'tags') {
         sets.push('tags = ?');
         vals.push(JSON.stringify(val));
+      } else if (key === 'decay_eligible' || key === 'archived' || key === 'vector_synced') {
+        sets.push(`${key} = ?`);
+        vals.push(val ? 1 : 0);
       } else {
         sets.push(`${key} = ?`);
         vals.push(val);
@@ -184,13 +258,13 @@ export class SqliteStore {
     vals.push(id);
     this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, vals as any[]);
 
-    if (fields.content || fields.summary || fields.tags) {
+    if (fields.content || fields.summary || fields.tags || fields.archived) {
       this.db.run(`DELETE FROM memories_fts WHERE id = ?`, [id]);
-      const mem = this.getMemoryById(id);
-      if (mem) {
+      const mem = this.getMemoryById(id, true);
+      if (mem && !mem.archived) {
         this.db.run(
           `INSERT INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
-          [mem.id, mem.namespace, mem.content, mem.summary, (mem.tags as string[]).join(' ')],
+          [mem.id, mem.namespace, mem.content, mem.summary, mem.tags.join(' ')],
         );
       }
     }
@@ -198,7 +272,7 @@ export class SqliteStore {
   }
 
   deleteMemory(id: string): boolean {
-    const mem = this.getMemoryById(id);
+    const mem = this.getMemoryById(id, true);
     if (!mem) return false;
     this.db.run(`DELETE FROM memories WHERE id = ?`, [id]);
     this.db.run(`DELETE FROM memories_fts WHERE id = ?`, [id]);
@@ -206,29 +280,37 @@ export class SqliteStore {
     return true;
   }
 
-  getMemoryById(id: string): (Omit<MemoryRecord, 'embedding'>) | null {
-    const stmt = this.db.prepare(`SELECT * FROM memories WHERE id = ?`);
+  getMemoryById(id: string, includeArchived = false): Omit<MemoryRecord, 'embedding'> | null {
+    const sql = includeArchived
+      ? `SELECT * FROM memories WHERE id = ?`
+      : `SELECT * FROM memories WHERE id = ? AND archived = 0`;
+    const stmt = this.db.prepare(sql);
     stmt.bind([id]);
-    if (!stmt.step()) { stmt.free(); return null; }
+    if (!stmt.step()) {
+      stmt.free();
+      return null;
+    }
     const row = stmt.getAsObject();
     stmt.free();
     return this.rowToMemory(row);
   }
 
-  getMemoryByChecksum(namespace: string, checksum: string): (Omit<MemoryRecord, 'embedding'>) | null {
-    const stmt = this.db.prepare(`SELECT * FROM memories WHERE namespace = ? AND checksum = ? LIMIT 1`);
+  getMemoryByChecksum(namespace: string, checksum: string): Omit<MemoryRecord, 'embedding'> | null {
+    const stmt = this.db.prepare(`SELECT * FROM memories WHERE namespace = ? AND checksum = ? AND archived = 0 LIMIT 1`);
     stmt.bind([namespace, checksum]);
-    if (!stmt.step()) { stmt.free(); return null; }
+    if (!stmt.step()) {
+      stmt.free();
+      return null;
+    }
     const row = stmt.getAsObject();
     stmt.free();
     return this.rowToMemory(row);
   }
 
   listMemories(namespace: string, limit: number, cursor?: string): Array<Omit<MemoryRecord, 'embedding'>> {
-    let sql = `SELECT * FROM memories WHERE namespace = ?`;
+    let sql = `SELECT * FROM memories WHERE namespace = ? AND archived = 0`;
     const params: unknown[] = [namespace];
     if (cursor) {
-      // Composite cursor: "created_at|id" for stable tie-breaking
       const sepIdx = cursor.indexOf('|');
       if (sepIdx !== -1) {
         const cursorTime = cursor.substring(0, sepIdx);
@@ -236,7 +318,6 @@ export class SqliteStore {
         sql += ` AND (created_at < ? OR (created_at = ? AND id < ?))`;
         params.push(cursorTime, cursorTime, cursorId);
       } else {
-        // Backwards-compatible: plain timestamp cursor
         sql += ` AND created_at < ?`;
         params.push(cursor);
       }
@@ -248,8 +329,8 @@ export class SqliteStore {
 
   countMemories(namespace?: string): number {
     const sql = namespace
-      ? `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ?`
-      : `SELECT COUNT(*) as cnt FROM memories`;
+      ? `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND archived = 0`
+      : `SELECT COUNT(*) as cnt FROM memories WHERE archived = 0`;
     const params = namespace ? [namespace] : [];
     const stmt = this.db.prepare(sql);
     stmt.bind(params);
@@ -261,7 +342,7 @@ export class SqliteStore {
 
   countMemoriesInCollection(namespace: string, collection: string): number {
     const stmt = this.db.prepare(
-      `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND collection = ?`,
+      `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`,
     );
     stmt.bind([namespace, collection]);
     stmt.step();
@@ -271,18 +352,15 @@ export class SqliteStore {
   }
 
   fullTextSearch(namespace: string, query: string, limit: number, collection?: string): Array<{ id: string; rank: number }> {
-    // Use LIKE-based search since sql.js WASM doesn't include FTS5
-    // When migrated to better-sqlite3 (with native build), switch to FTS5 MATCH
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
     if (terms.length === 0) return [];
 
     const conditions = terms.map(() => `(LOWER(f.content) LIKE ? OR LOWER(f.summary) LIKE ? OR LOWER(f.tags) LIKE ?)`);
     const params: unknown[] = [namespace];
 
-    // Collection-aware filtering: join with memories table to filter by collection
-    let collectionJoin = '';
+    let collectionJoin = ' JOIN memories m ON f.id = m.id AND m.archived = 0';
     if (collection) {
-      collectionJoin = ` JOIN memories m ON f.id = m.id AND m.collection = ?`;
+      collectionJoin += ` AND m.collection = ?`;
       params.push(collection);
     }
 
@@ -298,8 +376,7 @@ export class SqliteStore {
     const results: Array<{ id: string; rank: number }> = [];
     while (stmt.step()) {
       const row = stmt.getAsObject() as { id: string; rank: number };
-      // Compute a simple relevance score based on match count
-      results.push({ id: row.id, rank: -terms.length }); // negative rank = better (FTS5 convention)
+      results.push({ id: row.id, rank: -terms.length });
     }
     stmt.free();
     return results;
@@ -312,14 +389,14 @@ export class SqliteStore {
 
   getStaleMemories(importanceBelow: number, limit: number): Array<Omit<MemoryRecord, 'embedding'>> {
     return this.queryMemories(
-      `SELECT * FROM memories WHERE stale = 1 AND importance < ? AND category IS NULL ORDER BY importance ASC LIMIT ?`,
+      `SELECT * FROM memories WHERE stale = 1 AND importance < ? AND category IS NULL AND archived = 0 ORDER BY importance ASC LIMIT ?`,
       [importanceBelow, limit],
     );
   }
 
   listStaleCandidateIds(cutoffIso: string): string[] {
     const stmt = this.db.prepare(
-      `SELECT id FROM memories WHERE last_accessed < ? AND stale = 0 AND category IS NULL`,
+      `SELECT id FROM memories WHERE last_accessed < ? AND stale = 0 AND category IS NULL AND archived = 0`,
     );
     stmt.bind([cutoffIso]);
     const ids: string[] = [];
@@ -340,16 +417,192 @@ export class SqliteStore {
     this.markDirty();
   }
 
+  recordAccess(
+    id: string,
+    accessCount: number,
+    lastAccessed: string,
+    expiresAt?: string | null,
+    retentionTier?: RetentionTier,
+    reviewDue?: string | null,
+  ): void {
+    const sets = ['access_count = ?', 'last_accessed = ?'];
+    const params: unknown[] = [accessCount, lastAccessed];
+    if (expiresAt !== undefined) {
+      sets.push('expires_at = ?');
+      params.push(expiresAt);
+    }
+    if (retentionTier) {
+      sets.push('retention_tier = ?');
+      params.push(retentionTier);
+    }
+    if (reviewDue !== undefined) {
+      sets.push('review_due = ?');
+      params.push(reviewDue);
+    }
+    params.push(id);
+    this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, params as any[]);
+    this.markDirty();
+  }
+
+  markVectorSync(id: string, synced: boolean): void {
+    this.db.run(`UPDATE memories SET vector_synced = ? WHERE id = ?`, [synced ? 1 : 0, id]);
+    this.markDirty();
+  }
+
+  listExpiredMemories(nowIso: string, tier?: RetentionTier): Array<Omit<MemoryRecord, 'embedding'>> {
+    const sql = tier
+      ? `SELECT * FROM memories WHERE archived = 0 AND decay_eligible = 1 AND expires_at IS NOT NULL AND expires_at < ? AND retention_tier = ? ORDER BY expires_at ASC`
+      : `SELECT * FROM memories WHERE archived = 0 AND decay_eligible = 1 AND expires_at IS NOT NULL AND expires_at < ? ORDER BY expires_at ASC`;
+    const params = tier ? [nowIso, tier] : [nowIso];
+    return this.queryMemories(sql, params);
+  }
+
+  listExpiringMemories(nowIso: string, untilIso: string, limit: number): Array<Omit<MemoryRecord, 'embedding'>> {
+    return this.queryMemories(
+      `SELECT * FROM memories WHERE archived = 0 AND expires_at IS NOT NULL AND expires_at >= ? AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?`,
+      [nowIso, untilIso, limit],
+    );
+  }
+
+  countExpiringMemories(nowIso: string, untilIso: string): number {
+    const stmt = this.db.prepare(
+      `SELECT COUNT(*) as cnt FROM memories WHERE archived = 0 AND expires_at IS NOT NULL AND expires_at >= ? AND expires_at <= ?`,
+    );
+    stmt.bind([nowIso, untilIso]);
+    stmt.step();
+    const row = stmt.getAsObject() as { cnt: number };
+    stmt.free();
+    return row.cnt;
+  }
+
+  countByTier(): Record<RetentionTier, number> {
+    const counts: Record<RetentionTier, number> = { T0: 0, T1: 0, T2: 0, T3: 0 };
+    const stmt = this.db.prepare(
+      `SELECT retention_tier, COUNT(*) as cnt FROM memories WHERE archived = 0 GROUP BY retention_tier`,
+    );
+    while (stmt.step()) {
+      const row = stmt.getAsObject() as { retention_tier: RetentionTier; cnt: number };
+      counts[row.retention_tier] = row.cnt;
+    }
+    stmt.free();
+    return counts;
+  }
+
+  getTierStats(): TierStats[] {
+    const counts = this.countByTier();
+    return (Object.keys(counts) as RetentionTier[]).map(tier => ({ tier, count: counts[tier] }));
+  }
+
+  countArchivedMemories(): number {
+    const stmt = this.db.prepare(`SELECT COUNT(*) as cnt FROM memory_archive`);
+    stmt.step();
+    const row = stmt.getAsObject() as { cnt: number };
+    stmt.free();
+    return row.cnt;
+  }
+
+  countUnsyncedVectors(): number {
+    const stmt = this.db.prepare(`SELECT COUNT(*) as cnt FROM memories WHERE archived = 0 AND vector_synced = 0`);
+    stmt.step();
+    const row = stmt.getAsObject() as { cnt: number };
+    stmt.free();
+    return row.cnt;
+  }
+
+  archiveMemory(memory: Omit<MemoryRecord, 'embedding'>, expiredAt: string): void {
+    this.db.run(
+      `INSERT INTO memory_archive (memory_id, summary, tier, namespace, created_at, expired_at, access_count, tags)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        memory.id,
+        memory.summary,
+        memory.retention_tier,
+        memory.namespace,
+        memory.created_at,
+        expiredAt,
+        memory.access_count,
+        JSON.stringify(memory.tags),
+      ],
+    );
+    this.markDirty();
+  }
+
+  listArchive(limit: number): ArchiveRecord[] {
+    const stmt = this.db.prepare(`SELECT * FROM memory_archive ORDER BY expired_at DESC LIMIT ?`);
+    stmt.bind([limit]);
+    const rows: ArchiveRecord[] = [];
+    while (stmt.step()) {
+      rows.push(this.rowToArchive(stmt.getAsObject()));
+    }
+    stmt.free();
+    return rows;
+  }
+
+  searchArchive(query: string, limit: number): ArchiveRecord[] {
+    const like = `%${query.toLowerCase()}%`;
+    const stmt = this.db.prepare(
+      `SELECT * FROM memory_archive WHERE LOWER(summary) LIKE ? OR LOWER(tags) LIKE ? ORDER BY expired_at DESC LIMIT ?`,
+    );
+    stmt.bind([like, like, limit]);
+    const rows: ArchiveRecord[] = [];
+    while (stmt.step()) {
+      rows.push(this.rowToArchive(stmt.getAsObject()));
+    }
+    stmt.free();
+    return rows;
+  }
+
+  getArchiveByMemoryId(memoryId: string): ArchiveRecord | null {
+    const stmt = this.db.prepare(`SELECT * FROM memory_archive WHERE memory_id = ? ORDER BY id DESC LIMIT 1`);
+    stmt.bind([memoryId]);
+    if (!stmt.step()) {
+      stmt.free();
+      return null;
+    }
+    const row = this.rowToArchive(stmt.getAsObject());
+    stmt.free();
+    return row;
+  }
+
+  deleteArchive(memoryId: string): void {
+    this.db.run(`DELETE FROM memory_archive WHERE memory_id = ?`, [memoryId]);
+    this.markDirty();
+  }
+
+  insertRevision(memoryId: string, revision: number, content: string, updatedAt: string, updatedBy?: string): void {
+    this.db.run(
+      `INSERT INTO memory_revisions (memory_id, revision, content, updated_at, updated_by) VALUES (?, ?, ?, ?, ?)`,
+      [memoryId, revision, content, updatedAt, updatedBy ?? null],
+    );
+    this.markDirty();
+  }
+
+  listRevisions(memoryId: string): MemoryRevisionRecord[] {
+    const stmt = this.db.prepare(`SELECT * FROM memory_revisions WHERE memory_id = ? ORDER BY revision DESC`);
+    stmt.bind([memoryId]);
+    const results: MemoryRevisionRecord[] = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject() as any;
+      results.push({
+        id: row.id,
+        memory_id: row.memory_id,
+        revision: row.revision,
+        content: row.content,
+        updated_at: row.updated_at,
+        updated_by: row.updated_by ?? null,
+      });
+    }
+    stmt.free();
+    return results;
+  }
+
   getDbSizeBytes(): number {
     try {
-      const { size } = require('node:fs').statSync(this.dbPath);
-      return size;
+      return statSync(this.dbPath).size;
     } catch {
       return 0;
     }
   }
-
-  // -- Categories --
 
   setCategory(name: string, slot: string, content: string): CategoryRecord {
     const now = new Date().toISOString();
@@ -372,7 +625,10 @@ export class SqliteStore {
   getCategory(name: string): CategoryRecord | null {
     const stmt = this.db.prepare(`SELECT * FROM categories WHERE name = ?`);
     stmt.bind([name]);
-    if (!stmt.step()) { stmt.free(); return null; }
+    if (!stmt.step()) {
+      stmt.free();
+      return null;
+    }
     const row = stmt.getAsObject() as any;
     stmt.free();
     return { name: row.name, slot: row.slot, content: row.content, updated_at: row.updated_at, revision: row.revision };
@@ -397,8 +653,6 @@ export class SqliteStore {
     return true;
   }
 
-  // -- Collections --
-
   createCollection(namespace: string, name: string, embeddingModel: string, embeddingDimensions: number): void {
     const now = new Date().toISOString();
     this.db.run(
@@ -411,7 +665,10 @@ export class SqliteStore {
   getCollection(namespace: string, name: string): { name: string; namespace: string; embedding_model: string; embedding_dimensions: number } | null {
     const stmt = this.db.prepare(`SELECT * FROM collections WHERE namespace = ? AND name = ?`);
     stmt.bind([namespace, name]);
-    if (!stmt.step()) { stmt.free(); return null; }
+    if (!stmt.step()) {
+      stmt.free();
+      return null;
+    }
     const row = stmt.getAsObject() as any;
     stmt.free();
     return { name: row.name, namespace: row.namespace, embedding_model: row.embedding_model, embedding_dimensions: row.embedding_dimensions };
@@ -419,8 +676,8 @@ export class SqliteStore {
 
   listCollections(namespace?: string): Array<{ name: string; count: number }> {
     const sql = namespace
-      ? `SELECT c.name, COUNT(m.id) as count FROM collections c LEFT JOIN memories m ON c.name = m.collection AND c.namespace = m.namespace WHERE c.namespace = ? GROUP BY c.name ORDER BY c.name`
-      : `SELECT c.name, COUNT(m.id) as count FROM collections c LEFT JOIN memories m ON c.name = m.collection AND c.namespace = m.namespace GROUP BY c.namespace, c.name ORDER BY c.name`;
+      ? `SELECT c.name, COUNT(m.id) as count FROM collections c LEFT JOIN memories m ON c.name = m.collection AND c.namespace = m.namespace AND m.archived = 0 WHERE c.namespace = ? GROUP BY c.name ORDER BY c.name`
+      : `SELECT c.name, COUNT(m.id) as count FROM collections c LEFT JOIN memories m ON c.name = m.collection AND c.namespace = m.namespace AND m.archived = 0 GROUP BY c.namespace, c.name ORDER BY c.name`;
     const params = namespace ? [namespace] : [];
     const stmt = this.db.prepare(sql);
     stmt.bind(params);
@@ -445,7 +702,7 @@ export class SqliteStore {
   }
 
   deleteMemoriesInCollection(namespace: string, collection: string): { deleted: number; ids: string[] } {
-    const select = this.db.prepare(`SELECT id FROM memories WHERE namespace = ? AND collection = ?`);
+    const select = this.db.prepare(`SELECT id FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`);
     select.bind([namespace, collection]);
     const ids: string[] = [];
     while (select.step()) {
@@ -469,8 +726,6 @@ export class SqliteStore {
     return { deleted: ids.length, ids };
   }
 
-  // -- Audit --
-
   insertAudit(entry: AuditEntry): void {
     this.db.run(
       `INSERT INTO audit_log (id, timestamp, namespace, operation, memory_id, client_id, details) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -486,15 +741,18 @@ export class SqliteStore {
     while (stmt.step()) {
       const row = stmt.getAsObject() as any;
       results.push({
-        id: row.id, timestamp: row.timestamp, namespace: row.namespace,
-        operation: row.operation, memory_id: row.memory_id, client_id: row.client_id, details: row.details,
+        id: row.id,
+        timestamp: row.timestamp,
+        namespace: row.namespace,
+        operation: row.operation,
+        memory_id: row.memory_id,
+        client_id: row.client_id,
+        details: row.details,
       });
     }
     stmt.free();
     return results;
   }
-
-  // -- Backup metadata --
 
   insertBackupMeta(path: string, sizeBytes: number, memoryCount: number, checksum: string): void {
     this.db.run(
@@ -514,8 +772,6 @@ export class SqliteStore {
     stmt.free();
     return results;
   }
-
-  // -- Export/Import for backup --
 
   exportData(): Buffer {
     return Buffer.from(this.db.export());
@@ -542,8 +798,6 @@ export class SqliteStore {
     this.db.close();
   }
 
-  // -- Helpers --
-
   private queryMemories(sql: string, params: unknown[]): Array<Omit<MemoryRecord, 'embedding'>> {
     const stmt = this.db.prepare(sql);
     stmt.bind(params as any[]);
@@ -568,20 +822,61 @@ export class SqliteStore {
       source: row.source,
       checksum: row.checksum,
       importance: row.importance,
+      retention_tier: row.retention_tier ?? 'T2',
+      expires_at: row.expires_at ?? null,
+      decay_eligible: Boolean(row.decay_eligible),
+      review_due: row.review_due ?? null,
       access_count: row.access_count,
       last_operation: row.last_operation,
       merged_from: row.merged_from ?? null,
+      archived: Boolean(row.archived),
+      vector_synced: row.vector_synced === undefined ? true : Boolean(row.vector_synced),
       created_at: row.created_at,
       updated_at: row.updated_at,
       last_accessed: row.last_accessed,
     };
   }
+
+  private rowToArchive(row: any): ArchiveRecord {
+    return {
+      id: row.id,
+      memory_id: row.memory_id,
+      summary: row.summary,
+      tier: row.tier,
+      namespace: row.namespace,
+      created_at: row.created_at,
+      expired_at: row.expired_at,
+      access_count: row.access_count,
+      tags: JSON.parse(row.tags || '[]'),
+    };
+  }
+
+  private ensureMemoryColumns(): void {
+    const existingColumns = new Set<string>();
+    const stmt = this.db.prepare(`PRAGMA table_info(memories)`);
+    while (stmt.step()) {
+      const row = stmt.getAsObject() as { name: string };
+      existingColumns.add(row.name);
+    }
+    stmt.free();
+
+    const requiredColumns: Array<{ name: string; sql: string }> = [
+      { name: 'retention_tier', sql: `ALTER TABLE memories ADD COLUMN retention_tier TEXT NOT NULL DEFAULT 'T2'` },
+      { name: 'expires_at', sql: `ALTER TABLE memories ADD COLUMN expires_at TEXT` },
+      { name: 'decay_eligible', sql: `ALTER TABLE memories ADD COLUMN decay_eligible INTEGER NOT NULL DEFAULT 1` },
+      { name: 'review_due', sql: `ALTER TABLE memories ADD COLUMN review_due TEXT` },
+      { name: 'archived', sql: `ALTER TABLE memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0` },
+      { name: 'vector_synced', sql: `ALTER TABLE memories ADD COLUMN vector_synced INTEGER NOT NULL DEFAULT 1` },
+    ];
+
+    for (const column of requiredColumns) {
+      if (!existingColumns.has(column.name)) {
+        this.db.run(column.sql);
+      }
+    }
+  }
 }
 
-/**
- * Write file atomically: write to temp file then rename.
- * Prevents truncated/partial files on crash.
- */
 export function atomicWriteFileSync(targetPath: string, data: Buffer): void {
   const tmpPath = `${targetPath}.tmp`;
   writeFileSync(tmpPath, data);
