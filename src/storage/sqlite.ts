@@ -144,8 +144,10 @@ export class SqliteStore {
     } else {
       this.db = new SQL.Database();
     }
-    this.db.run(SCHEMA_SQL);
+    // Run column migrations BEFORE SCHEMA_SQL so new indexes (e.g. idx_memories_tier)
+    // that reference retention_tier don't fail on an existing DB that predates the column.
     this.ensureMemoryColumns();
+    this.db.run(SCHEMA_SQL);
     this.flush();
   }
 
@@ -161,8 +163,8 @@ export class SqliteStore {
     }
     const buffer = readFileSync(this.dbPath);
     this.db = new SQL.Database(buffer);
-    this.db.run(SCHEMA_SQL);
     this.ensureMemoryColumns();
+    this.db.run(SCHEMA_SQL);
     this.dirty = false;
   }
 
@@ -972,6 +974,15 @@ export class SqliteStore {
   }
 
   private ensureMemoryColumns(): void {
+    // Guard: if the memories table doesn't exist yet (fresh DB), skip migrations —
+    // SCHEMA_SQL will create it with all columns present.
+    const tableStmt = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='memories'`);
+    const tableFound = tableStmt.step();
+    tableStmt.free();
+    if (!tableFound) {
+      return;
+    }
+
     const existingColumns = new Set<string>();
     const stmt = this.db.prepare(`PRAGMA table_info(memories)`);
     while (stmt.step()) {
