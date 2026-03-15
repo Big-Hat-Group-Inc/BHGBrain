@@ -28,23 +28,6 @@ How to run the interview:
   9. Suggested tags/categories for my second brain
   10. Any missing information I should fill in later
 
-Important context already known:
-- My company is Big Hat Group.
-- Big Hat Group creates and manages its own repositories in GitHub.
-- My GitHub account is: kkaminsk
-- I am also a member of Steeves and Associates, which is a consulting group I do work for.
-- Biowest is confusing and must be carefully disambiguated.
-- “Biowest” refers to Biowest Energy in GitHub, and that is being used as the developer tenant for the Policy Solver application in their repository.
-- Biowest and Policy Solver have separate tenants.
-- Operationally, Biowest acts like the customer and Policy Solver acts like the software provider.
-- You must explicitly separate:
-  - legal/business entities
-  - GitHub accounts/orgs
-  - software products
-  - repositories
-  - environments/tenants
-  - customer/provider relationships
-
 Interview structure:
 Ask questions in this order:
 
@@ -101,11 +84,8 @@ For each entity, ask:
 - How does it relate to the other entities?
 
 Make sure to explicitly clarify:
-- Big Hat Group
-- Steeves and Associates
-- Biowest
-- Biowest Energy
-- Policy Solver
+- Aure Tenants
+- Microsoft 365 Tenants
 - Any GitHub orgs, repositories, or tenants tied to them
 
 SECTION 8: GitHub and repository structure
