@@ -28,23 +28,6 @@ How to run the interview:
   9. Suggested tags/categories for my second brain
   10. Any missing information I should fill in later
 
-Important context already known:
-- My company is [REDACTED].
-- My organization creates and manages its own repositories in GitHub.
-- My GitHub account is: [REDACTED]
-- I am also a member of a consulting group I do work for.
-- Client entities must be carefully disambiguated.
-- “ClientCo” refers to ClientCo Energy in GitHub, and that is being used as the developer tenant for the ProductApp application in their repository.
-- Client and product entities may have separate tenants.
-- Operationally, one entity may act as the customer while another acts as the software provider.
-- You must explicitly separate:
-  - legal/business entities
-  - GitHub accounts/orgs
-  - software products
-  - repositories
-  - environments/tenants
-  - customer/provider relationships
-
 Interview structure:
 Ask questions in this order:
 
@@ -101,6 +84,8 @@ For each entity, ask:
 - How does it relate to the other entities?
 
 Make sure to explicitly clarify:
+- Aure Tenants
+- Microsoft 365 Tenants
 - Any GitHub orgs, repositories, or tenants tied to them
 
 SECTION 8: GitHub and repository structure
