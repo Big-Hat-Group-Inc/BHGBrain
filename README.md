@@ -299,6 +299,29 @@ bhgbrain server token            # Generate a new bearer token
 
 ---
 
+## Upgrading
+
+### 1.0 → 1.2 (Tiered Memory Lifecycle)
+
+**No manual migration required.** BHGBrain automatically upgrades existing databases on startup.
+
+What happens on first start after upgrade:
+
+- SQLite schema is migrated in-place — new columns (`retention_tier`, `expires_at`, `decay_eligible`, `review_due`, `archived`, `vector_synced`) are added to the `memories` table with safe defaults.
+- All existing memories are assigned `retention_tier = T2` (standard retention, 90-day TTL by default).
+- Qdrant collections are unchanged — no re-indexing required.
+- Existing `config.json` files are fully forward-compatible. New config fields (`limits.tier_ttl`, `limits.tier_budgets`, etc.) are applied from defaults.
+
+**Backup recommended before upgrading** (precautionary):
+
+```bash
+bhgbrain backup create
+```
+
+The backup is stored in the data directory (`%LOCALAPPDATA%\BHGBrain\` on Windows, `~/.bhgbrain/` on Linux/macOS).
+
+---
+
 ## Behavior Notes
 
 ### Collections Delete Semantics
