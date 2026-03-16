@@ -8,6 +8,8 @@ export type WriteOperation = 'ADD' | 'UPDATE' | 'DELETE' | 'NOOP';
 
 export type SearchMode = 'semantic' | 'fulltext' | 'hybrid';
 
+export type RetentionTier = 'T0' | 'T1' | 'T2' | 'T3';
+
 export type HealthStatus = 'healthy' | 'degraded' | 'unhealthy';
 
 export type ErrorCode =
@@ -32,9 +34,15 @@ export interface MemoryRecord {
   checksum: string;
   embedding: number[];
   importance: number;
+  retention_tier: RetentionTier;
+  expires_at: string | null;
+  decay_eligible: boolean;
+  review_due: string | null;
   access_count: number;
   last_operation: WriteOperation;
   merged_from: string | null;
+  archived: boolean;
+  vector_synced: boolean;
   created_at: string;
   updated_at: string;
   last_accessed: string;
@@ -62,6 +70,9 @@ export interface SearchResult {
   score: number;
   semantic_score?: number;
   fulltext_score?: number;
+  retention_tier: RetentionTier;
+  expires_at?: string | null;
+  expiring_soon?: boolean;
   created_at: string;
   last_accessed: string;
 }
@@ -93,10 +104,18 @@ export interface HealthSnapshot {
     sqlite: ComponentHealth;
     qdrant: ComponentHealth;
     embedding: ComponentHealth;
+    retention?: ComponentHealth;
   };
   memory_count: number;
   db_size_bytes: number;
   uptime_seconds: number;
+  retention?: {
+    counts_by_tier: Record<RetentionTier, number>;
+    expiring_soon: number;
+    archived_count: number;
+    unsynced_vectors: number;
+    over_capacity: boolean;
+  };
 }
 
 export interface ErrorEnvelope {
@@ -130,4 +149,30 @@ export interface InjectPayload {
   total_results: number;
   categories_count: number;
   memories_count: number;
+}
+
+export interface ArchiveRecord {
+  id: number;
+  memory_id: string;
+  summary: string;
+  tier: RetentionTier;
+  namespace: string;
+  created_at: string;
+  expired_at: string;
+  access_count: number;
+  tags: string[];
+}
+
+export interface MemoryRevisionRecord {
+  id: number;
+  memory_id: string;
+  revision: number;
+  content: string;
+  updated_at: string;
+  updated_by: string | null;
+}
+
+export interface TierStats {
+  tier: RetentionTier;
+  count: number;
 }

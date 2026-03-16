@@ -2,6 +2,7 @@ import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { SearchMode, SearchResult } from '../domain/types.js';
+import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { embeddingUnavailable, internal } from '../errors/index.js';
 
 const RRF_K = 60;
@@ -15,11 +16,15 @@ interface RankedItem {
 }
 
 export class SearchService {
+  private lifecycle: MemoryLifecycleService;
+
   constructor(
     private config: BrainConfig,
     private storage: StorageManager,
     private embedding: EmbeddingProvider,
-  ) {}
+  ) {
+    this.lifecycle = new MemoryLifecycleService(config);
+  }
 
   async search(
     query: string,
@@ -60,25 +65,13 @@ export class SearchService {
       throw internal(`Semantic search failed: vector store unavailable — ${(err as Error).message}`);
     }
 
-    const searchResults: SearchResult[] = [];
-    for (const r of results) {
-      const mem = this.storage.sqlite.getMemoryById(r.id);
-      if (!mem) continue;
-      this.storage.sqlite.touchMemory(r.id);
-      searchResults.push({
-        id: mem.id,
-        content: mem.content,
-        summary: mem.summary,
-        type: mem.type,
-        tags: mem.tags,
+    return this.buildSearchResults(
+      results.map(r => ({
+        id: r.id,
         score: r.score,
         semantic_score: r.score,
-        created_at: mem.created_at,
-        last_accessed: mem.last_accessed,
-      });
-    }
-    this.storage.sqlite.scheduleDeferredFlush();
-    return searchResults;
+      })),
+    );
   }
 
   private fulltextSearch(
@@ -88,26 +81,16 @@ export class SearchService {
     limit: number,
   ): SearchResult[] {
     const ftsResults = this.storage.sqlite.fullTextSearch(namespace, query, limit, collection);
-    const searchResults: SearchResult[] = [];
-    for (const r of ftsResults) {
-      const mem = this.storage.sqlite.getMemoryById(r.id);
-      if (!mem) continue;
-      this.storage.sqlite.touchMemory(r.id);
-      const normalizedScore = Math.min(1, Math.abs(r.rank) / 10);
-      searchResults.push({
-        id: mem.id,
-        content: mem.content,
-        summary: mem.summary,
-        type: mem.type,
-        tags: mem.tags,
-        score: normalizedScore,
-        fulltext_score: normalizedScore,
-        created_at: mem.created_at,
-        last_accessed: mem.last_accessed,
-      });
-    }
-    this.storage.sqlite.scheduleDeferredFlush();
-    return searchResults;
+    return this.buildSearchResults(
+      ftsResults.map(r => {
+        const normalizedScore = Math.min(1, Math.abs(r.rank) / 10);
+        return {
+          id: r.id,
+          score: normalizedScore,
+          fulltext_score: normalizedScore,
+        };
+      }),
+    );
   }
 
   private async hybridSearch(
@@ -165,25 +148,117 @@ export class SearchService {
 
     scored.sort((a, b) => b.rrfScore - a.rrfScore);
 
+    return this.buildSearchResults(
+      scored.slice(0, limit).map(item => ({
+        id: item.id,
+        score: item.rrfScore,
+        semantic_score: item.semanticScore,
+        fulltext_score: item.fulltextScore,
+      })),
+      { boostT0: true },
+    );
+  }
+
+  private buildSearchResults(
+    ranked: Array<{ id: string; score: number; semantic_score?: number; fulltext_score?: number }>,
+    options?: { boostT0?: boolean },
+  ): SearchResult[] {
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const memories = typeof (this.storage.sqlite as any).getMemoriesByIds === 'function'
+      ? this.storage.sqlite.getMemoriesByIds(ranked.map(item => item.id))
+      : ranked
+        .map(item => this.storage.sqlite.getMemoryById(item.id))
+        .filter(Boolean);
+    const memoryMap = new Map(memories.map((mem: any) => [mem.id, mem]));
+    const accessUpdates: Array<{
+      id: string;
+      access_count: number;
+      last_accessed: string;
+      expires_at?: string | null;
+      retention_tier?: SearchResult['retention_tier'];
+      review_due?: string | null;
+    }> = [];
     const searchResults: SearchResult[] = [];
-    for (const item of scored.slice(0, limit)) {
-      const mem = this.storage.sqlite.getMemoryById(item.id);
+
+    for (const item of ranked) {
+      const mem = memoryMap.get(item.id);
       if (!mem) continue;
-      this.storage.sqlite.touchMemory(item.id);
+      if (this.lifecycle.isExpired(mem.expires_at, now)) continue;
+
+      let adjustedScore = item.score;
+      if (options?.boostT0 && mem.retention_tier === 'T0') {
+        adjustedScore += 0.1;
+      }
+
+      accessUpdates.push(this.buildAccessUpdate(mem, now, nowIso));
       searchResults.push({
         id: mem.id,
         content: mem.content,
         summary: mem.summary,
         type: mem.type,
         tags: mem.tags,
-        score: item.rrfScore,
-        semantic_score: item.semanticScore,
-        fulltext_score: item.fulltextScore,
+        score: adjustedScore,
+        semantic_score: item.semantic_score,
+        fulltext_score: item.fulltext_score,
+        retention_tier: mem.retention_tier,
+        expires_at: mem.expires_at,
+        expiring_soon: this.lifecycle.isExpiringSoon(mem.expires_at, now),
         created_at: mem.created_at,
-        last_accessed: mem.last_accessed,
+        last_accessed: nowIso,
       });
     }
-    this.storage.sqlite.scheduleDeferredFlush();
+
+    if (accessUpdates.length > 0) {
+      if (typeof (this.storage.sqlite as any).recordAccessBatch === 'function') {
+        this.storage.sqlite.recordAccessBatch(accessUpdates);
+      } else if (typeof (this.storage.sqlite as any).recordAccess === 'function') {
+        for (const update of accessUpdates) {
+          this.storage.sqlite.recordAccess(
+            update.id,
+            update.access_count,
+            update.last_accessed,
+            update.expires_at,
+            update.retention_tier,
+            update.review_due,
+          );
+        }
+      } else {
+        for (const update of accessUpdates) {
+          this.storage.sqlite.touchMemory(update.id);
+        }
+      }
+      this.storage.sqlite.scheduleDeferredFlush();
+    }
+
     return searchResults;
+  }
+
+  private buildAccessUpdate(
+    mem: { id: string; access_count: number; retention_tier: SearchResult['retention_tier']; expires_at: string | null },
+    now: Date,
+    nowIso: string,
+  ): {
+    id: string;
+    access_count: number;
+    last_accessed: string;
+    expires_at?: string | null;
+    retention_tier?: SearchResult['retention_tier'];
+    review_due?: string | null;
+  } {
+    const nextAccessCount = mem.access_count + 1;
+    const promotedTier = this.lifecycle.shouldPromote(mem.retention_tier, nextAccessCount) ?? mem.retention_tier;
+    const nextExpiry = this.lifecycle.extendExpiry(promotedTier, now);
+    const nextReviewDue = promotedTier === 'T1'
+      ? this.lifecycle.computeExpiry('T1', now)
+      : undefined;
+    return {
+      id: mem.id,
+      access_count: nextAccessCount,
+      last_accessed: nowIso,
+      expires_at: nextExpiry === null ? null : nextExpiry,
+      retention_tier: promotedTier !== mem.retention_tier ? promotedTier : undefined,
+      review_due: nextReviewDue,
+    };
   }
 }

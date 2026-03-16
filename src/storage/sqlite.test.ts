@@ -238,6 +238,21 @@ describe('SqliteStore', () => {
     store.cancelDeferredFlush();
   });
 
+  it('blocks mutating writes during lifecycle operations and skips access updates', () => {
+    const mem = sampleMemory();
+    store.insertMemory(mem);
+    store.flush();
+
+    store.beginLifecycleOperation('restore');
+    expect(() => store.setCategory('Blocked', 'custom', 'nope')).toThrow('lifecycle operation');
+
+    const before = store.getMemoryById(mem.id)!;
+    store.touchMemory(mem.id);
+    const after = store.getMemoryById(mem.id)!;
+    expect(after.access_count).toBe(before.access_count);
+    store.endLifecycleOperation('restore');
+  });
+
   // -- Health --
 
   it('passes health check', () => {

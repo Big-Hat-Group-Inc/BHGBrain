@@ -48,6 +48,18 @@ export class QdrantStore {
         field_name: 'type',
         field_schema: 'keyword',
       });
+      await this.client.createPayloadIndex(name, {
+        field_name: 'retention_tier',
+        field_schema: 'keyword',
+      });
+      await this.client.createPayloadIndex(name, {
+        field_name: 'decay_eligible',
+        field_schema: 'bool',
+      });
+      await this.client.createPayloadIndex(name, {
+        field_name: 'expires_at',
+        field_schema: 'integer',
+      });
     }
   }
 
@@ -77,8 +89,27 @@ export class QdrantStore {
         wait: true,
         points: [id],
       });
-    } catch {
-      // Collection may not exist; ignore
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return;
+      }
+      throw err;
+    }
+  }
+
+  async deleteMany(namespace: string, collection: string, ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    const name = this.collectionName(namespace, collection);
+    try {
+      await this.client.delete(name, {
+        wait: true,
+        points: ids,
+      });
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return;
+      }
+      throw err;
     }
   }
 
@@ -102,6 +133,13 @@ export class QdrantStore {
     if (filters?.type) {
       must.push({ key: 'type', match: { value: filters.type } });
     }
+    must.push({
+      should: [
+        { key: 'decay_eligible', match: { value: false } },
+        { key: 'expires_at', range: { gte: Math.floor(Date.now() / 1000) } },
+        { is_empty: { key: 'expires_at' } },
+      ],
+    });
 
     const results = await this.client.search(name, {
       vector,
@@ -163,8 +201,11 @@ export class QdrantStore {
     const name = this.collectionName(namespace, collection);
     try {
       await this.client.deleteCollection(name);
-    } catch {
-      // Ignore if doesn't exist
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return;
+      }
+      throw err;
     }
   }
 
@@ -176,5 +217,14 @@ export class QdrantStore {
     } catch {
       return null;
     }
+  }
+
+  private isNotFoundError(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false;
+    const maybeErr = err as { status?: number; response?: { status?: number }; message?: string };
+    const status = maybeErr.status ?? maybeErr.response?.status;
+    if (status === 404) return true;
+    const message = maybeErr.message?.toLowerCase() ?? '';
+    return message.includes('not found') || message.includes('does not exist');
   }
 }

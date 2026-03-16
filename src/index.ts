@@ -49,7 +49,7 @@ async function main() {
   const pipeline = new WritePipeline(config, storage, embedding);
   const searchService = new SearchService(config, storage, embedding);
   const backupService = new BackupService(config, storage, logger);
-  const healthService = new HealthService(storage, embedding);
+  const healthService = new HealthService(storage, embedding, config);
   const metrics = new MetricsCollector(config);
 
   const ctx: ToolContext = {

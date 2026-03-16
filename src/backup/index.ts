@@ -83,6 +83,7 @@ export class BackupService {
     }
 
     this.restoreInProgress = true;
+    this.storage.sqlite.beginLifecycleOperation('restore');
     try {
       this.logger?.info({ event: 'backup_restore_validate', path: backupPath });
       const data = readFileSync(backupPath);
@@ -131,6 +132,7 @@ export class BackupService {
       if (err instanceof BrainError) throw err;
       throw internal(`Backup restore failed: ${(err as Error).message}`);
     } finally {
+      this.storage.sqlite.endLifecycleOperation('restore');
       this.restoreInProgress = false;
     }
   }
