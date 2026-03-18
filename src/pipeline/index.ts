@@ -36,6 +36,7 @@ export class WritePipeline {
     source: MemorySource;
     clientId?: string;
     retention_tier?: RetentionTier;
+    device_id?: string | null;
   }): Promise<WriteResult[]> {
     const normalized = normalizeContent(input.content);
 
@@ -90,6 +91,7 @@ export class WritePipeline {
       source: MemorySource;
       clientId?: string;
       retention_tier?: RetentionTier;
+      device_id?: string | null;
     },
   ): Promise<WriteResult> {
     const checksum = computeChecksum(candidate.content);
@@ -208,6 +210,7 @@ export class WritePipeline {
       merged_from: null,
       archived: false,
       vector_synced: true,
+      device_id: input.device_id ?? null,
       created_at: now,
       updated_at: now,
       last_accessed: now,
@@ -252,6 +255,7 @@ export class WritePipeline {
       source: MemorySource;
       clientId?: string;
       retention_tier?: RetentionTier;
+      device_id?: string | null;
     },
     checksum: string,
     now: string,
@@ -291,6 +295,7 @@ export class WritePipeline {
       merged_from: null,
       archived: false,
       vector_synced: false,
+      device_id: input.device_id ?? null,
       created_at: now,
       updated_at: now,
       last_accessed: now,

@@ -1,9 +1,15 @@
 import { z } from 'zod';
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { hostname } from 'node:os';
+
+const DEVICE_ID_RE = /^[a-zA-Z0-9._-]{1,64}$/;
 
 const ConfigSchema = z.object({
   data_dir: z.string().optional(),
+  device: z.object({
+    id: z.string().regex(DEVICE_ID_RE).optional(),
+  }).default({}),
   embedding: z.object({
     provider: z.enum(['openai']).default('openai'),
     model: z.string().default('text-embedding-3-small'),
@@ -126,13 +132,52 @@ export function loadConfig(configPath?: string): BrainConfig {
   return config;
 }
 
+/**
+ * Sanitize a string for use as a device_id by lowercasing and replacing
+ * invalid characters with hyphens, then trimming to 64 characters.
+ */
+function sanitizeDeviceId(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-zA-Z0-9._-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 64) || 'unknown';
+}
+
+/**
+ * Resolve the device_id using the priority chain:
+ * 1. config.device.id (explicit)
+ * 2. BHGBRAIN_DEVICE_ID environment variable
+ * 3. os.hostname() (lowercased, sanitized)
+ *
+ * Mutates config.device.id with the resolved value.
+ */
+export function resolveDeviceId(config: BrainConfig): string {
+  if (config.device.id) {
+    return config.device.id;
+  }
+
+  const envId = process.env.BHGBRAIN_DEVICE_ID;
+  if (envId && DEVICE_ID_RE.test(envId)) {
+    config.device.id = envId;
+    return envId;
+  }
+
+  const hostId = sanitizeDeviceId(hostname());
+  config.device.id = hostId;
+  return hostId;
+}
+
 export function ensureDataDir(config: BrainConfig): void {
   const dir = config.data_dir!;
   mkdirSync(dir, { recursive: true });
   mkdirSync(join(dir, 'backups'), { recursive: true });
 
+  // Resolve device identity and persist to config.json
+  resolveDeviceId(config);
+
   const configPath = join(dir, 'config.json');
-  if (!existsSync(configPath)) {
-    writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
-  }
+  // Always write config to persist resolved device_id on first run
+  writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
 }

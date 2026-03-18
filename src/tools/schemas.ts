@@ -122,4 +122,16 @@ export const MCP_TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'repair',
+    description: 'Recover memories from Qdrant that are missing in SQLite. Scrolls all Qdrant collections and re-inserts any points with content into SQLite.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        dry_run: { type: 'boolean', description: 'If true, only report what would be recovered without making changes', default: false },
+        device_id: { type: 'string', description: 'Filter recovery to only points matching this device_id. If omitted, recovers all points.', pattern: '^[a-zA-Z0-9._-]{1,64}$' },
+      },
+      additionalProperties: false,
+    },
+  },
 ];

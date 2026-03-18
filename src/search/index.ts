@@ -70,6 +70,7 @@ export class SearchService {
         id: r.id,
         score: r.score,
         semantic_score: r.score,
+        qdrantPayload: r.payload,
       })),
     );
   }
@@ -160,7 +161,7 @@ export class SearchService {
   }
 
   private buildSearchResults(
-    ranked: Array<{ id: string; score: number; semantic_score?: number; fulltext_score?: number }>,
+    ranked: Array<{ id: string; score: number; semantic_score?: number; fulltext_score?: number; qdrantPayload?: Record<string, unknown> }>,
     options?: { boostT0?: boolean },
   ): SearchResult[] {
     const now = new Date();
@@ -183,7 +184,31 @@ export class SearchService {
 
     for (const item of ranked) {
       const mem = memoryMap.get(item.id);
-      if (!mem) continue;
+
+      // Fallback to Qdrant payload if SQLite miss
+      if (!mem) {
+        if (item.qdrantPayload && typeof item.qdrantPayload.content === 'string') {
+          const payload = item.qdrantPayload;
+          searchResults.push({
+            id: item.id,
+            content: payload.content as string,
+            summary: (payload.summary as string) ?? '',
+            type: (payload.type as SearchResult['type']) ?? 'semantic',
+            tags: Array.isArray(payload.tags) ? payload.tags as string[] : [],
+            score: item.score,
+            semantic_score: item.semantic_score,
+            fulltext_score: item.fulltext_score,
+            retention_tier: (payload.retention_tier as SearchResult['retention_tier']) ?? 'T2',
+            expires_at: null,
+            expiring_soon: false,
+            device_id: (payload.device_id as string) ?? null,
+            created_at: (payload.created_at as string) ?? nowIso,
+            last_accessed: nowIso,
+          });
+        }
+        continue;
+      }
+
       if (this.lifecycle.isExpired(mem.expires_at, now)) continue;
 
       let adjustedScore = item.score;
@@ -204,6 +229,7 @@ export class SearchService {
         retention_tier: mem.retention_tier,
         expires_at: mem.expires_at,
         expiring_soon: this.lifecycle.isExpiringSoon(mem.expires_at, now),
+        device_id: mem.device_id ?? null,
         created_at: mem.created_at,
         last_accessed: nowIso,
       });
