@@ -16,35 +16,40 @@ BHGBrain almacena memorias en SQLite (metadatos + búsqueda de texto completo) y
 6. [Variables de Entorno](#variables-de-entorno)
 7. [Ejecución del Servidor](#ejecución-del-servidor)
 8. [Configuración del Cliente MCP](#configuración-del-cliente-mcp)
-9. [Gestión de Memorias](#gestión-de-memorias)
-   - [Modelo de Datos de Memoria](#modelo-de-datos-de-memoria)
-   - [Tipos de Memoria](#tipos-de-memoria)
-   - [Namespaces y Colecciones](#namespaces-y-colecciones)
-   - [Niveles de Retención](#niveles-de-retención)
-   - [Ciclo de Vida por Nivel — Asignación, Promoción, Ventana Deslizante](#ciclo-de-vida-por-nivel--asignación-promoción-ventana-deslizante)
-   - [Deduplicación](#deduplicación)
-   - [Normalización de Contenido](#normalización-de-contenido)
-   - [Puntuación de Importancia](#puntuación-de-importancia)
-   - [Categorías — Slots de Política Persistente](#categorías--slots-de-política-persistente)
-   - [Decaimiento, Limpieza y Archivado](#decaimiento-limpieza-y-archivado)
-   - [Advertencias de Expiración Anticipada](#advertencias-de-expiración-anticipada)
-   - [Límites de Recursos y Presupuestos de Capacidad](#límites-de-recursos-y-presupuestos-de-capacidad)
-10. [Búsqueda](#búsqueda)
+9. [Memoria Multi-Dispositivo](#memoria-multi-dispositivo)
+   - [Cómo Funciona](#cómo-funciona)
+   - [Resolución de Identidad de Dispositivo](#resolución-de-identidad-de-dispositivo)
+   - [Qdrant Compartido, SQLite Local](#qdrant-compartido-sqlite-local)
+   - [Reparación y Recuperación](#reparación-y-recuperación)
+10. [Gestión de Memorias](#gestión-de-memorias)
+    - [Modelo de Datos de Memoria](#modelo-de-datos-de-memoria)
+    - [Tipos de Memoria](#tipos-de-memoria)
+    - [Namespaces y Colecciones](#namespaces-y-colecciones)
+    - [Niveles de Retención](#niveles-de-retención)
+    - [Ciclo de Vida por Nivel — Asignación, Promoción, Ventana Deslizante](#ciclo-de-vida-por-nivel--asignación-promoción-ventana-deslizante)
+    - [Deduplicación](#deduplicación)
+    - [Normalización de Contenido](#normalización-de-contenido)
+    - [Puntuación de Importancia](#puntuación-de-importancia)
+    - [Categorías — Slots de Política Persistente](#categorías--slots-de-política-persistente)
+    - [Decaimiento, Limpieza y Archivado](#decaimiento-limpieza-y-archivado)
+    - [Advertencias de Expiración Anticipada](#advertencias-de-expiración-anticipada)
+    - [Límites de Recursos y Presupuestos de Capacidad](#límites-de-recursos-y-presupuestos-de-capacidad)
+11. [Búsqueda](#búsqueda)
     - [Búsqueda Semántica](#búsqueda-semántica)
     - [Búsqueda de Texto Completo](#búsqueda-de-texto-completo)
     - [Búsqueda Híbrida](#búsqueda-híbrida)
     - [Recall vs Search — Diferencias](#recall-vs-search--diferencias)
     - [Filtrado](#filtrado)
     - [Umbrales de Puntuación y Bonificaciones por Nivel](#umbrales-de-puntuación-y-bonificaciones-por-nivel)
-11. [Copia de Seguridad y Restauración](#copia-de-seguridad-y-restauración)
-12. [Salud y Métricas](#salud-y-métricas)
-13. [Seguridad](#seguridad)
-14. [Recursos MCP](#recursos-mcp)
-15. [Prompt de Bootstrap](#prompt-de-bootstrap)
-16. [Referencia de la CLI](#referencia-de-la-cli)
-17. [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)
-18. [Actualización](#actualización)
-19. [Notas de Comportamiento](#notas-de-comportamiento)
+12. [Copia de Seguridad y Restauración](#copia-de-seguridad-y-restauración)
+13. [Salud y Métricas](#salud-y-métricas)
+14. [Seguridad](#seguridad)
+15. [Recursos MCP](#recursos-mcp)
+16. [Prompt de Bootstrap](#prompt-de-bootstrap)
+17. [Referencia de la CLI](#referencia-de-la-cli)
+18. [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)
+19. [Actualización](#actualización)
+20. [Notas de Comportamiento](#notas-de-comportamiento)
 
 ---
 
@@ -54,34 +59,53 @@ BHGBrain es un servidor de memoria persistente construido sobre el Model Context
 
 ### Arquitectura de Doble Almacén
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         MCP Client                              │
-│                (Claude Desktop / OpenClaw / Codex)              │
-└────────────────────────┬────────────────────────────────────────┘
-                         │  MCP (stdio or HTTP)
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       BHGBrain Server                           │
-│                                                                 │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │ Write       │  │ Search       │  │ Resource Handler     │   │
-│  │ Pipeline    │  │ Service      │  │ (memory:// URIs)     │   │
-│  └──────┬──────┘  └──────┬───────┘  └──────────────────────┘   │
-│         │                │                                       │
-│  ┌──────▼────────────────▼──────────────────────────────────┐   │
-│  │                  Storage Manager                          │   │
-│  │  ┌─────────────────────┐  ┌───────────────────────────┐  │   │
-│  │  │  SQLite (sql.js)    │  │  Qdrant (vector store)    │  │   │
-│  │  │  ─ metadata         │  │  ─ embeddings (1536d)     │  │   │
-│  │  │  ─ fulltext (FTS)   │  │  ─ cosine similarity      │  │   │
-│  │  │  ─ categories       │  │  ─ payload indexes        │  │   │
-│  │  │  ─ audit log        │  │  ─ per-collection NS      │  │   │
-│  │  │  ─ revisions        │  └───────────────────────────┘  │   │
-│  │  │  ─ archive          │                                  │   │
-│  │  └─────────────────────┘                                  │   │
-│  └────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph Client["MCP Client<br/><i>Claude Desktop / OpenClaw / Codex</i>"]
+    end
+
+    Client -->|"MCP (stdio or HTTP)"| Server
+
+    subgraph Server["BHGBrain Server"]
+        WP["Write Pipeline"]
+        SS["Search Service"]
+        RH["Resource Handler<br/><i>memory:// URIs</i>"]
+
+        subgraph Storage["Storage Manager"]
+            subgraph SQLite["SQLite (sql.js)"]
+                S1["metadata"]
+                S2["fulltext (FTS)"]
+                S3["categories"]
+                S4["audit log"]
+                S5["revisions"]
+                S6["archive"]
+            end
+            subgraph Qdrant["Qdrant (vector store)"]
+                Q1["embeddings (1536d)"]
+                Q2["cosine similarity"]
+                Q3["payload indexes"]
+            end
+        end
+
+        WP --> Storage
+        SS --> Storage
+        RH --> Storage
+    end
+
+    Server -.->|"embed content"| OpenAI["OpenAI Embedding API<br/><i>text-embedding-3-small</i>"]
+
+    classDef client fill:#4a90d9,stroke:#2c5f8a,color:#fff
+    classDef server fill:#f0f4f8,stroke:#4a90d9,color:#333
+    classDef component fill:#5ba85b,stroke:#3d7a3d,color:#fff
+    classDef sqlite fill:#e8a838,stroke:#b8841c,color:#fff
+    classDef qdrant fill:#d94a6e,stroke:#a83050,color:#fff
+    classDef external fill:#8b5cf6,stroke:#6d3fc4,color:#fff
+
+    class Client client
+    class WP,SS,RH component
+    class S1,S2,S3,S4,S5,S6 sqlite
+    class Q1,Q2,Q3 qdrant
+    class OpenAI external
 ```
 
 - **SQLite** (vía `sql.js`, en memoria con volcado atómico periódico a disco) es el **sistema de registro** para todos los metadatos de memoria, índice de búsqueda de texto completo, categorías, historial de auditoría, historial de revisiones y registros de archivo.
@@ -197,6 +221,14 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
 {
   // Directorio de datos (ruta absoluta). Por defecto, ubicación apropiada para la plataforma.
   "data_dir": null,
+
+  // Identidad de dispositivo para configuraciones multi-dispositivo (ver sección Memoria Multi-Dispositivo)
+  "device": {
+    // Identificador estable de dispositivo. Auto-generado desde el hostname si se omite.
+    // Patrón: ^[a-zA-Z0-9._-]{1,64}$
+    // También puede establecerse vía la variable de entorno BHGBRAIN_DEVICE_ID.
+    "id": null
+  },
 
   // Configuración del proveedor de embeddings
   "embedding": {
@@ -382,6 +414,7 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
 | `OPENAI_API_KEY` | Sí (para embeddings) | — | Clave API de OpenAI. El servidor inicia en **modo degradado** si no está presente — la búsqueda semántica y la ingesta fallarán, pero la búsqueda de texto completo y las lecturas de categorías siguen funcionando. |
 | `BHGBRAIN_TOKEN` | Requerida para HTTP no-loopback | — | Bearer token para autenticación HTTP. El servidor **se niega a iniciar** si el host es no-loopback y esto no está configurado (a menos que `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Requerida para Qdrant Cloud | — | Establece `qdrant.api_key_env` en la configuración con el nombre de esta variable. El nombre predeterminado del campo de configuración es `QDRANT_API_KEY`. |
+| `BHGBRAIN_DEVICE_ID` | No | Auto-generado desde el hostname | Anular el identificador de dispositivo para configuraciones multi-dispositivo. Ver [Resolución de Identidad de Dispositivo](#resolución-de-identidad-de-dispositivo). |
 | `BHGBRAIN_EXTRACTION_API_KEY` | No | Usa `OPENAI_API_KEY` como respaldo | Clave API para el modelo de extracción LLM (uso futuro). |
 
 Generar un bearer token seguro:
@@ -517,6 +550,169 @@ O usando búsqueda de variable de entorno si tu mcporter lo admite:
 
 ---
 
+## Memoria Multi-Dispositivo
+
+BHGBrain soporta la ejecución de múltiples instancias en diferentes máquinas (p.ej., una estación de trabajo principal y un entorno de desarrollo en la nube) que comparten el mismo backend de Qdrant Cloud. Cada instancia mantiene su propia base de datos SQLite local mientras lee y escribe en un almacén de vectores compartido.
+
+### Cómo Funciona
+
+```mermaid
+graph TD
+    subgraph DevA["Device A (Workstation)"]
+        SA["SQLite (local)<br/>device_id: ws-1"]
+    end
+
+    subgraph DevB["Device B (Cloud PC)"]
+        SB["SQLite (local)<br/>device_id: w365"]
+    end
+
+    SA -->|"write + read"| QC
+    SB -->|"write + read"| QC
+
+    subgraph QC["Qdrant Cloud (shared backend)"]
+        V["vectors"]
+        CP["content payload"]
+        DI["device_id index"]
+    end
+
+    SA -.->|"fallback search<br/>for Device B memories"| QC
+    SB -.->|"fallback search<br/>for Device A memories"| QC
+
+    classDef device fill:#4a90d9,stroke:#2c5f8a,color:#fff
+    classDef sqlite fill:#e8a838,stroke:#b8841c,color:#fff
+    classDef qdrant fill:#d94a6e,stroke:#a83050,color:#fff
+
+    class SA,SB sqlite
+    class V,CP,DI qdrant
+```
+
+Cada escritura de memoria almacena el contenido completo tanto en SQLite (local) como en el payload de Qdrant (compartido). Esto significa:
+
+- **Sin punto único de fallo**: Si el SQLite de un dispositivo se pierde, el contenido puede recuperarse desde Qdrant.
+- **Visibilidad entre dispositivos**: Todos los dispositivos ven todas las memorias vía Qdrant, incluso si su SQLite local solo tiene un subconjunto.
+- **Seguimiento de procedencia**: Cada memoria se etiqueta con el `device_id` de la instancia que la creó.
+
+### Resolución de Identidad de Dispositivo
+
+Cada instancia de BHGBrain resuelve un `device_id` estable al iniciar, usando este orden de prioridad:
+
+1. **Configuración explícita**: Campo `device.id` en `config.json`
+2. **Variable de entorno**: `BHGBRAIN_DEVICE_ID`
+3. **Auto-generado**: Derivado de `os.hostname()`, en minúsculas y sanitizado a `[a-zA-Z0-9._-]`
+
+En la primera ejecución, el ID resuelto se persiste en `config.json` para que permanezca estable entre reinicios, incluso si el hostname cambia posteriormente.
+
+```jsonc
+// config.json — sección de dispositivo
+{
+  "device": {
+    "id": "cpc-kevin-98f91"   // auto-generado desde el hostname, o establecido explícitamente
+  }
+}
+```
+
+El `device_id` aparece en:
+- Cada payload de Qdrant (como campo indexado por keyword)
+- Cada registro de memoria en SQLite
+- Resultados de búsqueda (para que los llamadores puedan identificar qué dispositivo creó una memoria)
+
+### Qdrant Compartido, SQLite Local
+
+Cada dispositivo mantiene su propia base de datos SQLite de forma independiente. No hay protocolo de sincronización entre dispositivos — Qdrant es la capa compartida.
+
+**Lo que ve cada dispositivo:**
+
+| Fuente | Dispositivo A ve | Dispositivo B ve |
+|---|---|---|
+| Memorias del Dispositivo A (vía SQLite local) | ✅ Registro completo | ❌ No está en SQLite local |
+| Memorias del Dispositivo A (vía fallback de Qdrant) | ✅ Registro completo | ✅ Contenido desde payload de Qdrant |
+| Memorias del Dispositivo B (vía SQLite local) | ❌ No está en SQLite local | ✅ Registro completo |
+| Memorias del Dispositivo B (vía fallback de Qdrant) | ✅ Contenido desde payload de Qdrant | ✅ Registro completo |
+
+Cuando una búsqueda devuelve una memoria que existe en Qdrant pero no en el SQLite local, BHGBrain construye el resultado desde el payload de Qdrant en lugar de descartarla silenciosamente. Esto significa que ambos dispositivos obtienen resultados de búsqueda completos independientemente de qué dispositivo creó la memoria.
+
+### Reparación y Recuperación
+
+```mermaid
+flowchart TD
+    START["repair tool invoked"] --> SCROLL["Scroll all bhgbrain_*<br/>Qdrant collections"]
+    SCROLL --> LOOP{"Next point?"}
+    LOOP -->|Yes| CHECK{"Point ID exists<br/>in local SQLite?"}
+    CHECK -->|Yes| SKIP1["Skip<br/><i>already_in_sqlite++</i>"]
+    SKIP1 --> LOOP
+    CHECK -->|No| CONTENT{"Has content<br/>in Qdrant payload?"}
+    CONTENT -->|No| SKIP2["Skip<br/><i>skipped_no_content++</i><br/><i>(pre-1.3 memory)</i>"]
+    SKIP2 --> LOOP
+    CONTENT -->|Yes| INSERT["Insert into SQLite<br/><i>Preserve original device_id</i><br/><i>recovered++</i>"]
+    INSERT --> LOOP
+    LOOP -->|"No more points"| REPORT["Report Stats<br/><i>collections scanned</i><br/><i>points scanned</i><br/><i>recovered / skipped / errors</i>"]
+
+    classDef start fill:#4a90d9,stroke:#2c5f8a,color:#fff
+    classDef skip fill:#6c757d,stroke:#495057,color:#fff
+    classDef recover fill:#5ba85b,stroke:#3d7a3d,color:#fff
+    classDef report fill:#8b5cf6,stroke:#6d3fc4,color:#fff
+
+    class START start
+    class SKIP1,SKIP2 skip
+    class INSERT recover
+    class REPORT report
+```
+
+La herramienta `repair` reconstruye el SQLite local de un dispositivo desde Qdrant. Úsala después de:
+
+- Configurar un nuevo dispositivo que comparte un backend de Qdrant existente
+- Recuperarse de una pérdida de datos de SQLite
+- Migrar a una nueva máquina
+
+```json
+// Vista previa de lo que se recuperaría (sin cambios)
+{ "dry_run": true }
+
+// Recuperar todas las memorias desde Qdrant al SQLite local
+{ "dry_run": false }
+
+// Recuperar solo memorias creadas por un dispositivo específico
+{ "device_id": "cpc-kevin-98f91", "dry_run": false }
+```
+
+La herramienta de reparación:
+- Recorre todos los puntos en todas las colecciones `bhgbrain_*` de Qdrant
+- Inserta cualquier memoria con `content` en su payload de Qdrant que falte en el SQLite local
+- Preserva la procedencia original del `device_id` (o etiqueta con el ID del dispositivo local si no existe ninguno)
+- Reporta: colecciones escaneadas, puntos escaneados, recuperados, omitidos (sin contenido), errores
+
+**Nota**: Las memorias almacenadas antes de que se añadiera la función de contenido en Qdrant (pre-1.3) no tienen contenido en su payload de Qdrant y no pueden recuperarse vía reparación. Solo los metadatos (etiquetas, tipo, importancia) sobreviven para esas entradas.
+
+### Ejemplo de Configuración Multi-Dispositivo
+
+**Dispositivo A** (`config.json`):
+```jsonc
+{
+  "device": { "id": "workstation" },
+  "qdrant": {
+    "mode": "external",
+    "external_url": "https://your-cluster.cloud.qdrant.io",
+    "api_key_env": "QDRANT_API_KEY"
+  }
+}
+```
+
+**Dispositivo B** (`config.json`):
+```jsonc
+{
+  "device": { "id": "cloud-pc" },
+  "qdrant": {
+    "mode": "external",
+    "external_url": "https://your-cluster.cloud.qdrant.io",
+    "api_key_env": "QDRANT_API_KEY"
+  }
+}
+```
+
+Ambos apuntan al mismo clúster de Qdrant. Cada uno obtiene su propio `device_id`. Todas las memorias fluyen a las mismas colecciones de vectores y son visibles para ambas instancias.
+
+---
+
 ## Gestión de Memorias
 
 Esta sección describe el ciclo de vida completo de las memorias — desde la ingesta hasta la clasificación, deduplicación, seguimiento de accesos, promoción, decaimiento y eventual expiración o retención permanente.
@@ -549,6 +745,7 @@ Cada memoria almacenada en BHGBrain es un `MemoryRecord` con los siguientes camp
 | `merged_from` | `string \| null` | ID de la memoria desde la que se fusionó esta (ruta UPDATE de dedup) |
 | `archived` | `boolean` | Si esta memoria está archivada de forma flexible (excluida de búsqueda/recall) |
 | `vector_synced` | `boolean` | Si el vector de Qdrant está sincronizado con el estado de SQLite |
+| `device_id` | `string \| null` | Identificador de la instancia de BHGBrain que creó esta memoria (ver [Memoria Multi-Dispositivo](#memoria-multi-dispositivo)) |
 | `created_at` | `string (ISO 8601)` | Marca de tiempo de creación |
 | `updated_at` | `string (ISO 8601)` | Marca de tiempo de la última actualización |
 | `last_accessed` | `string (ISO 8601)` | Marca de tiempo de la última recuperación |
@@ -579,6 +776,7 @@ Cada colección de Qdrant mantiene los siguientes índices de payload para un fi
 - `retention_tier` (keyword)
 - `decay_eligible` (boolean)
 - `expires_at` (integer — almacenado como segundos de época Unix)
+- `device_id` (keyword)
 
 ---
 
@@ -690,6 +888,34 @@ La asignación de nivel ocurre durante el pipeline de escritura, en este orden d
 
 7. **Predeterminado:** `T2` — el predeterminado seguro y tolerante.
 
+```mermaid
+flowchart TD
+    START["Memory Ingested"] --> Q1{"Explicit<br/>retention_tier<br/>provided?"}
+    Q1 -->|Yes| USE["Use provided tier"]
+    Q1 -->|No| Q2{"Has category?"}
+    Q2 -->|Yes| T0A["T0 — Foundational"]
+    Q2 -->|No| Q3{"source:agent +<br/>type:procedural?"}
+    Q3 -->|Yes| T1A["T1 — Institutional"]
+    Q3 -->|No| Q4{"source:agent +<br/>type:episodic?"}
+    Q4 -->|Yes| T2A["T2 — Operational"]
+    Q4 -->|No| Q5{"Transient pattern<br/>match?<br/><i>JIRA-1234, From:, standup...</i>"}
+    Q5 -->|Yes| T3A["T3 — Transient"]
+    Q5 -->|No| Q6{"T0 keyword<br/>match?<br/><i>architecture, compliance...</i>"}
+    Q6 -->|Yes| T0B["T0 — Foundational"]
+    Q6 -->|No| T2B["T2 — Default"]
+
+    classDef t0 fill:#dc3545,stroke:#a71d2a,color:#fff
+    classDef t1 fill:#e8a838,stroke:#b8841c,color:#fff
+    classDef t2 fill:#4a90d9,stroke:#2c5f8a,color:#fff
+    classDef t3 fill:#6c757d,stroke:#495057,color:#fff
+    classDef decision fill:#f0f4f8,stroke:#4a90d9,color:#333
+
+    class T0A,T0B t0
+    class T1A t1
+    class T2A,T2B,USE t2
+    class T3A t3
+```
+
 #### Metadatos de Nivel Calculados en la Asignación
 
 ```typescript
@@ -716,6 +942,36 @@ La promoción es **monotónica** — la degradación automática nunca ocurre. L
 
 Cuando se promueve una memoria, su `expires_at` se recalcula desde el TTL del nuevo nivel usando la marca de tiempo actual como ancla de la ventana deslizante.
 
+```mermaid
+stateDiagram-v2
+    [*] --> T3: New memory<br/>assigned T3
+
+    T3: T3 — Transient<br/>TTL: 30 days
+    T2: T2 — Operational<br/>TTL: 90 days
+    T1: T1 — Institutional<br/>TTL: 365 days
+    T0: T0 — Foundational<br/>TTL: ∞ (never)
+
+    T3 --> T2: Auto-promote<br/>(5 accesses)
+    T2 --> T1: Auto-promote<br/>(5 accesses)
+    T1 --> T0: Manual only<br/>(explicit tier set)
+
+    T3 --> Expired: TTL exceeded<br/>(no access in 30d)
+    T2 --> Expired: TTL exceeded<br/>(no access in 90d)
+    T1 --> Expired: TTL exceeded<br/>(no access in 365d)
+
+    T3 --> T3: Access resets<br/>sliding window
+    T2 --> T2: Access resets<br/>sliding window
+    T1 --> T1: Access resets<br/>sliding window
+
+    Expired --> Archive: archive_before_delete<br/>= true
+    Expired --> Deleted: archive_before_delete<br/>= false
+    Archive --> Deleted: Cleanup cycle
+
+    [*] --> T2: Default assignment
+    [*] --> T0: Category or<br/>explicit T0
+    [*] --> T1: agent + procedural
+```
+
 #### Expiración con Ventana Deslizante
 
 Cuando `sliding_window_enabled: true` (el valor predeterminado), cada recuperación exitosa vía `recall`, `search` o `memory://inject` restablece el reloj de TTL:
@@ -733,6 +989,44 @@ El seguimiento de accesos se realiza en lote después de cada búsqueda (volcado
 ### Deduplicación
 
 BHGBrain evita almacenar contenido duplicado o casi duplicado mediante un pipeline de deduplicación en dos fases.
+
+```mermaid
+flowchart TD
+    A["Incoming Content"] --> B["Content Normalization<br/><i>strip controls, collapse blanks</i>"]
+    B --> C{"Secret Detected?"}
+    C -->|Yes| REJECT["❌ REJECT<br/>INVALID_INPUT"]
+    C -->|No| D["SHA-256 Checksum"]
+    D --> E{"Exact Match<br/>in namespace?"}
+    E -->|Yes| NOOP1["🔄 NOOP<br/>Return existing ID"]
+    E -->|No| F["Embed Content<br/><i>OpenAI text-embedding-3-small</i>"]
+    F --> G["Semantic Dedup<br/>Top-10 similarity search"]
+    G --> H{"Highest Cosine<br/>Similarity Score"}
+    H -->|"score ≥ noop threshold"| NOOP2["🔄 NOOP<br/>Near-duplicate found"]
+    H -->|"score ≥ update threshold"| UPD["✏️ UPDATE Path"]
+    H -->|"score < update threshold"| ADD["➕ ADD Path"]
+
+    UPD --> U1["Merge tags (union)"]
+    U1 --> U2["Replace content"]
+    U2 --> U3["importance = max(old, new)"]
+    U3 --> U4["SQLite UPDATE"]
+    U4 --> U5["Qdrant Upsert"]
+
+    ADD --> A1["Tier Assignment"]
+    A1 --> A2["SQLite INSERT"]
+    A2 --> A3["Qdrant Upsert"]
+
+    classDef reject fill:#dc3545,stroke:#a71d2a,color:#fff
+    classDef noop fill:#6c757d,stroke:#495057,color:#fff
+    classDef update fill:#e8a838,stroke:#b8841c,color:#fff
+    classDef add fill:#5ba85b,stroke:#3d7a3d,color:#fff
+    classDef process fill:#4a90d9,stroke:#2c5f8a,color:#fff
+
+    class REJECT reject
+    class NOOP1,NOOP2 noop
+    class UPD,U1,U2,U3,U4,U5 update
+    class ADD,A1,A2,A3 add
+    class A,B,C,D,E,F,G,H process
+```
 
 #### Fase 1: Deduplicación Exacta (Checksum)
 
@@ -1053,6 +1347,35 @@ La búsqueda de texto completo usa la coincidencia de texto interno de SQLite pa
 
 ### Búsqueda Híbrida
 
+```mermaid
+flowchart TD
+    Q["Search Query"] --> P1 & P2
+
+    subgraph Semantic["Semantic Search"]
+        P1["Embed Query<br/><i>OpenAI API</i>"] --> QD["Qdrant<br/>Vector Search"]
+        QD --> SR["Ranked Results<br/><i>by cosine similarity</i>"]
+    end
+
+    subgraph Fulltext["Fulltext Search"]
+        P2["Tokenize Query"] --> FTS["SQLite FTS<br/>LIKE matching"]
+        FTS --> FR["Ranked Results<br/><i>by term count</i>"]
+    end
+
+    SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
+    FR --> RRF
+    RRF --> BOOST["T0 Score Boost<br/><i>+0.1 for foundational</i>"]
+    BOOST --> TOP["Return Top N Results"]
+    TOP --> TRACK["Update Access Tracking<br/><i>count++, sliding window reset</i>"]
+
+    classDef search fill:#4a90d9,stroke:#2c5f8a,color:#fff
+    classDef fusion fill:#8b5cf6,stroke:#6d3fc4,color:#fff
+    classDef result fill:#5ba85b,stroke:#3d7a3d,color:#fff
+
+    class P1,QD,SR,P2,FTS,FR search
+    class RRF,BOOST fusion
+    class TOP,TRACK result
+```
+
 La búsqueda híbrida combina resultados semánticos y de texto completo usando **Reciprocal Rank Fusion (RRF)**, un algoritmo de fusión basado en rangos que es robusto a las diferencias de escala de puntuación entre los dos sistemas de recuperación.
 
 **Cómo funciona:**
@@ -1149,6 +1472,43 @@ Tanto `recall` como `search` admiten alcance por namespace y colección. `recall
 ---
 
 ## Copia de Seguridad y Restauración
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant S as BHGBrain Server
+    participant DB as SQLite
+    participant FS as Filesystem
+
+    rect rgb(230, 245, 230)
+        Note over C,FS: CREATE BACKUP
+        C->>S: backup create
+        S->>DB: Export full database
+        DB-->>S: Raw DB bytes
+        S->>S: Compute SHA-256 checksum
+        S->>S: Build JSON header<br/>(version, count, checksum)
+        S->>FS: Atomic write .bhgb file<br/>(write-to-temp-then-rename)
+        FS-->>S: Success
+        S-->>C: path, size, memory_count
+    end
+
+    rect rgb(230, 235, 250)
+        Note over C,FS: RESTORE BACKUP
+        C->>S: backup restore (path)
+        S->>FS: Read .bhgb file
+        FS-->>S: Header + DB bytes
+        S->>S: Validate SHA-256 checksum
+        alt Checksum mismatch
+            S-->>C: ❌ INVALID_INPUT
+        else Checksum valid
+            S->>FS: Atomic write to data dir<br/>(write-to-temp-then-rename)
+            S->>DB: Hot-reload in-memory SQLite
+            S->>DB: Run schema migrations
+            DB-->>S: Ready
+            S-->>C: memory_count, activated: true
+        end
+    end
+```
 
 ### Creación de una Copia de Seguridad
 
@@ -1540,7 +1900,7 @@ bhgbrain server token                 # Generar un nuevo bearer token aleatorio
 
 ## Referencia de Herramientas MCP
 
-BHGBrain expone 8 herramientas MCP. Todas las herramientas validan la entrada con esquemas Zod y devuelven JSON estructurado. Los errores usan un sobre consistente:
+BHGBrain expone 9 herramientas MCP. Todas las herramientas validan la entrada con esquemas Zod y devuelven JSON estructurado. Los errores usan un sobre consistente:
 
 ```json
 {
@@ -1866,7 +2226,65 @@ Crea, lista o restaura copias de seguridad de memorias.
 
 ---
 
+### `repair` — Reconstruir SQLite desde Qdrant
+
+Recuperar memorias desde Qdrant a la base de datos SQLite local. Se usa para configuración multi-dispositivo, recuperación de pérdida de datos o incorporación de nuevos dispositivos. Ver [Reparación y Recuperación](#reparación-y-recuperación).
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Predeterminado | Descripción |
+|---|---|---|---|---|
+| `dry_run` | `boolean` | No | `false` | Cuando es `true`, reporta lo que se recuperaría sin hacer cambios. |
+| `device_id` | `string` | No | — | Filtrar la recuperación a memorias creadas por un dispositivo específico. Omitir para recuperar todas. |
+
+**Salida:**
+
+```json
+{
+  "collections_scanned": 2,
+  "points_scanned": 47,
+  "already_in_sqlite": 12,
+  "skipped_no_content": 3,
+  "recovered": 32,
+  "errors": 0
+}
+```
+
+**Notas:**
+- Solo los puntos con `content` en su payload de Qdrant pueden recuperarse. Las memorias pre-1.3 sin contenido en Qdrant se reportan como `skipped_no_content`.
+- Las memorias recuperadas preservan su `device_id` original del payload de Qdrant. Si no existe `device_id` en el payload, se usa el ID del dispositivo local.
+- Después de la recuperación, ejecuta `npm run build` y reinicia el servidor si es necesario. Las memorias recuperadas están inmediatamente disponibles para búsqueda y recall.
+
+---
+
 ## Actualización
+
+### 1.2 → 1.3 (Memoria Multi-Dispositivo y Resiliencia de Datos)
+
+**No se requiere migración manual.** BHGBrain actualiza automáticamente al iniciar.
+
+Lo que ocurre en el primer inicio después de la actualización:
+
+- **SQLite**: Se añade una columna nullable `device_id` a la tabla `memories`. Las memorias existentes permanecen con `device_id = null` (pre-migración).
+- **Qdrant**: Se crea un índice keyword `device_id` en cada colección (gestionado por `ensureCollection`).
+- **Config**: Se resuelve un campo `device.id` (desde la configuración, variable de entorno o hostname) y se persiste en `config.json`.
+- **Ruta de escritura**: Todas las nuevas memorias almacenan `content`, `summary` y `device_id` en el payload de Qdrant junto con el embedding vectorial.
+- **Ruta de búsqueda**: Si una memoria existe en Qdrant pero no en el SQLite local, el resultado de búsqueda se construye desde el payload de Qdrant en lugar de ser descartado.
+
+**Nueva herramienta**: `repair` — reconstruye el SQLite local desde Qdrant. Ejecútala en cualquier dispositivo que tenga una base de datos SQLite vacía o incompleta para recuperar memorias compartidas.
+
+**Nueva sección de configuración**:
+```jsonc
+{
+  "device": {
+    "id": "my-workstation"  // opcional — auto-generado desde el hostname si se omite
+  }
+}
+```
+
+**Retrocompatible**: Las memorias pre-1.3 sin `device_id` o contenido en Qdrant continúan funcionando normalmente. Simplemente no pueden recuperarse vía la herramienta `repair`.
+
+---
 
 ### 1.0 → 1.2 (Ciclo de Vida de Memoria por Niveles)
 
