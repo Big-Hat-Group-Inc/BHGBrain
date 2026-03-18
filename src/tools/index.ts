@@ -100,6 +100,7 @@ async function handleRemember(ctx: ToolContext, args: unknown, clientId: string)
     importance: input.importance,
     source: input.source,
     retention_tier: input.retention_tier,
+    device_id: ctx.config.device.id ?? null,
     clientId,
   });
 
@@ -275,11 +276,14 @@ async function handleBackup(ctx: ToolContext, args: unknown): Promise<unknown> {
 async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
   const input = parseInput(RepairInputSchema, args);
   const dryRun = input.dry_run;
+  const filterDeviceId = input.device_id;
+  const localDeviceId = ctx.config.device.id ?? null;
 
   const collections = await ctx.storage.qdrant.listAllCollections();
   let scannedPoints = 0;
   let recoveredCount = 0;
   let skippedNoContent = 0;
+  let skippedDeviceFilter = 0;
   let alreadyInSqlite = 0;
   const errors: string[] = [];
 
@@ -300,6 +304,13 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
 
       if (!content) {
         skippedNoContent++;
+        continue;
+      }
+
+      // Filter by device_id if specified
+      const pointDeviceId = (payload.device_id as string) ?? null;
+      if (filterDeviceId && pointDeviceId !== filterDeviceId) {
+        skippedDeviceFilter++;
         continue;
       }
 
@@ -329,6 +340,9 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
         );
       }
 
+      // Use original device_id from payload, or fall back to local device_id
+      const recoveredDeviceId = pointDeviceId ?? localDeviceId;
+
       const mem: Omit<MemoryRecord, 'embedding'> = {
         id: point.id,
         namespace,
@@ -350,6 +364,7 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
         merged_from: null,
         archived: false,
         vector_synced: true,
+        device_id: recoveredDeviceId,
         created_at: (payload.created_at as string) ?? now,
         updated_at: now,
         last_accessed: now,
@@ -371,10 +386,12 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
 
   return {
     dry_run: dryRun,
+    device_id_filter: filterDeviceId ?? null,
     collections_scanned: collections.length,
     points_scanned: scannedPoints,
     already_in_sqlite: alreadyInSqlite,
     skipped_no_content: skippedNoContent,
+    skipped_device_filter: filterDeviceId ? skippedDeviceFilter : undefined,
     recovered: recoveredCount,
     errors: errors.length > 0 ? errors : undefined,
   };

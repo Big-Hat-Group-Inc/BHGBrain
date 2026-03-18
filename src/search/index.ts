@@ -201,6 +201,7 @@ export class SearchService {
             retention_tier: (payload.retention_tier as SearchResult['retention_tier']) ?? 'T2',
             expires_at: null,
             expiring_soon: false,
+            device_id: (payload.device_id as string) ?? null,
             created_at: (payload.created_at as string) ?? nowIso,
             last_accessed: nowIso,
           });
@@ -228,6 +229,7 @@ export class SearchService {
         retention_tier: mem.retention_tier,
         expires_at: mem.expires_at,
         expiring_soon: this.lifecycle.isExpiringSoon(mem.expires_at, now),
+        device_id: mem.device_id ?? null,
         created_at: mem.created_at,
         last_accessed: nowIso,
       });

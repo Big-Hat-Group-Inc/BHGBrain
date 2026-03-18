@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS memories (
   stale INTEGER NOT NULL DEFAULT 0,
   archived INTEGER NOT NULL DEFAULT 0,
   vector_synced INTEGER NOT NULL DEFAULT 1,
+  device_id TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_accessed TEXT NOT NULL
@@ -206,12 +207,13 @@ export class SqliteStore {
     const reviewDue = mem.review_due ?? null;
     const archived = mem.archived ?? false;
     const vectorSynced = mem.vector_synced ?? true;
+    const deviceId = mem.device_id ?? null;
     this.db.run(
       `INSERT INTO memories (
         id, namespace, collection, type, category, content, summary, tags, source, checksum,
         importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
-        last_operation, merged_from, stale, archived, vector_synced, created_at, updated_at, last_accessed
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        last_operation, merged_from, stale, archived, vector_synced, device_id, created_at, updated_at, last_accessed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         mem.id,
         mem.namespace,
@@ -234,6 +236,7 @@ export class SqliteStore {
         0,
         archived ? 1 : 0,
         vectorSynced ? 1 : 0,
+        deviceId,
         mem.created_at,
         mem.updated_at,
         mem.last_accessed,
@@ -953,6 +956,7 @@ export class SqliteStore {
       merged_from: row.merged_from ?? null,
       archived: Boolean(row.archived),
       vector_synced: row.vector_synced === undefined ? true : Boolean(row.vector_synced),
+      device_id: row.device_id ?? null,
       created_at: row.created_at,
       updated_at: row.updated_at,
       last_accessed: row.last_accessed,
@@ -998,6 +1002,7 @@ export class SqliteStore {
       { name: 'review_due', sql: `ALTER TABLE memories ADD COLUMN review_due TEXT` },
       { name: 'archived', sql: `ALTER TABLE memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0` },
       { name: 'vector_synced', sql: `ALTER TABLE memories ADD COLUMN vector_synced INTEGER NOT NULL DEFAULT 1` },
+      { name: 'device_id', sql: `ALTER TABLE memories ADD COLUMN device_id TEXT` },
     ];
 
     for (const column of requiredColumns) {

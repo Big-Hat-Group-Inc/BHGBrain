@@ -41,6 +41,7 @@ export class StorageManager {
         retention_tier: mem.retention_tier,
         decay_eligible: mem.decay_eligible,
         expires_at: mem.expires_at ? Math.floor(Date.parse(mem.expires_at) / 1000) : null,
+        device_id: mem.device_id ?? null,
         created_at: mem.created_at,
       });
       if (typeof (this.sqlite as any).markVectorSync === 'function') {
@@ -109,6 +110,7 @@ export class StorageManager {
             retention_tier: fields.retention_tier ?? existing.retention_tier,
             decay_eligible: fields.decay_eligible ?? existing.decay_eligible,
             expires_at: (fields.expires_at ?? existing.expires_at) ? Math.floor(Date.parse((fields.expires_at ?? existing.expires_at)! as string) / 1000) : null,
+            device_id: fields.device_id ?? existing.device_id ?? null,
             created_at: existing.created_at,
           },
         );

@@ -43,6 +43,7 @@ export interface MemoryRecord {
   merged_from: string | null;
   archived: boolean;
   vector_synced: boolean;
+  device_id?: string | null;
   created_at: string;
   updated_at: string;
   last_accessed: string;
@@ -73,6 +74,7 @@ export interface SearchResult {
   retention_tier: RetentionTier;
   expires_at?: string | null;
   expiring_soon?: boolean;
+  device_id?: string | null;
   created_at: string;
   last_accessed: string;
 }

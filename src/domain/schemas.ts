@@ -84,6 +84,7 @@ export const BackupInputSchema = z.object({
 
 export const RepairInputSchema = z.object({
   dry_run: z.boolean().optional().default(false),
+  device_id: z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/).optional(),
 }).strict();
 
 export type RememberInput = z.infer<typeof RememberInputSchema>;

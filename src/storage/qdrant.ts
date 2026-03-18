@@ -60,6 +60,10 @@ export class QdrantStore {
         field_name: 'expires_at',
         field_schema: 'integer',
       });
+      await this.client.createPayloadIndex(name, {
+        field_name: 'device_id',
+        field_schema: 'keyword',
+      });
     }
   }
 
