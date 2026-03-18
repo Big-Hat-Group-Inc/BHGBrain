@@ -10,10 +10,11 @@ import type pino from 'pino';
 import {
   RememberInputSchema, RecallInputSchema, ForgetInputSchema,
   SearchInputSchema, TagInputSchema, CollectionsInputSchema,
-  CategoryInputSchema, BackupInputSchema,
+  CategoryInputSchema, BackupInputSchema, RepairInputSchema,
 } from '../domain/schemas.js';
-import type { WriteResult, SearchResult } from '../domain/types.js';
+import type { WriteResult, SearchResult, MemoryRecord } from '../domain/types.js';
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
+import { computeChecksum } from '../domain/normalize.js';
 import { ZodError } from 'zod';
 
 export interface ToolContext {
@@ -81,6 +82,7 @@ async function dispatch(
     case 'collections': return handleCollections(ctx, args);
     case 'category': return handleCategory(ctx, args);
     case 'backup': return handleBackup(ctx, args);
+    case 'repair': return handleRepair(ctx, args);
     default:
       throw invalidInput(`Unknown tool: ${toolName}`);
   }
@@ -268,4 +270,112 @@ async function handleBackup(ctx: ToolContext, args: unknown): Promise<unknown> {
       if (!input.path) throw invalidInput('path is required for restore');
       return ctx.backup.restore(input.path);
   }
+}
+
+async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
+  const input = parseInput(RepairInputSchema, args);
+  const dryRun = input.dry_run;
+
+  const collections = await ctx.storage.qdrant.listAllCollections();
+  let scannedPoints = 0;
+  let recoveredCount = 0;
+  let skippedNoContent = 0;
+  let alreadyInSqlite = 0;
+  const errors: string[] = [];
+
+  for (const collectionName of collections) {
+    let points: Array<{ id: string; payload: Record<string, unknown> }>;
+    try {
+      points = await ctx.storage.qdrant.scrollAll(collectionName);
+    } catch (err) {
+      errors.push(`Failed to scroll ${collectionName}: ${(err as Error).message}`);
+      continue;
+    }
+
+    scannedPoints += points.length;
+
+    for (const point of points) {
+      const payload = point.payload;
+      const content = payload.content as string | undefined;
+
+      if (!content) {
+        skippedNoContent++;
+        continue;
+      }
+
+      // Check if already in SQLite
+      const existing = ctx.storage.sqlite.getMemoryById(point.id);
+      if (existing) {
+        alreadyInSqlite++;
+        continue;
+      }
+
+      if (dryRun) {
+        recoveredCount++;
+        continue;
+      }
+
+      // Reconstruct and insert into SQLite
+      const now = new Date().toISOString();
+      const namespace = (payload.namespace as string) ?? 'global';
+      const collection = (payload.collection as string) ?? 'general';
+
+      // Ensure the collection exists in SQLite
+      const colRecord = ctx.storage.sqlite.getCollection(namespace, collection);
+      if (!colRecord) {
+        ctx.storage.sqlite.createCollection(
+          namespace, collection,
+          ctx.embedding.model, ctx.embedding.dimensions,
+        );
+      }
+
+      const mem: Omit<MemoryRecord, 'embedding'> = {
+        id: point.id,
+        namespace,
+        collection,
+        type: (payload.type as MemoryRecord['type']) ?? 'semantic',
+        category: (payload.category as string) ?? null,
+        content,
+        summary: (payload.summary as string) ?? '',
+        tags: Array.isArray(payload.tags) ? payload.tags as string[] : [],
+        source: (payload.source as MemoryRecord['source']) ?? 'import',
+        checksum: computeChecksum(content),
+        importance: (payload.importance as number) ?? 0.5,
+        retention_tier: (payload.retention_tier as MemoryRecord['retention_tier']) ?? 'T2',
+        expires_at: null,
+        decay_eligible: (payload.decay_eligible as boolean) ?? true,
+        review_due: null,
+        access_count: 0,
+        last_operation: 'ADD',
+        merged_from: null,
+        archived: false,
+        vector_synced: true,
+        created_at: (payload.created_at as string) ?? now,
+        updated_at: now,
+        last_accessed: now,
+      };
+
+      try {
+        ctx.storage.sqlite.insertMemory(mem);
+        recoveredCount++;
+      } catch (err) {
+        errors.push(`Failed to insert ${point.id}: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  if (recoveredCount > 0 && !dryRun) {
+    ctx.storage.sqlite.flushIfDirty();
+    ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
+  }
+
+  return {
+    dry_run: dryRun,
+    collections_scanned: collections.length,
+    points_scanned: scannedPoints,
+    already_in_sqlite: alreadyInSqlite,
+    skipped_no_content: skippedNoContent,
+    recovered: recoveredCount,
+    errors: errors.length > 0 ? errors : undefined,
+  };
 }

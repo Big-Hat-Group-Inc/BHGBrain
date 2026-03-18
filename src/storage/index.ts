@@ -33,10 +33,15 @@ export class StorageManager {
         type: mem.type,
         tags: mem.tags,
         collection: mem.collection,
+        content: mem.content,
+        summary: mem.summary,
+        category: mem.category,
+        source: mem.source,
         importance: mem.importance,
         retention_tier: mem.retention_tier,
         decay_eligible: mem.decay_eligible,
         expires_at: mem.expires_at ? Math.floor(Date.parse(mem.expires_at) / 1000) : null,
+        created_at: mem.created_at,
       });
       if (typeof (this.sqlite as any).markVectorSync === 'function') {
         this.sqlite.markVectorSync(mem.id, true);
@@ -96,10 +101,15 @@ export class StorageManager {
             type: fields.type ?? existing.type,
             tags: fields.tags ?? existing.tags,
             collection: existing.collection,
+            content: fields.content ?? existing.content,
+            summary: fields.summary ?? existing.summary,
+            category: fields.category ?? existing.category,
+            source: existing.source,
             importance: fields.importance ?? existing.importance,
             retention_tier: fields.retention_tier ?? existing.retention_tier,
             decay_eligible: fields.decay_eligible ?? existing.decay_eligible,
             expires_at: (fields.expires_at ?? existing.expires_at) ? Math.floor(Date.parse((fields.expires_at ?? existing.expires_at)! as string) / 1000) : null,
+            created_at: existing.created_at,
           },
         );
         if (typeof (this.sqlite as any).markVectorSync === 'function') {

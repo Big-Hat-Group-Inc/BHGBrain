@@ -82,6 +82,10 @@ export const BackupInputSchema = z.object({
   path: z.string().optional(),
 }).strict();
 
+export const RepairInputSchema = z.object({
+  dry_run: z.boolean().optional().default(false),
+}).strict();
+
 export type RememberInput = z.infer<typeof RememberInputSchema>;
 export type RecallInput = z.infer<typeof RecallInputSchema>;
 export type ForgetInput = z.infer<typeof ForgetInputSchema>;
@@ -90,3 +94,4 @@ export type TagInput = z.infer<typeof TagInputSchema>;
 export type CollectionsInput = z.infer<typeof CollectionsInputSchema>;
 export type CategoryInput = z.infer<typeof CategoryInputSchema>;
 export type BackupInput = z.infer<typeof BackupInputSchema>;
+export type RepairInput = z.infer<typeof RepairInputSchema>;

@@ -219,6 +219,42 @@ export class QdrantStore {
     }
   }
 
+  async listAllCollections(): Promise<string[]> {
+    const response = await this.client.getCollections();
+    return response.collections
+      .map(c => c.name)
+      .filter(name => name.startsWith(COLLECTION_PREFIX));
+  }
+
+  async scrollAll(
+    collectionName: string,
+    batchSize = 100,
+  ): Promise<Array<{ id: string; payload: Record<string, unknown> }>> {
+    const allPoints: Array<{ id: string; payload: Record<string, unknown> }> = [];
+    let offset: string | number | undefined = undefined;
+
+    while (true) {
+      const response = await this.client.scroll(collectionName, {
+        limit: batchSize,
+        offset,
+        with_payload: true,
+        with_vector: false,
+      });
+
+      for (const point of response.points) {
+        allPoints.push({
+          id: point.id as string,
+          payload: (point.payload ?? {}) as Record<string, unknown>,
+        });
+      }
+
+      if (!response.next_page_offset) break;
+      offset = response.next_page_offset as string | number | undefined;
+    }
+
+    return allPoints;
+  }
+
   private isNotFoundError(err: unknown): boolean {
     if (!err || typeof err !== 'object') return false;
     const maybeErr = err as { status?: number; response?: { status?: number }; message?: string };
