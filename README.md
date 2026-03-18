@@ -16,7 +16,12 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
 6. [Environment Variables](#environment-variables)
 7. [Running the Server](#running-the-server)
 8. [MCP Client Configuration](#mcp-client-configuration)
-9. [Memory Management](#memory-management)
+9. [Multi-Device Memory](#multi-device-memory)
+   - [How It Works](#how-it-works)
+   - [Device Identity Resolution](#device-identity-resolution)
+   - [Shared Qdrant, Local SQLite](#shared-qdrant-local-sqlite)
+   - [Repair and Recovery](#repair-and-recovery)
+10. [Memory Management](#memory-management)
    - [Memory Data Model](#memory-data-model)
    - [Memory Types](#memory-types)
    - [Namespaces and Collections](#namespaces-and-collections)
@@ -29,22 +34,22 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
    - [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving)
    - [Pre-Expiry Warnings](#pre-expiry-warnings)
    - [Resource Limits and Capacity Budgets](#resource-limits-and-capacity-budgets)
-10. [Search](#search)
+11. [Search](#search)
     - [Semantic Search](#semantic-search)
     - [Fulltext Search](#fulltext-search)
     - [Hybrid Search](#hybrid-search)
     - [Recall vs Search — Differences](#recall-vs-search--differences)
     - [Filtering](#filtering)
     - [Score Thresholds and Tier Boosts](#score-thresholds-and-tier-boosts)
-11. [Backup & Restore](#backup--restore)
-12. [Health & Metrics](#health--metrics)
-13. [Security](#security)
-14. [MCP Resources](#mcp-resources)
-15. [Bootstrap Prompt](#bootstrap-prompt)
-16. [CLI Reference](#cli-reference)
-17. [MCP Tools Reference](#mcp-tools-reference)
-18. [Upgrading](#upgrading)
-19. [Behavior Notes](#behavior-notes)
+12. [Backup & Restore](#backup--restore)
+13. [Health & Metrics](#health--metrics)
+14. [Security](#security)
+15. [MCP Resources](#mcp-resources)
+16. [Bootstrap Prompt](#bootstrap-prompt)
+17. [CLI Reference](#cli-reference)
+18. [MCP Tools Reference](#mcp-tools-reference)
+19. [Upgrading](#upgrading)
+20. [Behavior Notes](#behavior-notes)
 
 ---
 
@@ -197,6 +202,14 @@ The file is created automatically on first run with all defaults applied. Edit i
 {
   // Data directory (absolute path). Defaults to platform-appropriate location.
   "data_dir": null,
+
+  // Device identity for multi-device setups (see Multi-Device Memory section)
+  "device": {
+    // Stable device identifier. Auto-generated from hostname if omitted.
+    // Pattern: ^[a-zA-Z0-9._-]{1,64}$
+    // Can also be set via BHGBRAIN_DEVICE_ID environment variable.
+    "id": null
+  },
 
   // Embedding provider configuration
   "embedding": {
@@ -382,6 +395,7 @@ The file is created automatically on first run with all defaults applied. Edit i
 | `OPENAI_API_KEY` | Yes (for embeddings) | — | OpenAI API key. Server starts in **degraded mode** if missing — semantic search and ingestion will fail, but fulltext search and category reads still work. |
 | `BHGBRAIN_TOKEN` | Required for non-loopback HTTP | — | Bearer token for HTTP authentication. Server **refuses to start** if the host is non-loopback and this is unset (unless `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Required for Qdrant Cloud | — | Set `qdrant.api_key_env` in config to the name of this variable. The default config field name is `QDRANT_API_KEY`. |
+| `BHGBRAIN_DEVICE_ID` | No | Auto-generated from hostname | Override the device identifier for multi-device setups. See [Device Identity Resolution](#device-identity-resolution). |
 | `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model (future use). |
 
 Generate a secure bearer token:
@@ -517,6 +531,137 @@ Or using environment variable lookup if your mcporter supports it:
 
 ---
 
+## Multi-Device Memory
+
+BHGBrain supports running multiple instances across different machines (e.g., a primary workstation and a cloud dev box) that share the same Qdrant Cloud backend. Each instance maintains its own local SQLite database while reading from and writing to a shared vector store.
+
+### How It Works
+
+```
+┌───────────────────────┐     ┌───────────────────────┐
+│  Device A (Workstation)│     │  Device B (Cloud PC)  │
+│                       │     │                       │
+│  ┌─────────────────┐  │     │  ┌─────────────────┐  │
+│  │ SQLite (local)  │  │     │  │ SQLite (local)  │  │
+│  │ device_id: ws-1 │  │     │  │ device_id: w365 │  │
+│  └────────┬────────┘  │     │  └────────┬────────┘  │
+│           │           │     │           │           │
+└───────────┼───────────┘     └───────────┼───────────┘
+            │                             │
+            └──────────┬──────────────────┘
+                       │
+            ┌──────────▼──────────┐
+            │  Qdrant Cloud       │
+            │  (shared backend)   │
+            │                     │
+            │  ─ vectors          │
+            │  ─ content payload  │
+            │  ─ device_id index  │
+            └─────────────────────┘
+```
+
+Every memory write stores the full content in both SQLite (local) and the Qdrant payload (shared). This means:
+
+- **No single point of failure**: If a device's SQLite is lost, content can be recovered from Qdrant.
+- **Cross-device visibility**: All devices see all memories via Qdrant, even if their local SQLite only has a subset.
+- **Provenance tracking**: Every memory is tagged with the `device_id` of the instance that created it.
+
+### Device Identity Resolution
+
+Each BHGBrain instance resolves a stable `device_id` on startup, using this priority order:
+
+1. **Explicit config**: `device.id` field in `config.json`
+2. **Environment variable**: `BHGBRAIN_DEVICE_ID`
+3. **Auto-generated**: Derived from `os.hostname()`, lowercased and sanitized to `[a-zA-Z0-9._-]`
+
+On first run, the resolved ID is persisted to `config.json` so it remains stable across restarts, even if the hostname changes later.
+
+```jsonc
+// config.json — device section
+{
+  "device": {
+    "id": "cpc-kevin-98f91"   // auto-generated from hostname, or set explicitly
+  }
+}
+```
+
+The `device_id` appears in:
+- Every Qdrant payload (as a keyword-indexed field)
+- Every SQLite memory record
+- Search results (so callers can identify which device created a memory)
+
+### Shared Qdrant, Local SQLite
+
+Each device maintains its own SQLite database independently. There is no sync protocol between devices — Qdrant is the shared layer.
+
+**What each device sees:**
+
+| Source | Device A sees | Device B sees |
+|---|---|---|
+| Device A's memories (via local SQLite) | ✅ Full record | ❌ Not in local SQLite |
+| Device A's memories (via Qdrant fallback) | ✅ Full record | ✅ Content from Qdrant payload |
+| Device B's memories (via local SQLite) | ❌ Not in local SQLite | ✅ Full record |
+| Device B's memories (via Qdrant fallback) | ✅ Content from Qdrant payload | ✅ Full record |
+
+When a search returns a memory that exists in Qdrant but not in the local SQLite, BHGBrain constructs the result from the Qdrant payload instead of silently dropping it. This means both devices get full search results regardless of which device created the memory.
+
+### Repair and Recovery
+
+The `repair` tool reconstructs a device's local SQLite from Qdrant. Use it after:
+
+- Setting up a new device that shares an existing Qdrant backend
+- Recovering from SQLite data loss
+- Migrating to a new machine
+
+```json
+// Preview what would be recovered (no changes)
+{ "dry_run": true }
+
+// Recover all memories from Qdrant into local SQLite
+{ "dry_run": false }
+
+// Recover only memories created by a specific device
+{ "device_id": "cpc-kevin-98f91", "dry_run": false }
+```
+
+The repair tool:
+- Scrolls all points across all `bhgbrain_*` Qdrant collections
+- Inserts any memory with `content` in its Qdrant payload that is missing from local SQLite
+- Preserves the original `device_id` provenance (or tags with the local device's ID if none exists)
+- Reports: collections scanned, points scanned, recovered, skipped (no content), errors
+
+**Note**: Memories stored before the content-in-Qdrant feature was added (pre-1.3) do not have content in their Qdrant payload and cannot be recovered via repair. Only metadata (tags, type, importance) survives for those entries.
+
+### Multi-Device Configuration Example
+
+**Device A** (`config.json`):
+```jsonc
+{
+  "device": { "id": "workstation" },
+  "qdrant": {
+    "mode": "external",
+    "external_url": "https://your-cluster.cloud.qdrant.io",
+    "api_key_env": "QDRANT_API_KEY"
+  }
+}
+```
+
+**Device B** (`config.json`):
+```jsonc
+{
+  "device": { "id": "cloud-pc" },
+  "qdrant": {
+    "mode": "external",
+    "external_url": "https://your-cluster.cloud.qdrant.io",
+    "api_key_env": "QDRANT_API_KEY"
+  }
+}
+```
+
+Both point to the same Qdrant cluster. Each gets its own `device_id`. All memories flow to the same vector collections and are visible to both instances.
+
+---
+
 ## Memory Management
 
 This section describes the complete memory lifecycle — from ingestion through classification, deduplication, access tracking, promotion, decay, and eventual expiration or permanent retention.
@@ -549,6 +694,7 @@ Every memory stored in BHGBrain is a `MemoryRecord` with the following fields:
 | `merged_from` | `string \| null` | ID of the memory this was merged from (dedup UPDATE path) |
 | `archived` | `boolean` | Whether this memory is soft-archived (excluded from search/recall) |
 | `vector_synced` | `boolean` | Whether the Qdrant vector is in sync with SQLite state |
+| `device_id` | `string \| null` | Identifier of the BHGBrain instance that created this memory (see [Multi-Device Memory](#multi-device-memory)) |
 | `created_at` | `string (ISO 8601)` | Creation timestamp |
 | `updated_at` | `string (ISO 8601)` | Last update timestamp |
 | `last_accessed` | `string (ISO 8601)` | Last retrieval timestamp |
@@ -579,6 +725,7 @@ Each Qdrant collection maintains the following payload indexes for efficient vec
 - `retention_tier` (keyword)
 - `decay_eligible` (boolean)
 - `expires_at` (integer — stored as Unix epoch seconds)
+- `device_id` (keyword)
 
 ---
 
@@ -1539,7 +1686,7 @@ bhgbrain server token                 # Generate a new random bearer token
 
 ## MCP Tools Reference
 
-BHGBrain exposes 8 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
+BHGBrain exposes 9 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
 
 ```json
 {
@@ -1865,7 +2012,65 @@ Create, list, or restore memory backups.
 
 ---
 
+### `repair` — Rebuild SQLite from Qdrant
+
+Recover memories from Qdrant into the local SQLite database. Used for multi-device setup, data loss recovery, or new device onboarding. See [Repair and Recovery](#repair-and-recovery).
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `dry_run` | `boolean` | No | `false` | When `true`, reports what would be recovered without making changes. |
+| `device_id` | `string` | No | — | Filter recovery to memories created by a specific device. Omit to recover all. |
+
+**Output:**
+
+```json
+{
+  "collections_scanned": 2,
+  "points_scanned": 47,
+  "already_in_sqlite": 12,
+  "skipped_no_content": 3,
+  "recovered": 32,
+  "errors": 0
+}
+```
+
+**Notes:**
+- Only points with `content` in their Qdrant payload can be recovered. Pre-1.3 memories without content in Qdrant are reported as `skipped_no_content`.
+- Recovered memories preserve their original `device_id` from the Qdrant payload. If no `device_id` exists in the payload, the local device's ID is used.
+- After recovery, run `npm run build` and restart the server if needed. The recovered memories are immediately available for search and recall.
+
+---
+
 ## Upgrading
+
+### 1.2 → 1.3 (Multi-Device Memory & Data Resilience)
+
+**No manual migration required.** BHGBrain automatically upgrades on startup.
+
+What happens on first start after upgrade:
+
+- **SQLite**: A nullable `device_id` column is added to the `memories` table. Existing memories remain `device_id = null` (pre-migration).
+- **Qdrant**: A `device_id` keyword index is created on each collection (handled by `ensureCollection`).
+- **Config**: A `device.id` field is resolved (from config, env, or hostname) and persisted to `config.json`.
+- **Write path**: All new memories store `content`, `summary`, and `device_id` in the Qdrant payload alongside the vector embedding.
+- **Search path**: If a memory exists in Qdrant but not in local SQLite, the search result is constructed from the Qdrant payload instead of being dropped.
+
+**New tool**: `repair` — reconstructs local SQLite from Qdrant. Run this on any device that has an empty or incomplete SQLite database to recover shared memories.
+
+**New config section**:
+```jsonc
+{
+  "device": {
+    "id": "my-workstation"  // optional — auto-generated from hostname if omitted
+  }
+}
+```
+
+**Backward compatible**: Pre-1.3 memories without `device_id` or content in Qdrant continue to work normally. They simply cannot be recovered via the `repair` tool.
+
+---
 
 ### 1.0 → 1.2 (Tiered Memory Lifecycle)
 
