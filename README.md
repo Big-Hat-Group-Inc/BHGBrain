@@ -59,34 +59,53 @@ BHGBrain is a persistent memory server built on the Model Context Protocol. It s
 
 ### Dual-Store Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         MCP Client                              │
-│                (Claude Desktop / OpenClaw / Codex)              │
-└────────────────────────┬────────────────────────────────────────┘
-                         │  MCP (stdio or HTTP)
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       BHGBrain Server                           │
-│                                                                 │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │ Write       │  │ Search       │  │ Resource Handler     │   │
-│  │ Pipeline    │  │ Service      │  │ (memory:// URIs)     │   │
-│  └──────┬──────┘  └──────┬───────┘  └──────────────────────┘   │
-│         │                │                                       │
-│  ┌──────▼────────────────▼──────────────────────────────────┐   │
-│  │                  Storage Manager                          │   │
-│  │  ┌─────────────────────┐  ┌───────────────────────────┐  │   │
-│  │  │  SQLite (sql.js)    │  │  Qdrant (vector store)    │  │   │
-│  │  │  ─ metadata         │  │  ─ embeddings (1536d)     │  │   │
-│  │  │  ─ fulltext (FTS)   │  │  ─ cosine similarity      │  │   │
-│  │  │  ─ categories       │  │  ─ payload indexes        │  │   │
-│  │  │  ─ audit log        │  │  ─ per-collection NS      │  │   │
-│  │  │  ─ revisions        │  └───────────────────────────┘  │   │
-│  │  │  ─ archive          │                                  │   │
-│  │  └─────────────────────┘                                  │   │
-│  └────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph Client["MCP Client<br/><i>Claude Desktop / OpenClaw / Codex</i>"]
+    end
+
+    Client -->|"MCP (stdio or HTTP)"| Server
+
+    subgraph Server["BHGBrain Server"]
+        WP["Write Pipeline"]
+        SS["Search Service"]
+        RH["Resource Handler<br/><i>memory:// URIs</i>"]
+
+        subgraph Storage["Storage Manager"]
+            subgraph SQLite["SQLite (sql.js)"]
+                S1["metadata"]
+                S2["fulltext (FTS)"]
+                S3["categories"]
+                S4["audit log"]
+                S5["revisions"]
+                S6["archive"]
+            end
+            subgraph Qdrant["Qdrant (vector store)"]
+                Q1["embeddings (1536d)"]
+                Q2["cosine similarity"]
+                Q3["payload indexes"]
+            end
+        end
+
+        WP --> Storage
+        SS --> Storage
+        RH --> Storage
+    end
+
+    Server -.->|"embed content"| OpenAI["OpenAI Embedding API<br/><i>text-embedding-3-small</i>"]
+
+    classDef client fill:#4a90d9,stroke:#2c5f8a,color:#fff
+    classDef server fill:#f0f4f8,stroke:#4a90d9,color:#333
+    classDef component fill:#5ba85b,stroke:#3d7a3d,color:#fff
+    classDef sqlite fill:#e8a838,stroke:#b8841c,color:#fff
+    classDef qdrant fill:#d94a6e,stroke:#a83050,color:#fff
+    classDef external fill:#8b5cf6,stroke:#6d3fc4,color:#fff
+
+    class Client client
+    class WP,SS,RH component
+    class S1,S2,S3,S4,S5,S6 sqlite
+    class Q1,Q2,Q3 qdrant
+    class OpenAI external
 ```
 
 - **SQLite** (via `sql.js`, in-memory with periodic atomic flush to disk) is the **system of record** for all memory metadata, fulltext search index, categories, audit trail, revision history, and archive records.
@@ -537,27 +556,34 @@ BHGBrain supports running multiple instances across different machines (e.g., a 
 
 ### How It Works
 
-```
-┌───────────────────────┐     ┌───────────────────────┐
-│  Device A (Workstation)│     │  Device B (Cloud PC)  │
-│                       │     │                       │
-│  ┌─────────────────┐  │     │  ┌─────────────────┐  │
-│  │ SQLite (local)  │  │     │  │ SQLite (local)  │  │
-│  │ device_id: ws-1 │  │     │  │ device_id: w365 │  │
-│  └────────┬────────┘  │     │  └────────┬────────┘  │
-│           │           │     │           │           │
-└───────────┼───────────┘     └───────────┼───────────┘
-            │                             │
-            └──────────┬──────────────────┘
-                       │
-            ┌──────────▼──────────┐
-            │  Qdrant Cloud       │
-            │  (shared backend)   │
-            │                     │
-            │  ─ vectors          │
-            │  ─ content payload  │
-            │  ─ device_id index  │
-            └─────────────────────┘
+```mermaid
+graph TD
+    subgraph DevA["Device A (Workstation)"]
+        SA["SQLite (local)<br/>device_id: ws-1"]
+    end
+
+    subgraph DevB["Device B (Cloud PC)"]
+        SB["SQLite (local)<br/>device_id: w365"]
+    end
+
+    SA -->|"write + read"| QC
+    SB -->|"write + read"| QC
+
+    subgraph QC["Qdrant Cloud (shared backend)"]
+        V["vectors"]
+        CP["content payload"]
+        DI["device_id index"]
+    end
+
+    SA -.->|"fallback search<br/>for Device B memories"| QC
+    SB -.->|"fallback search<br/>for Device A memories"| QC
+
+    classDef device fill:#4a90d9,stroke:#2c5f8a,color:#fff
+    classDef sqlite fill:#e8a838,stroke:#b8841c,color:#fff
+    classDef qdrant fill:#d94a6e,stroke:#a83050,color:#fff
+
+    class SA,SB sqlite
+    class V,CP,DI qdrant
 ```
 
 Every memory write stores the full content in both SQLite (local) and the Qdrant payload (shared). This means:
@@ -606,6 +632,31 @@ Each device maintains its own SQLite database independently. There is no sync pr
 When a search returns a memory that exists in Qdrant but not in the local SQLite, BHGBrain constructs the result from the Qdrant payload instead of silently dropping it. This means both devices get full search results regardless of which device created the memory.
 
 ### Repair and Recovery
+
+```mermaid
+flowchart TD
+    START["repair tool invoked"] --> SCROLL["Scroll all bhgbrain_*<br/>Qdrant collections"]
+    SCROLL --> LOOP{"Next point?"}
+    LOOP -->|Yes| CHECK{"Point ID exists<br/>in local SQLite?"}
+    CHECK -->|Yes| SKIP1["Skip<br/><i>already_in_sqlite++</i>"]
+    SKIP1 --> LOOP
+    CHECK -->|No| CONTENT{"Has content<br/>in Qdrant payload?"}
+    CONTENT -->|No| SKIP2["Skip<br/><i>skipped_no_content++</i><br/><i>(pre-1.3 memory)</i>"]
+    SKIP2 --> LOOP
+    CONTENT -->|Yes| INSERT["Insert into SQLite<br/><i>Preserve original device_id</i><br/><i>recovered++</i>"]
+    INSERT --> LOOP
+    LOOP -->|"No more points"| REPORT["Report Stats<br/><i>collections scanned</i><br/><i>points scanned</i><br/><i>recovered / skipped / errors</i>"]
+
+    classDef start fill:#4a90d9,stroke:#2c5f8a,color:#fff
+    classDef skip fill:#6c757d,stroke:#495057,color:#fff
+    classDef recover fill:#5ba85b,stroke:#3d7a3d,color:#fff
+    classDef report fill:#8b5cf6,stroke:#6d3fc4,color:#fff
+
+    class START start
+    class SKIP1,SKIP2 skip
+    class INSERT recover
+    class REPORT report
+```
 
 The `repair` tool reconstructs a device's local SQLite from Qdrant. Use it after:
 
@@ -837,6 +888,34 @@ Tier assignment happens during the write pipeline, in this priority order:
 
 7. **Default:** `T2` — the safe, forgiving default.
 
+```mermaid
+flowchart TD
+    START["Memory Ingested"] --> Q1{"Explicit<br/>retention_tier<br/>provided?"}
+    Q1 -->|Yes| USE["Use provided tier"]
+    Q1 -->|No| Q2{"Has category?"}
+    Q2 -->|Yes| T0A["T0 — Foundational"]
+    Q2 -->|No| Q3{"source:agent +<br/>type:procedural?"}
+    Q3 -->|Yes| T1A["T1 — Institutional"]
+    Q3 -->|No| Q4{"source:agent +<br/>type:episodic?"}
+    Q4 -->|Yes| T2A["T2 — Operational"]
+    Q4 -->|No| Q5{"Transient pattern<br/>match?<br/><i>JIRA-1234, From:, standup...</i>"}
+    Q5 -->|Yes| T3A["T3 — Transient"]
+    Q5 -->|No| Q6{"T0 keyword<br/>match?<br/><i>architecture, compliance...</i>"}
+    Q6 -->|Yes| T0B["T0 — Foundational"]
+    Q6 -->|No| T2B["T2 — Default"]
+
+    classDef t0 fill:#dc3545,stroke:#a71d2a,color:#fff
+    classDef t1 fill:#e8a838,stroke:#b8841c,color:#fff
+    classDef t2 fill:#4a90d9,stroke:#2c5f8a,color:#fff
+    classDef t3 fill:#6c757d,stroke:#495057,color:#fff
+    classDef decision fill:#f0f4f8,stroke:#4a90d9,color:#333
+
+    class T0A,T0B t0
+    class T1A t1
+    class T2A,T2B,USE t2
+    class T3A t3
+```
+
 #### Tier Metadata Computed at Assignment
 
 ```typescript
@@ -863,6 +942,36 @@ Promotion is **monotonic** — automatic demotion never occurs. Tier demotion re
 
 When a memory is promoted, its `expires_at` is recomputed from the new tier's TTL using the current timestamp as the sliding window anchor.
 
+```mermaid
+stateDiagram-v2
+    [*] --> T3: New memory<br/>assigned T3
+
+    T3: T3 — Transient<br/>TTL: 30 days
+    T2: T2 — Operational<br/>TTL: 90 days
+    T1: T1 — Institutional<br/>TTL: 365 days
+    T0: T0 — Foundational<br/>TTL: ∞ (never)
+
+    T3 --> T2: Auto-promote<br/>(5 accesses)
+    T2 --> T1: Auto-promote<br/>(5 accesses)
+    T1 --> T0: Manual only<br/>(explicit tier set)
+
+    T3 --> Expired: TTL exceeded<br/>(no access in 30d)
+    T2 --> Expired: TTL exceeded<br/>(no access in 90d)
+    T1 --> Expired: TTL exceeded<br/>(no access in 365d)
+
+    T3 --> T3: Access resets<br/>sliding window
+    T2 --> T2: Access resets<br/>sliding window
+    T1 --> T1: Access resets<br/>sliding window
+
+    Expired --> Archive: archive_before_delete<br/>= true
+    Expired --> Deleted: archive_before_delete<br/>= false
+    Archive --> Deleted: Cleanup cycle
+
+    [*] --> T2: Default assignment
+    [*] --> T0: Category or<br/>explicit T0
+    [*] --> T1: agent + procedural
+```
+
 #### Sliding Window Expiration
 
 When `sliding_window_enabled: true` (the default), every successful retrieval via `recall`, `search`, or `memory://inject` resets the TTL clock:
@@ -880,6 +989,44 @@ Access tracking is performed in batch after every search (up to 5-second deferre
 ### Deduplication
 
 BHGBrain prevents storing duplicate or near-duplicate content through a two-phase deduplication pipeline.
+
+```mermaid
+flowchart TD
+    A["Incoming Content"] --> B["Content Normalization<br/><i>strip controls, collapse blanks</i>"]
+    B --> C{"Secret Detected?"}
+    C -->|Yes| REJECT["❌ REJECT<br/>INVALID_INPUT"]
+    C -->|No| D["SHA-256 Checksum"]
+    D --> E{"Exact Match<br/>in namespace?"}
+    E -->|Yes| NOOP1["🔄 NOOP<br/>Return existing ID"]
+    E -->|No| F["Embed Content<br/><i>OpenAI text-embedding-3-small</i>"]
+    F --> G["Semantic Dedup<br/>Top-10 similarity search"]
+    G --> H{"Highest Cosine<br/>Similarity Score"}
+    H -->|"score ≥ noop threshold"| NOOP2["🔄 NOOP<br/>Near-duplicate found"]
+    H -->|"score ≥ update threshold"| UPD["✏️ UPDATE Path"]
+    H -->|"score < update threshold"| ADD["➕ ADD Path"]
+
+    UPD --> U1["Merge tags (union)"]
+    U1 --> U2["Replace content"]
+    U2 --> U3["importance = max(old, new)"]
+    U3 --> U4["SQLite UPDATE"]
+    U4 --> U5["Qdrant Upsert"]
+
+    ADD --> A1["Tier Assignment"]
+    A1 --> A2["SQLite INSERT"]
+    A2 --> A3["Qdrant Upsert"]
+
+    classDef reject fill:#dc3545,stroke:#a71d2a,color:#fff
+    classDef noop fill:#6c757d,stroke:#495057,color:#fff
+    classDef update fill:#e8a838,stroke:#b8841c,color:#fff
+    classDef add fill:#5ba85b,stroke:#3d7a3d,color:#fff
+    classDef process fill:#4a90d9,stroke:#2c5f8a,color:#fff
+
+    class REJECT reject
+    class NOOP1,NOOP2 noop
+    class UPD,U1,U2,U3,U4,U5 update
+    class ADD,A1,A2,A3 add
+    class A,B,C,D,E,F,G,H process
+```
 
 #### Phase 1: Exact Deduplication (Checksum)
 
@@ -1200,6 +1347,35 @@ Fulltext search uses SQLite's internal text matching to find memories containing
 
 ### Hybrid Search
 
+```mermaid
+flowchart TD
+    Q["Search Query"] --> P1 & P2
+
+    subgraph Semantic["Semantic Search"]
+        P1["Embed Query<br/><i>OpenAI API</i>"] --> QD["Qdrant<br/>Vector Search"]
+        QD --> SR["Ranked Results<br/><i>by cosine similarity</i>"]
+    end
+
+    subgraph Fulltext["Fulltext Search"]
+        P2["Tokenize Query"] --> FTS["SQLite FTS<br/>LIKE matching"]
+        FTS --> FR["Ranked Results<br/><i>by term count</i>"]
+    end
+
+    SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
+    FR --> RRF
+    RRF --> BOOST["T0 Score Boost<br/><i>+0.1 for foundational</i>"]
+    BOOST --> TOP["Return Top N Results"]
+    TOP --> TRACK["Update Access Tracking<br/><i>count++, sliding window reset</i>"]
+
+    classDef search fill:#4a90d9,stroke:#2c5f8a,color:#fff
+    classDef fusion fill:#8b5cf6,stroke:#6d3fc4,color:#fff
+    classDef result fill:#5ba85b,stroke:#3d7a3d,color:#fff
+
+    class P1,QD,SR,P2,FTS,FR search
+    class RRF,BOOST fusion
+    class TOP,TRACK result
+```
+
 Hybrid search combines semantic and fulltext results using **Reciprocal Rank Fusion (RRF)**, a rank-based fusion algorithm that is robust to score scale differences between the two retrieval systems.
 
 **How it works:**
@@ -1296,6 +1472,43 @@ Both `recall` and `search` support namespace and collection scoping. `recall` ad
 ---
 
 ## Backup & Restore
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant S as BHGBrain Server
+    participant DB as SQLite
+    participant FS as Filesystem
+
+    rect rgb(230, 245, 230)
+        Note over C,FS: CREATE BACKUP
+        C->>S: backup create
+        S->>DB: Export full database
+        DB-->>S: Raw DB bytes
+        S->>S: Compute SHA-256 checksum
+        S->>S: Build JSON header<br/>(version, count, checksum)
+        S->>FS: Atomic write .bhgb file<br/>(write-to-temp-then-rename)
+        FS-->>S: Success
+        S-->>C: path, size, memory_count
+    end
+
+    rect rgb(230, 235, 250)
+        Note over C,FS: RESTORE BACKUP
+        C->>S: backup restore (path)
+        S->>FS: Read .bhgb file
+        FS-->>S: Header + DB bytes
+        S->>S: Validate SHA-256 checksum
+        alt Checksum mismatch
+            S-->>C: ❌ INVALID_INPUT
+        else Checksum valid
+            S->>FS: Atomic write to data dir<br/>(write-to-temp-then-rename)
+            S->>DB: Hot-reload in-memory SQLite
+            S->>DB: Run schema migrations
+            DB-->>S: Ready
+            S-->>C: memory_count, activated: true
+        end
+    end
+```
 
 ### Creating a Backup
 
