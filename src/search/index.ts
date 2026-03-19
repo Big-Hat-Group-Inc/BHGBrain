@@ -2,6 +2,7 @@ import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { SearchMode, SearchResult } from '../domain/types.js';
+import type { MetricsCollector } from '../health/metrics.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { embeddingUnavailable, internal } from '../errors/index.js';
 
@@ -22,6 +23,7 @@ export class SearchService {
     private config: BrainConfig,
     private storage: StorageManager,
     private embedding: EmbeddingProvider,
+    private metrics?: MetricsCollector,
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
   }
@@ -33,13 +35,20 @@ export class SearchService {
     mode: SearchMode,
     limit: number,
   ): Promise<SearchResult[]> {
-    switch (mode) {
-      case 'semantic':
-        return this.semanticSearch(query, namespace, collection, limit);
-      case 'fulltext':
-        return this.fulltextSearch(query, namespace, collection, limit);
-      case 'hybrid':
-        return this.hybridSearch(query, namespace, collection, limit);
+    const start = Date.now();
+    try {
+      switch (mode) {
+        case 'semantic':
+          return await this.semanticSearch(query, namespace, collection, limit);
+        case 'fulltext':
+          return this.fulltextSearch(query, namespace, collection, limit);
+        case 'hybrid':
+          return await this.hybridSearch(query, namespace, collection, limit);
+      }
+      const unsupportedMode: never = mode;
+      throw new Error(`Unsupported search mode: ${unsupportedMode}`);
+    } finally {
+      this.metrics?.recordHistogram('search_total_ms', Date.now() - start);
     }
   }
 

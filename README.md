@@ -1665,8 +1665,13 @@ Returns plain-text key-value metrics (Prometheus-compatible format):
 | Metric | Type | Description |
 |---|---|---|
 | `bhgbrain_tool_calls_total` | counter | Total tool invocations |
-| `bhgbrain_tool_duration_seconds_avg` | histogram | Average tool call duration |
-| `bhgbrain_tool_duration_seconds_count` | counter | Number of tool call duration samples |
+| `bhgbrain_tool_handler_ms_avg` | histogram | Average tool handler latency in milliseconds |
+| `bhgbrain_tool_handler_ms_p50` | histogram | 50th percentile tool handler latency |
+| `bhgbrain_tool_handler_ms_p95` | histogram | 95th percentile tool handler latency |
+| `bhgbrain_tool_handler_ms_p99` | histogram | 99th percentile tool handler latency |
+| `bhgbrain_tool_handler_ms_count` | counter | Number of tool handler latency samples |
+| `embedding_embed_batch_ms_p95` | histogram | 95th percentile embedding batch latency |
+| `search_total_ms_p95` | histogram | 95th percentile end-to-end search latency |
 | `bhgbrain_memory_count` | gauge | Current total memory count (updated on write/delete) |
 | `bhgbrain_rate_limit_buckets` | gauge | Active rate limit tracking buckets |
 | `bhgbrain_rate_limited_total` | counter | Total rate-limited requests |
@@ -2361,7 +2366,7 @@ The backup is stored in the data directory (`%LOCALAPPDATA%\BHGBrain\` on Window
 ### Operational Observability
 
 - **Bounded metrics:** Histogram values use a bounded circular buffer (last 1000 samples).
-- **Metric semantics:** Histogram metrics emit `_avg` and `_count` suffixes.
+- **Metric semantics:** Histogram metrics emit `_avg`, `_p50`, `_p95`, `_p99`, and `_count` suffixes.
 - **Atomic writes:** Database and backup file writes use write-to-temp-then-rename to prevent truncated partial files on crash.
 - **Deferred flush:** Read-path access metadata (touch counts) uses bounded async batching (5s window) instead of synchronous full-database flushes per request.
 - **Cross-store consistency:** SQLite updates are rolled back if the corresponding Qdrant operation fails.

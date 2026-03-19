@@ -7,6 +7,16 @@ interface MetricEntry {
   labels?: Record<string, string>;
 }
 
+export function computePercentile(sortedValues: number[], p: number): number {
+  if (sortedValues.length === 0) {
+    return 0;
+  }
+
+  const rank = Math.ceil((p / 100) * sortedValues.length);
+  const index = Math.min(sortedValues.length - 1, Math.max(0, rank - 1));
+  return sortedValues[index] ?? 0;
+}
+
 /** Bounded circular buffer for histogram values */
 class BoundedBuffer {
   private buffer: number[];
@@ -79,7 +89,11 @@ export class MetricsCollector {
       const count = vals.length;
       const sum = count > 0 ? vals.reduce((a, b) => a + b, 0) : 0;
       const avg = count > 0 ? sum / count : 0;
+      const sortedValues = [...vals].sort((a, b) => a - b);
       entries.push({ name: `${name}_avg`, type: 'histogram', value: avg });
+      entries.push({ name: `${name}_p50`, type: 'histogram', value: computePercentile(sortedValues, 50) });
+      entries.push({ name: `${name}_p95`, type: 'histogram', value: computePercentile(sortedValues, 95) });
+      entries.push({ name: `${name}_p99`, type: 'histogram', value: computePercentile(sortedValues, 99) });
       entries.push({ name: `${name}_count`, type: 'counter', value: count });
     }
     for (const [name, value] of this.gauges) {

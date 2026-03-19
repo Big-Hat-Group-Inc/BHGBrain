@@ -1,4 +1,5 @@
 import type { BrainConfig } from '../config/index.js';
+import type { MetricsCollector } from '../health/metrics.js';
 import { embeddingUnavailable } from '../errors/index.js';
 
 export interface EmbeddingProvider {
@@ -15,7 +16,10 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private apiKey: string;
   private baseUrl = 'https://api.openai.com/v1';
 
-  constructor(config: BrainConfig) {
+  constructor(
+    config: BrainConfig,
+    private readonly metrics?: MetricsCollector,
+  ) {
     this.model = config.embedding.model;
     this.dimensions = config.embedding.dimensions;
     const key = process.env[config.embedding.api_key_env];
@@ -31,6 +35,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 
   async embedBatch(texts: string[]): Promise<number[][]> {
+    const start = Date.now();
     let response: Response;
     try {
       response = await fetch(`${this.baseUrl}/embeddings`, {
@@ -46,6 +51,8 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
       });
     } catch (err) {
       throw embeddingUnavailable(`Embedding provider unreachable: ${(err as Error).message}`);
+    } finally {
+      this.metrics?.recordHistogram('embedding_embed_batch_ms', Date.now() - start);
     }
 
     if (!response.ok) {
@@ -99,11 +106,14 @@ export class DegradedEmbeddingProvider implements EmbeddingProvider {
   }
 }
 
-export function createEmbeddingProvider(config: BrainConfig): EmbeddingProvider {
+export function createEmbeddingProvider(
+  config: BrainConfig,
+  options?: { metrics?: MetricsCollector },
+): EmbeddingProvider {
   switch (config.embedding.provider) {
     case 'openai':
       try {
-        return new OpenAIEmbeddingProvider(config);
+        return new OpenAIEmbeddingProvider(config, options?.metrics);
       } catch {
         // Missing credentials: start in degraded mode
         return new DegradedEmbeddingProvider(config);
