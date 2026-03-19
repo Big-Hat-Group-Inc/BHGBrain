@@ -2,7 +2,7 @@
 
 Persistent, vector-backed memory for MCP clients (Claude, Codex, OpenClaw, etc.).
 
-BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (semantic vectors), exposing them over the Model Context Protocol (MCP) via stdio or HTTP. It is designed to give AI agents a durable, searchable second brain that persists across sessions — with full lifecycle management, automatic deduplication, tiered retention, and hybrid search.
+BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (semantic vectors), exposing them over the Model Context Protocol (MCP) via stdio or HTTP. It is designed to give AI agents a durable, searchable second brain that persists across sessions - with full lifecycle management, automatic deduplication, tiered retention, and hybrid search.
 
 ---
 
@@ -26,11 +26,11 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
    - [Memory Types](#memory-types)
    - [Namespaces and Collections](#namespaces-and-collections)
    - [Retention Tiers](#retention-tiers)
-   - [Tier Lifecycle — Assignment, Promotion, Sliding Window](#tier-lifecycle--assignment-promotion-sliding-window)
+   - [Tier Lifecycle - Assignment, Promotion, Sliding Window](#tier-lifecycle--assignment-promotion-sliding-window)
    - [Deduplication](#deduplication)
    - [Content Normalization](#content-normalization)
    - [Importance Scoring](#importance-scoring)
-   - [Categories — Persistent Policy Slots](#categories--persistent-policy-slots)
+   - [Categories - Persistent Policy Slots](#categories--persistent-policy-slots)
    - [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving)
    - [Pre-Expiry Warnings](#pre-expiry-warnings)
    - [Resource Limits and Capacity Budgets](#resource-limits-and-capacity-budgets)
@@ -38,7 +38,7 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
     - [Semantic Search](#semantic-search)
     - [Fulltext Search](#fulltext-search)
     - [Hybrid Search](#hybrid-search)
-    - [Recall vs Search — Differences](#recall-vs-search--differences)
+    - [Recall vs Search - Differences](#recall-vs-search--differences)
     - [Filtering](#filtering)
     - [Score Thresholds and Tier Boosts](#score-thresholds-and-tier-boosts)
 12. [Backup & Restore](#backup--restore)
@@ -55,7 +55,7 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
 
 ## Overview & Architecture
 
-BHGBrain is a persistent memory server built on the Model Context Protocol. It stores everything AI agents learn, decide, and observe across sessions — then makes that knowledge available via semantic recall, fulltext search, and injected context.
+BHGBrain is a persistent memory server built on the Model Context Protocol. It stores everything AI agents learn, decide, and observe across sessions - then makes that knowledge available via semantic recall, fulltext search, and injected context.
 
 ### Dual-Store Architecture
 
@@ -111,7 +111,7 @@ graph TD
 - **SQLite** (via `sql.js`, in-memory with periodic atomic flush to disk) is the **system of record** for all memory metadata, fulltext search index, categories, audit trail, revision history, and archive records.
 - **Qdrant** holds semantic vector embeddings for similarity search. Qdrant is always written after SQLite succeeds; failures are tracked via the `vector_synced` flag and surfaced in the health endpoint.
 - **OpenAI text-embedding-3-small** (default, configurable) generates 1536-dimensional embeddings for every memory.
-- **Atomic writes** ensure database files are never partially written — all disk I/O uses write-to-temp-then-rename.
+- **Atomic writes** ensure database files are never partially written - all disk I/O uses write-to-temp-then-rename.
 - **Deferred flush** batches access metadata updates (up to 5 seconds) to avoid per-request database flushes on read-heavy paths.
 
 ---
@@ -122,13 +122,13 @@ graph TD
 |---|---|---|
 | Node.js | ≥ 20.0.0 | LTS recommended |
 | Qdrant | ≥ 1.9 | Must be running before starting BHGBrain |
-| OpenAI API key | — | For embeddings (`text-embedding-3-small` by default). Server starts in degraded mode if missing. |
+| OpenAI API key | - | For embeddings (`text-embedding-3-small` by default). Server starts in degraded mode if missing. |
 
 ---
 
 ## Qdrant Setup
 
-BHGBrain **requires an external Qdrant instance**. Even in the default `embedded` mode, the server connects to `http://localhost:6333` — there is no bundled Qdrant binary. You must run it yourself.
+BHGBrain **requires an external Qdrant instance**. Even in the default `embedded` mode, the server connects to `http://localhost:6333` - there is no bundled Qdrant binary. You must run it yourself.
 
 ### Option A: Docker (recommended)
 
@@ -248,7 +248,7 @@ The file is created automatically on first run with all defaults applied. Edit i
     // "embedded" = connect to localhost:6333
     // "external" = connect to external_url (Qdrant Cloud, remote instance, etc.)
     "mode": "embedded",
-    // Only used for embedded mode (currently unused — Qdrant must be started externally)
+    // Only used for embedded mode (currently unused - Qdrant must be started externally)
     "embedded_path": "./qdrant",
     // External Qdrant URL (used when mode = "external")
     "external_url": null,
@@ -443,6 +443,8 @@ node dist/index.js --stdio
 # With a custom config file
 node dist/index.js --stdio --config=/path/to/config.json
 ```
+
+> **Log routing in stdio mode:** When `--stdio` is active, all structured logs (pino) are automatically redirected to **stderr**. This is required because stdout is exclusively reserved for the MCP JSON-RPC protocol. Mixing log output into stdout would corrupt the MCP handshake and cause clients to fail to load the server. To capture logs when running in stdio mode, redirect stderr: `node dist/index.js --stdio 2>bhgbrain.log`
 
 ### HTTP mode
 
@@ -715,7 +717,7 @@ Both point to the same Qdrant cluster. Each gets its own `device_id`. All memori
 
 ## Memory Management
 
-This section describes the complete memory lifecycle — from ingestion through classification, deduplication, access tracking, promotion, decay, and eventual expiration or permanent retention.
+This section describes the complete memory lifecycle - from ingestion through classification, deduplication, access tracking, promotion, decay, and eventual expiration or permanent retention.
 
 ### Memory Data Model
 
@@ -734,9 +736,9 @@ Every memory stored in BHGBrain is a `MemoryRecord` with the following fields:
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | How the memory was created |
 | `checksum` | `string` | SHA-256 hash of normalized content (used for exact deduplication) |
 | `embedding` | `number[]` | Vector embedding (not stored in SQLite; lives in Qdrant) |
-| `importance` | `number (0–1)` | Importance score (default 0.5) |
+| `importance` | `number (0-1)` | Importance score (default 0.5) |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | Lifecycle tier governing TTL and cleanup behavior |
-| `expires_at` | `string (ISO 8601) \| null` | Expiry timestamp (null for T0 — never expires) |
+| `expires_at` | `string (ISO 8601) \| null` | Expiry timestamp (null for T0 - never expires) |
 | `decay_eligible` | `boolean` | Whether the memory participates in TTL cleanup (false for T0) |
 | `review_due` | `string (ISO 8601) \| null` | T1 review date (set to created_at + 365 days; reset on access) |
 | `access_count` | `number` | Number of times this memory has been retrieved |
@@ -804,7 +806,7 @@ If you do not provide a type, the pipeline defaults to `"semantic"`.
 
 **Namespaces** are top-level scoping identifiers that isolate memories from different contexts, users, or projects. All tool operations require a namespace (default: `"global"`).
 
-- Namespace pattern: `^[a-zA-Z0-9/-]{1,200}$` — alphanumeric characters, hyphens, and forward slashes
+- Namespace pattern: `^[a-zA-Z0-9/-]{1,200}$` - alphanumeric characters, hyphens, and forward slashes
 - Examples: `"global"`, `"project/alpha"`, `"user/kevin"`, `"tenant/acme-corp"`
 - Memories in different namespaces are never returned in each other's searches
 - Each namespace+collection pair maps to a separate Qdrant collection (named `bhgbrain_{namespace}_{collection}`)
@@ -813,7 +815,7 @@ If you do not provide a type, the pipeline defaults to `"semantic"`.
 
 - Collection pattern: `^[a-zA-Z0-9-]{1,100}$`
 - Examples: `"general"`, `"architecture"`, `"decisions"`, `"onboarding"`
-- Collections are tracked in the SQLite `collections` table with their embedding model and dimensions locked at creation time — you cannot mix embedding models within a collection
+- Collections are tracked in the SQLite `collections` table with their embedding model and dimensions locked at creation time - you cannot mix embedding models within a collection
 - Use the `collections` MCP tool to list, create, or delete collections
 
 **Isolation guarantees:**
@@ -825,7 +827,7 @@ If you do not provide a type, the pipeline defaults to `"semantic"`.
 
 ### Retention Tiers
 
-Every memory is assigned a **retention tier** at ingestion time that governs its entire lifecycle — how long it lives, how it's cleaned up, how strictly it's deduplicated, and whether it ever expires.
+Every memory is assigned a **retention tier** at ingestion time that governs its entire lifecycle - how long it lives, how it's cleaned up, how strictly it's deduplicated, and whether it ever expires.
 
 | Tier | Label | Default TTL | Decay Eligible | Examples |
 |---|---|---|---|---|
@@ -840,7 +842,7 @@ Every memory is assigned a **retention tier** at ingestion time that governs its
 
 - **T1**: `review_due` is set to `created_at + 365 days` and reset on each access. Memories approaching their `expires_at` are flagged with `expiring_soon: true` in search results.
 
-- **T2**: The default tier for most memories. 90-day sliding window — every access resets the TTL clock.
+- **T2**: The default tier for most memories. 90-day sliding window - every access resets the TTL clock.
 
 - **T3**: The most aggressive tier. Pattern-matched transient content (tickets, emails, standup notes) is automatically classified here. 30-day sliding window.
 
@@ -857,7 +859,7 @@ When a tier budget is exceeded, the health endpoint reports `degraded` and the c
 
 ---
 
-### Tier Lifecycle — Assignment, Promotion, Sliding Window
+### Tier Lifecycle - Assignment, Promotion, Sliding Window
 
 #### Tier Assignment
 
@@ -886,7 +888,7 @@ Tier assignment happens during the write pipeline, in this priority order:
 6. **T0 keyword signals (→ T0 for any source):**
    The same T0 keywords are checked for all sources (the T3 transient patterns are checked first). If a T0 keyword matches without a transient pattern, the memory is `T0`.
 
-7. **Default:** `T2` — the safe, forgiving default.
+7. **Default:** `T2` - the safe, forgiving default.
 
 ```mermaid
 flowchart TD
@@ -938,7 +940,7 @@ When a memory in tier `T2` or `T3` reaches the access threshold (`auto_promote_a
 
 Promotion cannot happen automatically to `T0`. Manual upgrade to `T0` is possible by passing `retention_tier: "T0"` on a subsequent `remember` call (which triggers the UPDATE path) or via the CLI's `bhgbrain tier set <id> T0`.
 
-Promotion is **monotonic** — automatic demotion never occurs. Tier demotion requires explicit user action.
+Promotion is **monotonic** - automatic demotion never occurs. Tier demotion requires explicit user action.
 
 When a memory is promoted, its `expires_at` is recomputed from the new tier's TTL using the current timestamp as the sliding window anchor.
 
@@ -1072,7 +1074,7 @@ If the embedding provider is unavailable and `pipeline.fallback_to_threshold_ded
 
 Before checksumming, embedding, or storing, all content goes through the normalization pipeline:
 
-1. **Control character stripping:** ASCII control characters (0x00–0x08, 0x0B, 0x0C, 0x0E–0x1F, 0x7F) are removed. Line feed (0x0A) and carriage return (0x0D) are preserved.
+1. **Control character stripping:** ASCII control characters (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0x7F) are removed. Line feed (0x0A) and carriage return (0x0D) are preserved.
 
 2. **CRLF normalization:** `\r\n` → `\n`
 
@@ -1098,12 +1100,12 @@ Before checksumming, embedding, or storing, all content goes through the normali
 
 ### Importance Scoring
 
-Every memory has an `importance` field — a float from 0.0 to 1.0.
+Every memory has an `importance` field - a float from 0.0 to 1.0.
 
 **Default:** `0.5` if not provided by the caller.
 
 **How it's used:**
-- During deduplication UPDATE merges, importance is set to `max(existing, new)` — importance only increases through merges.
+- During deduplication UPDATE merges, importance is set to `max(existing, new)` - importance only increases through merges.
 - Stale memory candidates (flagged by the consolidation pass) must have `importance < 0.5` and no category to be eligible for the stale marking pass. This protects high-importance memories from being marked stale.
 - Future LLM-based extraction may assign importance based on content analysis.
 
@@ -1122,7 +1124,7 @@ Pass `importance` explicitly in the `remember` tool. Values range from `0.0` (ve
 
 ---
 
-### Categories — Persistent Policy Slots
+### Categories - Persistent Policy Slots
 
 Categories are a special storage mechanism for persistent, always-injected policy context. Unlike regular memories (which are retrieved via semantic search), category content is always included in the `memory://inject` resource payload.
 
@@ -1141,10 +1143,10 @@ Each category is assigned to one of four named slots:
 
 #### Category Behavior
 
-- Categories are **always T0** — they never expire, never decay, and cannot be cleaned up by the retention system.
+- Categories are **always T0** - they never expire, never decay, and cannot be cleaned up by the retention system.
 - Category content is stored as full text in SQLite (not embedded in Qdrant).
 - In the `memory://inject` payload, category content is prepended before any regular memories.
-- Categories support revisions — when you update a category with `category set`, the `revision` counter increments.
+- Categories support revisions - when you update a category with `category set`, the `revision` counter increments.
 - Category names must be unique. You can have multiple categories per slot (e.g., `"api-contracts"` and `"database-schema"` both in the `"architecture"` slot).
 - Category content can be up to 100,000 characters.
 
@@ -1240,7 +1242,7 @@ bhgbrain archive search <query>       # Search archived summaries by text
 bhgbrain archive restore <memory_id>  # Restore an archived memory
 ```
 
-**Restore semantics:** A restored memory is re-created as a **new** `T2` memory from the archived summary text. The original content (if longer than the summary) cannot be recovered — the archive stores only the 120-character summary. The restored memory receives fresh timestamps and a new UUID, and is re-embedded in Qdrant.
+**Restore semantics:** A restored memory is re-created as a **new** `T2` memory from the archived summary text. The original content (if longer than the summary) cannot be recovered - the archive stores only the 120-character summary. The restored memory receives fresh timestamps and a new UUID, and is re-embedded in Qdrant.
 
 ---
 
@@ -1292,13 +1294,13 @@ BHGBrain supports three search modes that can be used independently or combined.
 
 ### Semantic Search
 
-Semantic search uses OpenAI embeddings and Qdrant vector similarity (cosine distance) to find memories that are conceptually similar to the query — even if they use different words.
+Semantic search uses OpenAI embeddings and Qdrant vector similarity (cosine distance) to find memories that are conceptually similar to the query - even if they use different words.
 
 **How it works:**
 1. The query string is embedded using the same model as stored memories (`text-embedding-3-small`, 1536 dimensions).
 2. Qdrant is queried for the nearest neighbors in the target collection.
 3. Qdrant applies payload filters to exclude expired memories: only memories where `decay_eligible = false` (T0/T1) OR `expires_at > now()` are returned.
-4. Results are ranked by cosine similarity score (0.0–1.0, higher is more similar).
+4. Results are ranked by cosine similarity score (0.0-1.0, higher is more similar).
 5. Access metadata is updated for each returned memory (access_count++, last_accessed, sliding window expiry reset).
 
 **When to use:** Conceptual queries, questions about how something works, retrieving architectural decisions without knowing exact keywords.
@@ -1325,8 +1327,8 @@ Fulltext search uses SQLite's internal text matching to find memories containing
 1. The query is split into lowercase terms.
 2. Each term is matched against the `memories_fts` shadow table using `LIKE %term%` on `content`, `summary`, and `tags` columns.
 3. Results are ranked by the number of matching terms (more matches = higher rank).
-4. The rank is normalized to a 0.0–1.0 score: `min(1.0, term_count / 10)`.
-5. Archived memories are excluded (the FTS table is kept in sync with the main memories table — archived rows are removed from FTS).
+4. The rank is normalized to a 0.0-1.0 score: `min(1.0, term_count / 10)`.
+5. Archived memories are excluded (the FTS table is kept in sync with the main memories table - archived rows are removed from FTS).
 6. Access metadata is updated for returned results.
 
 **When to use:** Exact keyword searches, searching for specific identifiers (memory IDs, project names, system names), when you know the exact terminology used.
@@ -1387,7 +1389,7 @@ Hybrid search combines semantic and fulltext results using **Reciprocal Rank Fus
    RRF_score(item) = (semantic_weight / (K + semantic_rank))
                    + (fulltext_weight  / (K + fulltext_rank))
    ```
-   
+
    Where `K = 60` (standard RRF constant), `semantic_weight = 0.7`, `fulltext_weight = 0.3` (configurable via `search.hybrid_weights`).
 
 4. Items appearing in only one list receive `0` contribution from the other.
@@ -1397,7 +1399,7 @@ Hybrid search combines semantic and fulltext results using **Reciprocal Rank Fus
 
 **Graceful degradation:** If the embedding provider is unavailable, hybrid search silently falls back to fulltext-only results rather than erroring.
 
-**When to use:** Default for most queries — hybrid search provides the best recall because a memory might be returned by semantic matching even if the keywords don't match, or by fulltext even if the embedding is slightly off.
+**When to use:** Default for most queries - hybrid search provides the best recall because a memory might be returned by semantic matching even if the keywords don't match, or by fulltext even if the embedding is slightly off.
 
 ```json
 // Hybrid search (default mode)
@@ -1411,7 +1413,7 @@ Hybrid search combines semantic and fulltext results using **Reciprocal Rank Fus
 
 ---
 
-### Recall vs Search — Differences
+### Recall vs Search - Differences
 
 BHGBrain exposes two tools for memory retrieval with different semantics:
 
@@ -1419,20 +1421,20 @@ BHGBrain exposes two tools for memory retrieval with different semantics:
 |---|---|---|
 | **Primary purpose** | Retrieve memories most relevant to current context | Explore and investigate the memory store |
 | **Search mode** | Always semantic (vector similarity) | Configurable: `semantic`, `fulltext`, or `hybrid` (default) |
-| **Result limit** | 1–20 (default 5) | 1–50 (default 10) |
+| **Result limit** | 1-20 (default 5) | 1-50 (default 10) |
 | **Score filtering** | `min_score` filter applied (default 0.6) | No score filter |
 | **Type filtering** | Optional `type` filter (`episodic`/`semantic`/`procedural`) | No type filter |
 | **Tag filtering** | Optional `tags` filter (any matching tag) | No tag filter |
 | **Namespace** | Required (default `global`) | Required (default `global`) |
-| **Collection** | Optional — omit to search across all collections | Optional |
-| **Access tracking** | Yes — every recall updates access_count and sliding window | Yes — same behavior |
+| **Collection** | Optional - omit to search across all collections | Optional |
+| **Access tracking** | Yes - every recall updates access_count and sliding window | Yes - same behavior |
 | **Intended caller** | AI agents during task execution | Humans or admin agents doing investigation |
 
 **Score filtering in recall:**
-The `min_score` parameter (default 0.6) acts as a quality gate — only memories with cosine similarity ≥ 0.6 are returned. This prevents irrelevant results. You can lower `min_score` to retrieve more results at the cost of precision.
+The `min_score` parameter (default 0.6) acts as a quality gate - only memories with cosine similarity ≥ 0.6 are returned. This prevents irrelevant results. You can lower `min_score` to retrieve more results at the cost of precision.
 
 ```json
-// Recall example — semantic, filtered by type and tags
+// Recall example - semantic, filtered by type and tags
 {
   "query": "authentication architecture decisions",
   "namespace": "global",
@@ -1631,18 +1633,18 @@ Returns a `HealthSnapshot`:
 ```
 
 **Overall status logic:**
-- `unhealthy` — if SQLite or Qdrant is unhealthy
-- `degraded` — if embedding is degraded/unhealthy, OR retention is degraded (over capacity or unsynced vectors)
-- `healthy` — all components are healthy
+- `unhealthy` - if SQLite or Qdrant is unhealthy
+- `degraded` - if embedding is degraded/unhealthy, OR retention is degraded (over capacity or unsynced vectors)
+- `healthy` - all components are healthy
 
 **Component statuses:**
 
 | Component | Healthy condition | Degraded condition | Unhealthy condition |
 |---|---|---|---|
-| `sqlite` | `SELECT 1` succeeds | — | Query throws |
-| `qdrant` | `getCollections()` succeeds | — | Connection refused |
-| `embedding` | Embed API call succeeds | Missing credentials or unreachable | — |
-| `retention` | All budgets within limits, no unsynced vectors | Budget exceeded OR unsynced vectors > 0 | — |
+| `sqlite` | `SELECT 1` succeeds | - | Query throws |
+| `qdrant` | `getCollections()` succeeds | - | Connection refused |
+| `embedding` | Embed API call succeeds | Missing credentials or unreachable | - |
+| `retention` | All budgets within limits, no unsynced vectors | Budget exceeded OR unsynced vectors > 0 | - |
 
 **HTTP status codes:**
 - `200` for both `healthy` and `degraded`
@@ -1669,7 +1671,7 @@ Returns plain-text key-value metrics (Prometheus-compatible format):
 | `bhgbrain_rate_limit_buckets` | gauge | Active rate limit tracking buckets |
 | `bhgbrain_rate_limited_total` | counter | Total rate-limited requests |
 
-Histograms use a bounded circular buffer of the last 1,000 samples. Metrics are in-process only — there is no external push.
+Histograms use a bounded circular buffer of the last 1,000 samples. Metrics are in-process only - there is no external push.
 
 ---
 
@@ -1683,7 +1685,7 @@ When running in HTTP mode, requests to all endpoints except `/health` require a 
 Authorization: Bearer <your-token>
 ```
 
-The token value is read from the environment variable named in `transport.http.bearer_token_env` (default: `BHGBRAIN_TOKEN`). If the environment variable is not set, all HTTP requests are allowed through (a warning is logged but auth is not enforced — for loopback-only bindings this is acceptable).
+The token value is read from the environment variable named in `transport.http.bearer_token_env` (default: `BHGBRAIN_TOKEN`). If the environment variable is not set, all HTTP requests are allowed through (a warning is logged but auth is not enforced - for loopback-only bindings this is acceptable).
 
 **Fail-closed for external bindings:** If the HTTP host is non-loopback (not `127.0.0.1`, `localhost`, or `::1`) and no token is configured, the server **refuses to start**:
 
@@ -1762,12 +1764,12 @@ BHGBrain exposes MCP resources (readable via `ReadResource`) in addition to tool
 | `category://{name}` | Category | Full category content by name |
 | `collection://{name}` | Collection | Memories in a specific collection |
 
-### `memory://list` — Paginated Memory Listing
+### `memory://list` - Paginated Memory Listing
 
 Query parameters:
-- `namespace` — namespace to list (default: `global`)
-- `limit` — page size, 1–100 (default: 20)
-- `cursor` — opaque cursor from previous response for pagination
+- `namespace` - namespace to list (default: `global`)
+- `limit` - page size, 1-100 (default: 20)
+- `cursor` - opaque cursor from previous response for pagination
 
 Response:
 ```json
@@ -1781,7 +1783,7 @@ Response:
 
 Pagination uses composite cursors (`created_at|id`) for stable ordering. Ties at the same timestamp are broken by ID, ensuring no row is skipped or duplicated across pages.
 
-### `memory://inject` — Session Context Injection
+### `memory://inject` - Session Context Injection
 
 The inject resource builds a budgeted text payload for injecting into an LLM context window:
 
@@ -1790,7 +1792,7 @@ The inject resource builds a budgeted text payload for injecting into an LLM con
 3. The payload is truncated at `auto_inject.max_chars` (default 30,000 characters).
 
 Query parameters:
-- `namespace` — namespace to inject from (default: `global`)
+- `namespace` - namespace to inject from (default: `global`)
 
 Response:
 ```json
@@ -1837,7 +1839,7 @@ The interview walks through 10 sections:
 | 9. Tenant & environment map | Azure tenants, dev/staging/prod |
 | 10. Operating rules | Naming conventions, disambiguation, default assumptions |
 
-The output produces a clean structured profile with all 10 sections plus a disambiguation guide — exactly what BHGBrain needs to answer questions about your work reliably.
+The output produces a clean structured profile with all 10 sections plus a disambiguation guide - exactly what BHGBrain needs to answer questions about your work reliably.
 
 **Bootstrap memories default to T0.** Content ingested via the bootstrap flow should be tagged with `source: import` and `tags: ["bootstrap", "profile"]`. The heuristic classifier recognizes these signals and assigns T0 (foundational) tier.
 
@@ -1913,7 +1915,7 @@ BHGBrain exposes 9 MCP tools. All tools validate input with Zod schemas and retu
 
 ---
 
-### `remember` — Store a Memory
+### `remember` - Store a Memory
 
 Store content in BHGBrain with automatic deduplication, normalization, embedding, and tier classification.
 
@@ -1921,13 +1923,13 @@ Store content in BHGBrain with automatic deduplication, normalization, embedding
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `content` | `string` | **Yes** | — | The content to store. Max 100,000 characters. Control characters are stripped. Content matching secret patterns is rejected. |
+| `content` | `string` | **Yes** | - | The content to store. Max 100,000 characters. Control characters are stripped. Content matching secret patterns is rejected. |
 | `namespace` | `string` | No | `"global"` | Namespace scope. Pattern: `^[a-zA-Z0-9/-]{1,200}$` |
 | `collection` | `string` | No | `"general"` | Collection within the namespace. Max 100 chars. |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | No | `"semantic"` | Memory type. Influences default tier assignment. |
 | `tags` | `string[]` | No | `[]` | Tags for filtering and classification. Max 20 tags, each max 100 chars. Pattern: `^[a-zA-Z0-9-]+$` |
-| `category` | `string` | No | — | Attach to a category slot (implies T0 tier). Max 100 chars. |
-| `importance` | `number (0–1)` | No | `0.5` | Importance score. Higher values are prioritized in stale cleanup. |
+| `category` | `string` | No | - | Attach to a category slot (implies T0 tier). Max 100 chars. |
+| `importance` | `number (0-1)` | No | `0.5` | Importance score. Higher values are prioritized in stale cleanup. |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | No | `"cli"` | Source of the memory. Affects default tier (e.g., agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | No | auto-assigned | Explicit tier override. Takes precedence over all heuristics. |
 
@@ -1944,9 +1946,9 @@ Store content in BHGBrain with automatic deduplication, normalization, embedding
 ```
 
 `operation` is one of:
-- `ADD` — new memory created
-- `UPDATE` — existing similar memory was updated (content merged)
-- `NOOP` — exact or near-exact duplicate; existing memory returned
+- `ADD` - new memory created
+- `UPDATE` - existing similar memory was updated (content merged)
+- `NOOP` - exact or near-exact duplicate; existing memory returned
 
 For `UPDATE` operations, `merged_with_id` contains the ID of the memory that was updated.
 
@@ -1982,7 +1984,7 @@ For `UPDATE` operations, `merged_with_id` contains the ID of the memory that was
 
 ---
 
-### `recall` — Semantic Recall
+### `recall` - Semantic Recall
 
 Retrieve the most relevant memories for a query using semantic (vector) similarity search with optional filtering.
 
@@ -1990,13 +1992,13 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `query` | `string` | **Yes** | — | Recall query. Max 500 characters. |
+| `query` | `string` | **Yes** | - | Recall query. Max 500 characters. |
 | `namespace` | `string` | No | `"global"` | Namespace to search. |
-| `collection` | `string` | No | — | Filter to a specific collection. Omit to search the default collection. |
-| `type` | `"episodic" \| "semantic" \| "procedural"` | No | — | Filter results to a specific memory type. Applied post-retrieval. |
-| `tags` | `string[]` | No | — | Filter to memories with at least one matching tag. Applied post-retrieval. |
-| `limit` | `integer (1–20)` | No | `5` | Maximum number of results. |
-| `min_score` | `number (0–1)` | No | `0.6` | Minimum cosine similarity score. Results below this threshold are excluded. |
+| `collection` | `string` | No | - | Filter to a specific collection. Omit to search the default collection. |
+| `type` | `"episodic" \| "semantic" \| "procedural"` | No | - | Filter results to a specific memory type. Applied post-retrieval. |
+| `tags` | `string[]` | No | - | Filter to memories with at least one matching tag. Applied post-retrieval. |
+| `limit` | `integer (1-20)` | No | `5` | Maximum number of results. |
+| `min_score` | `number (0-1)` | No | `0.6` | Minimum cosine similarity score. Results below this threshold are excluded. |
 
 **Output:**
 
@@ -2023,7 +2025,7 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
 
 ---
 
-### `forget` — Delete a Memory
+### `forget` - Delete a Memory
 
 Permanently delete a specific memory by its UUID. Removes from both SQLite and Qdrant. Creates an audit log entry.
 
@@ -2046,7 +2048,7 @@ Returns `NOT_FOUND` error if the ID does not exist or is already archived.
 
 ---
 
-### `search` — Multi-Mode Search
+### `search` - Multi-Mode Search
 
 Search memories using semantic, fulltext, or hybrid modes. Offers more control than `recall` and supports higher result limits.
 
@@ -2054,17 +2056,17 @@ Search memories using semantic, fulltext, or hybrid modes. Offers more control t
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `query` | `string` | **Yes** | — | Search query. Max 500 characters. |
+| `query` | `string` | **Yes** | - | Search query. Max 500 characters. |
 | `namespace` | `string` | No | `"global"` | Namespace to search. |
-| `collection` | `string` | No | — | Filter to a specific collection. |
+| `collection` | `string` | No | - | Filter to a specific collection. |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | No | `"hybrid"` | Search algorithm. |
-| `limit` | `integer (1–50)` | No | `10` | Maximum number of results. |
+| `limit` | `integer (1-50)` | No | `10` | Maximum number of results. |
 
-**Output:** Same structure as `recall` — `{ "results": [...] }` — but without the `min_score` gate and supporting up to 50 results.
+**Output:** Same structure as `recall` - `{ "results": [...] }` - but without the `min_score` gate and supporting up to 50 results.
 
 ---
 
-### `tag` — Manage Tags
+### `tag` - Manage Tags
 
 Add or remove tags from a memory. Tags are merged/filtered atomically; the memory content and embedding are not affected.
 
@@ -2072,7 +2074,7 @@ Add or remove tags from a memory. Tags are merged/filtered atomically; the memor
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `id` | `string (UUID)` | **Yes** | — | Memory to tag. |
+| `id` | `string (UUID)` | **Yes** | - | Memory to tag. |
 | `add` | `string[]` | No | `[]` | Tags to add. Max 20 tags total after merge. |
 | `remove` | `string[]` | No | `[]` | Tags to remove. |
 
@@ -2089,7 +2091,7 @@ Returns `INVALID_INPUT` if adding tags would exceed the 20-tag limit.
 
 ---
 
-### `collections` — Manage Collections
+### `collections` - Manage Collections
 
 List, create, or delete collections within a namespace.
 
@@ -2097,9 +2099,9 @@ List, create, or delete collections within a namespace.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `action` | `"list" \| "create" \| "delete"` | **Yes** | — | Action to perform. |
+| `action` | `"list" \| "create" \| "delete"` | **Yes** | - | Action to perform. |
 | `namespace` | `string` | No | `"global"` | Namespace context. |
-| `name` | `string` | Required for `create`/`delete` | — | Collection name. Max 100 chars. |
+| `name` | `string` | Required for `create`/`delete` | - | Collection name. Max 100 chars. |
 | `force` | `boolean` | No | `false` | Required to delete a non-empty collection (deletes all memories). |
 
 **`list` output:**
@@ -2135,9 +2137,9 @@ List, create, or delete collections within a namespace.
 
 ---
 
-### `category` — Manage Policy Categories
+### `category` - Manage Policy Categories
 
-Manage persistent policy categories — always-available context blocks that are prepended to every `memory://inject` payload.
+Manage persistent policy categories - always-available context blocks that are prepended to every `memory://inject` payload.
 
 **Input:**
 
@@ -2183,7 +2185,7 @@ Manage persistent policy categories — always-available context blocks that are
 
 ---
 
-### `backup` — Backup and Restore
+### `backup` - Backup and Restore
 
 Create, list, or restore memory backups.
 
@@ -2291,9 +2293,9 @@ What happens on first start after upgrade:
 
 What happens on first start after upgrade:
 
-- SQLite schema is migrated in-place — new columns (`retention_tier`, `expires_at`, `decay_eligible`, `review_due`, `archived`, `vector_synced`) are added to the `memories` table with safe defaults.
+- SQLite schema is migrated in-place - new columns (`retention_tier`, `expires_at`, `decay_eligible`, `review_due`, `archived`, `vector_synced`) are added to the `memories` table with safe defaults.
 - All existing memories are assigned `retention_tier = T2` (standard retention, 90-day TTL by default).
-- Qdrant collections are unchanged — no re-indexing required.
+- Qdrant collections are unchanged - no re-indexing required.
 - Existing `config.json` files are fully forward-compatible. New config fields (`retention.tier_ttl`, `retention.tier_budgets`, etc.) are applied from defaults.
 
 **Backup recommended before upgrading** (precautionary):
@@ -2372,9 +2374,17 @@ When a T0 (foundational) memory is updated, the prior version is automatically s
 
 Collections lock their embedding model and dimensions at creation time. If you change `embedding.model` or `embedding.dimensions` in config, new memories in existing collections will be rejected with a `CONFLICT` error until you create a new collection. This prevents mixing incompatible embedding spaces in the same Qdrant index.
 
+### stdio Log Routing
+
+In stdio transport mode (`--stdio`), pino structured logs are written to **stderr** rather than stdout. This is non-negotiable for MCP protocol correctness: the MCP SDK uses stdout exclusively for JSON-RPC framing. Any non-JSON output on stdout (such as log lines) will cause MCP clients to fail the initialization handshake.
+
+- In HTTP mode, logs continue to write to stdout as normal.
+- The `createLogger()` function accepts an optional `destination` stream; `index.ts` passes `process.stderr` when `isStdio` is detected.
+- To capture stdio-mode logs to a file: `node dist/index.js --stdio 2>bhgbrain.log`
+
 ### Secret Detection
 
-The write pipeline rejects any content matching patterns for API keys, database credentials, private keys, and common secret formats. This is a safety net — never use BHGBrain as a secrets vault.
+The write pipeline rejects any content matching patterns for API keys, database credentials, private keys, and common secret formats. This is a safety net - never use BHGBrain as a secrets vault.
 
 ### Tier Promotion Does Not Reach T0
 
