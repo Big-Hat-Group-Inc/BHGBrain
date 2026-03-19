@@ -69,6 +69,13 @@ const ConfigSchema = z.object({
     enabled: z.boolean().default(true),
     similarity_threshold: z.number().min(0).max(1).default(0.92),
   }).default({}),
+  resilience: z.object({
+    circuit_breaker: z.object({
+      failure_threshold: z.number().int().min(1).default(5),
+      open_window_ms: z.number().int().min(1000).default(30000),
+      half_open_probe_count: z.number().int().min(1).default(1),
+    }).default({}),
+  }).default({}),
   search: z.object({
     hybrid_weights: z.object({
       semantic: z.number().min(0).max(1).default(0.7),
@@ -101,6 +108,7 @@ const ConfigSchema = z.object({
 });
 
 export type BrainConfig = z.infer<typeof ConfigSchema>;
+export type ResilienceConfig = BrainConfig['resilience'];
 
 export function getDefaultDataDir(): string {
   if (process.platform === 'win32') {

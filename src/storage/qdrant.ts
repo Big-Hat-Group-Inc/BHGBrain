@@ -1,5 +1,8 @@
 import { QdrantClient } from '@qdrant/js-client-rest';
 import type { BrainConfig } from '../config/index.js';
+import type { CircuitBreaker } from '../resilience/index.js';
+import { CircuitOpenError } from '../resilience/index.js';
+import { internal } from '../errors/index.js';
 
 const COLLECTION_PREFIX = 'bhgbrain_';
 
@@ -7,7 +10,10 @@ export class QdrantStore {
   private client: QdrantClient;
   private dimensions: number;
 
-  constructor(private config: BrainConfig) {
+  constructor(
+    private config: BrainConfig,
+    private readonly breaker?: CircuitBreaker,
+  ) {
     this.dimensions = config.embedding.dimensions;
 
     if (config.qdrant.mode === 'external' && config.qdrant.external_url) {
@@ -74,31 +80,35 @@ export class QdrantStore {
     vector: number[],
     payload: Record<string, unknown>,
   ): Promise<void> {
-    const name = this.collectionName(namespace, collection);
-    await this.ensureCollection(namespace, collection);
-    await this.client.upsert(name, {
-      wait: true,
-      points: [{
-        id,
-        vector,
-        payload: { ...payload, namespace },
-      }],
+    await this.executeWithBreaker(async () => {
+      const name = this.collectionName(namespace, collection);
+      await this.ensureCollection(namespace, collection);
+      await this.client.upsert(name, {
+        wait: true,
+        points: [{
+          id,
+          vector,
+          payload: { ...payload, namespace },
+        }],
+      });
     });
   }
 
   async delete(namespace: string, collection: string, id: string): Promise<void> {
-    const name = this.collectionName(namespace, collection);
-    try {
-      await this.client.delete(name, {
-        wait: true,
-        points: [id],
-      });
-    } catch (err) {
-      if (this.isNotFoundError(err)) {
-        return;
+    await this.executeWithBreaker(async () => {
+      const name = this.collectionName(namespace, collection);
+      try {
+        await this.client.delete(name, {
+          wait: true,
+          points: [id],
+        });
+      } catch (err) {
+        if (this.isNotFoundError(err)) {
+          return;
+        }
+        throw err;
       }
-      throw err;
-    }
+    });
   }
 
   async deleteMany(namespace: string, collection: string, ids: string[]): Promise<void> {
@@ -131,7 +141,7 @@ export class QdrantStore {
     const collName = collection ?? 'general';
     const name = this.collectionName(namespace, collName);
 
-    const must: any[] = [
+    const must: Array<Record<string, unknown>> = [
       { key: 'namespace', match: { value: namespace } },
     ];
     if (filters?.type) {
@@ -145,13 +155,13 @@ export class QdrantStore {
       ],
     });
 
-    const results = await this.client.search(name, {
+    const results = await this.executeWithBreaker(() => this.client.search(name, {
       vector,
       limit,
       filter: must.length > 0 ? { must } : undefined,
       score_threshold: filters?.minScore,
       with_payload: true,
-    });
+    }));
 
     return results.map(r => ({
       id: r.id as string,
@@ -266,5 +276,20 @@ export class QdrantStore {
     if (status === 404) return true;
     const message = maybeErr.message?.toLowerCase() ?? '';
     return message.includes('not found') || message.includes('does not exist');
+  }
+
+  private async executeWithBreaker<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this.breaker) {
+      return fn();
+    }
+
+    try {
+      return await this.breaker.execute(fn);
+    } catch (error) {
+      if (error instanceof CircuitOpenError) {
+        throw internal('Qdrant circuit breaker is open');
+      }
+      throw error;
+    }
   }
 }

@@ -21,10 +21,15 @@ import { BackupService } from './backup/index.js';
 import { HealthService } from './health/index.js';
 import { MetricsCollector } from './health/metrics.js';
 import { createLogger } from './health/logger.js';
+import { CircuitBreaker } from './resilience/index.js';
 import { ResourceHandler, MCP_RESOURCE_DEFINITIONS, MCP_RESOURCE_TEMPLATES } from './resources/index.js';
 import { handleTool, type ToolContext } from './tools/index.js';
 import { MCP_TOOL_DEFINITIONS } from './tools/schemas.js';
 import { createHttpServer } from './transport/http.js';
+
+function isErrorEnvelope(value: unknown): value is { error: unknown } {
+  return value != null && typeof value === 'object' && 'error' in value;
+}
 
 async function main() {
   const args = process.argv.slice(2);
@@ -42,16 +47,26 @@ async function main() {
   const sqlite = new SqliteStore(config.data_dir!);
   await sqlite.init();
 
+  const breakerOptions = {
+    failureThreshold: config.resilience.circuit_breaker.failure_threshold,
+    openWindowMs: config.resilience.circuit_breaker.open_window_ms,
+    halfOpenProbeCount: config.resilience.circuit_breaker.half_open_probe_count,
+  };
+  const embeddingBreaker = new CircuitBreaker(breakerOptions);
+  const qdrantBreaker = new CircuitBreaker(breakerOptions);
   const metrics = new MetricsCollector(config);
-  const qdrant = new QdrantStore(config);
-  const embedding = createEmbeddingProvider(config, { metrics });
+  const qdrant = new QdrantStore(config, qdrantBreaker);
+  const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
   const storage = new StorageManager(sqlite, qdrant, embedding);
 
   // Initialize services
   const pipeline = new WritePipeline(config, storage, embedding);
   const searchService = new SearchService(config, storage, embedding, metrics);
   const backupService = new BackupService(config, storage, logger);
-  const healthService = new HealthService(storage, embedding, config);
+  const healthService = new HealthService(storage, embedding, config, {
+    openai_embedding: embeddingBreaker,
+    qdrant: qdrantBreaker,
+  });
 
   const ctx: ToolContext = {
     config, storage, embedding, pipeline,
@@ -77,7 +92,7 @@ async function main() {
       const result = await handleTool(ctx, name, toolArgs);
 
       // Detect error envelopes and signal via MCP isError
-      const isError = result != null && typeof result === 'object' && 'error' in (result as any);
+      const isError = isErrorEnvelope(result);
       return {
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         ...(isError ? { isError: true } : {}),

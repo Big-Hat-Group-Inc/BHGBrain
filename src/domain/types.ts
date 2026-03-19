@@ -111,6 +111,7 @@ export interface HealthSnapshot {
   memory_count: number;
   db_size_bytes: number;
   uptime_seconds: number;
+  circuitBreakers?: Record<string, 'closed' | 'open' | 'half-open'>;
   retention?: {
     counts_by_tier: Record<RetentionTier, number>;
     expiring_soon: number;

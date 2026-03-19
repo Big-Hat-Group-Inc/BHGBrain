@@ -1,5 +1,6 @@
 import type { BrainConfig } from '../config/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
+import type { CircuitBreaker } from '../resilience/index.js';
 import { embeddingUnavailable } from '../errors/index.js';
 
 export interface EmbeddingProvider {
@@ -18,6 +19,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
 
   constructor(
     config: BrainConfig,
+    private readonly breaker?: CircuitBreaker,
     private readonly metrics?: MetricsCollector,
   ) {
     this.model = config.embedding.model;
@@ -36,25 +38,47 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
 
   async embedBatch(texts: string[]): Promise<number[][]> {
     const start = Date.now();
-    let response: Response;
     try {
-      response = await fetch(`${this.baseUrl}/embeddings`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: this.model,
-          input: texts,
-        }),
-      });
+      const response = await this.requestEmbeddings(texts, true);
+      return await this.parseEmbeddingsResponse(response);
     } catch (err) {
       throw embeddingUnavailable(`Embedding provider unreachable: ${(err as Error).message}`);
     } finally {
       this.metrics?.recordHistogram('embedding_embed_batch_ms', Date.now() - start);
     }
+  }
 
+  async healthCheck(): Promise<boolean> {
+    try {
+      const response = await this.requestEmbeddings(['health check'], false);
+      await this.parseEmbeddingsResponse(response);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async requestEmbeddings(texts: string[], useBreaker: boolean): Promise<Response> {
+    const executeFetch = () => fetch(`${this.baseUrl}/embeddings`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: this.model,
+        input: texts,
+      }),
+    });
+
+    if (useBreaker && this.breaker) {
+      return this.breaker.execute(executeFetch);
+    }
+
+    return executeFetch();
+  }
+
+  private async parseEmbeddingsResponse(response: Response): Promise<number[][]> {
     if (!response.ok) {
       const body = await response.text().catch(() => '');
       throw embeddingUnavailable(`Embedding API error ${response.status}: ${body.slice(0, 200)}`);
@@ -67,15 +91,6 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     return data.data
       .sort((a, b) => a.index - b.index)
       .map(d => d.embedding);
-  }
-
-  async healthCheck(): Promise<boolean> {
-    try {
-      await this.embed('health check');
-      return true;
-    } catch {
-      return false;
-    }
   }
 }
 
@@ -108,12 +123,12 @@ export class DegradedEmbeddingProvider implements EmbeddingProvider {
 
 export function createEmbeddingProvider(
   config: BrainConfig,
-  options?: { metrics?: MetricsCollector },
+  options?: { breaker?: CircuitBreaker; metrics?: MetricsCollector },
 ): EmbeddingProvider {
   switch (config.embedding.provider) {
     case 'openai':
       try {
-        return new OpenAIEmbeddingProvider(config, options?.metrics);
+        return new OpenAIEmbeddingProvider(config, options?.breaker, options?.metrics);
       } catch {
         // Missing credentials: start in degraded mode
         return new DegradedEmbeddingProvider(config);
