@@ -1,7 +1,8 @@
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
-import type { SearchMode, SearchResult } from '../domain/types.js';
+import type { SearchMode, SearchResult, MemoryRecord } from '../domain/types.js';
+import type { AccessUpdate } from '../storage/sqlite.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { embeddingUnavailable, internal } from '../errors/index.js';
@@ -169,32 +170,22 @@ export class SearchService {
     );
   }
 
+
   private buildSearchResults(
     ranked: Array<{ id: string; score: number; semantic_score?: number; fulltext_score?: number; qdrantPayload?: Record<string, unknown> }>,
     options?: { boostT0?: boolean },
   ): SearchResult[] {
     const now = new Date();
     const nowIso = now.toISOString();
-    const memories = typeof (this.storage.sqlite as any).getMemoriesByIds === 'function'
-      ? this.storage.sqlite.getMemoriesByIds(ranked.map(item => item.id))
-      : ranked
-        .map(item => this.storage.sqlite.getMemoryById(item.id))
-        .filter(Boolean);
-    const memoryMap = new Map(memories.map((mem: any) => [mem.id, mem]));
-    const accessUpdates: Array<{
-      id: string;
-      access_count: number;
-      last_accessed: string;
-      expires_at?: string | null;
-      retention_tier?: SearchResult['retention_tier'];
-      review_due?: string | null;
-    }> = [];
+    const memories = this.storage.sqlite.getMemoriesByIds(ranked.map(item => item.id));
+    const memoryMap = new Map(memories.map(mem => [mem.id, mem]));
+    const accessUpdates: AccessUpdate[] = [];
     const searchResults: SearchResult[] = [];
 
     for (const item of ranked) {
       const mem = memoryMap.get(item.id);
 
-      // Fallback to Qdrant payload if SQLite miss
+      // Fallback to Qdrant payload if SQLite miss (cross-device memory)
       if (!mem) {
         if (item.qdrantPayload && typeof item.qdrantPayload.content === 'string') {
           const payload = item.qdrantPayload;
@@ -245,24 +236,7 @@ export class SearchService {
     }
 
     if (accessUpdates.length > 0) {
-      if (typeof (this.storage.sqlite as any).recordAccessBatch === 'function') {
-        this.storage.sqlite.recordAccessBatch(accessUpdates);
-      } else if (typeof (this.storage.sqlite as any).recordAccess === 'function') {
-        for (const update of accessUpdates) {
-          this.storage.sqlite.recordAccess(
-            update.id,
-            update.access_count,
-            update.last_accessed,
-            update.expires_at,
-            update.retention_tier,
-            update.review_due,
-          );
-        }
-      } else {
-        for (const update of accessUpdates) {
-          this.storage.sqlite.touchMemory(update.id);
-        }
-      }
+      this.storage.sqlite.recordAccessBatch(accessUpdates);
       this.storage.sqlite.scheduleDeferredFlush();
     }
 
@@ -270,17 +244,10 @@ export class SearchService {
   }
 
   private buildAccessUpdate(
-    mem: { id: string; access_count: number; retention_tier: SearchResult['retention_tier']; expires_at: string | null },
+    mem: Pick<MemoryRecord, 'id' | 'access_count' | 'retention_tier' | 'expires_at'>,
     now: Date,
     nowIso: string,
-  ): {
-    id: string;
-    access_count: number;
-    last_accessed: string;
-    expires_at?: string | null;
-    retention_tier?: SearchResult['retention_tier'];
-    review_due?: string | null;
-  } {
+  ): AccessUpdate {
     const nextAccessCount = mem.access_count + 1;
     const promotedTier = this.lifecycle.shouldPromote(mem.retention_tier, nextAccessCount) ?? mem.retention_tier;
     const nextExpiry = this.lifecycle.extendExpiry(promotedTier, now);

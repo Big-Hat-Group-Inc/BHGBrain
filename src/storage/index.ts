@@ -5,6 +5,8 @@ import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MemoryRecord, WriteOperation, AuditEntry } from '../domain/types.js';
 import { internal, conflict } from '../errors/index.js';
 
+type MemoryRecordWithoutEmbedding = Omit<MemoryRecord, 'embedding'>;
+
 export class StorageManager {
   constructor(
     public readonly sqlite: SqliteStore,
@@ -17,7 +19,7 @@ export class StorageManager {
   }
 
   async writeMemory(
-    mem: Omit<MemoryRecord, 'embedding'>,
+    mem: MemoryRecordWithoutEmbedding,
     vector: number[],
   ): Promise<void> {
     this.ensureCollectionCompatible(mem.namespace, mem.collection);
@@ -44,13 +46,9 @@ export class StorageManager {
         device_id: mem.device_id ?? null,
         created_at: mem.created_at,
       });
-      if (typeof (this.sqlite as any).markVectorSync === 'function') {
-        this.sqlite.markVectorSync(mem.id, true);
-      }
+      this.sqlite.markVectorSync(mem.id, true);
     } catch (err) {
-      if (typeof (this.sqlite as any).markVectorSync === 'function') {
-        this.sqlite.markVectorSync(mem.id, false);
-      }
+      this.sqlite.markVectorSync(mem.id, false);
       this.sqlite.flushIfDirty();
       throw internal(`Qdrant write failed after SQLite persistence: ${(err as Error).message}`);
     }
@@ -58,7 +56,7 @@ export class StorageManager {
     this.sqlite.flushIfDirty();
   }
 
-  writeMemoryWithoutVector(mem: Omit<MemoryRecord, 'embedding'>): void {
+  writeMemoryWithoutVector(mem: MemoryRecordWithoutEmbedding): void {
     this.ensureCollectionCompatible(mem.namespace, mem.collection);
     try {
       this.sqlite.insertMemory({
@@ -80,9 +78,10 @@ export class StorageManager {
     if (!existing) throw internal(`Memory ${id} not found for update`);
 
     // Snapshot fields that will change for rollback
-    const rollbackFields: Partial<Omit<MemoryRecord, 'embedding'>> = {};
-    for (const key of Object.keys(fields) as Array<keyof typeof fields>) {
-      (rollbackFields as any)[key] = (existing as any)[key];
+    const rollbackFields: Partial<MemoryRecordWithoutEmbedding> = {};
+    for (const key of Object.keys(fields) as Array<keyof MemoryRecordWithoutEmbedding>) {
+      const currentValue = existing[key];
+      assignRollbackField(rollbackFields, key, currentValue);
     }
 
     if (existing.retention_tier === 'T0' && fields.content && fields.content !== existing.content) {
@@ -114,14 +113,10 @@ export class StorageManager {
             created_at: existing.created_at,
           },
         );
-        if (typeof (this.sqlite as any).markVectorSync === 'function') {
-          this.sqlite.markVectorSync(id, true);
-        }
+        this.sqlite.markVectorSync(id, true);
       } catch (err) {
         this.sqlite.updateMemory(id, rollbackFields);
-        if (typeof (this.sqlite as any).markVectorSync === 'function') {
-          this.sqlite.markVectorSync(id, false);
-        }
+        this.sqlite.markVectorSync(id, false);
         this.sqlite.flushIfDirty();
         throw internal(`Qdrant update failed, rolled back SQLite: ${(err as Error).message}`);
       }
@@ -238,3 +233,11 @@ export class StorageManager {
 
 export { SqliteStore } from './sqlite.js';
 export { QdrantStore } from './qdrant.js';
+
+function assignRollbackField<K extends keyof MemoryRecordWithoutEmbedding>(
+  target: Partial<MemoryRecordWithoutEmbedding>,
+  key: K,
+  value: MemoryRecordWithoutEmbedding[K],
+): void {
+  target[key] = value;
+}

@@ -3,6 +3,7 @@ import type { StorageManager } from '../storage/index.js';
 import type { SearchService } from '../search/index.js';
 import type { HealthService } from '../health/index.js';
 import type { InjectPayload, PaginatedResult, MemoryRecord } from '../domain/types.js';
+import type { CategoryHeader } from '../storage/sqlite.js';
 
 export class ResourceHandler {
   private static readonly LIST_LIMIT_MIN = 1;
@@ -139,16 +140,7 @@ export class ResourceHandler {
     };
 
     // 1. All category content (full)
-    const categoryHeaders = typeof (this.storage.sqlite as any).listCategoryHeaders === 'function'
-      ? this.storage.sqlite.listCategoryHeaders()
-      : this.storage.sqlite.listCategories().map((cat: any) => ({
-        name: cat.name,
-        slot: cat.slot,
-        revision: cat.revision,
-        updated_at: cat.updated_at,
-        content_length: cat.content.length,
-        content: cat.content,
-      }));
+    const categoryHeaders = this.storage.sqlite.listCategoryHeaders();
     let categoriesCount = 0;
     for (const cat of categoryHeaders) {
       if (totalChars >= maxChars) {
@@ -165,10 +157,8 @@ export class ResourceHandler {
         break;
       }
 
-      const content = 'content' in cat
-        ? cat.content.slice(0, remainingForContent)
-        : this.storage.sqlite.getCategoryContentSlice(cat.name, remainingForContent) ?? '';
-      const fullyIncluded = content.length >= (cat.content_length ?? content.length);
+      const content = this.storage.sqlite.getCategoryContentSlice(cat.name, remainingForContent) ?? '';
+      const fullyIncluded = content.length >= cat.content_length;
       if (!appendBlock(`${content}\n\n`)) break;
       if (!fullyIncluded) {
         truncated = true;

@@ -11,6 +11,108 @@ import type {
   TierStats,
 } from '../domain/types.js';
 
+type SqlValue = string | number | null | Uint8Array;
+export type SqlParams = SqlValue[];
+
+type SqlRow = Record<string, SqlValue | undefined>;
+
+type MemoryRecordWithoutEmbedding = Omit<MemoryRecord, 'embedding'>;
+
+export interface AccessUpdate {
+  id: string;
+  access_count: number;
+  last_accessed: string;
+  expires_at?: string | null;
+  retention_tier?: RetentionTier;
+  review_due?: string | null;
+}
+
+export interface CategoryHeader {
+  name: string;
+  slot: string;
+  updated_at: string;
+  revision: number;
+  content_length: number;
+}
+
+export interface CollectionRecord {
+  name: string;
+  namespace: string;
+  embedding_model: string;
+  embedding_dimensions: number;
+}
+
+export interface SqliteStorage {
+  init(): Promise<void>;
+  reloadFromDisk(): Promise<void>;
+  flush(): void;
+  flushIfDirty(): void;
+  scheduleDeferredFlush(): void;
+  cancelDeferredFlush(): void;
+  insertMemory(mem: MemoryRecordWithoutEmbedding): void;
+  updateMemory(id: string, fields: Partial<MemoryRecordWithoutEmbedding>): void;
+  deleteMemory(id: string): boolean;
+  getMemoryById(id: string, includeArchived?: boolean): MemoryRecordWithoutEmbedding | null;
+  getMemoryByChecksum(namespace: string, checksum: string): MemoryRecordWithoutEmbedding | null;
+  listMemories(namespace: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
+  countMemories(namespace?: string): number;
+  countMemoriesInCollection(namespace: string, collection: string): number;
+  fullTextSearch(namespace: string, query: string, limit: number, collection?: string): Array<{ id: string; rank: number }>;
+  markStale(memoryId: string): void;
+  getStaleMemories(importanceBelow: number, limit: number): MemoryRecordWithoutEmbedding[];
+  listStaleCandidateIds(cutoffIso: string): string[];
+  touchMemory(id: string): void;
+  recordAccess(
+    id: string,
+    accessCount: number,
+    lastAccessed: string,
+    expiresAt?: string | null,
+    retentionTier?: RetentionTier,
+    reviewDue?: string | null,
+  ): void;
+  markVectorSync(id: string, synced: boolean): void;
+  recordAccessBatch(updates: AccessUpdate[]): void;
+  listExpiredMemories(nowIso: string, tier?: RetentionTier): MemoryRecordWithoutEmbedding[];
+  listExpiringMemories(nowIso: string, untilIso: string, limit: number): MemoryRecordWithoutEmbedding[];
+  countExpiringMemories(nowIso: string, untilIso: string): number;
+  countByTier(): Record<RetentionTier, number>;
+  getTierStats(): TierStats[];
+  countArchivedMemories(): number;
+  countUnsyncedVectors(): number;
+  archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void;
+  listArchive(limit: number): ArchiveRecord[];
+  searchArchive(query: string, limit: number): ArchiveRecord[];
+  getArchiveByMemoryId(memoryId: string): ArchiveRecord | null;
+  deleteArchive(memoryId: string): void;
+  insertRevision(memoryId: string, revision: number, content: string, updatedAt: string, updatedBy?: string): void;
+  listRevisions(memoryId: string): MemoryRevisionRecord[];
+  getDbSizeBytes(): number;
+  setCategory(name: string, slot: string, content: string): CategoryRecord;
+  getCategory(name: string): CategoryRecord | null;
+  listCategories(): CategoryRecord[];
+  deleteCategory(name: string): boolean;
+  createCollection(namespace: string, name: string, embeddingModel: string, embeddingDimensions: number): void;
+  getCollection(namespace: string, name: string): CollectionRecord | null;
+  listCollections(namespace?: string): Array<{ name: string; count: number }>;
+  deleteCollection(namespace: string, name: string): boolean;
+  deleteMemoriesInCollection(namespace: string, collection: string): { deleted: number; ids: string[] };
+  insertAudit(entry: AuditEntry): void;
+  listAudit(limit: number): AuditEntry[];
+  insertBackupMeta(path: string, sizeBytes: number, memoryCount: number, checksum: string): void;
+  listBackups(): Array<{ path: string; size_bytes: number; memory_count: number; created_at: string }>;
+  exportData(): Buffer;
+  getDatabasePath(): string;
+  healthCheck(): boolean;
+  close(): void;
+  beginLifecycleOperation(reason: string): void;
+  endLifecycleOperation(reason?: string): void;
+  isLifecycleOperationInProgress(): boolean;
+  getMemoriesByIds(ids: string[]): MemoryRecordWithoutEmbedding[];
+  listMemoryIdsInCollection(namespace: string, collection: string): string[];
+  listCategoryHeaders(): CategoryHeader[];
+  getCategoryContentSlice(name: string, maxChars: number): string | null;
+}
+
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
@@ -125,7 +227,7 @@ CREATE INDEX IF NOT EXISTS idx_memory_archive_memory_id ON memory_archive(memory
 CREATE INDEX IF NOT EXISTS idx_memory_archive_expired_at ON memory_archive(expired_at DESC);
 `;
 
-export class SqliteStore {
+export class SqliteStore implements SqliteStorage {
   private db!: Database;
   private dbPath: string;
   private dirty = false;
@@ -199,7 +301,7 @@ export class SqliteStore {
     }
   }
 
-  insertMemory(mem: Omit<MemoryRecord, 'embedding'>): void {
+  insertMemory(mem: MemoryRecordWithoutEmbedding): void {
     this.assertMutableAllowed();
     const retentionTier = mem.retention_tier ?? 'T2';
     const expiresAt = mem.expires_at ?? null;
@@ -249,11 +351,15 @@ export class SqliteStore {
     this.markDirty();
   }
 
-  updateMemory(id: string, fields: Partial<Omit<MemoryRecord, 'embedding'>>): void {
+  updateMemory(id: string, fields: Partial<MemoryRecordWithoutEmbedding>): void {
     this.assertMutableAllowed();
     const sets: string[] = [];
-    const vals: unknown[] = [];
-    for (const [key, val] of Object.entries(fields)) {
+    const vals: SqlParams = [];
+    for (const key of Object.keys(fields) as Array<keyof MemoryRecordWithoutEmbedding>) {
+      const val = fields[key];
+      if (val === undefined) {
+        continue;
+      }
       if (key === 'tags') {
         sets.push('tags = ?');
         vals.push(JSON.stringify(val));
@@ -262,12 +368,12 @@ export class SqliteStore {
         vals.push(val ? 1 : 0);
       } else {
         sets.push(`${key} = ?`);
-        vals.push(val);
+        vals.push(this.toSqlValue(val, key));
       }
     }
     if (sets.length === 0) return;
     vals.push(id);
-    this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, vals as any[]);
+    this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, vals);
 
     if (fields.content || fields.summary || fields.tags || fields.archived) {
       this.db.run(`DELETE FROM memories_fts WHERE id = ?`, [id]);
@@ -292,7 +398,7 @@ export class SqliteStore {
     return true;
   }
 
-  getMemoryById(id: string, includeArchived = false): Omit<MemoryRecord, 'embedding'> | null {
+  getMemoryById(id: string, includeArchived = false): MemoryRecordWithoutEmbedding | null {
     const sql = includeArchived
       ? `SELECT * FROM memories WHERE id = ?`
       : `SELECT * FROM memories WHERE id = ? AND archived = 0`;
@@ -302,26 +408,26 @@ export class SqliteStore {
       stmt.free();
       return null;
     }
-    const row = stmt.getAsObject();
+    const row = this.getRow(stmt.getAsObject());
     stmt.free();
     return this.rowToMemory(row);
   }
 
-  getMemoryByChecksum(namespace: string, checksum: string): Omit<MemoryRecord, 'embedding'> | null {
+  getMemoryByChecksum(namespace: string, checksum: string): MemoryRecordWithoutEmbedding | null {
     const stmt = this.db.prepare(`SELECT * FROM memories WHERE namespace = ? AND checksum = ? AND archived = 0 LIMIT 1`);
     stmt.bind([namespace, checksum]);
     if (!stmt.step()) {
       stmt.free();
       return null;
     }
-    const row = stmt.getAsObject();
+    const row = this.getRow(stmt.getAsObject());
     stmt.free();
     return this.rowToMemory(row);
   }
 
-  listMemories(namespace: string, limit: number, cursor?: string): Array<Omit<MemoryRecord, 'embedding'>> {
+  listMemories(namespace: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
     let sql = `SELECT * FROM memories WHERE namespace = ? AND archived = 0`;
-    const params: unknown[] = [namespace];
+    const params: SqlParams = [namespace];
     if (cursor) {
       const sepIdx = cursor.indexOf('|');
       if (sepIdx !== -1) {
@@ -368,7 +474,7 @@ export class SqliteStore {
     if (terms.length === 0) return [];
 
     const conditions = terms.map(() => `(LOWER(f.content) LIKE ? OR LOWER(f.summary) LIKE ? OR LOWER(f.tags) LIKE ?)`);
-    const params: unknown[] = [namespace];
+    const params: SqlParams = [namespace];
 
     let collectionJoin = ' JOIN memories m ON f.id = m.id AND m.archived = 0';
     if (collection) {
@@ -384,11 +490,11 @@ export class SqliteStore {
 
     const sql = `SELECT f.id, ${terms.length} as rank FROM memories_fts f${collectionJoin} WHERE f.namespace = ? AND ${conditions.join(' AND ')} LIMIT ?`;
     const stmt = this.db.prepare(sql);
-    stmt.bind(params as any[]);
+    stmt.bind(params);
     const results: Array<{ id: string; rank: number }> = [];
     while (stmt.step()) {
-      const row = stmt.getAsObject() as { id: string; rank: number };
-      results.push({ id: row.id, rank: -terms.length });
+      const row = this.getRow(stmt.getAsObject());
+      results.push({ id: this.getString(row, 'id'), rank: -terms.length });
     }
     stmt.free();
     return results;
@@ -399,7 +505,7 @@ export class SqliteStore {
     this.markDirty();
   }
 
-  getStaleMemories(importanceBelow: number, limit: number): Array<Omit<MemoryRecord, 'embedding'>> {
+  getStaleMemories(importanceBelow: number, limit: number): MemoryRecordWithoutEmbedding[] {
     return this.queryMemories(
       `SELECT * FROM memories WHERE stale = 1 AND importance < ? AND category IS NULL AND archived = 0 ORDER BY importance ASC LIMIT ?`,
       [importanceBelow, limit],
@@ -413,8 +519,8 @@ export class SqliteStore {
     stmt.bind([cutoffIso]);
     const ids: string[] = [];
     while (stmt.step()) {
-      const row = stmt.getAsObject() as { id: string };
-      ids.push(row.id);
+      const row = this.getRow(stmt.getAsObject());
+      ids.push(this.getString(row, 'id'));
     }
     stmt.free();
     return ids;
@@ -440,7 +546,7 @@ export class SqliteStore {
   ): void {
     if (this.lifecycleOperation) return;
     const sets = ['access_count = ?', 'last_accessed = ?'];
-    const params: unknown[] = [accessCount, lastAccessed];
+    const params: SqlParams = [accessCount, lastAccessed];
     if (expiresAt !== undefined) {
       sets.push('expires_at = ?');
       params.push(expiresAt);
@@ -454,7 +560,7 @@ export class SqliteStore {
       params.push(reviewDue);
     }
     params.push(id);
-    this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, params as any[]);
+    this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, params);
     this.markDirty();
   }
 
@@ -465,19 +571,12 @@ export class SqliteStore {
   }
 
   recordAccessBatch(
-    updates: Array<{
-      id: string;
-      access_count: number;
-      last_accessed: string;
-      expires_at?: string | null;
-      retention_tier?: RetentionTier;
-      review_due?: string | null;
-    }>,
+    updates: AccessUpdate[],
   ): void {
     if (this.lifecycleOperation || updates.length === 0) return;
     for (const update of updates) {
       const sets = ['access_count = ?', 'last_accessed = ?'];
-      const params: unknown[] = [update.access_count, update.last_accessed];
+      const params: SqlParams = [update.access_count, update.last_accessed];
       if (update.expires_at !== undefined) {
         sets.push('expires_at = ?');
         params.push(update.expires_at);
@@ -491,12 +590,12 @@ export class SqliteStore {
         params.push(update.review_due);
       }
       params.push(update.id);
-      this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, params as any[]);
+      this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, params);
     }
     this.markDirty();
   }
 
-  listExpiredMemories(nowIso: string, tier?: RetentionTier): Array<Omit<MemoryRecord, 'embedding'>> {
+  listExpiredMemories(nowIso: string, tier?: RetentionTier): MemoryRecordWithoutEmbedding[] {
     const sql = tier
       ? `SELECT * FROM memories WHERE archived = 0 AND decay_eligible = 1 AND expires_at IS NOT NULL AND expires_at < ? AND retention_tier = ? ORDER BY expires_at ASC`
       : `SELECT * FROM memories WHERE archived = 0 AND decay_eligible = 1 AND expires_at IS NOT NULL AND expires_at < ? ORDER BY expires_at ASC`;
@@ -504,7 +603,7 @@ export class SqliteStore {
     return this.queryMemories(sql, params);
   }
 
-  listExpiringMemories(nowIso: string, untilIso: string, limit: number): Array<Omit<MemoryRecord, 'embedding'>> {
+  listExpiringMemories(nowIso: string, untilIso: string, limit: number): MemoryRecordWithoutEmbedding[] {
     return this.queryMemories(
       `SELECT * FROM memories WHERE archived = 0 AND expires_at IS NOT NULL AND expires_at >= ? AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?`,
       [nowIso, untilIso, limit],
@@ -556,7 +655,7 @@ export class SqliteStore {
     return row.cnt;
   }
 
-  archiveMemory(memory: Omit<MemoryRecord, 'embedding'>, expiredAt: string): void {
+  archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void {
     this.db.run(
       `INSERT INTO memory_archive (memory_id, summary, tier, namespace, created_at, expired_at, access_count, tags)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -631,14 +730,14 @@ export class SqliteStore {
     stmt.bind([memoryId]);
     const results: MemoryRevisionRecord[] = [];
     while (stmt.step()) {
-      const row = stmt.getAsObject() as any;
+      const row = this.getRow(stmt.getAsObject());
       results.push({
-        id: row.id,
-        memory_id: row.memory_id,
-        revision: row.revision,
-        content: row.content,
-        updated_at: row.updated_at,
-        updated_by: row.updated_by ?? null,
+        id: this.getNumber(row, 'id'),
+        memory_id: this.getString(row, 'memory_id'),
+        revision: this.getNumber(row, 'revision'),
+        content: this.getString(row, 'content'),
+        updated_at: this.getString(row, 'updated_at'),
+        updated_by: this.getNullableString(row, 'updated_by'),
       });
     }
     stmt.free();
@@ -679,17 +778,29 @@ export class SqliteStore {
       stmt.free();
       return null;
     }
-    const row = stmt.getAsObject() as any;
+    const row = this.getRow(stmt.getAsObject());
     stmt.free();
-    return { name: row.name, slot: row.slot, content: row.content, updated_at: row.updated_at, revision: row.revision };
+    return {
+      name: this.getString(row, 'name'),
+      slot: this.getString(row, 'slot') as CategoryRecord['slot'],
+      content: this.getString(row, 'content'),
+      updated_at: this.getString(row, 'updated_at'),
+      revision: this.getNumber(row, 'revision'),
+    };
   }
 
   listCategories(): CategoryRecord[] {
     const stmt = this.db.prepare(`SELECT * FROM categories ORDER BY name`);
     const results: CategoryRecord[] = [];
     while (stmt.step()) {
-      const row = stmt.getAsObject() as any;
-      results.push({ name: row.name, slot: row.slot, content: row.content, updated_at: row.updated_at, revision: row.revision });
+      const row = this.getRow(stmt.getAsObject());
+      results.push({
+        name: this.getString(row, 'name'),
+        slot: this.getString(row, 'slot') as CategoryRecord['slot'],
+        content: this.getString(row, 'content'),
+        updated_at: this.getString(row, 'updated_at'),
+        revision: this.getNumber(row, 'revision'),
+      });
     }
     stmt.free();
     return results;
@@ -714,16 +825,21 @@ export class SqliteStore {
     this.markDirty();
   }
 
-  getCollection(namespace: string, name: string): { name: string; namespace: string; embedding_model: string; embedding_dimensions: number } | null {
+  getCollection(namespace: string, name: string): CollectionRecord | null {
     const stmt = this.db.prepare(`SELECT * FROM collections WHERE namespace = ? AND name = ?`);
     stmt.bind([namespace, name]);
     if (!stmt.step()) {
       stmt.free();
       return null;
     }
-    const row = stmt.getAsObject() as any;
+    const row = this.getRow(stmt.getAsObject());
     stmt.free();
-    return { name: row.name, namespace: row.namespace, embedding_model: row.embedding_model, embedding_dimensions: row.embedding_dimensions };
+    return {
+      name: this.getString(row, 'name'),
+      namespace: this.getString(row, 'namespace'),
+      embedding_model: this.getString(row, 'embedding_model'),
+      embedding_dimensions: this.getNumber(row, 'embedding_dimensions'),
+    };
   }
 
   listCollections(namespace?: string): Array<{ name: string; count: number }> {
@@ -735,8 +851,8 @@ export class SqliteStore {
     stmt.bind(params);
     const results: Array<{ name: string; count: number }> = [];
     while (stmt.step()) {
-      const row = stmt.getAsObject() as any;
-      results.push({ name: row.name, count: row.count });
+      const row = this.getRow(stmt.getAsObject());
+      results.push({ name: this.getString(row, 'name'), count: this.getNumber(row, 'count') });
     }
     stmt.free();
     return results;
@@ -760,8 +876,8 @@ export class SqliteStore {
     select.bind([namespace, collection]);
     const ids: string[] = [];
     while (select.step()) {
-      const row = select.getAsObject() as { id: string };
-      ids.push(row.id);
+      const row = this.getRow(select.getAsObject());
+      ids.push(this.getString(row, 'id'));
     }
     select.free();
 
@@ -794,15 +910,15 @@ export class SqliteStore {
     stmt.bind([limit]);
     const results: AuditEntry[] = [];
     while (stmt.step()) {
-      const row = stmt.getAsObject() as any;
+      const row = this.getRow(stmt.getAsObject());
       results.push({
-        id: row.id,
-        timestamp: row.timestamp,
-        namespace: row.namespace,
-        operation: row.operation,
-        memory_id: row.memory_id,
-        client_id: row.client_id,
-        details: row.details,
+        id: this.getString(row, 'id'),
+        timestamp: this.getString(row, 'timestamp'),
+        namespace: this.getString(row, 'namespace'),
+        operation: this.getString(row, 'operation') as AuditEntry['operation'],
+        memory_id: this.getString(row, 'memory_id'),
+        client_id: this.getString(row, 'client_id'),
+        details: this.getNullableString(row, 'details') ?? undefined,
       });
     }
     stmt.free();
@@ -822,8 +938,13 @@ export class SqliteStore {
     const stmt = this.db.prepare(`SELECT * FROM backup_metadata ORDER BY created_at DESC`);
     const results: Array<{ path: string; size_bytes: number; memory_count: number; created_at: string }> = [];
     while (stmt.step()) {
-      const row = stmt.getAsObject() as any;
-      results.push({ path: row.path, size_bytes: row.size_bytes, memory_count: row.memory_count, created_at: row.created_at });
+      const row = this.getRow(stmt.getAsObject());
+      results.push({
+        path: this.getString(row, 'path'),
+        size_bytes: this.getNumber(row, 'size_bytes'),
+        memory_count: this.getNumber(row, 'memory_count'),
+        created_at: this.getString(row, 'created_at'),
+      });
     }
     stmt.free();
     return results;
@@ -873,7 +994,7 @@ export class SqliteStore {
     return this.lifecycleOperation !== null;
   }
 
-  getMemoriesByIds(ids: string[]): Array<Omit<MemoryRecord, 'embedding'>> {
+  getMemoriesByIds(ids: string[]): MemoryRecordWithoutEmbedding[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => '?').join(', ');
     return this.queryMemories(
@@ -887,24 +1008,24 @@ export class SqliteStore {
     stmt.bind([namespace, collection]);
     const ids: string[] = [];
     while (stmt.step()) {
-      const row = stmt.getAsObject() as { id: string };
-      ids.push(row.id);
+      const row = this.getRow(stmt.getAsObject());
+      ids.push(this.getString(row, 'id'));
     }
     stmt.free();
     return ids;
   }
 
-  listCategoryHeaders(): Array<{ name: string; slot: string; updated_at: string; revision: number; content_length: number }> {
+  listCategoryHeaders(): CategoryHeader[] {
     const stmt = this.db.prepare(`SELECT name, slot, updated_at, revision, LENGTH(content) as content_length FROM categories ORDER BY name`);
-    const results: Array<{ name: string; slot: string; updated_at: string; revision: number; content_length: number }> = [];
+    const results: CategoryHeader[] = [];
     while (stmt.step()) {
-      const row = stmt.getAsObject() as any;
+      const row = this.getRow(stmt.getAsObject());
       results.push({
-        name: row.name,
-        slot: row.slot,
-        updated_at: row.updated_at,
-        revision: row.revision,
-        content_length: row.content_length,
+        name: this.getString(row, 'name'),
+        slot: this.getString(row, 'slot'),
+        updated_at: this.getString(row, 'updated_at'),
+        revision: this.getNumber(row, 'revision'),
+        content_length: this.getNumber(row, 'content_length'),
       });
     }
     stmt.free();
@@ -918,62 +1039,62 @@ export class SqliteStore {
       stmt.free();
       return null;
     }
-    const row = stmt.getAsObject() as { content: string };
+    const row = this.getRow(stmt.getAsObject());
     stmt.free();
-    return row.content ?? '';
+    return this.getNullableString(row, 'content') ?? '';
   }
 
-  private queryMemories(sql: string, params: unknown[]): Array<Omit<MemoryRecord, 'embedding'>> {
+  private queryMemories(sql: string, params: SqlParams): MemoryRecordWithoutEmbedding[] {
     const stmt = this.db.prepare(sql);
-    stmt.bind(params as any[]);
-    const results: Array<Omit<MemoryRecord, 'embedding'>> = [];
+    stmt.bind(params);
+    const results: MemoryRecordWithoutEmbedding[] = [];
     while (stmt.step()) {
-      results.push(this.rowToMemory(stmt.getAsObject()));
+      results.push(this.rowToMemory(this.getRow(stmt.getAsObject())));
     }
     stmt.free();
     return results;
   }
 
-  private rowToMemory(row: any): Omit<MemoryRecord, 'embedding'> {
+  private rowToMemory(row: SqlRow): MemoryRecordWithoutEmbedding {
     return {
-      id: row.id,
-      namespace: row.namespace,
-      collection: row.collection,
-      type: row.type,
-      category: row.category ?? null,
-      content: row.content,
-      summary: row.summary,
-      tags: JSON.parse(row.tags || '[]'),
-      source: row.source,
-      checksum: row.checksum,
-      importance: row.importance,
-      retention_tier: row.retention_tier ?? 'T2',
-      expires_at: row.expires_at ?? null,
-      decay_eligible: Boolean(row.decay_eligible),
-      review_due: row.review_due ?? null,
-      access_count: row.access_count,
-      last_operation: row.last_operation,
-      merged_from: row.merged_from ?? null,
-      archived: Boolean(row.archived),
-      vector_synced: row.vector_synced === undefined ? true : Boolean(row.vector_synced),
-      device_id: row.device_id ?? null,
-      created_at: row.created_at,
-      updated_at: row.updated_at,
-      last_accessed: row.last_accessed,
+      id: this.getString(row, 'id'),
+      namespace: this.getString(row, 'namespace'),
+      collection: this.getString(row, 'collection'),
+      type: this.getString(row, 'type') as MemoryRecord['type'],
+      category: this.getNullableString(row, 'category'),
+      content: this.getString(row, 'content'),
+      summary: this.getString(row, 'summary'),
+      tags: JSON.parse(this.getNullableString(row, 'tags') ?? '[]') as string[],
+      source: this.getString(row, 'source') as MemoryRecord['source'],
+      checksum: this.getString(row, 'checksum'),
+      importance: this.getNumber(row, 'importance'),
+      retention_tier: (this.getNullableString(row, 'retention_tier') ?? 'T2') as RetentionTier,
+      expires_at: this.getNullableString(row, 'expires_at'),
+      decay_eligible: this.getBoolean(row, 'decay_eligible'),
+      review_due: this.getNullableString(row, 'review_due'),
+      access_count: this.getNumber(row, 'access_count'),
+      last_operation: this.getString(row, 'last_operation') as MemoryRecord['last_operation'],
+      merged_from: this.getNullableString(row, 'merged_from'),
+      archived: this.getBoolean(row, 'archived'),
+      vector_synced: row.vector_synced === undefined ? true : this.getBoolean(row, 'vector_synced'),
+      device_id: this.getNullableString(row, 'device_id'),
+      created_at: this.getString(row, 'created_at'),
+      updated_at: this.getString(row, 'updated_at'),
+      last_accessed: this.getString(row, 'last_accessed'),
     };
   }
 
-  private rowToArchive(row: any): ArchiveRecord {
+  private rowToArchive(row: SqlRow): ArchiveRecord {
     return {
-      id: row.id,
-      memory_id: row.memory_id,
-      summary: row.summary,
-      tier: row.tier,
-      namespace: row.namespace,
-      created_at: row.created_at,
-      expired_at: row.expired_at,
-      access_count: row.access_count,
-      tags: JSON.parse(row.tags || '[]'),
+      id: this.getNumber(row, 'id'),
+      memory_id: this.getString(row, 'memory_id'),
+      summary: this.getString(row, 'summary'),
+      tier: this.getString(row, 'tier') as RetentionTier,
+      namespace: this.getString(row, 'namespace'),
+      created_at: this.getString(row, 'created_at'),
+      expired_at: this.getString(row, 'expired_at'),
+      access_count: this.getNumber(row, 'access_count'),
+      tags: JSON.parse(this.getNullableString(row, 'tags') ?? '[]') as string[],
     };
   }
 
@@ -990,8 +1111,8 @@ export class SqliteStore {
     const existingColumns = new Set<string>();
     const stmt = this.db.prepare(`PRAGMA table_info(memories)`);
     while (stmt.step()) {
-      const row = stmt.getAsObject() as { name: string };
-      existingColumns.add(row.name);
+      const row = this.getRow(stmt.getAsObject());
+      existingColumns.add(this.getString(row, 'name'));
     }
     stmt.free();
 
@@ -1016,6 +1137,48 @@ export class SqliteStore {
     if (this.lifecycleOperation) {
       throw new Error(`Storage lifecycle operation in progress: ${this.lifecycleOperation}`);
     }
+  }
+
+  private getRow(value: unknown): SqlRow {
+    return value as SqlRow;
+  }
+
+  private getString(row: SqlRow, key: string): string {
+    const value = row[key];
+    if (typeof value !== 'string') {
+      throw new Error(`Expected string column "${key}"`);
+    }
+    return value;
+  }
+
+  private getNullableString(row: SqlRow, key: string): string | null {
+    const value = row[key];
+    if (value == null) {
+      return null;
+    }
+    if (typeof value !== 'string') {
+      throw new Error(`Expected nullable string column "${key}"`);
+    }
+    return value;
+  }
+
+  private getNumber(row: SqlRow, key: string): number {
+    const value = row[key];
+    if (typeof value !== 'number') {
+      throw new Error(`Expected number column "${key}"`);
+    }
+    return value;
+  }
+
+  private getBoolean(row: SqlRow, key: string): boolean {
+    return Boolean(this.getNumber(row, key));
+  }
+
+  private toSqlValue(value: string | number | boolean | string[] | null, key: string): SqlValue {
+    if (typeof value === 'string' || typeof value === 'number' || value === null) {
+      return value;
+    }
+    throw new Error(`Unsupported SQL value for "${key}"`);
   }
 }
 

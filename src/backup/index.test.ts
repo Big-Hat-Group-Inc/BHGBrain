@@ -4,6 +4,9 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { BackupService } from './index.js';
+import type { BrainConfig } from '../config/index.js';
+import type pino from 'pino';
+import type { StorageManager } from '../storage/index.js';
 
 function makeBackupFile(dir: string, payload: Buffer): string {
   const checksum = createHash('sha256').update(payload).digest('hex');
@@ -30,10 +33,11 @@ describe('BackupService restore activation', () => {
         countMemories: vi.fn(() => 7),
       },
       reloadSqliteFromDisk: vi.fn(async () => {}),
-    } as any;
+    } as unknown as StorageManager;
 
-    const logger = { info: vi.fn(), error: vi.fn() } as any;
-    const service = new BackupService({ data_dir: tempDir } as any, storage, logger);
+    const logger = { info: vi.fn(), error: vi.fn() } as unknown as pino.Logger;
+    const config = { data_dir: tempDir } as unknown as BrainConfig;
+    const service = new BackupService(config, storage, logger);
 
     const result = await service.restore(backupPath);
     expect(result).toEqual({ memory_count: 7, activated: true });
@@ -57,10 +61,11 @@ describe('BackupService restore activation', () => {
         countMemories: vi.fn(() => 0),
       },
       reloadSqliteFromDisk: vi.fn(async () => { throw new Error('reload exploded'); }),
-    } as any;
+    } as unknown as StorageManager;
 
-    const logger = { info: vi.fn(), error: vi.fn() } as any;
-    const service = new BackupService({ data_dir: tempDir } as any, storage, logger);
+    const logger = { info: vi.fn(), error: vi.fn() } as unknown as pino.Logger;
+    const config = { data_dir: tempDir } as unknown as BrainConfig;
+    const service = new BackupService(config, storage, logger);
 
     await expect(service.restore(backupPath)).rejects.toThrow('activation failed');
     expect(logger.error).toHaveBeenCalled();
@@ -85,9 +90,10 @@ describe('BackupService restore activation', () => {
       reloadSqliteFromDisk: vi.fn(() => new Promise<void>((resolve) => {
         resolveReload = resolve;
       })),
-    } as any;
+    } as unknown as StorageManager;
 
-    const service = new BackupService({ data_dir: tempDir } as any, storage);
+    const config = { data_dir: tempDir } as unknown as BrainConfig;
+    const service = new BackupService(config, storage);
 
     const first = service.restore(backupPath);
     const second = service.restore(backupPath);

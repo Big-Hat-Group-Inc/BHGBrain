@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { SqliteStore } from '../storage/sqlite.js';
 import { RetentionService } from './retention.js';
 import { vi } from 'vitest';
+import type { BrainConfig } from '../config/index.js';
+import type { StorageManager } from '../storage/index.js';
 
 describe('RetentionService', () => {
   let sqlite: SqliteStore;
@@ -49,7 +51,9 @@ describe('RetentionService', () => {
     sqlite.insertMemory(memory('cat-1', '2025-01-01T00:00:00.000Z', 'policy'));
     sqlite.flushIfDirty();
 
-    const retention = new RetentionService({ retention: { decay_after_days: 30 } } as any, { sqlite } as any);
+    const config = { retention: { decay_after_days: 30 } } as unknown as BrainConfig;
+    const storage = { sqlite } as unknown as StorageManager;
+    const retention = new RetentionService(config, storage);
     const staleMarked = retention.markStaleMemories();
 
     expect(staleMarked).toBe(1);
@@ -76,11 +80,12 @@ describe('RetentionService', () => {
       },
       deleteMemories: vi.fn(async () => 1),
       logAudit: vi.fn(),
-    } as any;
+    } as unknown as StorageManager;
 
-    const retention = new RetentionService({
+    const config = {
       retention: { archive_before_delete: true, pre_expiry_warning_days: 7 },
-    } as any, storage);
+    } as unknown as BrainConfig;
+    const retention = new RetentionService(config, storage);
 
     const result = await retention.runGc();
 
