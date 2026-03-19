@@ -34,7 +34,8 @@ async function main() {
   const config = loadConfig(configPath);
   ensureDataDir(config);
 
-  const logger = createLogger(config);
+  // When using stdio transport, pino must write to stderr — stdout is reserved for MCP JSON-RPC
+  const logger = createLogger(config, isStdio ? process.stderr : undefined);
   logger.info({ event: 'startup', data_dir: config.data_dir });
 
   // Initialize storage

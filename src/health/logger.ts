@@ -10,19 +10,22 @@ const REDACT_PATHS = [
 
 const CONTENT_PREVIEW_MAX = 50;
 
-export function createLogger(config: BrainConfig): pino.Logger {
+export function createLogger(config: BrainConfig, destination?: NodeJS.WritableStream): pino.Logger {
   const level = config.observability.log_level;
 
-  const logger = pino({
-    level,
-    formatters: {
-      level(label) {
-        return { level: label };
+  const logger = pino(
+    {
+      level,
+      formatters: {
+        level(label) {
+          return { level: label };
+        },
       },
+      timestamp: pino.stdTimeFunctions.isoTime,
+      redact: config.security.log_redaction ? REDACT_PATHS : undefined,
     },
-    timestamp: pino.stdTimeFunctions.isoTime,
-    redact: config.security.log_redaction ? REDACT_PATHS : undefined,
-  });
+    destination ?? process.stdout,
+  );
 
   return logger;
 }
