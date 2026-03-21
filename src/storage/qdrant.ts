@@ -292,4 +292,24 @@ export class QdrantStore {
       throw error;
     }
   }
+
+  async clearManagedCollections(): Promise<number> {
+    const collections = await this.executeWithBreaker(() => this.client.getCollections());
+    const managedNames = (collections.collections ?? [])
+      .map(collection => collection.name)
+      .filter((name): name is string => typeof name === 'string' && name.startsWith(COLLECTION_PREFIX));
+
+    for (const name of managedNames) {
+      try {
+        await this.executeWithBreaker(() => this.client.deleteCollection(name));
+      } catch (err) {
+        if (this.isNotFoundError(err)) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    return managedNames.length;
+  }
 }

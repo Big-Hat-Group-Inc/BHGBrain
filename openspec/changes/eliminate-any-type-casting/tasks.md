@@ -41,5 +41,5 @@
 
 - [x] 7.1 Run full test suite (`npm test`) and confirm no regressions
 - [x] 7.2 Run TypeScript compiler (`tsc --noEmit`) and confirm zero errors
-- [ ] 7.3 Commit with message: `refactor: eliminate as-any casting with typed interfaces and SqlParams (codereview2)`
-- [ ] 7.4 Push to active branch
+- [x] 7.3 Commit with message: `refactor: eliminate as-any casting with typed interfaces and SqlParams (codereview2)`
+- [x] 7.4 Push to active branch

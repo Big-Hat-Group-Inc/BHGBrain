@@ -61,5 +61,5 @@
 
 - [x] 7.1 Run `npm test` and confirm all new tests pass
 - [x] 7.2 Run coverage report and confirm all six target modules have meaningful coverage (>80% line)
-- [ ] 7.3 Commit with message: `test: add coverage for embedding, http transport, metrics, logger, health, and cli (codereview2)`
-- [ ] 7.4 Push to active branch
+- [x] 7.3 Commit with message: `test: add coverage for embedding, http transport, metrics, logger, health, and cli (codereview2)`
+- [x] 7.4 Push to active branch

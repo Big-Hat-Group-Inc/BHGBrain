@@ -70,7 +70,8 @@ export interface SqliteStorage {
     retentionTier?: RetentionTier,
     reviewDue?: string | null,
   ): void;
-  markVectorSync(id: string, synced: boolean): void;
+  markVectorSync(id: string, synced: boolean, options?: { allowDuringLifecycle?: boolean }): void;
+  markAllVectorsSyncState(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number;
   recordAccessBatch(updates: AccessUpdate[]): void;
   listExpiredMemories(nowIso: string, tier?: RetentionTier): MemoryRecordWithoutEmbedding[];
   listExpiringMemories(nowIso: string, untilIso: string, limit: number): MemoryRecordWithoutEmbedding[];
@@ -79,6 +80,7 @@ export interface SqliteStorage {
   getTierStats(): TierStats[];
   countArchivedMemories(): number;
   countUnsyncedVectors(): number;
+  listMemoriesNeedingVectorSync(limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
   archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void;
   listArchive(limit: number): ArchiveRecord[];
   searchArchive(query: string, limit: number): ArchiveRecord[];
@@ -107,6 +109,7 @@ export interface SqliteStorage {
   beginLifecycleOperation(reason: string): void;
   endLifecycleOperation(reason?: string): void;
   isLifecycleOperationInProgress(): boolean;
+  getLifecycleOperation(): string | null;
   getMemoriesByIds(ids: string[]): MemoryRecordWithoutEmbedding[];
   listMemoryIdsInCollection(namespace: string, collection: string): string[];
   listCategoryHeaders(): CategoryHeader[];
@@ -564,10 +567,25 @@ export class SqliteStore implements SqliteStorage {
     this.markDirty();
   }
 
-  markVectorSync(id: string, synced: boolean): void {
-    this.assertMutableAllowed();
+  markVectorSync(id: string, synced: boolean, options?: { allowDuringLifecycle?: boolean }): void {
+    if (!options?.allowDuringLifecycle) {
+      this.assertMutableAllowed();
+    }
     this.db.run(`UPDATE memories SET vector_synced = ? WHERE id = ?`, [synced ? 1 : 0, id]);
     this.markDirty();
+  }
+
+  markAllVectorsSyncState(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number {
+    if (!options?.allowDuringLifecycle) {
+      this.assertMutableAllowed();
+    }
+    const affected = synced ? this.countUnsyncedVectors() : this.countMemories();
+    if (affected === 0) {
+      return 0;
+    }
+    this.db.run(`UPDATE memories SET vector_synced = ? WHERE archived = 0`, [synced ? 1 : 0]);
+    this.markDirty();
+    return affected;
   }
 
   recordAccessBatch(
@@ -653,6 +671,26 @@ export class SqliteStore implements SqliteStorage {
     const row = stmt.getAsObject() as { cnt: number };
     stmt.free();
     return row.cnt;
+  }
+
+  listMemoriesNeedingVectorSync(limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
+    let sql = `SELECT * FROM memories WHERE archived = 0 AND vector_synced = 0`;
+    const params: SqlParams = [];
+    if (cursor) {
+      const sepIdx = cursor.indexOf('|');
+      if (sepIdx !== -1) {
+        const cursorTime = cursor.substring(0, sepIdx);
+        const cursorId = cursor.substring(sepIdx + 1);
+        sql += ` AND (created_at > ? OR (created_at = ? AND id > ?))`;
+        params.push(cursorTime, cursorTime, cursorId);
+      } else {
+        sql += ` AND created_at > ?`;
+        params.push(cursor);
+      }
+    }
+    sql += ` ORDER BY created_at ASC, id ASC LIMIT ?`;
+    params.push(limit);
+    return this.queryMemories(sql, params);
   }
 
   archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void {
@@ -992,6 +1030,10 @@ export class SqliteStore implements SqliteStorage {
 
   isLifecycleOperationInProgress(): boolean {
     return this.lifecycleOperation !== null;
+  }
+
+  getLifecycleOperation(): string | null {
+    return this.lifecycleOperation;
   }
 
   getMemoriesByIds(ids: string[]): MemoryRecordWithoutEmbedding[] {

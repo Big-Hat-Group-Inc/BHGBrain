@@ -1,5 +1,5 @@
 import type { BrainConfig } from '../config/index.js';
-import type { HealthSnapshot, HealthStatus, ComponentHealth } from '../domain/types.js';
+import type { HealthSnapshot, HealthStatus, ComponentHealth, VectorReconciliationStatus } from '../domain/types.js';
 import type { StorageManager } from '../storage/index.js';
 import { DegradedEmbeddingProvider, type EmbeddingProvider } from '../embedding/index.js';
 import type { RetentionTier } from '../domain/types.js';
@@ -26,8 +26,9 @@ export class HealthService {
       this.checkEmbedding(),
     ]);
     const retentionOk = this.checkRetention();
+    const vectorReconciliation = this.checkVectorReconciliation();
 
-    const overall = this.computeOverall(sqliteOk, qdrantOk, embeddingOk, retentionOk);
+    const overall = this.computeOverall(sqliteOk, qdrantOk, embeddingOk, vectorReconciliation, retentionOk);
     const countsByTier = this.storage.sqlite.countByTier();
     const now = new Date();
     const until = new Date(now.getTime() + (7 * 24 * 60 * 60 * 1000));
@@ -38,6 +39,7 @@ export class HealthService {
         sqlite: sqliteOk,
         qdrant: qdrantOk,
         embedding: embeddingOk,
+        vector_reconciliation: vectorReconciliation,
         retention: retentionOk,
       },
       memory_count: this.storage.sqlite.countMemories(),
@@ -105,16 +107,43 @@ export class HealthService {
     if (this.isOverCapacity(counts)) {
       return { status: 'degraded', message: 'Retention tier or total capacity threshold exceeded' };
     }
-    if (this.storage.sqlite.countUnsyncedVectors() > 0) {
-      return { status: 'degraded', message: 'SQLite and Qdrant lifecycle state are out of sync' };
-    }
     return { status: 'healthy' };
+  }
+
+  private checkVectorReconciliation(): VectorReconciliationStatus {
+    const unsyncedVectors = this.storage.sqlite.countUnsyncedVectors();
+    const lifecycleOperation = this.storage.sqlite.getLifecycleOperation();
+
+    if (lifecycleOperation === 'restore') {
+      return {
+        status: 'degraded',
+        state: 'reconciling',
+        unsynced_vectors: unsyncedVectors,
+        message: 'Restore is active and vector reconciliation is in progress.',
+      };
+    }
+
+    if (unsyncedVectors > 0) {
+      return {
+        status: 'degraded',
+        state: 'pending',
+        unsynced_vectors: unsyncedVectors,
+        message: 'SQLite metadata is active, but vector reconciliation is still required.',
+      };
+    }
+
+    return {
+      status: 'healthy',
+      state: 'reconciled',
+      unsynced_vectors: 0,
+    };
   }
 
   private computeOverall(
     sqlite: ComponentHealth,
     qdrant: ComponentHealth,
     embedding: ComponentHealth,
+    vectorReconciliation: VectorReconciliationStatus,
     retention: ComponentHealth,
   ): HealthStatus {
     if (sqlite.status === 'unhealthy') {
@@ -124,6 +153,8 @@ export class HealthService {
       qdrant.status === 'unhealthy' ||
       embedding.status === 'degraded' ||
       embedding.status === 'unhealthy' ||
+      vectorReconciliation.status === 'degraded' ||
+      vectorReconciliation.status === 'unhealthy' ||
       retention.status === 'degraded' ||
       retention.status === 'unhealthy' ||
       Object.values(this.breakers).some(breaker => breaker.getState() === 'open')

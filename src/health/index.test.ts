@@ -76,6 +76,7 @@ describe('HealthService', () => {
         countExpiringMemories: vi.fn(() => 0),
         countArchivedMemories: vi.fn(() => 0),
         countUnsyncedVectors: vi.fn(() => 0),
+        getLifecycleOperation: vi.fn(() => null),
       },
       qdrant: {
         healthCheck: vi.fn(async () => true),
@@ -130,6 +131,11 @@ describe('HealthService', () => {
     const health = new HealthService(storage, embedding, createConfig());
     const result = await health.check();
     expect(result.status).toBe('healthy');
+    expect(result.components.vector_reconciliation).toEqual({
+      status: 'healthy',
+      state: 'reconciled',
+      unsynced_vectors: 0,
+    });
   });
 
   it('caches embedding health check result', async () => {
@@ -173,5 +179,38 @@ describe('HealthService', () => {
 
     expect(result.status).toBe('unhealthy');
     expect(result.components.sqlite.status).toBe('unhealthy');
+  });
+
+  it('reports degraded when vectors still need reconciliation after restore', async () => {
+    const storage = createStorage();
+    storage.sqlite.countUnsyncedVectors = vi.fn(() => 3);
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.status).toBe('degraded');
+    expect(result.components.vector_reconciliation).toEqual({
+      status: 'degraded',
+      state: 'pending',
+      unsynced_vectors: 3,
+      message: 'SQLite metadata is active, but vector reconciliation is still required.',
+    });
+  });
+
+  it('reports reconciling while restore lifecycle work is active', async () => {
+    const storage = createStorage();
+    storage.sqlite.getLifecycleOperation = vi.fn(() => 'restore');
+    storage.sqlite.countUnsyncedVectors = vi.fn(() => 2);
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.status).toBe('degraded');
+    expect(result.components.vector_reconciliation).toEqual({
+      status: 'degraded',
+      state: 'reconciling',
+      unsynced_vectors: 2,
+      message: 'Restore is active and vector reconciliation is in progress.',
+    });
   });
 });

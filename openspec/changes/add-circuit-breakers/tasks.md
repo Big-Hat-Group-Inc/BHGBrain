@@ -55,5 +55,5 @@
 
 - [x] 8.1 Run `npm test` — confirm all tests pass
 - [x] 8.2 Run `tsc --noEmit` — confirm zero type errors
-- [ ] 8.3 Commit with message: `feat: add circuit breakers for OpenAI and Qdrant with health visibility (codereview2)`
-- [ ] 8.4 Push to active branch
+- [x] 8.3 Commit with message: `feat: add circuit breakers for OpenAI and Qdrant with health visibility (codereview2)`
+- [x] 8.4 Push to active branch
