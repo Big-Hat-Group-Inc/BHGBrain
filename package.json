@@ -1,6 +1,6 @@
 {
   "name": "bhgbrain-server",
-  "version": "1.0.0",
+  "version": "1.4.0",
   "description": "Persistent, vector-backed memory for MCP clients",
   "type": "module",
   "main": "dist/index.js",

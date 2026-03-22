@@ -346,6 +346,18 @@ The file is created automatically on first run with all defaults applied. Edit i
     "similarity_threshold": 0.92
   },
 
+  // Resilience settings (circuit breakers for external dependencies)
+  "resilience": {
+    "circuit_breaker": {
+      // Consecutive failures before the breaker opens
+      "failure_threshold": 5,
+      // Milliseconds to keep the breaker open before allowing a half-open probe
+      "open_window_ms": 30000,
+      // Successful probes required to close the breaker from half-open
+      "half_open_probe_count": 1
+    }
+  },
+
   // Search configuration
   "search": {
     // Weights used for Reciprocal Rank Fusion (RRF) in hybrid mode
@@ -1628,6 +1640,10 @@ Returns a `HealthSnapshot`:
     "archived_count": 128,
     "unsynced_vectors": 0,
     "over_capacity": false
+  },
+  "circuitBreakers": {
+    "openai_embedding": "closed",
+    "qdrant": "closed"
   }
 }
 ```
@@ -1645,6 +1661,8 @@ Returns a `HealthSnapshot`:
 | `qdrant` | `getCollections()` succeeds | - | Connection refused |
 | `embedding` | Embed API call succeeds | Missing credentials or unreachable | - |
 | `retention` | All budgets within limits, no unsynced vectors | Budget exceeded OR unsynced vectors > 0 | - |
+
+**Circuit breakers:** The `circuitBreakers` object reports the state of each external dependency breaker (`closed`, `open`, or `half-open`). When a breaker is `open`, requests to that dependency are short-circuited with a `CircuitOpenError` until the open window elapses and a half-open probe succeeds. Configure thresholds in `resilience.circuit_breaker` (see [Configuration](#configuration)).
 
 **HTTP status codes:**
 - `200` for both `healthy` and `degraded`
@@ -2265,6 +2283,34 @@ Recover memories from Qdrant into the local SQLite database. Used for multi-devi
 
 ## Upgrading
 
+### 1.3 → 1.4 (Resilience & Observability)
+
+**No manual migration required.** All new features use backward-compatible defaults.
+
+What's new:
+
+- **Circuit breakers** for OpenAI and Qdrant. After consecutive failures exceed the threshold (default 5), the breaker opens and short-circuits requests for 30 seconds before probing recovery. States are visible in the health endpoint (`circuitBreakers` field). Configure via `resilience.circuit_breaker` in `config.json`.
+- **Percentile metrics.** Histogram metrics now emit `_p50`, `_p95`, and `_p99` suffixes alongside the existing `_avg` and `_count`.
+- **Post-restore reconciliation hardening.** `backup.restore` now acquires a fail-safe guard via `beginRestoreOperation()`, isolates vector reconciliation errors per-step, and flushes progress incrementally. A vector-store failure during reconciliation returns degraded readiness instead of a full restore failure.
+- **stdio log routing.** Pino structured logs are redirected to stderr when `--stdio` is active, preventing corruption of the MCP JSON-RPC handshake on stdout.
+- **Type safety.** Internal `as any` casts replaced with typed interfaces and `SqlParams` throughout the codebase.
+- **Test coverage.** New test suites for embedding, HTTP transport, metrics, logger, health, and CLI modules.
+
+**New config section**:
+```jsonc
+{
+  "resilience": {
+    "circuit_breaker": {
+      "failure_threshold": 5,       // consecutive failures to open
+      "open_window_ms": 30000,      // ms before half-open probe
+      "half_open_probe_count": 1    // probes to close
+    }
+  }
+}
+```
+
+---
+
 ### 1.2 → 1.3 (Multi-Device Memory & Data Resilience)
 
 **No manual migration required.** BHGBrain automatically upgrades on startup.
@@ -2331,6 +2377,8 @@ The backup is stored in the data directory (`%LOCALAPPDATA%\BHGBrain\` on Window
 ### Backup Restore Activation
 
 `backup.restore` reloads runtime SQLite state before returning success. Restore responses include `activated: true` when restored data is immediately active. The server does not need to be restarted.
+
+As of v1.4, restore acquires a fail-safe guard (`beginRestoreOperation()`) so concurrent writes are blocked during recovery. Vector reconciliation runs per-step with isolated error handling - if Qdrant is unavailable during restore, SQLite is still activated and the response returns `readiness: "degraded"` instead of failing entirely. Progress is flushed incrementally, so a crash mid-reconciliation does not lose already-recovered records.
 
 ### HTTP Hardening
 
