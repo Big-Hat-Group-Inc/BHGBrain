@@ -198,19 +198,26 @@ export class StorageManager {
       for (const [index, memory] of memories.entries()) {
         const vector = vectors[index];
         if (!vector) {
+          this.sqlite.flushIfDirty();
           throw internal(`Missing embedding vector for memory ${memory.id}`);
         }
-        await this.qdrant.upsert(
-          memory.namespace,
-          memory.collection,
-          memory.id,
-          vector,
-          toQdrantPayload(memory),
-        );
-        this.sqlite.markVectorSync(memory.id, true, {
-          allowDuringLifecycle: options?.allowDuringLifecycle,
-        });
-        reconciled++;
+
+        try {
+          await this.qdrant.upsert(
+            memory.namespace,
+            memory.collection,
+            memory.id,
+            vector,
+            toQdrantPayload(memory),
+          );
+          this.sqlite.markVectorSync(memory.id, true, {
+            allowDuringLifecycle: options?.allowDuringLifecycle,
+          });
+          reconciled++;
+        } catch (err) {
+          this.sqlite.flushIfDirty();
+          throw err;
+        }
       }
 
       this.sqlite.flushIfDirty();

@@ -203,5 +203,40 @@ describe('StorageManager cross-store consistency', () => {
       });
       expect(result).toEqual({ reconciled: 2, remaining: 0 });
     });
+
+    it('flushes completed reconciliation progress before returning a later failure', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a', vector_synced: false });
+      sqlite.insertMemory({ ...baseMem, id: 'mem-b', vector_synced: false, content: 'content-b', checksum: 'chk2' });
+      sqlite.listMemoriesNeedingVectorSync
+        .mockReturnValueOnce([
+          sqlite.getMemoryById('mem-a')!,
+          sqlite.getMemoryById('mem-b')!,
+        ])
+        .mockReturnValueOnce([
+          sqlite.getMemoryById('mem-b')!,
+        ])
+        .mockReturnValueOnce([]);
+
+      qdrant.upsert
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error('Qdrant unavailable'))
+        .mockResolvedValueOnce(undefined);
+
+      await expect(storage.reconcileVectorsFromSqlite({ batchSize: 2 })).rejects.toThrow('Qdrant unavailable');
+      expect(sqlite.flushIfDirty).toHaveBeenCalledTimes(1);
+      expect(sqlite.getMemoryById('mem-a')?.vector_synced).toBe(true);
+      expect(sqlite.getMemoryById('mem-b')?.vector_synced).toBe(false);
+      expect(sqlite.countUnsyncedVectors()).toBe(1);
+
+      const retryResult = await storage.reconcileVectorsFromSqlite({ batchSize: 2 });
+
+      expect(retryResult).toEqual({ reconciled: 1, remaining: 0 });
+      expect(sqlite.getMemoryById('mem-b')?.vector_synced).toBe(true);
+    });
   });
 });

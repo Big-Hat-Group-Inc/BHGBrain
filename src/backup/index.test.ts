@@ -106,6 +106,47 @@ describe('BackupService restore activation', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it('reports pending vector reconciliation when managed vector clearing fails after activation', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
+    const payload = Buffer.from('db-bytes-clear-fail');
+    const backupPath = makeBackupFile(tempDir, payload);
+
+    const storage = {
+      sqlite: {
+        beginLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(),
+        getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
+        countMemories: vi.fn(() => 3),
+        countUnsyncedVectors: vi.fn(() => 3),
+      },
+      reloadSqliteFromDisk: vi.fn(async () => {}),
+      markAllMemoriesVectorSync: vi.fn(() => 3),
+      clearManagedVectors: vi.fn(async () => { throw new Error('qdrant clear exploded'); }),
+      reconcileVectorsFromSqlite: vi.fn(async () => ({ reconciled: 3, remaining: 0 })),
+    } as unknown as StorageManager;
+
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger;
+    const config = { data_dir: tempDir } as unknown as BrainConfig;
+    const service = new BackupService(config, storage, logger);
+
+    const result = await service.restore(backupPath);
+
+    expect(result).toEqual({
+      memory_count: 3,
+      metadata_activated: true,
+      vector_reconciliation: {
+        status: 'degraded',
+        state: 'pending',
+        unsynced_vectors: 3,
+        message: 'qdrant clear exploded',
+      },
+    });
+    expect(storage.reconcileVectorsFromSqlite).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalled();
+
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
   it('fails restore when activation fails', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
     const payload = Buffer.from('db-bytes-2');
@@ -132,6 +173,51 @@ describe('BackupService restore activation', () => {
     await expect(service.restore(backupPath)).rejects.toThrow('activation failed');
     expect(logger.error).toHaveBeenCalled();
     expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith('restore');
+
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('cleans up restore guard state when guard acquisition fails before activation', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
+    const payload = Buffer.from('db-bytes-guard-fail');
+    const backupPath = makeBackupFile(tempDir, payload);
+
+    const beginLifecycleOperation = vi.fn()
+      .mockImplementationOnce(() => {
+        throw new Error('restore lock busy');
+      })
+      .mockImplementation(() => {});
+
+    const storage = {
+      sqlite: {
+        beginLifecycleOperation,
+        endLifecycleOperation: vi.fn(),
+        getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
+        countMemories: vi.fn(() => 2),
+        countUnsyncedVectors: vi.fn(() => 0),
+      },
+      reloadSqliteFromDisk: vi.fn(async () => {}),
+      markAllMemoriesVectorSync: vi.fn(() => 2),
+      clearManagedVectors: vi.fn(async () => 1),
+      reconcileVectorsFromSqlite: vi.fn(async () => ({ reconciled: 2, remaining: 0 })),
+    } as unknown as StorageManager;
+
+    const config = { data_dir: tempDir } as unknown as BrainConfig;
+    const service = new BackupService(config, storage);
+
+    await expect(service.restore(backupPath)).rejects.toThrow('already in progress');
+
+    const secondAttempt = await service.restore(backupPath);
+    expect(secondAttempt).toEqual({
+      memory_count: 2,
+      metadata_activated: true,
+      vector_reconciliation: {
+        status: 'healthy',
+        state: 'reconciled',
+        unsynced_vectors: 0,
+      },
+    });
+    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledTimes(1);
 
     rmSync(tempDir, { recursive: true, force: true });
   });
