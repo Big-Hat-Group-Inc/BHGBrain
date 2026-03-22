@@ -58,6 +58,7 @@ export function createHttpServer(
   // Metrics endpoint (if enabled)
   if (config.observability.metrics_enabled) {
     app.get('/metrics', (_req, res) => {
+      // Histogram families emit `_avg`, `_p50`, `_p95`, `_p99`, and `_count` lines.
       const metrics = ctx.metrics.getMetrics();
       const lines = metrics.map(m => `${m.name} ${m.value}`);
       res.type('text/plain').send(lines.join('\n'));

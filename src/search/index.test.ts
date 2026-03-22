@@ -1,16 +1,36 @@
 import { describe, it, expect, vi } from 'vitest';
 import { SearchService } from './index.js';
+import type { BrainConfig } from '../config/index.js';
+import type { EmbeddingProvider } from '../embedding/index.js';
+import type { MetricsCollector } from '../health/metrics.js';
+import type { MemoryRecord } from '../domain/types.js';
+import type { StorageManager } from '../storage/index.js';
+
+type StoredMemory = Omit<MemoryRecord, 'embedding'>;
 
 describe('SearchService', () => {
   function createSearchService(opts: {
     fulltextResults?: Array<{ id: string; rank: number }>;
-    memories?: Map<string, any>;
+    memories?: Map<string, StoredMemory>;
   } = {}) {
     const memories = opts.memories ?? new Map([
       ['mem-1', {
         id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic',
         content: 'hello world', summary: 'hello', tags: [], source: 'cli',
-        score: 0.9, created_at: '2026-01-01T00:00:00Z', last_accessed: '2026-01-01T00:00:00Z',
+        checksum: 'mem-1',
+        importance: 0.9,
+        retention_tier: 'T2',
+        expires_at: '2026-12-31T00:00:00Z',
+        decay_eligible: true,
+        review_due: null,
+        access_count: 0,
+        last_operation: 'ADD',
+        merged_from: null,
+        archived: false,
+        vector_synced: true,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        last_accessed: '2026-01-01T00:00:00Z',
       }],
     ]);
 
@@ -28,15 +48,19 @@ describe('SearchService', () => {
       qdrant: {
         search: vi.fn(async () => []),
       },
-    } as any;
+    } as unknown as StorageManager;
 
     const config = {
       search: { hybrid_weights: { semantic: 0.7, fulltext: 0.3 } },
-    } as any;
+    } as unknown as BrainConfig;
 
     const embedding = {
+      model: 'test-model',
+      dimensions: 3,
       embed: vi.fn(async () => [1, 2, 3]),
-    } as any;
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [1, 2, 3])),
+      healthCheck: vi.fn(async () => true),
+    } as EmbeddingProvider;
 
     return {
       service: new SearchService(config, storage, embedding),

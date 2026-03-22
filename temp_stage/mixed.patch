@@ -1,0 +1,131 @@
+diff --git a/src/embedding/index.ts b/src/embedding/index.ts
+index 2a2f568..8d48c7f 100644
+--- a/src/embedding/index.ts
++++ b/src/embedding/index.ts
+@@ -1,4 +1,5 @@
+ import type { BrainConfig } from '../config/index.js';
++import type { MetricsCollector } from '../health/metrics.js';
+ import { embeddingUnavailable } from '../errors/index.js';
+ 
+ export interface EmbeddingProvider {
+@@ -15,7 +16,10 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
+   private apiKey: string;
+   private baseUrl = 'https://api.openai.com/v1';
+ 
+-  constructor(config: BrainConfig) {
++  constructor(
++    config: BrainConfig,
++    private readonly metrics?: MetricsCollector,
++  ) {
+     this.model = config.embedding.model;
+     this.dimensions = config.embedding.dimensions;
+     const key = process.env[config.embedding.api_key_env];
+@@ -31,6 +35,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
+   }
+ 
+   async embedBatch(texts: string[]): Promise<number[][]> {
++    const start = Date.now();
+     let response: Response;
+     try {
+       response = await fetch(`${this.baseUrl}/embeddings`, {
+@@ -46,6 +51,8 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
+       });
+     } catch (err) {
+       throw embeddingUnavailable(`Embedding provider unreachable: ${(err as Error).message}`);
++    } finally {
++      this.metrics?.recordHistogram('embedding_embed_batch_ms', Date.now() - start);
+     }
+ 
+     if (!response.ok) {
+@@ -99,11 +106,14 @@ export class DegradedEmbeddingProvider implements EmbeddingProvider {
+   }
+ }
+ 
+-export function createEmbeddingProvider(config: BrainConfig): EmbeddingProvider {
++export function createEmbeddingProvider(
++  config: BrainConfig,
++  options?: { metrics?: MetricsCollector },
++): EmbeddingProvider {
+   switch (config.embedding.provider) {
+     case 'openai':
+       try {
+-        return new OpenAIEmbeddingProvider(config);
++        return new OpenAIEmbeddingProvider(config, options?.metrics);
+       } catch {
+         // Missing credentials: start in degraded mode
+         return new DegradedEmbeddingProvider(config);
+
+diff --git a/src/search/index.ts b/src/search/index.ts
+index c639eff..df31968 100644
+--- a/src/search/index.ts
++++ b/src/search/index.ts
+@@ -2,6 +2,7 @@ import type { BrainConfig } from '../config/index.js';
+ import type { StorageManager } from '../storage/index.js';
+ import type { EmbeddingProvider } from '../embedding/index.js';
+ import type { SearchMode, SearchResult } from '../domain/types.js';
++import type { MetricsCollector } from '../health/metrics.js';
+ import { MemoryLifecycleService } from '../domain/lifecycle.js';
+ import { embeddingUnavailable, internal } from '../errors/index.js';
+ 
+@@ -22,6 +23,7 @@ export class SearchService {
+     private config: BrainConfig,
+     private storage: StorageManager,
+     private embedding: EmbeddingProvider,
++    private metrics?: MetricsCollector,
+   ) {
+     this.lifecycle = new MemoryLifecycleService(config);
+   }
+@@ -33,13 +35,20 @@ export class SearchService {
+     mode: SearchMode,
+     limit: number,
+   ): Promise<SearchResult[]> {
+-    switch (mode) {
+-      case 'semantic':
+-        return this.semanticSearch(query, namespace, collection, limit);
+-      case 'fulltext':
+-        return this.fulltextSearch(query, namespace, collection, limit);
+-      case 'hybrid':
+-        return this.hybridSearch(query, namespace, collection, limit);
++    const start = Date.now();
++    try {
++      switch (mode) {
++        case 'semantic':
++          return await this.semanticSearch(query, namespace, collection, limit);
++        case 'fulltext':
++          return this.fulltextSearch(query, namespace, collection, limit);
++        case 'hybrid':
++          return await this.hybridSearch(query, namespace, collection, limit);
++      }
++      const unsupportedMode: never = mode;
++      throw new Error(`Unsupported search mode: ${unsupportedMode}`);
++    } finally {
++      this.metrics?.recordHistogram('search_total_ms', Date.now() - start);
+     }
+   }
+ 
+
+diff --git a/src/index.ts b/src/index.ts
+index ca15f7e..d4bf378 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -42,16 +42,16 @@ async function main() {
+   const sqlite = new SqliteStore(config.data_dir!);
+   await sqlite.init();
+ 
++  const metrics = new MetricsCollector(config);
+   const qdrant = new QdrantStore(config);
+-  const embedding = createEmbeddingProvider(config);
++  const embedding = createEmbeddingProvider(config, { metrics });
+   const storage = new StorageManager(sqlite, qdrant, embedding);
+ 
+   // Initialize services
+   const pipeline = new WritePipeline(config, storage, embedding);
+-  const searchService = new SearchService(config, storage, embedding);
++  const searchService = new SearchService(config, storage, embedding, metrics);
+   const backupService = new BackupService(config, storage, logger);
+   const healthService = new HealthService(storage, embedding, config);
+-  const metrics = new MetricsCollector(config);
+ 
+   const ctx: ToolContext = {
+     config, storage, embedding, pipeline,
+

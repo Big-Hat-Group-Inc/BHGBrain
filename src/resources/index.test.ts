@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { ResourceHandler, MCP_RESOURCE_DEFINITIONS, MCP_RESOURCE_TEMPLATES } from './index.js';
+import type { BrainConfig } from '../config/index.js';
+import type { HealthService } from '../health/index.js';
+import type { SearchService } from '../search/index.js';
+import type { StorageManager } from '../storage/index.js';
+import type { BrainErrorEnvelope, ErrorEnvelope } from '../errors/index.js';
+
+type ListResult = { items: unknown[]; total_results: number };
+type InjectResult = { content: string; truncated: boolean };
+type ResourceResult = ListResult | InjectResult | ErrorEnvelope;
 
 describe('resource pagination bounds', () => {
   function createHandler() {
@@ -34,57 +43,67 @@ describe('resource pagination bounds', () => {
         listCollections: () => [],
         getCategory: () => null,
       },
-    } as any;
+    } as unknown as StorageManager;
+
+    const config = {
+      defaults: { namespace: 'global', auto_inject_limit: 5 },
+      auto_inject: { max_chars: 500 },
+    } as unknown as BrainConfig;
 
     return new ResourceHandler(
-      { defaults: { namespace: 'global', auto_inject_limit: 5 }, auto_inject: { max_chars: 500 } } as any,
+      config,
       storage,
-      {} as any,
-      { check: async () => ({ status: 'healthy' }) } as any,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
     );
   }
 
   it('returns INVALID_INPUT for non-numeric limit', async () => {
     const handler = createHandler();
-    const result = await handler.handle('memory://list?limit=abc') as any;
+    const result = await handler.handle('memory://list?limit=abc') as ResourceResult;
     expect(result.error.code).toBe('INVALID_INPUT');
   });
 
   it('returns INVALID_INPUT for out-of-range limit', async () => {
     const handler = createHandler();
-    const result = await handler.handle('memory://list?limit=1000') as any;
+    const result = await handler.handle('memory://list?limit=1000') as ResourceResult;
     expect(result.error.code).toBe('INVALID_INPUT');
   });
 
   it('returns bounded paginated response for valid limit', async () => {
     const handler = createHandler();
-    const result = await handler.handle('memory://list?limit=1') as any;
+    const result = await handler.handle('memory://list?limit=1') as ResourceResult;
     expect(result.items).toHaveLength(1);
     expect(result.total_results).toBe(2);
   });
 
   it('builds inject payload within budget without concatenating all category content', async () => {
+    const config = {
+      defaults: { namespace: 'global', auto_inject_limit: 5 },
+      auto_inject: { max_chars: 24 },
+    } as unknown as BrainConfig;
+    const storage = {
+      sqlite: {
+        listCategoryHeaders: () => [{ name: 'Policy', slot: 'custom', revision: 1, updated_at: '2026-01-01T00:00:00Z', content_length: 200 }],
+        getCategoryContentSlice: (_name: string, maxChars: number) => 'x'.repeat(maxChars),
+        listMemories: () => [],
+        countMemories: () => 0,
+        getMemoryById: () => null,
+        touchMemory: () => undefined,
+        scheduleDeferredFlush: () => undefined,
+        listCategories: () => [],
+        listCollections: () => [],
+        getCategory: () => null,
+      },
+    } as unknown as StorageManager;
     const handler = new ResourceHandler(
-      { defaults: { namespace: 'global', auto_inject_limit: 5 }, auto_inject: { max_chars: 24 } } as any,
-      {
-        sqlite: {
-          listCategoryHeaders: () => [{ name: 'Policy', slot: 'custom', revision: 1, updated_at: '2026-01-01T00:00:00Z', content_length: 200 }],
-          getCategoryContentSlice: (_name: string, maxChars: number) => 'x'.repeat(maxChars),
-          listMemories: () => [],
-          countMemories: () => 0,
-          getMemoryById: () => null,
-          touchMemory: () => undefined,
-          scheduleDeferredFlush: () => undefined,
-          listCategories: () => [],
-          listCollections: () => [],
-          getCategory: () => null,
-        },
-      } as any,
-      {} as any,
-      { check: async () => ({ status: 'healthy' }) } as any,
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
     );
 
-    const result = await handler.handle('memory://inject') as any;
+    const result = await handler.handle('memory://inject') as ResourceResult;
     expect(result.content.length).toBeLessThanOrEqual(24);
     expect(result.truncated).toBe(true);
   });

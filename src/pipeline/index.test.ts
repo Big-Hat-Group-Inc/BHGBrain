@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { WritePipeline } from './index.js';
 import type { BrainConfig } from '../config/index.js';
+import type { EmbeddingProvider } from '../embedding/index.js';
+import type { StorageManager } from '../storage/index.js';
 
 describe('WritePipeline NOOP handling', () => {
   const config = {
@@ -8,11 +10,15 @@ describe('WritePipeline NOOP handling', () => {
     pipeline: { extraction_enabled: true, fallback_to_threshold_dedup: true },
   } as unknown as BrainConfig;
 
-  const embedding = {
+  const embedding: EmbeddingProvider = {
+    model: 'test-model',
+    dimensions: 2,
     embed: vi.fn(async () => [0.1, 0.2]),
-  } as any;
+    embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
+    healthCheck: vi.fn(async () => true),
+  };
 
-  let storage: any;
+  let storage: StorageManager;
 
   beforeEach(() => {
     storage = {
@@ -36,7 +42,7 @@ describe('WritePipeline NOOP handling', () => {
       writeMemory: vi.fn(),
       writeMemoryWithoutVector: vi.fn(),
       logAudit: vi.fn(),
-    };
+    } as unknown as StorageManager;
   });
 
   it('returns NOOP without writes when classification is NOOP', async () => {

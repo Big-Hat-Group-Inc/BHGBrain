@@ -5,6 +5,8 @@ import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MemoryRecord, WriteOperation, AuditEntry } from '../domain/types.js';
 import { internal, conflict } from '../errors/index.js';
 
+type MemoryRecordWithoutEmbedding = Omit<MemoryRecord, 'embedding'>;
+
 export class StorageManager {
   constructor(
     public readonly sqlite: SqliteStore,
@@ -17,7 +19,7 @@ export class StorageManager {
   }
 
   async writeMemory(
-    mem: Omit<MemoryRecord, 'embedding'>,
+    mem: MemoryRecordWithoutEmbedding,
     vector: number[],
   ): Promise<void> {
     this.ensureCollectionCompatible(mem.namespace, mem.collection);
@@ -29,28 +31,10 @@ export class StorageManager {
     }
 
     try {
-      await this.qdrant.upsert(mem.namespace, mem.collection, mem.id, vector, {
-        type: mem.type,
-        tags: mem.tags,
-        collection: mem.collection,
-        content: mem.content,
-        summary: mem.summary,
-        category: mem.category,
-        source: mem.source,
-        importance: mem.importance,
-        retention_tier: mem.retention_tier,
-        decay_eligible: mem.decay_eligible,
-        expires_at: mem.expires_at ? Math.floor(Date.parse(mem.expires_at) / 1000) : null,
-        device_id: mem.device_id ?? null,
-        created_at: mem.created_at,
-      });
-      if (typeof (this.sqlite as any).markVectorSync === 'function') {
-        this.sqlite.markVectorSync(mem.id, true);
-      }
+      await this.qdrant.upsert(mem.namespace, mem.collection, mem.id, vector, toQdrantPayload(mem));
+      this.sqlite.markVectorSync(mem.id, true);
     } catch (err) {
-      if (typeof (this.sqlite as any).markVectorSync === 'function') {
-        this.sqlite.markVectorSync(mem.id, false);
-      }
+      this.sqlite.markVectorSync(mem.id, false);
       this.sqlite.flushIfDirty();
       throw internal(`Qdrant write failed after SQLite persistence: ${(err as Error).message}`);
     }
@@ -58,7 +42,7 @@ export class StorageManager {
     this.sqlite.flushIfDirty();
   }
 
-  writeMemoryWithoutVector(mem: Omit<MemoryRecord, 'embedding'>): void {
+  writeMemoryWithoutVector(mem: MemoryRecordWithoutEmbedding): void {
     this.ensureCollectionCompatible(mem.namespace, mem.collection);
     try {
       this.sqlite.insertMemory({
@@ -80,9 +64,10 @@ export class StorageManager {
     if (!existing) throw internal(`Memory ${id} not found for update`);
 
     // Snapshot fields that will change for rollback
-    const rollbackFields: Partial<Omit<MemoryRecord, 'embedding'>> = {};
-    for (const key of Object.keys(fields) as Array<keyof typeof fields>) {
-      (rollbackFields as any)[key] = (existing as any)[key];
+    const rollbackFields: Partial<MemoryRecordWithoutEmbedding> = {};
+    for (const key of Object.keys(fields) as Array<keyof MemoryRecordWithoutEmbedding>) {
+      const currentValue = existing[key];
+      assignRollbackField(rollbackFields, key, currentValue);
     }
 
     if (existing.retention_tier === 'T0' && fields.content && fields.content !== existing.content) {
@@ -98,30 +83,16 @@ export class StorageManager {
           existing.collection,
           id,
           newVector,
-          {
-            type: fields.type ?? existing.type,
-            tags: fields.tags ?? existing.tags,
+          toQdrantPayload({
+            ...existing,
+            ...fields,
             collection: existing.collection,
-            content: fields.content ?? existing.content,
-            summary: fields.summary ?? existing.summary,
-            category: fields.category ?? existing.category,
-            source: existing.source,
-            importance: fields.importance ?? existing.importance,
-            retention_tier: fields.retention_tier ?? existing.retention_tier,
-            decay_eligible: fields.decay_eligible ?? existing.decay_eligible,
-            expires_at: (fields.expires_at ?? existing.expires_at) ? Math.floor(Date.parse((fields.expires_at ?? existing.expires_at)! as string) / 1000) : null,
-            device_id: fields.device_id ?? existing.device_id ?? null,
-            created_at: existing.created_at,
-          },
+          }),
         );
-        if (typeof (this.sqlite as any).markVectorSync === 'function') {
-          this.sqlite.markVectorSync(id, true);
-        }
+        this.sqlite.markVectorSync(id, true);
       } catch (err) {
         this.sqlite.updateMemory(id, rollbackFields);
-        if (typeof (this.sqlite as any).markVectorSync === 'function') {
-          this.sqlite.markVectorSync(id, false);
-        }
+        this.sqlite.markVectorSync(id, false);
         this.sqlite.flushIfDirty();
         throw internal(`Qdrant update failed, rolled back SQLite: ${(err as Error).message}`);
       }
@@ -195,6 +166,72 @@ export class StorageManager {
     await this.sqlite.reloadFromDisk();
   }
 
+  markAllMemoriesVectorSync(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number {
+    const affected = this.sqlite.markAllVectorsSyncState(synced, options);
+    this.sqlite.flushIfDirty();
+    return affected;
+  }
+
+  async clearManagedVectors(): Promise<number> {
+    return this.qdrant.clearManagedCollections();
+  }
+
+  async reconcileVectorsFromSqlite(
+    options?: { batchSize?: number; allowDuringLifecycle?: boolean },
+  ): Promise<{ reconciled: number; remaining: number }> {
+    const batchSize = options?.batchSize ?? 100;
+    let cursor: string | undefined;
+    let reconciled = 0;
+
+    while (true) {
+      const memories = this.sqlite.listMemoriesNeedingVectorSync(batchSize, cursor);
+      if (memories.length === 0) {
+        break;
+      }
+
+      for (const memory of memories) {
+        this.ensureCollectionCompatible(memory.namespace, memory.collection);
+      }
+
+      const vectors = await this.embedding.embedBatch(memories.map(memory => memory.content));
+
+      for (const [index, memory] of memories.entries()) {
+        const vector = vectors[index];
+        if (!vector) {
+          this.sqlite.flushIfDirty();
+          throw internal(`Missing embedding vector for memory ${memory.id}`);
+        }
+
+        try {
+          await this.qdrant.upsert(
+            memory.namespace,
+            memory.collection,
+            memory.id,
+            vector,
+            toQdrantPayload(memory),
+          );
+          this.sqlite.markVectorSync(memory.id, true, {
+            allowDuringLifecycle: options?.allowDuringLifecycle,
+          });
+          reconciled++;
+        } catch (err) {
+          this.sqlite.flushIfDirty();
+          throw err;
+        }
+      }
+
+      this.sqlite.flushIfDirty();
+
+      if (memories.length < batchSize) {
+        break;
+      }
+      const last = memories[memories.length - 1]!;
+      cursor = `${last.created_at}|${last.id}`;
+    }
+
+    return { reconciled, remaining: this.sqlite.countUnsyncedVectors() };
+  }
+
   logAudit(
     operation: WriteOperation | 'FORGET',
     memoryId: string,
@@ -238,3 +275,35 @@ export class StorageManager {
 
 export { SqliteStore } from './sqlite.js';
 export { QdrantStore } from './qdrant.js';
+
+function assignRollbackField<K extends keyof MemoryRecordWithoutEmbedding>(
+  target: Partial<MemoryRecordWithoutEmbedding>,
+  key: K,
+  value: MemoryRecordWithoutEmbedding[K],
+): void {
+  target[key] = value;
+}
+
+function toQdrantPayload(
+  mem: Pick<
+    MemoryRecordWithoutEmbedding,
+    'type' | 'tags' | 'collection' | 'content' | 'summary' | 'category' | 'source' |
+    'importance' | 'retention_tier' | 'decay_eligible' | 'expires_at' | 'created_at'
+  > & { device_id?: string | null },
+): Record<string, unknown> {
+  return {
+    type: mem.type,
+    tags: mem.tags,
+    collection: mem.collection,
+    content: mem.content,
+    summary: mem.summary,
+    category: mem.category ?? null,
+    source: mem.source,
+    importance: mem.importance,
+    retention_tier: mem.retention_tier,
+    decay_eligible: mem.decay_eligible,
+    expires_at: mem.expires_at ? Math.floor(Date.parse(mem.expires_at) / 1000) : null,
+    device_id: mem.device_id ?? null,
+    created_at: mem.created_at,
+  };
+}

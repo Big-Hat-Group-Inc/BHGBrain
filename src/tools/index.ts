@@ -53,7 +53,7 @@ export async function handleTool(
   try {
     const result = await dispatch(ctx, toolName, args, clientId);
     const duration = Date.now() - start;
-    ctx.metrics.recordHistogram('bhgbrain_tool_duration_seconds', duration / 1000);
+    ctx.metrics.recordHistogram('bhgbrain_tool_handler_ms', duration);
     ctx.logger.info({ event: 'tool_call', tool: toolName, duration_ms: duration, client_id: clientId });
     return result;
   } catch (err) {

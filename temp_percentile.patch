@@ -1,0 +1,204 @@
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1305,8 +1305,13 @@ Returns plain-text key-value metrics (Prometheus-compatible format):
+ | Metric | Type | Description |
+ |---|---|---|
+ | `bhgbrain_tool_calls_total` | counter | Total tool invocations |
+-| `bhgbrain_tool_duration_seconds_avg` | histogram | Average tool call duration |
+-| `bhgbrain_tool_duration_seconds_count` | counter | Number of tool call duration samples |
++| `bhgbrain_tool_handler_ms_avg` | histogram | Average tool handler latency in milliseconds |
++| `bhgbrain_tool_handler_ms_p50` | histogram | 50th percentile tool handler latency |
++| `bhgbrain_tool_handler_ms_p95` | histogram | 95th percentile tool handler latency |
++| `bhgbrain_tool_handler_ms_p99` | histogram | 99th percentile tool handler latency |
++| `bhgbrain_tool_handler_ms_count` | counter | Number of tool handler latency samples |
++| `embedding_embed_batch_ms_p95` | histogram | 95th percentile embedding batch latency |
++| `search_total_ms_p95` | histogram | 95th percentile end-to-end search latency |
+ | `bhgbrain_memory_count` | gauge | Current total memory count (updated on write/delete) |
+ | `bhgbrain_rate_limit_buckets` | gauge | Active rate limit tracking buckets |
+ | `bhgbrain_rate_limited_total` | counter | Total rate-limited requests |
+@@ -1943,7 +1948,7 @@ The backup is stored in the data directory (`%LOCALAPPDATA%\BHGBrain\` on Window
+ ### Operational Observability
+ 
+ - **Bounded metrics:** Histogram values use a bounded circular buffer (last 1000 samples).
+-- **Metric semantics:** Histogram metrics emit `_avg` and `_count` suffixes.
++- **Metric semantics:** Histogram metrics emit `_avg`, `_p50`, `_p95`, `_p99`, and `_count` suffixes.
+ - **Atomic writes:** Database and backup file writes use write-to-temp-then-rename to prevent truncated partial files on crash.
+ - **Deferred flush:** Read-path access metadata (touch counts) uses bounded async batching (5s window) instead of synchronous full-database flushes per request.
+ - **Cross-store consistency:** SQLite updates are rolled back if the corresponding Qdrant operation fails.
+diff --git a/src/embedding/index.ts b/src/embedding/index.ts
+--- a/src/embedding/index.ts
++++ b/src/embedding/index.ts
+@@ -1,4 +1,5 @@
+ import type { BrainConfig } from '../config/index.js';
++import type { MetricsCollector } from '../health/metrics.js';
+ import { embeddingUnavailable } from '../errors/index.js';
+@@ -14,7 +15,10 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
+   private apiKey: string;
+   private baseUrl = 'https://api.openai.com/v1';
+ 
+-  constructor(config: BrainConfig) {
++  constructor(
++    config: BrainConfig,
++    private readonly metrics?: MetricsCollector,
++  ) {
+     this.model = config.embedding.model;
+     this.dimensions = config.embedding.dimensions;
+     const key = process.env[config.embedding.api_key_env];
+@@ -29,6 +33,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
+   }
+ 
+   async embedBatch(texts: string[]): Promise<number[][]> {
++    const start = Date.now();
+     let response: Response;
+     try {
+       response = await fetch(`${this.baseUrl}/embeddings`, {
+@@ -45,6 +50,8 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
+       });
+     } catch (err) {
+       throw embeddingUnavailable(`Embedding provider unreachable: ${(err as Error).message}`);
++    } finally {
++      this.metrics?.recordHistogram('embedding_embed_batch_ms', Date.now() - start);
+     }
+ 
+     if (!response.ok) {
+@@ -89,11 +96,14 @@ export class DegradedEmbeddingProvider implements EmbeddingProvider {
+   }
+ }
+ 
+-export function createEmbeddingProvider(config: BrainConfig): EmbeddingProvider {
++export function createEmbeddingProvider(
++  config: BrainConfig,
++  options?: { metrics?: MetricsCollector },
++): EmbeddingProvider {
+   switch (config.embedding.provider) {
+     case 'openai':
+       try {
+-        return new OpenAIEmbeddingProvider(config);
++        return new OpenAIEmbeddingProvider(config, options?.metrics);
+       } catch {
+         // Missing credentials: start in degraded mode
+         return new DegradedEmbeddingProvider(config);
+diff --git a/src/health/metrics.ts b/src/health/metrics.ts
+--- a/src/health/metrics.ts
++++ b/src/health/metrics.ts
+@@ -7,6 +7,16 @@ interface MetricEntry {
+   labels?: Record<string, string>;
+ }
+ 
++export function computePercentile(sortedValues: number[], p: number): number {
++  if (sortedValues.length === 0) {
++    return 0;
++  }
++
++  const rank = Math.ceil((p / 100) * sortedValues.length);
++  const index = Math.min(sortedValues.length - 1, Math.max(0, rank - 1));
++  return sortedValues[index] ?? 0;
++}
++
+ /** Bounded circular buffer for histogram values */
+ class BoundedBuffer {
+   private buffer: number[];
+@@ -72,7 +82,11 @@ export class MetricsCollector {
+       const count = vals.length;
+       const sum = count > 0 ? vals.reduce((a, b) => a + b, 0) : 0;
+       const avg = count > 0 ? sum / count : 0;
++      const sortedValues = [...vals].sort((a, b) => a - b);
+       entries.push({ name: `${name}_avg`, type: 'histogram', value: avg });
++      entries.push({ name: `${name}_p50`, type: 'histogram', value: computePercentile(sortedValues, 50) });
++      entries.push({ name: `${name}_p95`, type: 'histogram', value: computePercentile(sortedValues, 95) });
++      entries.push({ name: `${name}_p99`, type: 'histogram', value: computePercentile(sortedValues, 99) });
+       entries.push({ name: `${name}_count`, type: 'counter', value: count });
+     }
+     for (const [name, value] of this.gauges) {
+diff --git a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -37,16 +37,17 @@ async function main() {
+   const sqlite = new SqliteStore(config.data_dir!);
+   await sqlite.init();
+ 
++  const metrics = new MetricsCollector(config);
+   const qdrant = new QdrantStore(config);
+-  const embedding = createEmbeddingProvider(config);
++  const embedding = createEmbeddingProvider(config, { metrics });
+   const storage = new StorageManager(sqlite, qdrant, embedding);
+ 
+   // Initialize services
+   const pipeline = new WritePipeline(config, storage, embedding);
+-  const searchService = new SearchService(config, storage, embedding);
++  const searchService = new SearchService(config, storage, embedding, metrics);
+   const backupService = new BackupService(config, storage, logger);
+   const healthService = new HealthService(storage, embedding, config);
+-  const metrics = new MetricsCollector(config);
+ 
+   const ctx: ToolContext = {
+     config, storage, embedding, pipeline,
+diff --git a/src/search/index.ts b/src/search/index.ts
+--- a/src/search/index.ts
++++ b/src/search/index.ts
+@@ -2,6 +2,7 @@ import type { BrainConfig } from '../config/index.js';
+ import type { StorageManager } from '../storage/index.js';
+ import type { EmbeddingProvider } from '../embedding/index.js';
+ import type { SearchMode, SearchResult } from '../domain/types.js';
++import type { MetricsCollector } from '../health/metrics.js';
+ import { MemoryLifecycleService } from '../domain/lifecycle.js';
+ import { embeddingUnavailable, internal } from '../errors/index.js';
+@@ -20,6 +21,7 @@ export class SearchService {
+     private config: BrainConfig,
+     private storage: StorageManager,
+     private embedding: EmbeddingProvider,
++    private metrics?: MetricsCollector,
+   ) {
+     this.lifecycle = new MemoryLifecycleService(config);
+   }
+@@ -30,13 +32,20 @@ export class SearchService {
+     mode: SearchMode,
+     limit: number,
+   ): Promise<SearchResult[]> {
+-    switch (mode) {
+-      case 'semantic':
+-        return this.semanticSearch(query, namespace, collection, limit);
+-      case 'fulltext':
+-        return this.fulltextSearch(query, namespace, collection, limit);
+-      case 'hybrid':
+-        return this.hybridSearch(query, namespace, collection, limit);
++    const start = Date.now();
++    try {
++      switch (mode) {
++        case 'semantic':
++          return await this.semanticSearch(query, namespace, collection, limit);
++        case 'fulltext':
++          return this.fulltextSearch(query, namespace, collection, limit);
++        case 'hybrid':
++          return await this.hybridSearch(query, namespace, collection, limit);
++      }
++      const unsupportedMode: never = mode;
++      throw new Error(`Unsupported search mode: ${unsupportedMode}`);
++    } finally {
++      this.metrics?.recordHistogram('search_total_ms', Date.now() - start);
+     }
+   }
+diff --git a/src/tools/index.ts b/src/tools/index.ts
+--- a/src/tools/index.ts
++++ b/src/tools/index.ts
+@@ -48,7 +48,7 @@ export async function handleTool(
+   try {
+     const result = await dispatch(ctx, toolName, args, clientId);
+     const duration = Date.now() - start;
+-    ctx.metrics.recordHistogram('bhgbrain_tool_duration_seconds', duration / 1000);
++    ctx.metrics.recordHistogram('bhgbrain_tool_handler_ms', duration);
+     ctx.logger.info({ event: 'tool_call', tool: toolName, duration_ms: duration, client_id: clientId });
+     return result;
+   } catch (err) {
+diff --git a/src/transport/http.ts b/src/transport/http.ts
+--- a/src/transport/http.ts
++++ b/src/transport/http.ts
+@@ -52,6 +52,7 @@ export function createHttpServer(
+   // Metrics endpoint (if enabled)
+   if (config.observability.metrics_enabled) {
+     app.get('/metrics', (_req, res) => {
++      // Histogram families emit `_avg`, `_p50`, `_p95`, `_p99`, and `_count` lines.
+       const metrics = ctx.metrics.getMetrics();
+       const lines = metrics.map(m => `${m.name} ${m.value}`);
+       res.type('text/plain').send(lines.join('\n'));

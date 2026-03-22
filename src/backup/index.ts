@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import { atomicWriteFileSync } from '../storage/sqlite.js';
-import type { BackupInfo } from '../domain/types.js';
+import type { BackupInfo, RestoreResult, VectorReconciliationStatus } from '../domain/types.js';
 import { BrainError, invalidInput, internal } from '../errors/index.js';
 import type pino from 'pino';
 
@@ -73,18 +73,15 @@ export class BackupService {
     }));
   }
 
-  async restore(backupPath: string): Promise<{ memory_count: number; activated: boolean }> {
-    if (this.restoreInProgress) {
-      throw invalidInput('Backup restore already in progress');
-    }
-
+  async restore(backupPath: string): Promise<RestoreResult> {
     if (!existsSync(backupPath)) {
       throw invalidInput(`Backup file not found: ${backupPath}`);
     }
 
-    this.restoreInProgress = true;
-    this.storage.sqlite.beginLifecycleOperation('restore');
+    let restoreGuardAcquired = false;
     try {
+      this.beginRestoreOperation();
+      restoreGuardAcquired = true;
       this.logger?.info({ event: 'backup_restore_validate', path: backupPath });
       const data = readFileSync(backupPath);
       const headerLen = data.readUInt32LE(0);
@@ -120,20 +117,110 @@ export class BackupService {
       }
 
       const activeCount = this.storage.sqlite.countMemories();
+      const vectorReconciliation = await this.restoreVectorStateAfterActivation(activeCount);
       this.logger?.info({
         event: 'backup_restore_complete',
         path: backupPath,
-        activated: true,
+        metadata_activated: true,
         memory_count: activeCount,
+        vector_reconciliation_state: vectorReconciliation.state,
+        unsynced_vectors: vectorReconciliation.unsynced_vectors,
       });
 
-      return { memory_count: activeCount, activated: true };
+      return {
+        memory_count: activeCount,
+        metadata_activated: true,
+        vector_reconciliation: vectorReconciliation,
+      };
     } catch (err) {
       if (err instanceof BrainError) throw err;
       throw internal(`Backup restore failed: ${(err as Error).message}`);
     } finally {
-      this.storage.sqlite.endLifecycleOperation('restore');
-      this.restoreInProgress = false;
+      if (restoreGuardAcquired) {
+        try {
+          this.storage.sqlite.endLifecycleOperation('restore');
+        } finally {
+          this.restoreInProgress = false;
+        }
+      }
     }
+  }
+
+  private beginRestoreOperation(): void {
+    if (this.restoreInProgress) {
+      throw invalidInput('Backup restore already in progress');
+    }
+
+    try {
+      this.storage.sqlite.beginLifecycleOperation('restore');
+    } catch {
+      throw invalidInput('Backup restore already in progress');
+    }
+
+    this.restoreInProgress = true;
+  }
+
+  private async restoreVectorStateAfterActivation(memoryCount: number): Promise<VectorReconciliationStatus> {
+    try {
+      this.storage.markAllMemoriesVectorSync(false, { allowDuringLifecycle: true });
+    } catch (err) {
+      return this.toPendingVectorReconciliation(err, 'backup_restore_vector_invalidation_pending');
+    }
+
+    try {
+      await this.storage.clearManagedVectors();
+    } catch (err) {
+      return this.toPendingVectorReconciliation(err, 'backup_restore_vector_clear_pending');
+    }
+
+    return this.reconcileVectorsAfterRestore(memoryCount);
+  }
+
+  private async reconcileVectorsAfterRestore(memoryCount: number): Promise<VectorReconciliationStatus> {
+    if (memoryCount === 0) {
+      return {
+        status: 'healthy',
+        state: 'reconciled',
+        unsynced_vectors: 0,
+      };
+    }
+
+    try {
+      const result = await this.storage.reconcileVectorsFromSqlite({ batchSize: 100, allowDuringLifecycle: true });
+      if (result.remaining > 0) {
+        return {
+          status: 'degraded',
+          state: 'pending',
+          unsynced_vectors: result.remaining,
+          message: 'Restore activated SQLite metadata, but vector reconciliation is still pending.',
+        };
+      }
+      return {
+        status: 'healthy',
+        state: 'reconciled',
+        unsynced_vectors: 0,
+      };
+    } catch (err) {
+      return this.toPendingVectorReconciliation(err, 'backup_restore_vector_reconciliation_pending');
+    }
+  }
+
+  private toPendingVectorReconciliation(
+    err: unknown,
+    event: string,
+  ): VectorReconciliationStatus {
+    const message = err instanceof Error
+      ? err.message
+      : 'Restore activated SQLite metadata, but vector reconciliation is still pending.';
+    this.logger?.warn?.({
+      event,
+      error: message,
+    });
+    return {
+      status: 'degraded',
+      state: 'pending',
+      unsynced_vectors: this.storage.sqlite.countUnsyncedVectors(),
+      message,
+    };
   }
 }

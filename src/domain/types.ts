@@ -12,6 +12,8 @@ export type RetentionTier = 'T0' | 'T1' | 'T2' | 'T3';
 
 export type HealthStatus = 'healthy' | 'degraded' | 'unhealthy';
 
+export type VectorReconciliationState = 'reconciled' | 'reconciling' | 'pending';
+
 export type ErrorCode =
   | 'INVALID_INPUT'
   | 'NOT_FOUND'
@@ -100,17 +102,30 @@ export interface ComponentHealth {
   message?: string;
 }
 
+export interface VectorReconciliationStatus extends ComponentHealth {
+  state: VectorReconciliationState;
+  unsynced_vectors: number;
+}
+
+export interface RestoreResult {
+  memory_count: number;
+  metadata_activated: boolean;
+  vector_reconciliation: VectorReconciliationStatus;
+}
+
 export interface HealthSnapshot {
   status: HealthStatus;
   components: {
     sqlite: ComponentHealth;
     qdrant: ComponentHealth;
     embedding: ComponentHealth;
+    vector_reconciliation: VectorReconciliationStatus;
     retention?: ComponentHealth;
   };
   memory_count: number;
   db_size_bytes: number;
   uptime_seconds: number;
+  circuitBreakers?: Record<string, 'closed' | 'open' | 'half-open'>;
   retention?: {
     counts_by_tier: Record<RetentionTier, number>;
     expiring_soon: number;
