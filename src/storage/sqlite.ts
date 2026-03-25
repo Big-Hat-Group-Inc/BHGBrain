@@ -112,6 +112,7 @@ export interface SqliteStorage {
   getLifecycleOperation(): string | null;
   getMemoriesByIds(ids: string[]): MemoryRecordWithoutEmbedding[];
   listMemoryIdsInCollection(namespace: string, collection: string): string[];
+  upsertMemoryFromPayload(id: string, payload: Record<string, unknown>): boolean;
   listCategoryHeaders(): CategoryHeader[];
   getCategoryContentSlice(name: string, maxChars: number): string | null;
 }
@@ -352,6 +353,58 @@ export class SqliteStore implements SqliteStorage {
       [mem.id, mem.namespace, mem.content, mem.summary, mem.tags.join(' ')],
     );
     this.markDirty();
+  }
+
+  upsertMemoryFromPayload(id: string, payload: Record<string, unknown>): boolean {
+    this.assertMutableAllowed();
+    const now = new Date().toISOString();
+    const content = typeof payload.content === 'string' ? payload.content : '';
+    const summary = typeof payload.summary === 'string' ? payload.summary : '';
+    const namespace = typeof payload.namespace === 'string' ? payload.namespace : 'global';
+    const collection = typeof payload.collection === 'string' ? payload.collection : 'general';
+    const type = typeof payload.type === 'string' ? payload.type : 'semantic';
+    const tags: string[] = Array.isArray(payload.tags) ? payload.tags.filter((t): t is string => typeof t === 'string') : [];
+    const importance = typeof payload.importance === 'number' ? payload.importance : 0.5;
+    const retentionTier = typeof payload.retention_tier === 'string' ? payload.retention_tier : 'T2';
+    const deviceId = typeof payload.device_id === 'string' ? payload.device_id : null;
+    const createdAt = typeof payload.created_at === 'string' ? payload.created_at : now;
+    const source = typeof payload.source === 'string' ? payload.source : 'import';
+    const category = typeof payload.category === 'string' ? payload.category : null;
+    const decayEligible = typeof payload.decay_eligible === 'boolean' ? payload.decay_eligible : true;
+    const checksum = typeof payload.checksum === 'string' ? payload.checksum : '';
+
+    // Handle expires_at which may be stored as epoch seconds in Qdrant
+    let expiresAt: string | null = null;
+    if (typeof payload.expires_at === 'number' && payload.expires_at > 0) {
+      expiresAt = new Date(payload.expires_at * 1000).toISOString();
+    } else if (typeof payload.expires_at === 'string') {
+      expiresAt = payload.expires_at;
+    }
+
+    // Check if already exists — skip if so (idempotent)
+    if (this.getMemoryById(id)) {
+      return false;
+    }
+
+    this.db.run(
+      `INSERT OR IGNORE INTO memories (
+        id, namespace, collection, type, category, content, summary, tags, source, checksum,
+        importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
+        last_operation, merged_from, stale, archived, vector_synced, device_id, created_at, updated_at, last_accessed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id, namespace, collection, type, category, content, summary,
+        JSON.stringify(tags), source, checksum, importance, retentionTier,
+        expiresAt, decayEligible ? 1 : 0, null, 0,
+        'ADD', null, 0, 0, 1, deviceId, createdAt, now, now,
+      ],
+    );
+    this.db.run(
+      `INSERT OR IGNORE INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
+      [id, namespace, content, summary, tags.join(' ')],
+    );
+    this.markDirty();
+    return true;
   }
 
   updateMemory(id: string, fields: Partial<MemoryRecordWithoutEmbedding>): void {

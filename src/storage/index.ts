@@ -172,6 +172,31 @@ export class StorageManager {
     return affected;
   }
 
+  async bootstrapFromQdrant(logger?: { info: (obj: Record<string, unknown>) => void }): Promise<number> {
+    const log = (msg: string, data?: Record<string, unknown>) => {
+      if (logger) logger.info({ event: 'bootstrap', message: msg, ...data });
+    };
+
+    const collections = await this.qdrant.listAllCollections();
+    log(`[bootstrap] hydrating from qdrant: found ${collections.length} collections`, { collections_count: collections.length });
+
+    let total = 0;
+    for (const collectionName of collections) {
+      const points = await this.qdrant.scrollAll(collectionName);
+      let hydrated = 0;
+      for (const point of points) {
+        const inserted = this.sqlite.upsertMemoryFromPayload(point.id, point.payload);
+        if (inserted) hydrated++;
+      }
+      this.sqlite.flushIfDirty();
+      log(`[bootstrap] collection ${collectionName}: ${hydrated} points hydrated`, { collection: collectionName, hydrated });
+      total += hydrated;
+    }
+
+    log(`[bootstrap] complete: ${total} total memories hydrated`, { total });
+    return total;
+  }
+
   async clearManagedVectors(): Promise<number> {
     return this.qdrant.clearManagedCollections();
   }

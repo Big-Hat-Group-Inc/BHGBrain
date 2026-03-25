@@ -1,0 +1,4 @@
+id: new-device-bootstrap
+title: New-Device Bootstrap – Hydrate SQLite from Qdrant on First Run
+status: proposed
+created: 2026-03-25
