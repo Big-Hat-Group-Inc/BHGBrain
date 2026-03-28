@@ -42,6 +42,14 @@ export interface CollectionRecord {
   embedding_dimensions: number;
 }
 
+export interface BootstrapSectionRow {
+  namespace: string;
+  section_number: number;
+  status: 'pending' | 'complete';
+  memory_ids: string[];
+  updated_at: string;
+}
+
 export interface SqliteStorage {
   init(): Promise<void>;
   reloadFromDisk(): Promise<void>;
@@ -115,6 +123,13 @@ export interface SqliteStorage {
   upsertMemoryFromPayload(id: string, payload: Record<string, unknown>): boolean;
   listCategoryHeaders(): CategoryHeader[];
   getCategoryContentSlice(name: string, maxChars: number): string | null;
+
+  // Bootstrap session methods
+  createBootstrapSession(namespace: string, totalSections: number): void;
+  getBootstrapSession(namespace: string): BootstrapSectionRow[];
+  updateBootstrapSection(namespace: string, sectionNumber: number, status: 'pending' | 'complete', memoryIds: string[]): void;
+  resetBootstrapSection(namespace: string, sectionNumber: number): string[];
+  bootstrapSessionExists(namespace: string): boolean;
 }
 
 const SCHEMA_SQL = `
@@ -229,6 +244,15 @@ CREATE TABLE IF NOT EXISTS memory_archive (
 
 CREATE INDEX IF NOT EXISTS idx_memory_archive_memory_id ON memory_archive(memory_id);
 CREATE INDEX IF NOT EXISTS idx_memory_archive_expired_at ON memory_archive(expired_at DESC);
+
+CREATE TABLE IF NOT EXISTS bootstrap_sessions (
+  namespace TEXT NOT NULL,
+  section_number INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','complete')),
+  memory_ids TEXT NOT NULL DEFAULT '[]',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (namespace, section_number)
+);
 `;
 
 export class SqliteStore implements SqliteStorage {
@@ -1191,6 +1215,80 @@ export class SqliteStore implements SqliteStorage {
       access_count: this.getNumber(row, 'access_count'),
       tags: JSON.parse(this.getNullableString(row, 'tags') ?? '[]') as string[],
     };
+  }
+
+  // -- Bootstrap session methods --
+
+  createBootstrapSession(namespace: string, totalSections: number): void {
+    const now = new Date().toISOString();
+    for (let i = 1; i <= totalSections; i++) {
+      this.db.run(
+        `INSERT OR IGNORE INTO bootstrap_sessions (namespace, section_number, status, memory_ids, updated_at) VALUES (?, ?, 'pending', '[]', ?)`,
+        [namespace, i, now],
+      );
+    }
+    this.dirty = true;
+    this.scheduleDeferredFlush();
+  }
+
+  getBootstrapSession(namespace: string): BootstrapSectionRow[] {
+    const stmt = this.db.prepare(`SELECT * FROM bootstrap_sessions WHERE namespace = ? ORDER BY section_number`);
+    stmt.bind([namespace]);
+    const rows: BootstrapSectionRow[] = [];
+    while (stmt.step()) {
+      const row = this.getRow(stmt.getAsObject());
+      rows.push({
+        namespace: this.getString(row, 'namespace'),
+        section_number: this.getNumber(row, 'section_number'),
+        status: this.getString(row, 'status') as 'pending' | 'complete',
+        memory_ids: JSON.parse(this.getString(row, 'memory_ids')) as string[],
+        updated_at: this.getString(row, 'updated_at'),
+      });
+    }
+    stmt.free();
+    return rows;
+  }
+
+  updateBootstrapSection(namespace: string, sectionNumber: number, status: 'pending' | 'complete', memoryIds: string[]): void {
+    const now = new Date().toISOString();
+    this.db.run(
+      `UPDATE bootstrap_sessions SET status = ?, memory_ids = ?, updated_at = ? WHERE namespace = ? AND section_number = ?`,
+      [status, JSON.stringify(memoryIds), now, namespace, sectionNumber],
+    );
+    this.dirty = true;
+    this.scheduleDeferredFlush();
+  }
+
+  resetBootstrapSection(namespace: string, sectionNumber: number): string[] {
+    const stmt = this.db.prepare(`SELECT memory_ids FROM bootstrap_sessions WHERE namespace = ? AND section_number = ?`);
+    stmt.bind([namespace, sectionNumber]);
+    let memoryIds: string[] = [];
+    if (stmt.step()) {
+      const row = this.getRow(stmt.getAsObject());
+      memoryIds = JSON.parse(this.getString(row, 'memory_ids')) as string[];
+    }
+    stmt.free();
+
+    const now = new Date().toISOString();
+    this.db.run(
+      `UPDATE bootstrap_sessions SET status = 'pending', memory_ids = '[]', updated_at = ? WHERE namespace = ? AND section_number = ?`,
+      [now, namespace, sectionNumber],
+    );
+    this.dirty = true;
+    this.scheduleDeferredFlush();
+    return memoryIds;
+  }
+
+  bootstrapSessionExists(namespace: string): boolean {
+    const stmt = this.db.prepare(`SELECT COUNT(*) as cnt FROM bootstrap_sessions WHERE namespace = ?`);
+    stmt.bind([namespace]);
+    let exists = false;
+    if (stmt.step()) {
+      const row = this.getRow(stmt.getAsObject());
+      exists = this.getNumber(row, 'cnt') > 0;
+    }
+    stmt.free();
+    return exists;
   }
 
   private ensureMemoryColumns(): void {

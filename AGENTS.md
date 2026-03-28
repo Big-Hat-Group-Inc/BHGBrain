@@ -40,6 +40,7 @@ src/
 ├── storage/              # SQLite + Qdrant data layer
 ├── embedding/            # OpenAI embedding provider
 ├── pipeline/             # Write pipeline (extraction → decision → store)
+├── bootstrap/            # Onboarding: section definitions, session state
 ├── search/               # Hybrid semantic + fulltext search
 ├── tools/                # MCP tool handlers and schemas
 ├── resources/            # MCP resource handlers

@@ -15,6 +15,8 @@ import {
 import type { WriteResult, SearchResult, MemoryRecord } from '../domain/types.js';
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
 import { computeChecksum } from '../domain/normalize.js';
+import { handleImport } from './import.js';
+import { handleBootstrap } from './bootstrap.js';
 import { ZodError } from 'zod';
 
 export interface ToolContext {
@@ -82,6 +84,8 @@ async function dispatch(
     case 'collections': return handleCollections(ctx, args);
     case 'category': return handleCategory(ctx, args);
     case 'backup': return handleBackup(ctx, args);
+    case 'bootstrap': return handleBootstrap(ctx, args);
+    case 'import': return handleImport(ctx, args);
     case 'repair': return handleRepair(ctx, args);
     default:
       throw invalidInput(`Unknown tool: ${toolName}`);

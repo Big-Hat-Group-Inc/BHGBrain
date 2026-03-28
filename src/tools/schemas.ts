@@ -123,6 +123,36 @@ export const MCP_TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'bootstrap',
+    description: 'Interactive bootstrap interview for building your profile. Drives a stateful 10-section interview, storing memories as you go. Supports pause/resume across sessions.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: { type: 'string', enum: ['start', 'submit', 'status', 'reset'], description: 'The action to perform' },
+        section: { type: 'number', minimum: 1, maximum: 10, description: 'Section number (required for submit and reset)' },
+        answers: { type: 'string', description: 'Your answers for the section (required for submit)', maxLength: 500000 },
+        namespace: { type: 'string', description: 'Namespace scope (default: profile)', pattern: '^[a-zA-Z0-9/-]{1,200}$' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'import',
+    description: 'Import a structured profile or freeform document as discrete memories. Supports the 12-section bootstrap format and arbitrary markdown text.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        format: { type: 'string', enum: ['profile', 'freeform'], description: 'Input format: "profile" for 12-section bootstrap output, "freeform" for arbitrary text' },
+        content: { type: 'string', description: 'The document text to import', maxLength: 500000 },
+        namespace: { type: 'string', description: 'Namespace scope (default: profile)', pattern: '^[a-zA-Z0-9/-]{1,200}$' },
+        dry_run: { type: 'boolean', description: 'If true, returns a preview of what would be stored without writing', default: false },
+      },
+      required: ['format', 'content'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'repair',
     description: 'Recover memories from Qdrant that are missing in SQLite. Scrolls all Qdrant collections and re-inserts any points with content into SQLite.',
     inputSchema: {
