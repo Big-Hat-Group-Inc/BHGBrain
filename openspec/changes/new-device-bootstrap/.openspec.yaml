@@ -1,0 +1,8 @@
+schema: spec-driven
+created: 2026-03-25
+status: implemented
+implemented: 2026-03-25
+branch: feat/new-device-bootstrap
+issue: 5
+tests_added: 11
+tests_total: 145

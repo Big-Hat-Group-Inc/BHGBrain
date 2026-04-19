@@ -1,0 +1,58 @@
+You are working in the BHGBrain project at C:\GitHub\BHGBrain.
+
+gh CLI is authenticated. Remote is Big-Hat-Group-Inc/BHGBrain. GH_TOKEN is set in environment.
+
+## Background
+
+BHGBrain uses Qdrant Cloud as a shared vector store across multiple devices. Each device has its own local SQLite as a metadata index. On a new device, SQLite is empty. Qdrant already had 141 vectors from Device 1. BHGBrain health showed memory_count: 0 and all searches returned empty — because the search path JOINs Qdrant results against SQLite rows, and there are none on a new device. No bootstrap/sync mechanism exists.
+
+## Task 1: Create GitHub issue
+
+Run this exact gh command:
+gh issue create --repo Big-Hat-Group-Inc/BHGBrain --title "feat: new-device bootstrap - hydrate SQLite from Qdrant on first run" --body "When BHGBrain is installed on a new device, local SQLite is empty. Qdrant Cloud already contains memories from other devices, but all searches return empty because the search path JOINs Qdrant results against local SQLite rows which do not exist on the new device. Observed: Device 2 started fresh, Qdrant had 141 vectors from Device 1, memory_count showed 0, all searches empty. Proposed fix: on startup when memory_count=0 and Qdrant has data, scan all bhgbrain_* collections, reconstruct MemoryRecord rows from Qdrant payloads, upsert into SQLite. Also add bhgbrain repair --from-qdrant CLI command."
+
+## Task 2: Create openspec
+
+Create directory openspec/changes/new-device-bootstrap/ with these 3 files, following the structure of openspec/changes/device-namespace-partitioning/ exactly:
+
+.openspec.yaml:
+schema: spec-driven
+created: 2026-03-25
+
+proposal.md - include sections: Why, What Changes, Capabilities (new: new-device-bootstrap-hydration, repair-from-qdrant), Impact, Non-Goals (no real-time sync, no conflict resolution)
+
+design.md - cover: scanAllCollections() method, bootstrapFromQdrant() on StorageManager, startup hook, payload field mapping (id, content, summary, namespace, collection, type, tags, importance, retention_tier, device_id, created_at, checksum), CLI repair --from-qdrant subcommand
+
+tasks.md - numbered tasks:
+1. src/storage/qdrant.ts: add scanAllCollections() - list bhgbrain_* collections via getCollections(), scroll all points per collection, return array of payloads
+2. src/storage/sqlite.ts: add upsertMemoryFromPayload() - INSERT OR IGNORE by id, map payload fields to columns
+3. src/storage/index.ts: add bootstrapFromQdrant() on StorageManager - orchestrate scan+upsert, log progress per collection, return total count
+4. src/index.ts: after startup health check, if memory_count === 0 call bootstrapFromQdrant(), log results, wrap in try/catch so failure warns but does not crash
+5. src/cli/index.ts: add repair --from-qdrant flag to existing repair command (or new subcommand), calls bootstrapFromQdrant(), prints summary
+6. npm run build - must succeed
+7. npm test - must pass
+
+## Task 3: Implement the patch
+
+Implement all tasks above. Notes:
+- QdrantClient: use client.getCollections() then client.scroll(collectionName, { limit: 100, with_payload: true }) with pagination via next_page_offset
+- Filter collections: name.startsWith('bhgbrain_')
+- SQLite upsert: INSERT OR IGNORE INTO memories (id, content, ...) VALUES (?, ?, ...)
+- Startup: check ctx.storage.getStats().memory_count === 0 (or equivalent health check result)
+- Wrap bootstrapFromQdrant in try/catch, log warning on failure, never throw to caller
+- Log lines: "[bootstrap] scanning qdrant for existing memories..." and "[bootstrap] hydrated N memories from Qdrant across M collections"
+
+## Task 4: Build and test
+
+cd C:\GitHub\BHGBrain
+npm run build
+npm test
+
+## Task 5: Commit and push
+
+git checkout -b feat/new-device-bootstrap
+git add -A
+git commit -m "feat: new-device bootstrap - hydrate SQLite from Qdrant on first run"
+git push -u origin feat/new-device-bootstrap
+
+When completely finished, run: openclaw system event --text "Done: BHGBrain new-device-bootstrap complete - issue created, openspec written, patch implemented and tested, branch feat/new-device-bootstrap pushed" --mode now
