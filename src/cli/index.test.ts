@@ -267,4 +267,25 @@ describe('CLI', () => {
     expect(logSpy).toHaveBeenCalledWith(JSON.stringify([{ id: 'arch-1' }], null, 2));
     expect(logSpy).toHaveBeenCalledWith(JSON.stringify({ restored: true }, null, 2));
   });
+
+  it('repair --from-qdrant calls bootstrapFromQdrant and prints summary', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const context = createMockContext();
+    (context.storage as unknown as Record<string, unknown>).bootstrapFromQdrant = vi.fn(async () => 42);
+
+    await runProgram(['repair', '--from-qdrant'], context);
+
+    expect((context.storage as unknown as { bootstrapFromQdrant: ReturnType<typeof vi.fn> }).bootstrapFromQdrant).toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith('[repair] hydrated 42 memories from Qdrant');
+  });
+
+  it('repair without flags shows error', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const context = createMockContext();
+
+    await runProgram(['repair'], context);
+
+    expect(errorSpy).toHaveBeenCalledWith('Please specify a repair source. Available: --from-qdrant');
+    expect(process.exitCode).toBe(1);
+  });
 });

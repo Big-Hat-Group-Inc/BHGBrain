@@ -14,6 +14,25 @@
 
 ## Planned
 
+### Docker Container Support
+**Priority:** High
+**Effort:** ~1 day
+
+Add official Docker packaging so users can run BHGBrain with a single `docker compose up` command instead of manually installing Node.js, cloning the repo, and building from source.
+
+**Proposed approach:**
+- Multi-stage `Dockerfile` based on `node:20-slim` with built-in healthcheck
+- `docker-compose.yml` with profiles: `self-hosted` (bundled Qdrant sidecar) and default (Qdrant Cloud via env vars)
+- `BHGBRAIN_*` env vars override `config.json` for idiomatic Docker configuration
+- Single `/data` volume for SQLite DB, config, and backups
+
+**Behavior:**
+- New containers with empty `/data` auto-hydrate from Qdrant via `bootstrapFromQdrant()`
+- Env vars take precedence over file-based config (env wins over file)
+- Defaults set for container use: `0.0.0.0` bind, loopback check disabled, `/data` volume path
+
+---
+
 ### Bulk Profile Import Tool
 **Priority:** Medium  
 **Effort:** ~1–2 days  
