@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AzureFoundryEmbeddingProvider } from './azure-foundry.js';
 import { DegradedEmbeddingProvider, OpenAIEmbeddingProvider, createEmbeddingProvider } from './index.js';
 import type { BrainConfig } from '../config/index.js';
 import type { CircuitBreaker } from '../resilience/index.js';
@@ -7,7 +8,18 @@ describe('OpenAIEmbeddingProvider', () => {
   function createConfig(): BrainConfig {
     return {
       data_dir: 'test-data',
-      embedding: { provider: 'openai', model: 'test-model', api_key_env: 'OPENAI_API_KEY', dimensions: 3 },
+      embedding: {
+        provider: 'openai',
+        model: 'test-model',
+        api_key_env: 'OPENAI_API_KEY',
+        dimensions: 3,
+        request_timeout_ms: 30000,
+        max_batch_inputs: 2048,
+        retry: {
+          max_attempts: 3,
+          backoff_ms: 1000,
+        },
+      },
       qdrant: { mode: 'embedded', embedded_path: './qdrant', external_url: null, api_key_env: null },
       transport: {
         http: { enabled: true, host: '127.0.0.1', port: 3721, bearer_token_env: 'BHGBRAIN_TOKEN' },
@@ -66,7 +78,24 @@ describe('OpenAIEmbeddingProvider', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     delete process.env.OPENAI_API_KEY;
+    delete process.env.AZURE_FOUNDRY_API_KEY;
   });
+
+  function createAzureConfig(): BrainConfig {
+    return {
+      ...createConfig(),
+      embedding: {
+        ...createConfig().embedding,
+        provider: 'azure-foundry',
+        model: 'text-embedding-3-small',
+        dimensions: 1536,
+        azure: {
+          resource_name: 'test-resource',
+          api_key_env: 'AZURE_FOUNDRY_API_KEY',
+        },
+      },
+    };
+  }
 
   it('invokes the breaker for embed calls', async () => {
     process.env.OPENAI_API_KEY = 'test-key';
@@ -147,6 +176,30 @@ describe('OpenAIEmbeddingProvider', () => {
 
     const created = createEmbeddingProvider(config);
     expect(created).toBeInstanceOf(DegradedEmbeddingProvider);
+  });
+
+  it('creates the Azure provider when Azure credentials are present', () => {
+    process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
+    const created = createEmbeddingProvider(createAzureConfig());
+    expect(created).toBeInstanceOf(AzureFoundryEmbeddingProvider);
+  });
+
+  it('degrades the Azure provider only when startup credentials are missing', () => {
+    const created = createEmbeddingProvider(createAzureConfig());
+    expect(created).toBeInstanceOf(DegradedEmbeddingProvider);
+  });
+
+  it('rethrows invalid Azure config instead of degrading', () => {
+    process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
+    const config = {
+      ...createAzureConfig(),
+      embedding: {
+        ...createAzureConfig().embedding,
+        azure: undefined,
+      },
+    };
+
+    expect(() => createEmbeddingProvider(config)).toThrow('embedding.azure configuration is required for Azure provider');
   });
 
   it('throws when createEmbeddingProvider receives an unknown provider', () => {

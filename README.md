@@ -187,6 +187,8 @@ Set `qdrant.mode` to `external` in your config and point `external_url` at your 
 }
 ```
 
+For Azure, `embedding.model` is the deployment name sent upstream, not the public model-family label. Azure credentials are loaded once at startup from `AZURE_FOUNDRY_API_KEY`; rotating that secret requires a restart or explicit config reload.
+
 ---
 
 ## Installation
@@ -233,15 +235,31 @@ The file is created automatically on first run with all defaults applied. Edit i
 
   // Embedding provider configuration
   "embedding": {
-    // Only "openai" is supported currently
+    // Provider: "openai" or "azure-foundry"
     "provider": "openai",
-    // OpenAI model to use for embeddings
+    // Model name (for OpenAI) or Azure deployment name (for Azure)
     "model": "text-embedding-3-small",
-    // Name of the environment variable holding the OpenAI API key
-    "api_key_env": "OPENAI_API_KEY",
     // Vector dimensions produced by the model. Must match the model's output.
     // IMPORTANT: Changing this after collections are created requires recreating collections.
-    "dimensions": 1536
+    "dimensions": 1536,
+    // Request timeout in milliseconds
+    "request_timeout_ms": 30000,
+    // Maximum inputs per embedding request (chunking threshold)
+    "max_batch_inputs": 2048,
+    // Retry configuration for transient failures
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 1000
+    },
+    // Name of the environment variable holding the OpenAI API key (ignored for Azure)
+    "api_key_env": "OPENAI_API_KEY",
+    // Azure-specific configuration (required when provider = "azure-foundry")
+    "azure": {
+      // Azure resource name used to construct the endpoint URL
+      "resource_name": "my-foundry-resource",
+      // Name of the environment variable holding the Azure API key
+      "api_key_env": "AZURE_FOUNDRY_API_KEY"
+    }
   },
 
   // Qdrant connection configuration
@@ -424,7 +442,8 @@ The file is created automatically on first run with all defaults applied. Edit i
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `OPENAI_API_KEY` | Yes (for embeddings) | — | OpenAI API key. Server starts in **degraded mode** if missing — semantic search and ingestion will fail, but fulltext search and category reads still work. |
+| `OPENAI_API_KEY` | Yes (for OpenAI provider) | — | OpenAI API key. Server starts in **degraded mode** if missing — semantic search and ingestion will fail, but fulltext search and category reads still work. |
+| `AZURE_FOUNDRY_API_KEY` | Yes (for Azure provider) | — | Azure API key for Azure OpenAI-compatible embeddings endpoint. Required when `embedding.provider = "azure-foundry"`. |
 | `BHGBRAIN_TOKEN` | Required for non-loopback HTTP | — | Bearer token for HTTP authentication. Server **refuses to start** if the host is non-loopback and this is unset (unless `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Required for Qdrant Cloud | — | Set `qdrant.api_key_env` in config to the name of this variable. The default config field name is `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generated from hostname | Override the device identifier for multi-device setups. See [Device Identity Resolution](#device-identity-resolution). |
@@ -2460,6 +2479,8 @@ The image uses a multi-stage build on `node:20-slim` (~200MB final size). The he
 What's new:
 
 - **Circuit breakers** for OpenAI and Qdrant. After consecutive failures exceed the threshold (default 5), the breaker opens and short-circuits requests for 30 seconds before probing recovery. States are visible in the health endpoint (`circuitBreakers` field). Configure via `resilience.circuit_breaker` in `config.json`.
+- **Azure embedding provider.** Added support for Azure AI Foundry (Azure OpenAI-compatible embeddings endpoint). Configure `embedding.provider: "azure-foundry"` and provide `embedding.azure.resource_name` and `AZURE_FOUNDRY_API_KEY` environment variable.
+- **Azure rollout guidance.** Treat `embedding.model` as the Azure deployment name, validate retrieval quality in a canary namespace or collection before cutover, and roll back by switching `embedding.provider` back to `"openai"` and restarting the process.
 - **Percentile metrics.** Histogram metrics now emit `_p50`, `_p95`, and `_p99` suffixes alongside the existing `_avg` and `_count`.
 - **Post-restore reconciliation hardening.** `backup.restore` now acquires a fail-safe guard via `beginRestoreOperation()`, isolates vector reconciliation errors per-step, and flushes progress incrementally. A vector-store failure during reconciliation returns degraded readiness instead of a full restore failure.
 - **stdio log routing.** Pino structured logs are redirected to stderr when `--stdio` is active, preventing corruption of the MCP JSON-RPC handshake on stdout.
@@ -2474,6 +2495,20 @@ What's new:
       "failure_threshold": 5,       // consecutive failures to open
       "open_window_ms": 30000,      // ms before half-open probe
       "half_open_probe_count": 1    // probes to close
+    }
+  }
+}
+```
+
+**Azure embedding configuration** (adds `embedding.azure`):
+```jsonc
+{
+  "embedding": {
+    "provider": "azure-foundry",
+    "model": "my-embedding-deployment",
+    "dimensions": 1536,
+    "azure": {
+      "resource_name": "my-foundry-resource"
     }
   }
 }
@@ -2596,6 +2631,17 @@ When a T0 (foundational) memory is updated, the prior version is automatically s
 ### Embedding Model Compatibility
 
 Collections lock their embedding model and dimensions at creation time. If you change `embedding.model` or `embedding.dimensions` in config, new memories in existing collections will be rejected with a `CONFLICT` error until you create a new collection. This prevents mixing incompatible embedding spaces in the same Qdrant index.
+
+**Provider-specific notes:**
+- **OpenAI**: The `embedding.model` field specifies the OpenAI model name (e.g., `text-embedding-3-small`).
+- **Azure Foundry**: The `embedding.model` field specifies the Azure deployment name. The `embedding.dimensions` must match the output dimensions configured for that deployment.
+
+Make sure to set `embedding.provider` to `"openai"` or `"azure-foundry"` accordingly.
+
+**Migration guidance:**
+- Use a canary namespace or collection before switching production traffic to Azure.
+- Roll back by switching `embedding.provider` back to `"openai"` and restarting BHGBrain.
+- Reuse an existing collection only when the model family and configured dimensions remain compatible; otherwise create a new collection to avoid mixing embedding spaces.
 
 ### stdio Log Routing
 

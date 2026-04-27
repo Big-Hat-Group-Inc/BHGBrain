@@ -5,16 +5,65 @@ import { hostname } from 'node:os';
 
 const DEVICE_ID_RE = /^[a-zA-Z0-9._-]{1,64}$/;
 
+const AzureEmbeddingSchema = z.object({
+  resource_name: z.string()
+    .trim()
+    .toLowerCase()
+    .regex(/^[a-z0-9-]+$/, 'resource_name must contain only lowercase letters, numbers, and hyphens'),
+  api_key_env: z.string().default('AZURE_FOUNDRY_API_KEY'),
+});
+
 const ConfigSchema = z.object({
   data_dir: z.string().optional(),
   device: z.object({
     id: z.string().regex(DEVICE_ID_RE).optional(),
   }).default({}),
   embedding: z.object({
-    provider: z.enum(['openai']).default('openai'),
+    provider: z.enum(['openai', 'azure-foundry']).default('openai'),
     model: z.string().default('text-embedding-3-small'),
     api_key_env: z.string().default('OPENAI_API_KEY'),
     dimensions: z.number().int().positive().default(1536),
+    request_timeout_ms: z.number().int().positive().default(30000),
+    max_batch_inputs: z.number().int().min(1).max(2048).default(2048),
+    retry: z.object({
+      max_attempts: z.number().int().min(1).max(5).default(3),
+      backoff_ms: z.number().int().positive().default(1000),
+    }).default({}),
+    azure: AzureEmbeddingSchema.optional(),
+  }).superRefine((value, ctx) => {
+    if (value.provider === 'azure-foundry' && !value.azure) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'embedding.azure is required when embedding.provider = "azure-foundry"',
+        path: ['azure'],
+      });
+    }
+
+    if (value.provider === 'azure-foundry') {
+      if (value.model === 'text-embedding-ada-002' && value.dimensions !== 1536) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'text-embedding-ada-002 requires dimensions = 1536',
+          path: ['dimensions'],
+        });
+      }
+
+      if (value.model === 'text-embedding-3-small' && value.dimensions > 1536) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'text-embedding-3-small supports at most 1536 dimensions',
+          path: ['dimensions'],
+        });
+      }
+
+      if (value.model === 'text-embedding-3-large' && value.dimensions > 3072) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'text-embedding-3-large supports at most 3072 dimensions',
+          path: ['dimensions'],
+        });
+      }
+    }
   }).default({}),
   qdrant: z.object({
     mode: z.enum(['embedded', 'external']).default('embedded'),
