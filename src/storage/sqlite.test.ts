@@ -253,6 +253,80 @@ describe('SqliteStore', () => {
     store.endLifecycleOperation('restore');
   });
 
+  // -- upsertMemoryFromPayload (bootstrap) --
+
+  it('upsertMemoryFromPayload inserts a record from Qdrant payload', () => {
+    const payload = {
+      content: 'bootstrapped content',
+      summary: 'bootstrapped summary',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic',
+      tags: ['imported'],
+      importance: 0.8,
+      retention_tier: 'T1',
+      device_id: 'device-1',
+      created_at: '2026-01-01T00:00:00.000Z',
+      source: 'api',
+      category: null,
+      decay_eligible: false,
+      checksum: 'qdrant-chk',
+    };
+    const inserted = store.upsertMemoryFromPayload('bootstrap-id-1', payload);
+    expect(inserted).toBe(true);
+
+    const mem = store.getMemoryById('bootstrap-id-1');
+    expect(mem).not.toBeNull();
+    expect(mem!.content).toBe('bootstrapped content');
+    expect(mem!.summary).toBe('bootstrapped summary');
+    expect(mem!.importance).toBe(0.8);
+    expect(mem!.retention_tier).toBe('T1');
+    expect(mem!.device_id).toBe('device-1');
+    expect(mem!.source).toBe('api');
+    expect(mem!.decay_eligible).toBe(false);
+    expect(mem!.vector_synced).toBe(true);
+  });
+
+  it('upsertMemoryFromPayload is idempotent — skips existing rows', () => {
+    const payload = { content: 'first', summary: 'first', checksum: 'chk1' };
+    expect(store.upsertMemoryFromPayload('dup-id', payload)).toBe(true);
+    expect(store.upsertMemoryFromPayload('dup-id', { content: 'second', summary: 'second', checksum: 'chk2' })).toBe(false);
+    expect(store.getMemoryById('dup-id')!.content).toBe('first');
+  });
+
+  it('upsertMemoryFromPayload applies defaults for missing fields', () => {
+    const inserted = store.upsertMemoryFromPayload('defaults-id', {});
+    expect(inserted).toBe(true);
+
+    const mem = store.getMemoryById('defaults-id')!;
+    expect(mem.content).toBe('');
+    expect(mem.namespace).toBe('global');
+    expect(mem.collection).toBe('general');
+    expect(mem.type).toBe('semantic');
+    expect(mem.importance).toBe(0.5);
+    expect(mem.retention_tier).toBe('T2');
+    expect(mem.source).toBe('import');
+    expect(mem.decay_eligible).toBe(true);
+  });
+
+  it('upsertMemoryFromPayload converts epoch seconds expires_at', () => {
+    const epochSec = 1735689600; // 2025-01-01T00:00:00Z
+    store.upsertMemoryFromPayload('epoch-id', { expires_at: epochSec, checksum: 'e' });
+    const mem = store.getMemoryById('epoch-id')!;
+    expect(mem.expires_at).toBe(new Date(epochSec * 1000).toISOString());
+  });
+
+  it('upsertMemoryFromPayload populates FTS index for search', () => {
+    store.upsertMemoryFromPayload('fts-id', {
+      content: 'quantum computing breakthrough',
+      summary: 'quantum summary',
+      tags: ['physics', 'cs'],
+      checksum: 'fts-chk',
+    });
+    const results = store.fullTextSearch('global', 'quantum', 10);
+    expect(results.some(r => r.id === 'fts-id')).toBe(true);
+  });
+
   // -- Health --
 
   it('passes health check', () => {

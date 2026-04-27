@@ -59,6 +59,20 @@ async function main() {
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
   const storage = new StorageManager(sqlite, qdrant, embedding);
 
+  // Bootstrap: hydrate SQLite from Qdrant if this is a new device
+  try {
+    const memoryCount = sqlite.countMemories();
+    if (memoryCount === 0) {
+      logger.info({ event: 'bootstrap', message: '[bootstrap] SQLite empty, checking Qdrant for existing memories' });
+      const hydrated = await storage.bootstrapFromQdrant(logger);
+      if (hydrated > 0) {
+        logger.info({ event: 'bootstrap', message: `[bootstrap] hydrated ${hydrated} memories from Qdrant` });
+      }
+    }
+  } catch (err) {
+    logger.warn({ event: 'bootstrap_error', message: `[bootstrap] failed to hydrate from Qdrant: ${(err as Error).message}` });
+  }
+
   // Initialize services
   const pipeline = new WritePipeline(config, storage, embedding);
   const searchService = new SearchService(config, storage, embedding, metrics);

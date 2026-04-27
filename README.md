@@ -45,11 +45,12 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
 13. [Health & Metrics](#health--metrics)
 14. [Security](#security)
 15. [MCP Resources](#mcp-resources)
-16. [Bootstrap Prompt](#bootstrap-prompt)
+16. [Onboarding](#onboarding)
 17. [CLI Reference](#cli-reference)
 18. [MCP Tools Reference](#mcp-tools-reference)
-19. [Upgrading](#upgrading)
-20. [Behavior Notes](#behavior-notes)
+19. [Docker](#docker)
+20. [Upgrading](#upgrading)
+21. [Behavior Notes](#behavior-notes)
 
 ---
 
@@ -1851,22 +1852,54 @@ Touching a memory via `memory://{id}` increments its access count and schedules 
 
 ---
 
-## Bootstrap Prompt
+## Onboarding
 
-`BootstrapPrompt.txt` contains a structured interview prompt for building a **work second brain profile** with an AI agent.
+BHGBrain offers three ways to build your work profile, from fully guided to batch import.
 
-Use it when onboarding a new AI assistant or when you want to populate BHGBrain with a rich, structured profile of your work context, entities, tenants, and disambiguation rules.
+### Option 1: Interactive Bootstrap Tool (Recommended)
 
-### How to use it
+The `bootstrap` MCP tool drives a stateful 10-section interview directly within BHGBrain. It tracks progress, stores memories as you go, and supports pause/resume across sessions.
 
-1. Start a fresh conversation with your AI assistant (Claude, GPT-4, etc.).
-2. Paste the entire contents of `BootstrapPrompt.txt` as your first message.
-3. Let the agent interview you section by section.
-4. At the end, the agent will produce a structured profile you can save to BHGBrain via `bhgbrain.remember` calls (or `mcporter call bhgbrain.remember`).
+```json
+// Start (or resume) the interview
+{ "name": "bootstrap", "arguments": { "action": "start" } }
+
+// Submit answers for a section
+{ "name": "bootstrap", "arguments": { "action": "submit", "section": 1, "answers": "Jane Doe, CTO at Acme Corp..." } }
+
+// Check progress
+{ "name": "bootstrap", "arguments": { "action": "status" } }
+
+// Re-do a section
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+```
+
+The tool returns the next section's questions after each submission, so the agent can drive the conversation naturally. Sessions persist in SQLite — you can close your client and pick up where you left off.
+
+### Option 2: Bulk Profile Import
+
+If you already have a completed profile document (from a previous bootstrap, a wiki, or structured notes), use the `import` tool to ingest it in one shot:
+
+```json
+// Import a 12-section bootstrap profile
+{ "name": "import", "arguments": { "format": "profile", "content": "## 1. Identity & Role\n..." } }
+
+// Import arbitrary markdown as memories
+{ "name": "import", "arguments": { "format": "freeform", "content": "## Architecture\nWe use microservices..." } }
+
+// Preview what would be stored without writing
+{ "name": "import", "arguments": { "format": "profile", "content": "...", "dry_run": true } }
+```
+
+The tool parses the document into discrete memories with correct collection, tier, type, importance, and tags per section. Deduplication applies — safe to re-import after updates.
+
+### Option 3: Manual Bootstrap Prompt
+
+`BootstrapPrompt.txt` contains a standalone interview prompt you can paste into any AI conversation. The agent interviews you section by section and calls `bhgbrain.remember` for each fact. This works with any MCP-connected client without requiring the `bootstrap` or `import` tools.
 
 ### What it covers
 
-The interview walks through 10 sections:
+All three methods walk through the same 10 sections:
 
 | Section | What it captures |
 |---|---|
@@ -1881,9 +1914,7 @@ The interview walks through 10 sections:
 | 9. Tenant & environment map | Azure tenants, dev/staging/prod |
 | 10. Operating rules | Naming conventions, disambiguation, default assumptions |
 
-The output produces a clean structured profile with all 10 sections plus a disambiguation guide - exactly what BHGBrain needs to answer questions about your work reliably.
-
-**Bootstrap memories default to T0.** Content ingested via the bootstrap flow should be tagged with `source: import` and `tags: ["bootstrap", "profile"]`. The heuristic classifier recognizes these signals and assigns T0 (foundational) tier.
+**Bootstrap memories default to T0.** Content ingested via the bootstrap flow is tagged with the appropriate source (`agent` for the bootstrap tool, `import` for bulk import) and assigned tiers per the section mapping table.
 
 ---
 
@@ -1943,7 +1974,7 @@ bhgbrain server token                 # Generate a new random bearer token
 
 ## MCP Tools Reference
 
-BHGBrain exposes 9 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
+BHGBrain exposes 11 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
 
 ```json
 {
@@ -2269,6 +2300,79 @@ Create, list, or restore memory backups.
 
 ---
 
+### `bootstrap` - Interactive Onboarding
+
+Drive a stateful 10-section interview to build your work profile. Supports pause/resume across sessions.
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `action` | `"start" \| "submit" \| "status" \| "reset"` | **Yes** | - | The action to perform. |
+| `section` | `integer (1-10)` | For submit/reset | - | Section number to submit answers for or reset. |
+| `answers` | `string` | For submit | - | Your answers for the section. Max 500,000 characters. |
+| `namespace` | `string` | No | `"profile"` | Namespace scope. |
+
+**Actions:**
+
+- **`start`** — Creates a new session or resumes an existing one. Returns the first incomplete section's title, questions, and instructions.
+- **`submit`** — Stores answers as discrete memories for the given section, marks it complete, and returns the next section.
+- **`status`** — Returns progress overview: which sections are complete, memory counts, last updated.
+- **`reset`** — Deletes all memories for a section and marks it as pending for re-collection.
+
+**Output (start):**
+
+```json
+{
+  "complete": false,
+  "current_section": 1,
+  "title": "Identity & Role",
+  "questions": ["What is your full name...?", "..."],
+  "progress": { "complete": 0, "total": 10 }
+}
+```
+
+**Notes:**
+- Sessions are persisted in SQLite — survives client restarts.
+- One session per namespace. Calling `start` on an existing session resumes it.
+- Submitting to an already-complete section returns an error; use `reset` first.
+
+---
+
+### `import` - Bulk Profile Import
+
+Import a structured profile or freeform document as discrete memories in one shot.
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `format` | `"profile" \| "freeform"` | **Yes** | - | `"profile"` for 12-section bootstrap output, `"freeform"` for arbitrary markdown. |
+| `content` | `string` | **Yes** | - | The document text to import. Max 500,000 characters. |
+| `namespace` | `string` | No | `"profile"` | Namespace scope. |
+| `dry_run` | `boolean` | No | `false` | When `true`, returns a preview of what would be stored without writing. |
+
+**Output:**
+
+```json
+{
+  "dry_run": false,
+  "format": "profile",
+  "memories_created": 24,
+  "duplicates_skipped": 2,
+  "collections": ["identity", "goals", "entities", "..."],
+  "sections_processed": 10
+}
+```
+
+**Notes:**
+- `format: "profile"` recognizes `## N.` section headings and maps each to the correct collection, tier, type, importance, and tags.
+- `format: "freeform"` splits by headings and paragraph boundaries with default metadata (collection: `general`, tier: `T2`).
+- Deduplication applies via the existing write pipeline — safe to re-import.
+- `dry_run: true` returns memory previews with zero writes.
+
+---
+
 ### `repair` — Rebuild SQLite from Qdrant
 
 Recover memories from Qdrant into the local SQLite database. Used for multi-device setup, data loss recovery, or new device onboarding. See [Repair and Recovery](#repair-and-recovery).
@@ -2297,6 +2401,72 @@ Recover memories from Qdrant into the local SQLite database. Used for multi-devi
 - Only points with `content` in their Qdrant payload can be recovered. Pre-1.3 memories without content in Qdrant are reported as `skipped_no_content`.
 - Recovered memories preserve their original `device_id` from the Qdrant payload. If no `device_id` exists in the payload, the local device's ID is used.
 - After recovery, run `npm run build` and restart the server if needed. The recovered memories are immediately available for search and recall.
+
+---
+
+## Docker
+
+BHGBrain provides official Docker support with two deployment modes: self-hosted Qdrant (sidecar container) and Qdrant Cloud (external).
+
+### Quick Start
+
+```bash
+# 1. Copy and configure environment
+cp .env.example .env
+# Edit .env with your OPENAI_API_KEY and other settings
+
+# 2a. Self-hosted Qdrant (includes Qdrant sidecar)
+docker compose --profile self-hosted up
+
+# 2b. Qdrant Cloud (no sidecar, configure BHGBRAIN_QDRANT_URL in .env)
+docker compose up
+```
+
+The server is available at `http://localhost:3721`. Check health with:
+
+```bash
+curl http://localhost:3721/health
+```
+
+### Compose Profiles
+
+| Command | What runs |
+|---------|-----------|
+| `docker compose --profile self-hosted up` | BHGBrain + Qdrant sidecar (port 6333) |
+| `docker compose up` | BHGBrain only (connect to Qdrant Cloud via env vars) |
+
+### Docker Environment Variables
+
+These `BHGBRAIN_*` env vars override values from `config.json` when set:
+
+| Variable | Config field | Default in container | Description |
+|----------|-------------|---------------------|-------------|
+| `BHGBRAIN_DATA_DIR` | `data_dir` | `/data` | Container volume path |
+| `BHGBRAIN_HTTP_HOST` | `transport.http.host` | `0.0.0.0` | Bind address |
+| `BHGBRAIN_HTTP_PORT` | `transport.http.port` | `3721` | HTTP port |
+| `BHGBRAIN_QDRANT_MODE` | `qdrant.mode` | `embedded` | `embedded` or `external` |
+| `BHGBRAIN_QDRANT_URL` | `qdrant.external_url` | — | Qdrant endpoint URL |
+| `BHGBRAIN_REQUIRE_LOOPBACK` | `security.require_loopback_http` | `false` | Loopback restriction |
+| `BHGBRAIN_ALLOW_UNAUTHENTICATED` | `security.allow_unauthenticated_http` | `false` | Skip auth check |
+| `BHGBRAIN_LOG_LEVEL` | `observability.log_level` | `info` | Log verbosity |
+
+Plus the existing runtime variables: `OPENAI_API_KEY`, `BHGBRAIN_TOKEN`, `QDRANT_API_KEY`, `BHGBRAIN_DEVICE_ID`.
+
+### Volume
+
+The `/data` volume persists the SQLite database, resolved `config.json`, and backups across container restarts. This maps to `BHGBRAIN_DATA_DIR`.
+
+### Bootstrap on First Run
+
+When a container starts with an empty `/data` volume and connects to a Qdrant instance that already has memories, BHGBrain automatically hydrates the local SQLite database from Qdrant via `bootstrapFromQdrant()`. No manual `repair` step is needed.
+
+### Building the Image
+
+```bash
+docker build -t bhgbrain .
+```
+
+The image uses a multi-stage build on `node:20-slim` (~200MB final size). The healthcheck uses Node.js native `fetch()` — no `curl` required.
 
 ---
 

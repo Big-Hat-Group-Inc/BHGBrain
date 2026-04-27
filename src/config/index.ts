@@ -186,7 +186,59 @@ export function loadConfig(configPath?: string): BrainConfig {
     config.data_dir = getDefaultDataDir();
   }
 
+  applyEnvOverrides(config);
+
   return config;
+}
+
+/**
+ * Override config values from BHGBRAIN_* environment variables.
+ * Env vars take precedence over file-based config — the expected
+ * behavior when running inside a Docker container.
+ */
+export function applyEnvOverrides(config: BrainConfig): void {
+  const env = process.env;
+
+  if (env.BHGBRAIN_DATA_DIR) {
+    config.data_dir = env.BHGBRAIN_DATA_DIR;
+  }
+
+  if (env.BHGBRAIN_HTTP_HOST) {
+    config.transport.http.host = env.BHGBRAIN_HTTP_HOST;
+  }
+
+  if (env.BHGBRAIN_HTTP_PORT) {
+    const port = parseInt(env.BHGBRAIN_HTTP_PORT, 10);
+    if (!Number.isNaN(port)) {
+      config.transport.http.port = port;
+    }
+  }
+
+  if (env.BHGBRAIN_QDRANT_MODE) {
+    const mode = env.BHGBRAIN_QDRANT_MODE;
+    if (mode === 'embedded' || mode === 'external') {
+      config.qdrant.mode = mode;
+    }
+  }
+
+  if (env.BHGBRAIN_QDRANT_URL) {
+    config.qdrant.external_url = env.BHGBRAIN_QDRANT_URL;
+  }
+
+  if (env.BHGBRAIN_REQUIRE_LOOPBACK) {
+    config.security.require_loopback_http = env.BHGBRAIN_REQUIRE_LOOPBACK === 'true';
+  }
+
+  if (env.BHGBRAIN_ALLOW_UNAUTHENTICATED) {
+    config.security.allow_unauthenticated_http = env.BHGBRAIN_ALLOW_UNAUTHENTICATED === 'true';
+  }
+
+  if (env.BHGBRAIN_LOG_LEVEL) {
+    const level = env.BHGBRAIN_LOG_LEVEL;
+    if (level === 'debug' || level === 'info' || level === 'warn' || level === 'error') {
+      config.observability.log_level = level;
+    }
+  }
 }
 
 /**

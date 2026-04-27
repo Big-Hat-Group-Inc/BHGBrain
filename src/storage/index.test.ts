@@ -239,4 +239,78 @@ describe('StorageManager cross-store consistency', () => {
       expect(sqlite.getMemoryById('mem-b')?.vector_synced).toBe(true);
     });
   });
+
+  describe('bootstrapFromQdrant', () => {
+    it('hydrates SQLite from Qdrant collections and returns total count', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => [
+        'bhgbrain_global_general',
+        'bhgbrain_global_notes',
+      ]);
+      (qdrant as unknown as Record<string, unknown>).scrollAll = vi.fn(async (name: string) => {
+        if (name === 'bhgbrain_global_general') {
+          return [
+            { id: 'p1', payload: { content: 'c1', summary: 's1' } },
+            { id: 'p2', payload: { content: 'c2', summary: 's2' } },
+          ];
+        }
+        return [{ id: 'p3', payload: { content: 'c3', summary: 's3' } }];
+      });
+      (sqlite as unknown as Record<string, unknown>).upsertMemoryFromPayload = vi.fn(() => true);
+
+      const total = await storage.bootstrapFromQdrant();
+
+      expect(total).toBe(3);
+      expect((sqlite as unknown as { upsertMemoryFromPayload: ReturnType<typeof vi.fn> }).upsertMemoryFromPayload).toHaveBeenCalledTimes(3);
+      expect(sqlite.flushIfDirty).toHaveBeenCalled();
+    });
+
+    it('returns 0 when Qdrant has no collections', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => []);
+
+      const total = await storage.bootstrapFromQdrant();
+      expect(total).toBe(0);
+    });
+
+    it('skips existing rows via upsert idempotency', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => ['bhgbrain_global_general']);
+      (qdrant as unknown as Record<string, unknown>).scrollAll = vi.fn(async () => [
+        { id: 'existing', payload: { content: 'c1' } },
+        { id: 'new', payload: { content: 'c2' } },
+      ]);
+      // First call returns false (already exists), second returns true (inserted)
+      const upsertMock = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+      (sqlite as unknown as Record<string, unknown>).upsertMemoryFromPayload = upsertMock;
+
+      const total = await storage.bootstrapFromQdrant();
+      expect(total).toBe(1); // only the new one counted
+    });
+
+    it('passes logger through for progress logging', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => []);
+      const logger = { info: vi.fn() };
+
+      await storage.bootstrapFromQdrant(logger);
+      expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({ event: 'bootstrap' }));
+    });
+  });
 });

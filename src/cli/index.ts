@@ -374,6 +374,23 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     });
 
   program
+    .command('repair')
+    .description('Repair local state from external sources')
+    .option('--from-qdrant', 'Hydrate local SQLite from Qdrant Cloud payloads')
+    .action(async (opts) => {
+      if (!opts.fromQdrant) {
+        console.error('Please specify a repair source. Available: --from-qdrant');
+        process.exitCode = 1;
+        return;
+      }
+      const ctx = await createContextImpl();
+      console.log('[repair] scanning Qdrant collections...');
+      const hydrated = await ctx.storage.bootstrapFromQdrant();
+      console.log(`[repair] hydrated ${hydrated} memories from Qdrant`);
+      ctx.storage.sqlite.close();
+    });
+
+  program
     .command('health')
     .description('Check system health')
     .action(async () => {
