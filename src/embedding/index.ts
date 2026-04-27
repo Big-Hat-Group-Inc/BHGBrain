@@ -2,6 +2,11 @@ import type { BrainConfig } from '../config/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { CircuitBreaker } from '../resilience/index.js';
 import { embeddingUnavailable } from '../errors/index.js';
+import { AzureFoundryEmbeddingProvider } from './azure-foundry.js';
+
+function isMissingCredentialError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith('Missing environment variable: ');
+}
 
 export interface EmbeddingProvider {
   readonly model: string;
@@ -121,6 +126,12 @@ export class DegradedEmbeddingProvider implements EmbeddingProvider {
   }
 }
 
+export function getEmbeddingBreakerKey(provider: BrainConfig['embedding']['provider']): string {
+  return provider === 'azure-foundry'
+    ? 'azure_foundry_embedding'
+    : 'openai_embedding';
+}
+
 export function createEmbeddingProvider(
   config: BrainConfig,
   options?: { breaker?: CircuitBreaker; metrics?: MetricsCollector },
@@ -129,9 +140,20 @@ export function createEmbeddingProvider(
     case 'openai':
       try {
         return new OpenAIEmbeddingProvider(config, options?.breaker, options?.metrics);
-      } catch {
-        // Missing credentials: start in degraded mode
-        return new DegradedEmbeddingProvider(config);
+      } catch (error) {
+        if (isMissingCredentialError(error)) {
+          return new DegradedEmbeddingProvider(config);
+        }
+        throw error;
+      }
+    case 'azure-foundry':
+      try {
+        return new AzureFoundryEmbeddingProvider(config, options?.breaker, options?.metrics);
+      } catch (error) {
+        if (isMissingCredentialError(error)) {
+          return new DegradedEmbeddingProvider(config);
+        }
+        throw error;
       }
     default:
       throw new Error(`Unknown embedding provider: ${config.embedding.provider}`);

@@ -10,7 +10,18 @@ describe('HealthService', () => {
   function createConfig(): BrainConfig {
     return {
       data_dir: 'test-data',
-      embedding: { provider: 'openai', model: 'test-model', api_key_env: 'OPENAI_API_KEY', dimensions: 3 },
+      embedding: {
+        provider: 'openai',
+        model: 'test-model',
+        api_key_env: 'OPENAI_API_KEY',
+        dimensions: 3,
+        request_timeout_ms: 30000,
+        max_batch_inputs: 2048,
+        retry: {
+          max_attempts: 3,
+          backoff_ms: 1000,
+        },
+      },
       qdrant: { mode: 'embedded', embedded_path: './qdrant', external_url: null, api_key_env: null },
       transport: {
         http: { enabled: true, host: '127.0.0.1', port: 3721, bearer_token_env: 'BHGBRAIN_TOKEN' },
@@ -94,6 +105,20 @@ describe('HealthService', () => {
     };
   }
 
+  function createAzureConfig(): BrainConfig {
+    return {
+      ...createConfig(),
+      embedding: {
+        ...createConfig().embedding,
+        provider: 'azure-foundry',
+        azure: {
+          resource_name: 'test-resource',
+          api_key_env: 'AZURE_FOUNDRY_API_KEY',
+        },
+      },
+    };
+  }
+
   it('reports degraded when embedding provider is in degraded mode', async () => {
     const storage = createStorage();
     const embedding = new DegradedEmbeddingProvider(createConfig());
@@ -123,6 +148,27 @@ describe('HealthService', () => {
 
     expect(result.status).toBe('degraded');
     expect(result.circuitBreakers).toEqual({ openai_embedding: 'open' });
+  });
+
+  it('reports the Azure embedding breaker with the provider-aware key', async () => {
+    const storage = createStorage();
+    const embedding = createEmbedding(true);
+    const breaker = new CircuitBreaker(
+      { failureThreshold: 1, openWindowMs: 30000, halfOpenProbeCount: 1 },
+      () => 0,
+    );
+
+    await expect(breaker.execute(async () => {
+      throw new Error('trip');
+    })).rejects.toThrow('trip');
+
+    const health = new HealthService(storage, embedding, createAzureConfig(), {
+      azure_foundry_embedding: breaker,
+    });
+    const result = await health.check();
+
+    expect(result.status).toBe('degraded');
+    expect(result.circuitBreakers).toEqual({ azure_foundry_embedding: 'open' });
   });
 
   it('reports healthy when all components are up', async () => {

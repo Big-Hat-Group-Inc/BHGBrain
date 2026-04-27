@@ -14,7 +14,7 @@ import { loadConfig, ensureDataDir } from './config/index.js';
 import { SqliteStore } from './storage/sqlite.js';
 import { QdrantStore } from './storage/qdrant.js';
 import { StorageManager } from './storage/index.js';
-import { createEmbeddingProvider } from './embedding/index.js';
+import { createEmbeddingProvider, getEmbeddingBreakerKey } from './embedding/index.js';
 import { WritePipeline } from './pipeline/index.js';
 import { SearchService } from './search/index.js';
 import { BackupService } from './backup/index.js';
@@ -64,7 +64,7 @@ async function main() {
   const searchService = new SearchService(config, storage, embedding, metrics);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {
-    openai_embedding: embeddingBreaker,
+    [getEmbeddingBreakerKey(config.embedding.provider)]: embeddingBreaker,
     qdrant: qdrantBreaker,
   });
 
