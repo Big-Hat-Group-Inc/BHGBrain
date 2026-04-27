@@ -1,0 +1,129 @@
+# Linear-MCP Code Audit — Orchestrated Multi-Agent Review
+
+Perform a comprehensive audit of this repository across five dimensions:
+**(1) Design & architecture, (2) Performance, (3) Resilience & error handling, (4) Logging & observability, (5) Security.**
+
+Use the tools and agents installed on this machine exactly as described. Do not skip steps. Do not guess — verify with evidence.
+
+---
+
+## Phase 0 — Setup & ground truth
+
+1. Invoke `superpowers:verification-before-completion` and keep it active for the whole run. Every finding you report must cite a file + line, or a tool output.
+2. Check GitNexus index freshness:
+   - `gitnexus://repo/linear-mcp/context` — confirm symbol/relationship counts.
+   - If the index is stale, tell the user to run `npx gitnexus analyze` and stop.
+3. Read `CLAUDE.md`, `architecture.md`, and `README.md` once for authoritative conventions (ESM `.js` imports, tool schema/validator parity, `/sse` unsupported, release verification gate).
+4. Create a todo list with one item per phase below so progress is visible.
+
+---
+
+## Phase 1 — Map the surface (GitNexus + Explore)
+
+Run these in parallel:
+
+- GitNexus:
+  - `gitnexus://repo/linear-mcp/clusters` — list functional areas.
+  - `gitnexus://repo/linear-mcp/processes` — list execution flows.
+  - `gitnexus_query({query: "auth"})`, `{query: "graphql request"}`, `{query: "error handling"}`, `{query: "logging"}`, `{query: "transport stream stdio"}` — locate hot paths.
+- Dispatch one `Explore` subagent (thoroughness: "medium") with this brief:
+  > Map the Linear-MCP server: entrypoint, transport bootstrap (stdio vs streamable HTTP), handler factory + registration, GraphQL client + retry policy, runtime capabilities, concurrency guards, tool schema/validator coupling, release verification scripts. Return a tight file-path index grouped by concern. Under 400 words.
+
+Record the output as the shared context for Phase 2.
+
+---
+
+## Phase 2 — Parallel specialist reviews
+
+Use `superpowers:dispatching-parallel-agents` to dispatch the following agents **in a single message** (all independent, no shared state). Each gets the Phase-1 map plus a narrow charter. Require every finding to include: `file:line`, severity (Critical / High / Medium / Low), evidence, and a concrete fix suggestion.
+
+### 2a. Design & architecture — `feature-dev:code-reviewer`
+Charter: evaluate layering (core / features / graphql / types), handler factory cohesion, schema-handler-validator parity in `src/core/types/tool.types.ts` ↔ `src/core/validation/tool-validator.ts` ↔ `src/core/handlers/handler.factory.ts`, domain boundaries under `src/features/*`, capability-aware tool behavior, and adherence to the filter-first (`linear_list_issues`) vs query-first (`linear_search_issues`) split. Flag premature abstraction, leaky coupling, and drift from `architecture.md`.
+
+### 2b. Type design — `pr-review-toolkit:type-design-analyzer`
+Charter: review public types in `src/types/`, `src/core/types/`, and feature `types/` folders. Rate encapsulation, invariant expression, usefulness, enforcement. Call out stringly-typed fields, optionality overuse, and type assertions that hide runtime risk.
+
+### 2c. Resilience & error handling — `pr-review-toolkit:silent-failure-hunter`
+Charter: hunt silent failures, swallowed promises, inappropriate fallbacks, missing timeouts, unbounded retries, and missing backoff around `src/core/request-policy.ts`, `src/graphql/`, `src/features/*/handlers/`, and the transport bootstrap in `src/index.ts`. Cross-check `src/core/concurrency.ts` guards actually wrap the right handlers.
+
+### 2d. Test coverage for critical paths — `pr-review-toolkit:pr-test-analyzer`
+Charter: scoped to `src/__tests__/` and feature tests. Identify coverage gaps for: OAuth callback single-use invariant, API-key precedence (`LINEAR_API_KEY` wins over `LINEAR_ACCESS_TOKEN`), `/sse` rejection, transport switching, query-backed `linear_search_issues`, retry/backoff behavior, concurrency limits. Recommend missing tests — do not rewrite existing ones.
+
+### 2e. Security — `security-review` skill
+Charter: run the skill against the current branch. Additionally verify: secret handling (env var surface in `.env.example`, no logs of `LINEAR_API_KEY`), OAuth state handling (single-use, CSRF-safe), webhook signature verification, input validation at tool boundaries (ajv), SSRF / injection in GraphQL variables, dependency advisories (`npm audit --omit=dev`), and prototype-pollution-shaped merges. Treat OAuth callback reuse, token leakage, and unvalidated tool input as **Critical** by default.
+
+### 2f. Performance — `Explore` subagent (thoroughness: "very thorough")
+Charter: Identify N+1 patterns around GraphQL pagination, unbounded list fetches, blocking ops on the request path, missing streaming on streamable-HTTP transport, and handlers that don't honor `src/core/capabilities.ts`. For each hotspot, use `gitnexus_impact({target: "<symbol>", direction: "upstream"})` to size the blast radius. Report as ranked list with measured-or-inferred cost.
+
+### 2g. Logging & observability — `Explore` subagent (thoroughness: "medium")
+Charter: audit `src/core/runtime-observability.ts` + every `console.*` / logger call-site. Verify: structured fields, no PII/secret leakage, correlation IDs across transports, log levels used correctly, failure modes observable (retries, circuit states, auth failures). Propose concrete fields to add where gaps exist.
+
+---
+
+## Phase 3 — Cross-cutting verification
+
+After the parallel agents return:
+
+1. For every **High** or **Critical** finding that proposes a code change, run `gitnexus_impact({target: "<symbol>", direction: "upstream"})` to confirm blast radius and surface d=1 dependents that must be updated together.
+2. Sanity-run the release gate non-destructively: `npm run build` and `npm test` (do NOT run `verify:release` or anything that hits Linear's live API without asking the user first).
+3. Run `gitnexus_detect_changes({scope: "all"})` to confirm the audit itself produced no accidental edits.
+
+---
+
+## Phase 4 — Deliverable
+
+Write a single report to `codeaudit-<model>-YYYY-MM-DD.md` at the repo root, where:
+- `<model>` is the short model slug of the model running this audit (e.g. `opus-4-7`, `sonnet-4-6`, `haiku-4-5`). Derive it from your own model ID — strip the `claude-` prefix and any trailing date suffix. If the model is unknown, use `unknown`.
+- `YYYY-MM-DD` is today's date in ISO form, UTC.
+
+Example filenames: `codeaudit-opus-4-7-2026-04-22.md`, `codeaudit-sonnet-4-6-2026-04-22.md`.
+
+If a file with that exact name already exists, append `-2`, `-3`, ... before `.md` to avoid overwriting a prior run.
+
+Use this structure:
+
+```
+# Linear-MCP Code Audit — <model> — <ISO date>
+
+## Executive summary
+- Overall posture (1–2 sentences per dimension)
+- Top 5 risks ranked
+
+## Findings by dimension
+### Design & architecture
+### Type design
+### Performance
+### Resilience & error handling
+### Logging & observability
+### Security
+### Test coverage
+
+Each finding:
+- **Severity** — Critical / High / Medium / Low
+- **Location** — `path/to/file.ts:LINE`
+- **Evidence** — quoted code or tool output
+- **Impact** — upstream blast radius from gitnexus_impact
+- **Recommendation** — concrete change, not a platitude
+
+## Quick wins (< 1 hour each)
+## Larger refactors (flag for OpenSpec proposal under openspec/changes/)
+## Appendix — tools & agents used, with invocation counts
+```
+
+Rules for the report:
+- No praise, no filler. Every bullet must be actionable.
+- Do not recommend adding comments, docs, or abstractions unless a concrete defect justifies them.
+- If a dimension is clean, say so in one sentence and move on.
+- Flag anything that would need an OpenSpec change (non-trivial capability shifts) rather than silently proposing edits.
+
+---
+
+## Guardrails
+
+- **Do not modify source files.** This is an audit, not a fix run.
+- **Do not run** `verify:release`, `verify:package-install`, or any network-touching verify step without the user's explicit OK.
+- **Do not skip** GitNexus impact analysis for any High/Critical finding — the CLAUDE.md rule is non-negotiable.
+- **Do not** collapse parallel agents into sequential calls to "save tokens" — the charters are scoped to run concurrently.
+- If any agent returns low-signal output, re-dispatch it once with a tighter charter before giving up.
+
+Begin with Phase 0.
