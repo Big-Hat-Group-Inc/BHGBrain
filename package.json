@@ -1,5 +1,5 @@
 {
-  "name": "bhgbrain-server",
+  "name": "@kkaminsk/bhgbrain",
   "version": "1.4.0",
   "description": "Persistent, vector-backed memory for MCP clients",
   "type": "module",
@@ -8,6 +8,11 @@
     "bhgbrain": "dist/cli/index.js",
     "bhgbrain-server": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
@@ -16,7 +21,8 @@
     "test:watch": "vitest",
     "lint": "npm run lint:types && npm run lint:eslint",
     "lint:types": "tsc --noEmit",
-    "lint:eslint": "eslint src"
+    "lint:eslint": "eslint src",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "mcp",
@@ -25,6 +31,17 @@
     "vector",
     "qdrant"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Big-Hat-Group-Inc/BHGBrain.git"
+  },
+  "homepage": "https://github.com/Big-Hat-Group-Inc/BHGBrain#readme",
+  "bugs": {
+    "url": "https://github.com/Big-Hat-Group-Inc/BHGBrain/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "license": "MIT",
   "engines": {
     "node": ">=20.0.0"

@@ -52,7 +52,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
   const program = new Command()
     .name('bhgbrain')
     .description('BHGBrain companion CLI for managing persistent memory')
-    .version('1.0.0');
+    .version('1.4.0');
 
   program
     .command('list')

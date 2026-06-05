@@ -193,6 +193,17 @@ For Azure, `embedding.model` is the deployment name sent upstream, not the publi
 
 ## Installation
 
+Install from npm (no clone required):
+
+```bash
+npx @kkaminsk/bhgbrain --help
+# or install globally
+npm install -g @kkaminsk/bhgbrain
+bhgbrain --help
+```
+
+To build from source:
+
 ```bash
 git clone https://github.com/Big-Hat-Group-Inc/BHGBrain.git
 cd BHGBrain
@@ -200,7 +211,7 @@ npm install
 npm run build
 ```
 
-To install globally as a CLI:
+To install your local checkout globally as a CLI:
 
 ```bash
 npm install -g .

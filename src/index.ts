@@ -93,7 +93,7 @@ async function main() {
   if (isStdio || !config.transport.http.enabled) {
     // MCP stdio transport
     const server = new Server(
-      { name: 'bhgbrain', version: '1.0.0' },
+      { name: 'bhgbrain', version: '1.4.0' },
       { capabilities: { tools: {}, resources: {} } },
     );
 
