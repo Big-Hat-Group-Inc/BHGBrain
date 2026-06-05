@@ -9,7 +9,7 @@ BHGBrain is a persistent, vector-backed memory system for MCP (Model Context Pro
 - ES modules (`"type": "module"`)
 - SQLite for metadata storage (via sql.js)
 - Qdrant for vector storage
-- OpenAI for embeddings
+- OpenAI or Azure Foundry for embeddings (selectable via `embedding.provider`)
 - Express.js for HTTP transport
 - MCP SDK for stdio transport
 - Vitest for testing
@@ -38,7 +38,7 @@ src/
 ├── types.d.ts            # TypeScript declarations for sql.js
 ├── config/               # Configuration management with Zod schemas
 ├── storage/              # SQLite + Qdrant data layer
-├── embedding/            # OpenAI embedding provider
+├── embedding/            # Embedding providers (OpenAI + Azure Foundry)
 ├── pipeline/             # Write pipeline (extraction → decision → store)
 ├── bootstrap/            # Onboarding: section definitions, session state
 ├── search/               # Hybrid semantic + fulltext search
@@ -114,12 +114,41 @@ describe('feature', () => {
 
 ## Configuration System
 
-- **Schema**: Zod validation with defaults
+- **Schema**: Zod validation with defaults (`src/config/index.ts`)
 - **Format**: JSON at `{data_dir}/config.json`
-- **Environment**: Supports env var references (e.g., `OPENAI_API_KEY`)
 - **Location**: Platform-specific data directories
   - Windows: `%LOCALAPPDATA%\BHGBrain`
   - Unix: `~/.bhgbrain`
+
+### Config vs. environment
+
+Most settings (including **embedding provider/model/dimensions**) live **only** in
+`config.json`. The environment supplies just two things:
+
+1. **Secrets**, referenced indirectly by `*_api_key_env` keys. The config stores the
+   *name* of the env var to read, not the secret itself:
+   - `embedding.api_key_env` → defaults to `OPENAI_API_KEY`
+   - `embedding.azure.api_key_env` → defaults to `AZURE_FOUNDRY_API_KEY`
+   - `qdrant.api_key_env` → null by default; set to `"QDRANT_API_KEY"` for Qdrant Cloud
+   - `pipeline.extraction_model_env` → defaults to `BHGBRAIN_EXTRACTION_API_KEY`
+2. **Runtime overrides** applied by `applyEnvOverrides()` — a fixed set only:
+   `BHGBRAIN_DATA_DIR`, `BHGBRAIN_HTTP_HOST`, `BHGBRAIN_HTTP_PORT`,
+   `BHGBRAIN_QDRANT_MODE`, `BHGBRAIN_QDRANT_URL`, `BHGBRAIN_REQUIRE_LOOPBACK`,
+   `BHGBRAIN_ALLOW_UNAUTHENTICATED`, `BHGBRAIN_LOG_LEVEL`, plus `BHGBRAIN_DEVICE_ID`.
+
+Setting an env var outside these two categories has **no effect**. See `.env.example`
+for the full, documented variable list.
+
+### Embedding providers
+
+Selected via `embedding.provider` in `config.json`:
+
+- **`openai`** (default) — `src/embedding/index.ts`; key from `OPENAI_API_KEY`.
+- **`azure-foundry`** — `src/embedding/azure-foundry.ts`; requires
+  `embedding.azure.resource_name`. Endpoint is derived as
+  `https://<resource_name>.openai.azure.com`; key from `AZURE_FOUNDRY_API_KEY`.
+  Note the per-model dimension constraints enforced by the Zod schema
+  (e.g. `text-embedding-3-small` ≤ 1536, `text-embedding-3-large` ≤ 3072).
 
 ## Error Handling
 
