@@ -106,8 +106,8 @@ export class WritePipeline {
     });
     const lifecycleMetadata = this.lifecycle.buildMetadata(tier, new Date(now));
 
-    // Step 1: Exact dedup by checksum
-    const exactMatch = this.storage.sqlite.getMemoryByChecksum(input.namespace, checksum);
+    // Step 1: Exact dedup by checksum, scoped to the target collection
+    const exactMatch = this.storage.sqlite.getMemoryByChecksum(input.namespace, checksum, input.collection);
     if (exactMatch) {
       return {
         id: exactMatch.id,

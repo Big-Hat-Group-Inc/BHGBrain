@@ -151,8 +151,11 @@ export function validateExternalAuthBinding(config: BrainConfig, logger?: pino.L
   if (!hasToken && !allowUnauthenticated) {
     throw new Error(
       `SECURITY: HTTP binding to "${host}" is externally reachable but no bearer token is configured ` +
-      `(env: ${tokenEnv}). Either set ${tokenEnv} or explicitly opt in to unauthenticated mode ` +
-      `with security.allow_unauthenticated_http=true.`,
+      `(env: ${tokenEnv}). To fix this:\n` +
+      `  • Set a token:           export ${tokenEnv}="$(openssl rand -hex 24)"\n` +
+      `  • In Docker:             the container entrypoint auto-generates ${tokenEnv} and prints it ` +
+      `(saved to <data_dir>/bhgbrain-token); pass your own ${tokenEnv} to use a stable value.\n` +
+      `  • To run open anyway:    set security.allow_unauthenticated_http=true (NOT recommended for non-loopback).`,
     );
   }
 

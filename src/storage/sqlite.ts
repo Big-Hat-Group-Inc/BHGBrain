@@ -61,8 +61,9 @@ export interface SqliteStorage {
   updateMemory(id: string, fields: Partial<MemoryRecordWithoutEmbedding>): void;
   deleteMemory(id: string): boolean;
   getMemoryById(id: string, includeArchived?: boolean): MemoryRecordWithoutEmbedding | null;
-  getMemoryByChecksum(namespace: string, checksum: string): MemoryRecordWithoutEmbedding | null;
+  getMemoryByChecksum(namespace: string, checksum: string, collection?: string): MemoryRecordWithoutEmbedding | null;
   listMemories(namespace: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
+  listMemoriesInCollection(namespace: string, collection: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
   countMemories(namespace?: string): number;
   countMemoriesInCollection(namespace: string, collection: string): number;
   fullTextSearch(namespace: string, query: string, limit: number, collection?: string): Array<{ id: string; rank: number }>;
@@ -493,9 +494,19 @@ export class SqliteStore implements SqliteStorage {
     return this.rowToMemory(row);
   }
 
-  getMemoryByChecksum(namespace: string, checksum: string): MemoryRecordWithoutEmbedding | null {
-    const stmt = this.db.prepare(`SELECT * FROM memories WHERE namespace = ? AND checksum = ? AND archived = 0 LIMIT 1`);
-    stmt.bind([namespace, checksum]);
+  getMemoryByChecksum(namespace: string, checksum: string, collection?: string): MemoryRecordWithoutEmbedding | null {
+    // Exact dedup is scoped to the collection when one is given, so identical
+    // content in a different collection is treated as a distinct memory rather
+    // than a cross-collection NOOP.
+    let sql = `SELECT * FROM memories WHERE namespace = ? AND checksum = ? AND archived = 0`;
+    const params: SqlParams = [namespace, checksum];
+    if (collection !== undefined) {
+      sql += ` AND collection = ?`;
+      params.push(collection);
+    }
+    sql += ` LIMIT 1`;
+    const stmt = this.db.prepare(sql);
+    stmt.bind(params);
     if (!stmt.step()) {
       stmt.free();
       return null;
@@ -508,6 +519,26 @@ export class SqliteStore implements SqliteStorage {
   listMemories(namespace: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
     let sql = `SELECT * FROM memories WHERE namespace = ? AND archived = 0`;
     const params: SqlParams = [namespace];
+    if (cursor) {
+      const sepIdx = cursor.indexOf('|');
+      if (sepIdx !== -1) {
+        const cursorTime = cursor.substring(0, sepIdx);
+        const cursorId = cursor.substring(sepIdx + 1);
+        sql += ` AND (created_at < ? OR (created_at = ? AND id < ?))`;
+        params.push(cursorTime, cursorTime, cursorId);
+      } else {
+        sql += ` AND created_at < ?`;
+        params.push(cursor);
+      }
+    }
+    sql += ` ORDER BY created_at DESC, id DESC LIMIT ?`;
+    params.push(limit);
+    return this.queryMemories(sql, params);
+  }
+
+  listMemoriesInCollection(namespace: string, collection: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
+    let sql = `SELECT * FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`;
+    const params: SqlParams = [namespace, collection];
     if (cursor) {
       const sepIdx = cursor.indexOf('|');
       if (sepIdx !== -1) {
@@ -566,18 +597,50 @@ export class SqliteStore implements SqliteStorage {
       const like = `%${term}%`;
       params.push(like, like, like);
     }
-    params.push(limit);
+    // Over-fetch a bounded candidate pool so the relevance ranker below has rows to
+    // order; the matching predicate is non-sargable LIKE, so keep the cap modest.
+    const candidateLimit = Math.min(Math.max(limit * 5, 50), 500);
+    params.push(candidateLimit);
 
-    const sql = `SELECT f.id, ${terms.length} as rank FROM memories_fts f${collectionJoin} WHERE f.namespace = ? AND ${conditions.join(' AND ')} LIMIT ?`;
+    // `memories_fts` is a plain table (not an FTS5 virtual table), so there is no
+    // bm25()/rank available. Compute a deterministic term-frequency relevance score
+    // per row — weighting matches in the curated summary/tags above the body — and
+    // return rows ordered by descending relevance. Ordering is what feeds hybrid RRF
+    // (which ranks by array position), so this replaces the previous constant rank
+    // that made the fulltext RRF component degenerate.
+    const sql = `SELECT f.id, f.content, f.summary, f.tags FROM memories_fts f${collectionJoin} WHERE f.namespace = ? AND ${conditions.join(' AND ')} LIMIT ?`;
     const stmt = this.db.prepare(sql);
     stmt.bind(params);
-    const results: Array<{ id: string; rank: number }> = [];
+    const scored: Array<{ id: string; rank: number }> = [];
     while (stmt.step()) {
       const row = this.getRow(stmt.getAsObject());
-      results.push({ id: this.getString(row, 'id'), rank: -terms.length });
+      const content = this.getString(row, 'content').toLowerCase();
+      const summary = this.getString(row, 'summary').toLowerCase();
+      const tags = this.getString(row, 'tags').toLowerCase();
+      let score = 0;
+      for (const term of terms) {
+        score += SqliteStore.countOccurrences(content, term)
+          + SqliteStore.countOccurrences(summary, term) * 2
+          + SqliteStore.countOccurrences(tags, term) * 2;
+      }
+      scored.push({ id: this.getString(row, 'id'), rank: score });
     }
     stmt.free();
-    return results;
+    // Higher relevance first; break ties on id for deterministic ordering.
+    scored.sort((a, b) => (b.rank - a.rank) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    return scored.slice(0, limit);
+  }
+
+  /** Counts non-overlapping occurrences of `needle` within `haystack`. */
+  private static countOccurrences(haystack: string, needle: string): number {
+    if (!needle) return 0;
+    let count = 0;
+    let pos = haystack.indexOf(needle);
+    while (pos !== -1) {
+      count++;
+      pos = haystack.indexOf(needle, pos + needle.length);
+    }
+    return count;
   }
 
   markStale(memoryId: string): void {

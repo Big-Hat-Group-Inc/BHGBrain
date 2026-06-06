@@ -104,3 +104,45 @@ describe('collections delete semantics', () => {
     expect(storage.sqlite.deleteCollection).not.toHaveBeenCalled();
   });
 });
+
+describe('tool input contracts', () => {
+  // Input validation happens (via strict Zod schemas) before any dependency is
+  // touched, so a bare ctx with metrics + logger is enough to exercise rejection.
+  function createCtx(): ToolContext {
+    return {
+      config: {} as ToolContext['config'],
+      storage: {} as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  const UUID = '550e8400-e29b-41d4-a716-446655440000';
+
+  // For each tool: an input with an unknown field, and one with an out-of-bounds /
+  // invalid value. Strict schemas must reject both with an INVALID_INPUT envelope.
+  const cases: Array<{ tool: string; unknownField: unknown; outOfBounds: unknown }> = [
+    { tool: 'recall', unknownField: { query: 'hi', bogus: 1 }, outOfBounds: { query: 'hi', limit: 21 } },
+    { tool: 'search', unknownField: { query: 'hi', bogus: 1 }, outOfBounds: { query: 'hi', limit: 51 } },
+    { tool: 'tag', unknownField: { id: UUID, bogus: 1 }, outOfBounds: { id: 'not-a-uuid' } },
+    { tool: 'category', unknownField: { action: 'list', bogus: 1 }, outOfBounds: { action: 'bogus' } },
+    { tool: 'backup', unknownField: { action: 'list', bogus: 1 }, outOfBounds: { action: 'bogus' } },
+  ];
+
+  for (const { tool, unknownField, outOfBounds } of cases) {
+    it(`${tool} rejects an unknown field with INVALID_INPUT`, async () => {
+      const result = await handleTool(createCtx(), tool, unknownField, 'c1') as BrainErrorEnvelope;
+      expect(result.error.code).toBe('INVALID_INPUT');
+    });
+
+    it(`${tool} rejects an out-of-bounds/invalid value with INVALID_INPUT`, async () => {
+      const result = await handleTool(createCtx(), tool, outOfBounds, 'c1') as BrainErrorEnvelope;
+      expect(result.error.code).toBe('INVALID_INPUT');
+    });
+  }
+});

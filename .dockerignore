@@ -8,3 +8,11 @@ Research/
 .codex/
 .github/
 temp_stage/
+codeaudit/
+.env
+.env.*
+*.pem
+*.key
+*.md
+AGENTS.md
+CLAUDE.md

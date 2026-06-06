@@ -2422,7 +2422,8 @@ BHGBrain provides official Docker support with two deployment modes: self-hosted
 ### Quick Start
 
 ```bash
-# 1. Copy and configure environment
+# 1. Copy and configure environment (optional — a missing .env no longer aborts
+#    startup; you still need OPENAI_API_KEY for embeddings).
 cp .env.example .env
 # Edit .env with your OPENAI_API_KEY and other settings
 
@@ -2433,11 +2434,43 @@ docker compose --profile self-hosted up
 docker compose up
 ```
 
-The server is available at `http://localhost:3721`. Check health with:
+The server is available at `http://localhost:3721` (published to host loopback
+only by default). Check health with:
 
 ```bash
 curl http://localhost:3721/health
 ```
+
+### Security defaults
+
+The container binds the API to `0.0.0.0` so the published port is reachable, and
+is **authenticated by default**:
+
+- If `BHGBRAIN_TOKEN` is unset, the entrypoint **generates a bearer token** on
+  first run, persists it to `/data/bhgbrain-token`, and prints it to the logs.
+  Retrieve it with:
+
+  ```bash
+  docker compose logs bhgbrain | grep token
+  # or
+  docker compose exec bhgbrain cat /data/bhgbrain-token
+  ```
+
+- Provide your own stable token by setting `BHGBRAIN_TOKEN` in `.env`:
+
+  ```bash
+  echo "BHGBRAIN_TOKEN=$(openssl rand -hex 24)" >> .env
+  ```
+
+- The published port maps to host loopback (`127.0.0.1:3721:3721`), so the API is
+  not LAN-reachable by default. Change the mapping in `docker-compose.yml` to
+  expose it externally.
+
+- To intentionally run **without** authentication, set
+  `BHGBRAIN_ALLOW_UNAUTHENTICATED=true` (the server logs a warning; not
+  recommended for non-loopback bindings).
+
+The container also runs as a non-root user (`node`).
 
 ### Compose Profiles
 

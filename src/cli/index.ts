@@ -38,7 +38,7 @@ async function createContext(): Promise<ToolContext> {
   const storage = new StorageManager(sqlite, qdrant, embedding);
 
   const pipeline = new WritePipeline(config, storage, embedding);
-  const searchService = new SearchService(config, storage, embedding, metrics);
+  const searchService = new SearchService(config, storage, embedding, metrics, logger);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {
     [getEmbeddingBreakerKey(config.embedding.provider)]: embeddingBreaker,

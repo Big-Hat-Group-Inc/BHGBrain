@@ -141,3 +141,73 @@ describe('MCP tool error signaling', () => {
     expect(typeof envelope.error.retryable).toBe('boolean');
   });
 });
+
+describe('collection resource scoping', () => {
+  type CollectionResult = {
+    collection: string;
+    namespace: string;
+    memories: Array<{ id: string }>;
+    cursor: string | null;
+    total_results: number;
+    truncated: boolean;
+  };
+
+  function createHandler() {
+    const calls: Array<{ namespace: string; collection: string }> = [];
+    const mkMem = (id: string, namespace: string, collection: string) => ({
+      id, namespace, collection, type: 'semantic', category: null,
+      content: 'c', summary: 's', tags: [], source: 'cli', checksum: id,
+      importance: 0.5, access_count: 0, last_operation: 'ADD', merged_from: null,
+      created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z',
+      last_accessed: '2026-01-01T00:00:00.000Z',
+    });
+    const rows = [
+      mkMem('g1', 'global', 'work'),
+      mkMem('o1', 'other', 'work'),
+    ];
+
+    const storage = {
+      sqlite: {
+        listCollections: (_ns?: string) => [],
+        listMemoriesInCollection: (namespace: string, collection: string, limit: number) => {
+          calls.push({ namespace, collection });
+          return rows.filter(m => m.namespace === namespace && m.collection === collection).slice(0, limit);
+        },
+        countMemoriesInCollection: (namespace: string, collection: string) =>
+          rows.filter(m => m.namespace === namespace && m.collection === collection).length,
+      },
+    } as unknown as StorageManager;
+
+    const config = {
+      defaults: { namespace: 'global', auto_inject_limit: 5 },
+      auto_inject: { max_chars: 500 },
+    } as unknown as BrainConfig;
+
+    const handler = new ResourceHandler(
+      config, storage, {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+    return { handler, calls };
+  }
+
+  it('defaults collection reads to the configured namespace (no cross-namespace leak)', async () => {
+    const { handler, calls } = createHandler();
+    const result = await handler.handle('collection://work') as CollectionResult;
+    expect(calls[0]!.namespace).toBe('global');
+    expect(result.namespace).toBe('global');
+    expect(result.memories.map(m => m.id)).toEqual(['g1']);
+  });
+
+  it('honors an explicit ?namespace= override', async () => {
+    const { handler } = createHandler();
+    const result = await handler.handle('collection://work?namespace=other') as CollectionResult;
+    expect(result.namespace).toBe('other');
+    expect(result.memories.map(m => m.id)).toEqual(['o1']);
+  });
+
+  it('rejects an invalid limit', async () => {
+    const { handler } = createHandler();
+    const result = await handler.handle('collection://work?limit=abc') as { error: { code: string } };
+    expect(result.error.code).toBe('INVALID_INPUT');
+  });
+});

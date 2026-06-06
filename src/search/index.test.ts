@@ -12,6 +12,7 @@ describe('SearchService', () => {
   function createSearchService(opts: {
     fulltextResults?: Array<{ id: string; rank: number }>;
     memories?: Map<string, StoredMemory>;
+    slidingWindowEnabled?: boolean;
   } = {}) {
     const memories = opts.memories ?? new Map([
       ['mem-1', {
@@ -52,6 +53,14 @@ describe('SearchService', () => {
 
     const config = {
       search: { hybrid_weights: { semantic: 0.7, fulltext: 0.3 } },
+      ...(opts.slidingWindowEnabled === undefined ? {} : {
+        retention: {
+          tier_ttl: { T0: null, T1: 365, T2: 90, T3: 30 },
+          auto_promote_access_threshold: 5,
+          sliding_window_enabled: opts.slidingWindowEnabled,
+          pre_expiry_warning_days: 7,
+        },
+      }),
     } as unknown as BrainConfig;
 
     const embedding = {
@@ -62,10 +71,15 @@ describe('SearchService', () => {
       healthCheck: vi.fn(async () => true),
     } as EmbeddingProvider;
 
+    const metrics = { incCounter: vi.fn(), recordHistogram: vi.fn() } as unknown as MetricsCollector;
+    const logger = { warn: vi.fn() };
+
     return {
-      service: new SearchService(config, storage, embedding),
+      service: new SearchService(config, storage, embedding, metrics, logger),
       storage,
       embedding,
+      metrics,
+      logger,
     };
   }
 
@@ -92,6 +106,56 @@ describe('SearchService', () => {
     const { service, storage } = createSearchService();
     await service.search('hello', 'global', undefined, 'fulltext', 10);
     expect(storage.sqlite.getMemoriesByIds).toHaveBeenCalledWith(['mem-1']);
+  });
+
+  it('preserves existing expiry on read when sliding window is disabled', async () => {
+    // Regression: non-sliding access updates must not clear T2/T3 TTLs.
+    const { service, storage } = createSearchService({ slidingWindowEnabled: false });
+    await service.search('hello', 'global', undefined, 'fulltext', 10);
+    expect(storage.sqlite.recordAccessBatch).toHaveBeenCalledTimes(1);
+    const updates = (storage.sqlite.recordAccessBatch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(updates).toHaveLength(1);
+    // undefined = "no change" -> recordAccessBatch leaves expires_at untouched.
+    expect(updates[0].expires_at).toBeUndefined();
+    expect(updates[0].access_count).toBe(1);
+  });
+
+  it('extends expiry on read when sliding window is enabled', async () => {
+    const { service, storage } = createSearchService({ slidingWindowEnabled: true });
+    await service.search('hello', 'global', undefined, 'fulltext', 10);
+    const updates = (storage.sqlite.recordAccessBatch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    // sliding mode recomputes the deadline -> a concrete ISO timestamp string.
+    expect(typeof updates[0].expires_at).toBe('string');
+  });
+
+  it('signals (metric + warn) instead of silently swallowing embedding outage in hybrid mode', async () => {
+    const { service, storage, embedding, metrics, logger } = createSearchService();
+    (embedding.embed as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('embeddings down'));
+    // Hybrid degrades to fulltext-only rather than throwing...
+    const results = await service.search('hello', 'global', undefined, 'hybrid', 10);
+    expect(results.length).toBeGreaterThan(0);
+    // ...but the degradation is observable.
+    expect(metrics.incCounter).toHaveBeenCalledWith('search_embedding_degraded');
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'embedding_degraded', degraded: 'fulltext_only' }),
+    );
+    // Qdrant should not have been queried once embedding failed.
+    expect(storage.qdrant.search).not.toHaveBeenCalled();
+  });
+
+  it('sets the degraded signal when hybrid falls back to fulltext-only', async () => {
+    const { service, embedding } = createSearchService();
+    (embedding.embed as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('embeddings down'));
+    const signal: { degraded?: boolean } = {};
+    await service.search('hello', 'global', undefined, 'hybrid', 10, signal);
+    expect(signal.degraded).toBe(true);
+  });
+
+  it('leaves the degraded signal unset on a healthy hybrid search', async () => {
+    const { service } = createSearchService();
+    const signal: { degraded?: boolean } = {};
+    await service.search('hello', 'global', undefined, 'hybrid', 10, signal);
+    expect(signal.degraded).toBeUndefined();
   });
 
   it('surfaces Qdrant failures as errors in semantic search', async () => {
