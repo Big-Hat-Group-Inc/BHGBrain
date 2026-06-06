@@ -33,6 +33,31 @@ Alternative considered: Hidden merge behavior with only final IDs returned. Reje
 Rationale: v1 must function when extraction/classification models are unavailable; threshold-based dedup keeps behavior predictable.
 Alternative considered: Fail all writes on model outage. Rejected because it violates graceful degradation goals.
 
+5. Audit-driven decisions (2026-06-05).
+The audit (`codeaudit/bootstrap-memory-core-2026-06-05-02-19.md`) surfaced spec-to-code
+drift that this amendment resolves by tightening the contract:
+   - **DELETE must be reachable or de-scoped.** Declaring and typing `DELETE` while the
+     classifier can never produce it is treated as a defect; the spec now requires the
+     operation be emitted (or removed from the contract).
+   - **Fallback must threshold, not always ADD — the dedup-fallback duplication risk is
+     the central concern.** Because the fallback path is entered precisely when
+     embedding failed, it has no vector, and the current code unconditionally ADDs.
+     Every near-duplicate written during a degraded window becomes a brand-new memory
+     that the normal path would have merged, silently inflating storage and degrading
+     recall quality. The amendment requires a vectorless similarity proxy (e.g.
+     FTS/trigram) to restore UPDATE/ADD parity, or an explicit narrowing of the spec to
+     checksum-only fallback. Either way, the divergence must be eliminated.
+   - **Missing UPDATE target must be observable, never a silent duplicate.** A drifted
+     store (Qdrant returns a target that SQLite no longer has) currently turns an
+     intended UPDATE into a duplicate ADD with no signal — masking the very cross-store
+     divergence listed as the top risk below. The amendment requires an error or an
+     explicit warning log/metric.
+   - **Degraded writes must be observable.** Entering the embedding-failure fallback
+     must emit a structured log/metric so operators can see when recall quality is
+     silently degraded.
+Alternative considered: leave the code as-is and document the gaps only. Rejected —
+the spec and implementation must agree, and the duplication risk is user-visible.
+
 ## Risks / Trade-offs
 
 - [Cross-store divergence] -> Mitigate with write orchestration and rollback/compensation on partial failures.

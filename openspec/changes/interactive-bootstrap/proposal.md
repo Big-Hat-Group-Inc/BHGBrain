@@ -11,6 +11,23 @@ First-time users currently need to paste the bootstrap prompt into their MCP cli
 - `status` returns a progress overview (sections complete, memory counts, last updated)
 - `reset` clears and re-runs a specific section, removing its stored memories before re-collecting
 
+### Audit follow-ups (2026-06-05)
+
+Two issues surfaced by the code audit (`codeaudit/interactive-bootstrap-2026-06-05-02-19.md`
+and `codeaudit/bulk-profile-import-2026-06-05-02-19.md`, same root drift):
+
+- **Canonical section count = 10.** The proposal/design/spec/tasks and two tool description
+  strings said "12 sections", but the implementation, tests, and Zod validator use **10**
+  (`BOOTSTRAP_SECTIONS` / `TOTAL_SECTIONS` in `src/bootstrap/sections.ts`). This change
+  reconciles every reference to 10 — spec, tasks, the "outside 1–12 → INVALID_INPUT"
+  scenario (now 1–10), the `import` tool description ("12-section bootstrap format"), and the
+  `bulk-profile-import` parser that silently drops headings 11–12. Because the section table
+  is shared, this **also resolves the `bulk-profile-import` drift — no separate proposal.**
+- **Reset cross-store ordering bug.** `reset` cleared the SQLite `memory_ids` tracking before
+  deleting the Qdrant vectors, orphaning vector data if a deletion failed. Reset now deletes
+  vectors first and only clears tracking after deletions succeed (preserving the recovery
+  list on partial failure).
+
 ## Capabilities
 
 ### New Capabilities

@@ -12,6 +12,14 @@ Without a formal OpenSpec change, implementation would drift across storage, pip
 - Add operational requirements for cleanup jobs, capacity budgets, and storage-drift health reporting.
 - Modify the existing retention capability to replace stale-only behavior with tier-based archive/delete behavior for eligible memories.
 
+Audit-driven additions (from `codeaudit/add-tiered-memory-lifecycle-2026-06-05-02-19.md`):
+
+- Wire the scheduled cleanup job and threshold-driven compaction (currently dead config).
+- Emit cleanup metrics and lifecycle-specific tier-transition audit events.
+- Make GC failure-safe with a degraded retention health signal on partial failure.
+- Exclude expired memories from MCP resource reads (close the expired-memory leakage drift).
+- Gate `T1` deletion behind a warning/review window instead of hard-deleting on expiry.
+
 ## Capabilities
 
 ### New Capabilities

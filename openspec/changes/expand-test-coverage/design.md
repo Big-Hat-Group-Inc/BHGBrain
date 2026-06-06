@@ -42,3 +42,33 @@ The existing 13-file test suite covers core storage, domain logic, search, servi
 
 - **[Risk] CLI tests are harder to unit-test** — `src/cli/index.ts` likely calls `process.exit()` on errors, which terminates the test runner. Mitigation: spy on `process.exit`, or use a child-process integration test with expected exit code assertions.
 - **[Risk] HTTP transport tests must not accidentally start a real server** — Mitigation: use `supertest` in-process mode only; never call `.listen()` in tests.
+
+## Audit follow-ups (2026-06-05)
+
+Findings from `codeaudit/expand-test-coverage-2026-06-05-02-19.md`. These refine the
+decisions above; they do not introduce new production behavior.
+
+### Note: The implemented HTTP suite deviated from the supertest decision
+
+The audit found `src/transport/http.test.ts` binds a real ephemeral socket via
+`app.listen(0, '127.0.0.1', ...)` and drives it over the network with `fetch`, directly
+contradicting the Decision "Use `supertest` or direct Express app" and the mitigation
+"never call `.listen()` in tests." The real-port approach reintroduces the very
+connection-teardown and CI port-pressure flakiness that decision aimed to avoid — visible
+as the explicit `closeIdleConnections` / `closeAllConnections` / `close` plumbing and the
+bumped 15s timeout needed to keep the suite green.
+
+**Resolution:** The supertest/in-process decision stands and is now expressed as a
+requirement (`specs/http-transport-test-coverage/spec.md`). The suite SHALL be rewritten
+to dispatch through `supertest(app)` with no socket bind. If, instead, real-port binding
+is later chosen deliberately, this design MUST be amended to record that choice rather
+than leaving code and design contradictory.
+
+### Note: Enumerated MetricsCollector behaviors must actually be asserted
+
+The audit found tasks 3.1/3.2/3.5/3.6 were never asserted — `incCounter`, `setGauge`, and
+the disabled-collector short-circuit ship uncovered (`metrics.ts:85-86, 100-101, 107-108`;
+branch coverage 70.8%). These are public-API contracts the `/metrics` endpoint and
+rate-limiter depend on. They are now expressed as a requirement
+(`specs/metrics-logger-test-coverage/spec.md`) and tracked in the tasks follow-up group,
+along with the partial `type`-field (3.7) and direct `BoundedBuffer` wrap (3.4) assertions.

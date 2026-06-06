@@ -26,3 +26,15 @@
 - [ ] 4.3 Add unit tests for lifecycle policy logic and tier-specific dedup behavior.
 - [ ] 4.4 Add integration tests for SQLite/Qdrant partial-failure recovery, archive-before-delete, and retrieval-path expiry filtering.
 - [ ] 4.5 Add end-to-end CLI/MCP tests for tier management, cleanup dry-run, and tier-aware stats.
+
+## Audit follow-ups (2026-06-05)
+
+These items capture the genuinely missing or drifted work surfaced by the audit report `codeaudit/add-tiered-memory-lifecycle-2026-06-05-02-19.md`. Core lifecycle (domain model, schema, write/read paths, GC service, CLI, health tier counts) is already shipped; the gaps below are the operational tail and two correctness drifts.
+
+- [ ] 5.1 Wire the scheduled cleanup job: `embedding.cleanup_schedule` (cron, `src/config/index.ts:113`) is dead config read nowhere; add a scheduler that reads it and invokes `RetentionService.runGc` on the same execution surface as the CLI.
+- [ ] 5.2 Implement threshold-driven compaction: `compaction_deleted_threshold` (`src/config/index.ts:115`) is dead config; add a Qdrant compaction step gated on the deleted-vector ratio after GC.
+- [ ] 5.3 Emit cleanup metrics from `runGc` (`src/backup/retention.ts:54-66`): record duration, deleted count, archived count, and compaction activity via the existing `MetricsCollector` (`incCounter`/`recordHistogram`).
+- [ ] 5.4 Emit tier-transition audit events for promotion (`src/search/index.ts:252`), archival (`src/backup/retention.ts:56`), revision (`src/storage/index.ts:74`), delete, and restore, carrying `{memory_id, prior_tier, new_tier, actor, timestamp, action}` — today only generic `ADD`/`UPDATE`/`FORGET` codes are logged.
+- [ ] 5.5 Make GC failure-safe (`src/backup/retention.ts:54-66`): bracket the destructive phase with `beginLifecycleOperation`/`endLifecycleOperation` in a `finally`, wrap archive+delete in `try/catch`, and surface a degraded retention health signal on partial failure instead of throwing raw.
+- [ ] 5.6 DRIFT: filter expired memories from resource reads. `memory://{id}` (`src/resources/index.ts:61-67`) and `memory://list` (`src/resources/index.ts:73-92`) read SQLite directly with no expiry filtering, leaking expired decay-eligible `T2`/`T3` memories that search already excludes; route them through the shared retention-aware filter (call `lifecycle.isExpired` before returning) while keeping `T0`/`T1` eligible.
+- [ ] 5.7 DRIFT: gate `T1` deletion behind a warning/review window. `runGc` (`src/backup/retention.ts:29-33`) hard-deletes every decay-eligible non-`T0` row whose `expires_at < now`, including `T1`, ignoring `review_due`; exclude `T1` from direct delete and instead surface expired/`review_due`-past `T1` rows as review candidates, restricting direct deletion to `T2`/`T3`.

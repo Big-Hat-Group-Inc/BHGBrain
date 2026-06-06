@@ -116,3 +116,45 @@ The `ToolContext` interface in `src/tools/index.ts` already has `config`. The `d
 - Memories without `device_id` (pre-migration) are treated as `device_id: null` everywhere.
 - No MCP tool interface changes — `device_id` is additive in search results.
 - Existing callers that don't pass `device_id` to `remember` get the server's configured device ID automatically.
+
+## Decisions (audit follow-ups, 2026-06-05)
+
+Reference: `codeaudit/device-namespace-partitioning-2026-06-05-02-19.md`.
+
+### D1. Idempotent index migration on existing collections
+
+`ensureCollection` originally created the `device_id` keyword index only inside the
+collection-not-found `catch` branch, so existing collections returned early and were
+never migrated — the exact post-upgrade multi-device Qdrant Cloud scenario the proposal
+targets. **Decision:** ensure the `device_id` payload index **unconditionally** on every
+`ensureCollection` call (after the create/exists branch), wrapped in a try/catch that
+tolerates an "already exists" conflict so it is idempotent across restarts. `createPayloadIndex`
+in Qdrant is effectively idempotent; the only cost is a cheap no-op call per boot.
+
+### D2. Env precedence: `BHGBRAIN_DEVICE_ID` wins over persisted `device.id`
+
+The original resolution returned `config.device.id` before consulting the env var, and
+because the resolved id is persisted, `BHGBRAIN_DEVICE_ID` was permanently ignored after
+first run — contradicting the project-wide "env vars take precedence over file-based
+config" contract. **Decision:** `BHGBRAIN_DEVICE_ID`, when set, **overrides** the
+persisted `device.id`, and the override is re-persisted. Resolution order becomes:
+`BHGBRAIN_DEVICE_ID` env → persisted `config.device.id` → `os.hostname()` (sanitized).
+This keeps Docker/W365 re-homing working as documented. `sanitizeDeviceId` is also
+reordered to slice-then-strip-trailing-hyphen so truncation cannot reintroduce a `-`.
+
+### D3. Conditional config write
+
+The original `ensureDataDir` rewrote `config.json` on every startup, expanding all Zod
+defaults and stripping user formatting/comments. **Decision:** persist `config.json`
+**only** when the device id was newly synthesized (or the config file is absent),
+determined by a flag returned from `resolveDeviceId` (or a before/after comparison).
+Steady-state startups perform no config write.
+
+### D4. Explicit `--all-devices` flag
+
+"All devices" was implemented implicitly (omit `device_id`). **Decision:** add an
+explicit `all_devices` boolean to `RepairInputSchema` and the repair MCP schema as the
+documented all-devices path, mutually exclusive with `device_id`. (Out of scope here but
+noted by the audit: the repair filter still runs client-side after `scrollAll`, so the
+new index is not yet load-bearing for repair; pushing the filter server-side is a
+separate optimization.)

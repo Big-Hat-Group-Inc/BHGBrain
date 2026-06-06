@@ -69,3 +69,85 @@
 - Run `npm run build` — must compile cleanly
 - Run `npm test` — all existing tests must pass
 - Manually verify: start server, call `remember`, confirm `device_id` appears in both SQLite and Qdrant payload
+
+## Audit follow-ups (2026-06-05)
+
+Source: `codeaudit/device-namespace-partitioning-2026-06-05-02-19.md`. The feature is
+wired end-to-end but has one real migration bug plus several contract drifts, and the
+new logic is effectively untested.
+
+### 10. BUG: Qdrant device_id index never migrates onto existing collections
+**File**: `src/storage/qdrant.ts` (`ensureCollection`, `:38-73`)
+**Severity**: High
+**Effort**: Small
+
+- [ ] 10.1 The `device_id` keyword index is created **only inside the
+  collection-not-found `catch` branch** (`:42-73`), so any collection that already
+  exists returns early at `:41` and never gets the index — this is exactly the
+  post-upgrade multi-device Qdrant Cloud case the proposal targets.
+- [ ] 10.2 Move the `createPayloadIndex` call for `device_id` out of the `catch` so it
+  runs **unconditionally and idempotently** on existing collections too (run it after
+  the try/catch, or in both branches).
+- [ ] 10.3 Make it idempotent: wrap in a try/catch that tolerates an "already exists"
+  conflict from Qdrant so repeated startups are no-ops.
+- [ ] 10.4 Add a regression test asserting the `device_id` index is created when the
+  collection already exists (see 14.x).
+
+### 11. DRIFT: config.json rewritten unconditionally on every boot
+**File**: `src/config/index.ts` (`ensureDataDir` / `resolveDeviceId`, `:287-291`)
+**Severity**: Medium
+**Effort**: Small
+
+- [ ] 11.1 `ensureDataDir` always `writeFileSync(configPath, ...)` after resolving the
+  device id, rewriting the fully Zod-defaulted config every startup (strips user
+  comments/formatting, avoidable disk write). Task 1 specifies "if not already set".
+- [ ] 11.2 Track whether `resolveDeviceId` actually **synthesized** a new id (return a
+  flag or compare before/after) and only write `config.json` when the file is missing
+  or `device.id` was newly assigned.
+
+### 12. DRIFT: persisted device.id silently overrides BHGBRAIN_DEVICE_ID
+**File**: `src/config/index.ts` (`resolveDeviceId`, `:266-274`)
+**Severity**: Low (contract correctness)
+**Effort**: Small
+
+- [ ] 12.1 `resolveDeviceId` returns `config.device.id` first (`:266-267`), before
+  consulting `BHGBRAIN_DEVICE_ID` (`:270`); combined with persistence (#11) the env var
+  is permanently ignored after first run. This contradicts the documented "env wins"
+  contract (`:196-197`, `.env.example`).
+- [ ] 12.2 Make `BHGBRAIN_DEVICE_ID` take precedence over the persisted `device.id`:
+  check the env var ahead of the file value, and re-persist when env overrides.
+- [ ] 12.3 Reconcile `sanitizeDeviceId` truncation while here: slice to 64 chars
+  **then** strip a trailing hyphen (`.slice(0,64).replace(/-+$/,'') || 'unknown'`) so
+  truncation cannot re-introduce a trailing `-` (`:248-254`).
+
+### 13. DRIFT: --all-devices is an omit-filter, not an explicit flag
+**Files**: `src/tools/index.ts` (`handleRepair`, `:305-319`), `src/tools/schemas.ts`,
+`src/domain/schemas.ts`
+**Severity**: Low
+**Effort**: Small
+
+- [ ] 13.1 Today "all devices" is implicit: omitting `device_id` recovers every device
+  (`:316`). The proposal documents an explicit `--all-devices` capability.
+- [ ] 13.2 Add an explicit boolean `all_devices` field to `RepairInputSchema` and the
+  repair MCP schema, and have `handleRepair` treat it as the documented all-devices
+  path (mutually exclusive with `device_id`); keep omit-behavior backward-compatible or
+  document the precedence.
+
+### 14. Tests: cover device tagging, repair filter, and index migration
+**Files**: `src/storage/sqlite.test.ts`, `src/config/*.test.ts`,
+`src/storage/qdrant.test.ts` (new), `src/tools/*.test.ts`
+**Severity**: Medium
+**Effort**: Small/Medium
+
+- [ ] 14.1 `resolveDeviceId` priority chain: explicit id / `BHGBRAIN_DEVICE_ID` /
+  hostname fallback, **and the env-wins-over-persisted case** from #12.
+- [ ] 14.2 `sanitizeDeviceId` edge cases incl. the truncation/trailing-hyphen fix.
+- [ ] 14.3 Device tagging round-trip: a `remember` write tags `device_id` into both
+  SQLite and the Qdrant payload, and search surfaces it (including the Qdrant-fallback
+  path).
+- [ ] 14.4 Repair device filter: seed two devices' points, assert the filter recovers
+  only the requested device, and that the local id is set on recovered records lacking
+  one.
+- [ ] 14.5 Qdrant index migration: assert `ensureCollection` creates the `device_id`
+  index when the collection **already exists** (regression for #10), and that a second
+  call is a no-op.

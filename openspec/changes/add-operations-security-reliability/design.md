@@ -33,6 +33,10 @@ Alternative considered: Metadata-only backups with re-embedding rebuild. Rejecte
 Rationale: Predictable outages are required for clients to react safely (`EMBEDDING_UNAVAILABLE`, retries on locks, etc.).
 Alternative considered: Generic internal errors for all failures. Rejected because it hides operator and client recovery options.
 
+5. (Audit follow-up 2026-06-05) Audit/client identity is sourced from the authenticated principal, not from request headers.
+Rationale: Audit logs are the accountability record. The `x-client-id` header is fully attacker-controllable, so using it lets any caller impersonate or obscure identity in the audit trail. The HTTP audit `clientId` SHALL be derived from `req.ip` and/or an authenticated bearer-token identity — the same trusted source the rate limiter already keys on — with `x-client-id` retained only as a non-authoritative hint.
+Alternative considered: Continue trusting `x-client-id` for convenience. Rejected because it defeats the integrity guarantee the audit trail exists to provide. Evidence: `src/transport/http.ts:42`.
+
 ## Risks / Trade-offs
 
 - [Rate limits affect bursty local workloads] -> Mitigate with configurable defaults and clear limit headers.

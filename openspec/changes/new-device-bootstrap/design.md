@@ -75,3 +75,33 @@ Calls `storage.bootstrapFromQdrant()` and prints:
 - `[bootstrap] hydrating from qdrant: found N collections`
 - `[bootstrap] collection <name>: M points hydrated`
 - `[bootstrap] complete: N total memories hydrated`
+
+## Decisions (audit-driven, 2026-06-05)
+
+5. **Hydration is atomic and fail-loud per memory.** The original
+   `upsertMemoryFromPayload` ran two independent, non-transactional `INSERT OR IGNORE`
+   statements. Because `memories.type` carries
+   `CHECK(type IN ('episodic','semantic','procedural'))` and the payload `type` was
+   reconstructed verbatim (only a `typeof === 'string'` guard), a payload with any other
+   `type` string was silently dropped from `memories` while the `memories_fts` insert
+   still succeeded and the method returned `true`. The net effect — an orphan FTS row, an
+   inflated hydrated count, and a memory that surfaces in full-text search but cannot be
+   loaded via `getMemoryById` — *recreates the exact silent cross-device drop this
+   proposal exists to eliminate.* Decision: validate `type` against the allowed enum
+   before insert (falling back to the documented `'semantic'` default on mismatch) **and**
+   make the two inserts atomic — either by wrapping them in a single transaction or by
+   gating the FTS insert and the `return true` on the `memories` insert actually applying
+   (`db.getRowsModified()`). A constraint violation must fail loudly; it must never leave
+   an orphan `memories_fts` row or over-report the count. A regression test exercises the
+   out-of-enum `type` path.
+
+6. **`repair` contract single-sourced with `device-namespace-partitioning`.**
+   `bootstrapFromQdrant` and `repair --from-qdrant` originally hydrated every device's
+   memories with no `device_id` predicate, contradicting `device-namespace-partitioning`,
+   which scopes `repair` to the current device (or `--all-devices`). Decision: align the
+   two contracts so `repair` device-scoping is defined in one place — add an optional
+   `device_id` filter (default `config.device.id`, `--all-devices` override) to
+   `bootstrapFromQdrant` and the CLI, or formally delegate the unfiltered hydration to
+   this command and update the partitioning spec/naming to match. This proposal's prior
+   "Per-device filtering is a Non-Goal" stance is superseded only to the extent needed to
+   remove the ambiguity in the shared `repair` surface.

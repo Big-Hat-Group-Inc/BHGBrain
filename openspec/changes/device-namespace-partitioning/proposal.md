@@ -17,6 +17,21 @@ The recent data loss incident (SQLite wiped on one device while Qdrant retained 
 - Auto-generate a stable `device_id` on first run if not explicitly configured (based on hostname).
 - The `repair` tool uses `device_id` to selectively recover only the current device's memories, or all memories with `--all-devices`.
 
+**Audit-driven refinements (2026-06-05):**
+
+- The `device_id` Qdrant payload index is ensured **idempotently on existing
+  collections**, not just on newly created ones. The original implementation created it
+  only in the collection-not-found branch, so post-upgrade collections (the multi-device
+  case) were never migrated.
+- `BHGBRAIN_DEVICE_ID` **takes precedence over** a persisted `device.id`, matching the
+  documented "env wins" contract for `BHGBRAIN_*` overrides. When env overrides, the
+  resolved value is re-persisted.
+- `config.json` is written **only when the device id was newly synthesized** (or the
+  file is missing), not unconditionally on every boot, so user formatting/comments are
+  preserved and startup avoids needless disk writes.
+- `--all-devices` is exposed as an **explicit** repair flag rather than an implicit
+  "omit `device_id`" behavior.
+
 ## Capabilities
 
 ### New Capabilities

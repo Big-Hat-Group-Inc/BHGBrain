@@ -39,6 +39,16 @@ BHGBrain is a dual-store memory system: SQLite is the durable metadata store and
 - Decision: prior stale marking behavior becomes one internal signal, not the terminal behavior. Eligible `T2` and `T3` memories may be archived and deleted once expiry policy is met.
 - Rationale: this is required by the new specification and is the only way to maintain vector hygiene over time.
 
+6. Filter expired memories at every read surface, not just search (audit follow-up).
+- Decision: route MCP resource reads (`memory://list`, `memory://{id}`) through the same retention-aware expiry filter used by the search path, excluding expired decay-eligible `T2`/`T3` records while keeping `T0`/`T1` eligible.
+- Rationale: the audit found resource reads bypass expiry filtering, leaking memories the lifecycle intended to retire and producing client-visible state that disagrees with `recall`/`search`.
+- Alternative considered: filter only in search and document resources as raw. Rejected because the spec requires consistent lifecycle visibility across tools, resources, and CLI.
+
+7. Gate `T1` deletion behind a review window instead of TTL-only delete (audit follow-up).
+- Decision: GC excludes `T1` from direct archive-and-delete; expired or `review_due`-past `T1` rows are surfaced as review candidates and only `T2`/`T3` are eligible for direct deletion.
+- Rationale: the audit found `runGc` hard-deletes `T1` on `expires_at < now` and never consults `review_due`, defeating the protected institutional tier.
+- Alternative considered: delete `T1` after a longer TTL with no review step. Rejected because the spec explicitly requires warning/review semantics before any `T1` deletion path.
+
 ## Risks / Trade-offs
 
 - [Cross-store drift during partial failures] -> Mitigation: add `vector_synced` or equivalent reconciliation metadata and expose drift in health.
@@ -99,3 +109,4 @@ BHGBrain is a dual-store memory system: SQLite is the durable metadata store and
 
 - Should `T1` review workflows be surfaced only via CLI initially, or also through MCP resources in the same change?
 - Should expired memories be soft-deleted for one release window before permanent deletion, or is archive-only recovery sufficient?
+- Should the scheduled cleanup job be enabled by default once wired, or remain opt-in (manual `bhgbrain gc` only) until compaction and degraded-health handling are proven in production?

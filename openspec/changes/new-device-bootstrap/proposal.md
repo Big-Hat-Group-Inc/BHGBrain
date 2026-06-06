@@ -18,6 +18,19 @@ dropped and `memory_count` reports 0.
 2. **`bhgbrain repair --from-qdrant`** – A CLI command to trigger the same
    hydration on demand, regardless of memory count.
 
+### Audit-driven amendments (2026-06-05)
+
+3. **Atomic, fail-loud hydration** – Hydration must be atomic per memory. A Qdrant
+   payload that violates the `memories.type` CHECK constraint must fail loudly rather
+   than being silently dropped while an orphan `memories_fts` row is left behind and
+   the hydrated count is over-reported. The original implementation
+   (`upsertMemoryFromPayload`) used two non-transactional `INSERT OR IGNORE` statements
+   that recreate the exact silent-drop failure this proposal set out to fix; `type` is
+   now validated against the enum and the inserts are made atomic.
+4. **`repair` contract alignment** – The `repair --from-qdrant` flow is reconciled with
+   `device-namespace-partitioning` so the `repair` device-scoping contract is
+   single-sourced (see Decision 6 in design.md).
+
 ## Capabilities
 
 | Capability | Description |
