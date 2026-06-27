@@ -189,6 +189,8 @@ Set `qdrant.mode` to `external` in your config and point `external_url` at your 
 
 For Azure, `embedding.model` is the deployment name sent upstream, not the public model-family label. Azure credentials are loaded once at startup from `AZURE_FOUNDRY_API_KEY`; rotating that secret requires a restart or explicit config reload.
 
+> **Provisioning from scratch?** The PowerShell scripts in [`scripts/azure/`](./scripts/azure/README.md) stand up an Azure AI Foundry / Azure OpenAI resource, deploy an embedding model (with the deployment name set to match the model name, as required), and wire BHGBrain's `config.json` + `AZURE_FOUNDRY_API_KEY` for you — starting from nothing but an Azure subscription.
+
 ---
 
 ## Installation
