@@ -1,12 +1,17 @@
 services:
   bhgbrain:
     build: .
+    # Publish to host loopback only, so even an explicitly unauthenticated mode is
+    # not reachable from the LAN. Change to "3721:3721" to expose externally.
     ports:
-      - "3721:3721"
+      - "127.0.0.1:3721:3721"
     volumes:
       - bhgbrain_data:/data
+    # Optional: a missing .env must not abort first run. The entrypoint provisions
+    # a bearer token automatically when none is supplied.
     env_file:
-      - .env
+      - path: .env
+        required: false
     depends_on:
       qdrant:
         condition: service_healthy
@@ -14,7 +19,9 @@ services:
     restart: unless-stopped
 
   qdrant:
-    image: qdrant/qdrant:latest
+    # Pinned rather than :latest for reproducible builds. Verify/update the tag
+    # for your deployment; this service is opt-in via the self-hosted profile.
+    image: qdrant/qdrant:v1.12.4
     profiles:
       - self-hosted
     ports:

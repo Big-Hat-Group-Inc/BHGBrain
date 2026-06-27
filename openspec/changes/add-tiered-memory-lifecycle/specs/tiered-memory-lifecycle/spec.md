@@ -91,3 +91,44 @@ The system SHALL expose lifecycle administration via CLI and retention-aware met
 #### Scenario: Cleanup dry-run reports candidates without deleting
 - **WHEN** an operator runs `bhgbrain gc --dry-run`
 - **THEN** the system reports cleanup candidates and counts without mutating memory state
+
+### Requirement: Cleanup SHALL execute on the configured schedule
+
+The system SHALL run lifecycle cleanup automatically on the configured `cleanup_schedule` using the same execution path as the manual CLI command.
+
+#### Scenario: Scheduled cleanup runs without operator action
+
+- **WHEN** the configured `cleanup_schedule` interval elapses
+- **AND** scheduled cleanup is enabled
+- **THEN** the system invokes the retention execution service automatically
+- **AND** applies the same archive-before-delete and tier-eligibility rules as `bhgbrain gc`
+
+### Requirement: Resource reads SHALL exclude expired memories
+
+The system SHALL exclude expired decay-eligible memories from MCP resource read paths the same way the search path does, while keeping `T0` and `T1` memories eligible.
+
+#### Scenario: Expired transient memory is not surfaced through resources
+
+- **WHEN** a client reads `memory://list` or `memory://{id}`
+- **AND** a `T3` memory has passed `expires_at` and is decay-eligible
+- **THEN** the resource response does not include that expired memory
+
+#### Scenario: Foundational and institutional memories remain visible to resources
+
+- **WHEN** a client reads a `T0` or `T1` memory through a resource path
+- **THEN** the memory is returned regardless of transient expiry filters
+
+### Requirement: Institutional tier deletion SHALL be gated behind review
+
+The system SHALL NOT directly delete `T1` memories during cleanup and SHALL instead surface expired or review-due `T1` memories as review candidates.
+
+#### Scenario: Expired institutional memory is flagged rather than deleted
+
+- **WHEN** cleanup evaluates a `T1` memory whose `expires_at` or `review_due` has passed
+- **THEN** the system marks it as a review candidate
+- **AND** does not remove it from active SQLite and Qdrant stores in the same run
+
+#### Scenario: Direct deletion is limited to transient tiers
+
+- **WHEN** cleanup performs direct archive-and-delete
+- **THEN** only `T2` and `T3` decay-eligible memories are eligible for direct deletion

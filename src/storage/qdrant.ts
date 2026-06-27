@@ -138,9 +138,6 @@ export class QdrantStore {
       minScore?: number;
     },
   ): Promise<Array<{ id: string; score: number; payload: Record<string, unknown> }>> {
-    const collName = collection ?? 'general';
-    const name = this.collectionName(namespace, collName);
-
     const must: Array<Record<string, unknown>> = [
       { key: 'namespace', match: { value: namespace } },
     ];
@@ -155,19 +152,45 @@ export class QdrantStore {
       ],
     });
 
-    const results = await this.executeWithBreaker(() => this.client.search(name, {
-      vector,
-      limit,
-      filter: must.length > 0 ? { must } : undefined,
-      score_threshold: filters?.minScore,
-      with_payload: true,
-    }));
+    // When no collection is specified, search every collection in the namespace
+    // rather than silently defaulting to `general` (which hid all other
+    // collections). The payload `namespace` filter keeps results correct even if
+    // the prefix match is broad, so over-inclusion is safe.
+    let targets: string[];
+    if (collection !== undefined) {
+      targets = [this.collectionName(namespace, collection)];
+    } else {
+      const all = await this.listAllCollections();
+      const prefix = `${COLLECTION_PREFIX}${namespace}_`;
+      targets = all.filter(n => n.startsWith(prefix));
+      if (targets.length === 0) return [];
+    }
 
-    return results.map(r => ({
+    const perCollection = await Promise.all(targets.map(name =>
+      this.executeWithBreaker(() => this.client.search(name, {
+        vector,
+        limit,
+        filter: must.length > 0 ? { must } : undefined,
+        score_threshold: filters?.minScore,
+        with_payload: true,
+      })).catch((err: unknown) => {
+        // A target collection that no longer exists simply contributes no results.
+        if (this.isNotFoundError(err)) return [];
+        throw err;
+      }),
+    ));
+
+    const merged = perCollection.flat().map(r => ({
       id: r.id as string,
       score: r.score,
       payload: (r.payload ?? {}) as Record<string, unknown>,
     }));
+    // Top-K across the merged candidate set when fanning out over collections.
+    if (targets.length > 1) {
+      merged.sort((a, b) => b.score - a.score);
+      return merged.slice(0, limit);
+    }
+    return merged;
   }
 
   async searchSimilar(

@@ -32,3 +32,22 @@ The system SHALL record audit events for memory writes and deletes including tim
 #### Scenario: Delete operation emits audit event
 - **WHEN** a memory delete operation succeeds
 - **THEN** an audit entry is recorded with required metadata
+
+## MODIFIED Requirements
+
+### Requirement: Audit logging SHALL capture all write and delete operations
+The system SHALL record audit events for memory writes and deletes including timestamp, namespace, operation type, and client id. The recorded client id SHALL be derived from the authenticated principal (e.g. `req.ip` and/or an authenticated bearer-token identity) and SHALL NOT be derived from an unauthenticated, caller-supplied request header such as `x-client-id`.
+
+#### Scenario: Write operation emits audit event
+- **WHEN** a memory write operation succeeds
+- **THEN** an audit entry is recorded with required metadata
+
+#### Scenario: Delete operation emits audit event
+- **WHEN** a memory delete operation succeeds
+- **THEN** an audit entry is recorded with required metadata
+
+#### Scenario: Spoofed client identity header is not trusted for audit
+- **WHEN** an HTTP request supplies an attacker-controlled `x-client-id` header
+- **AND** the request is authorized and triggers a write or delete audit event
+- **THEN** the recorded audit client id is derived from the authenticated principal (`req.ip` / bearer-token identity)
+- **AND** the recorded audit client id is not the unverified `x-client-id` header value

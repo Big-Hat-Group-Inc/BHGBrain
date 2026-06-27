@@ -199,6 +199,10 @@ export class ResourceHandler {
   }
 
   private handleCategory(uri: string): unknown {
+    // Categories are intentionally global: they hold shared policy context
+    // (company values, architecture, coding requirements) and have no namespace
+    // dimension in the schema, so `category://` reads are not namespace-scoped.
+    // This is by design — contrast with `collection://`, which IS namespace-scoped.
     const url = new URL(uri);
     const path = url.hostname || url.pathname.replace('//', '');
 
@@ -226,15 +230,36 @@ export class ResourceHandler {
     const url = new URL(uri);
     const path = url.hostname || url.pathname.replace('//', '');
 
+    // Resolve namespace the same way memory:// does: scoped to the configured
+    // default namespace, with ?namespace= as an explicit, opt-in override. This
+    // closes the cross-namespace leak where collection reads always saw `global`.
+    const namespace = url.searchParams.get('namespace') ?? this.config.defaults.namespace;
+
     if (path === 'list') {
-      return { collections: this.storage.sqlite.listCollections() };
+      return { collections: this.storage.sqlite.listCollections(namespace) };
     }
 
-    // collection://{name} - list memories in collection
-    const namespace = url.searchParams.get('namespace') ?? 'global';
-    const memories = this.storage.sqlite.listMemories(namespace, 50);
-    const filtered = memories.filter(m => m.collection === path);
-    return { collection: path, memories: filtered };
+    // collection://{name} - list memories in the collection, namespace-scoped and
+    // cursor-paginated (no longer a fixed 50-row in-memory filter that silently
+    // dropped collections whose members fell outside the first page).
+    const parsedLimit = this.parseListLimit(url.searchParams.get('limit'));
+    if (typeof parsedLimit !== 'number') {
+      return parsedLimit;
+    }
+    const cursor = url.searchParams.get('cursor') ?? undefined;
+    const items = this.storage.sqlite.listMemoriesInCollection(namespace, path, parsedLimit + 1, cursor);
+    const hasMore = items.length > parsedLimit;
+    const page = hasMore ? items.slice(0, parsedLimit) : items;
+    const lastItem = page[page.length - 1];
+    const nextCursor = hasMore && lastItem ? `${lastItem.created_at}|${lastItem.id}` : null;
+    return {
+      collection: path,
+      namespace,
+      memories: page,
+      cursor: nextCursor,
+      total_results: this.storage.sqlite.countMemoriesInCollection(namespace, path),
+      truncated: hasMore,
+    };
   }
 }
 

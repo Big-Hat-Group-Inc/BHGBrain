@@ -45,6 +45,39 @@ The bulk-profile-import tool (separate change) handles batch ingestion of comple
 
 **Rationale:** Clean reset ensures no stale data. The `memory_ids` column provides an exact deletion list without needing content-based matching.
 
+### 5. Canonical section count is 10 (audit reconciliation, 2026-06-05)
+
+**Decision:** The bootstrap interview has **10** storage-mapped sections, not 12. The single
+source of truth is `BOOTSTRAP_SECTIONS` / `TOTAL_SECTIONS` in `src/bootstrap/sections.ts`,
+already used by the bootstrap tool, the profile parser, the tests, and the Zod validator. All
+"12-section" references in this proposal's narrative, the spec scenarios, the tasks, the
+"section outside 1–12 → INVALID_INPUT" bound (now 1–10), and the `import` tool description
+strings in `src/tools/schemas.ts` are corrected to 10.
+
+**Rationale:** The audit (`codeaudit/interactive-bootstrap-2026-06-05-02-19.md` Finding 1)
+found the docs/spec drifted from internally-consistent code. Because the section table is
+shared with bulk import, the same drift was independently flagged in
+`codeaudit/bulk-profile-import-2026-06-05-02-19.md` (Finding 1). Owning the reconciliation
+here keeps a single source of truth and **resolves the `bulk-profile-import` drift without a
+separate proposal**. The `bulk-profile-import` parser must also stop silently dropping
+headings 11–12 (make the ignore explicit / surface it), so a "12-section" document no longer
+loses data without notice. Choosing 10 (over restoring 2 sections) avoids changing runtime
+behavior and matches what users already see in the README "10-section interview" wording.
+
+### 6. Reset deletes vectors before clearing SQLite tracking (audit fix, 2026-06-05)
+
+**Decision:** `reset` SHALL delete the section's memories — including their Qdrant vectors —
+**before** it clears the `memory_ids` column or marks the section pending. On a partial
+deletion failure the `memory_ids` list SHALL be preserved so the section remains recoverable
+and re-resettable.
+
+**Rationale:** The audit (`codeaudit/interactive-bootstrap-2026-06-05-02-19.md` Finding 2)
+found `resetBootstrapSection` zeroed `memory_ids` in SQLite first and then looped
+`deleteMemory`; a `deleteMemory` throw (Qdrant failure) or crash after the column was zeroed
+orphaned the vectors/rows with no tracked recovery list — contradicting Decision 4's guarantee
+that `memory_ids` "provides an exact deletion list". Deleting vectors first (or wrapping the
+operation so the ID list survives failure) keeps the two stores consistent.
+
 ## Risks / Trade-offs
 
 - **Section definition coupling** — The 12-section format is hardcoded; changes to the bootstrap prompt require code updates → Mitigation: Extract section definitions into a shared module that both bootstrap and import tools reference.

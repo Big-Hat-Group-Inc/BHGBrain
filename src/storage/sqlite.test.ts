@@ -327,6 +327,47 @@ describe('SqliteStore', () => {
     expect(results.some(r => r.id === 'fts-id')).toBe(true);
   });
 
+  it('fullTextSearch ranks by term-frequency relevance instead of a constant', () => {
+    // Low relevance: one body mention.
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000a1', checksum: 'rk-low',
+      content: 'a passing mention of vector search here', summary: 'misc note', tags: [],
+    });
+    // High relevance: repeated mentions plus a tag/summary hit.
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000a2', checksum: 'rk-high',
+      content: 'vector vector vector indexing for vector search', summary: 'vector ranking', tags: ['vector'],
+    });
+    const results = store.fullTextSearch('global', 'vector', 10);
+    expect(results.map(r => r.id)).toEqual([
+      '00000000-0000-0000-0000-0000000000a2',
+      '00000000-0000-0000-0000-0000000000a1',
+    ]);
+    // Ranks are real relevance scores (distinct, descending), not a constant.
+    expect(results[0]!.rank).toBeGreaterThan(results[1]!.rank);
+  });
+
+  it('getMemoryByChecksum scopes to collection when provided', () => {
+    const inGeneral = { ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000b1', collection: 'general', checksum: 'dup-chk' };
+    const inWork = { ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000b2', collection: 'work', checksum: 'dup-chk' };
+    store.insertMemory(inGeneral);
+    store.insertMemory(inWork);
+    // Collection-scoped: identical content in a different collection is not a match.
+    expect(store.getMemoryByChecksum('global', 'dup-chk', 'work')!.id).toBe(inWork.id);
+    expect(store.getMemoryByChecksum('global', 'dup-chk', 'general')!.id).toBe(inGeneral.id);
+    expect(store.getMemoryByChecksum('global', 'dup-chk', 'archive')).toBeNull();
+    // Unscoped lookup still finds one (back-compat).
+    expect(store.getMemoryByChecksum('global', 'dup-chk')).not.toBeNull();
+  });
+
+  it('listMemoriesInCollection scopes by namespace and collection', () => {
+    store.insertMemory({ ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000c1', collection: 'work', checksum: 'c1' });
+    store.insertMemory({ ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000c2', collection: 'general', checksum: 'c2' });
+    store.insertMemory({ ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000c3', namespace: 'other', collection: 'work', checksum: 'c3' });
+    const work = store.listMemoriesInCollection('global', 'work', 10);
+    expect(work.map(m => m.id)).toEqual(['00000000-0000-0000-0000-0000000000c1']);
+  });
+
   // -- Health --
 
   it('passes health check', () => {

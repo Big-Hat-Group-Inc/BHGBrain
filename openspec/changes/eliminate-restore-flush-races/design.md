@@ -24,6 +24,12 @@
 3. Activation is all-or-nothing from the caller perspective.
 - If reload coordination fails, restore returns an error and operators receive explicit guidance.
 
+4. (Audit follow-up, 2026-06-05) The lifecycle guard covers every state-mutating path, including retention.
+- `markStale` (`src/storage/sqlite.ts:583-586`) and `archiveMemory` (`src/storage/sqlite.ts:773-788`) call `markDirty()` directly without `assertMutableAllowed()`, unlike all other mutators. They are driven by the retention engine (`src/backup/retention.ts:56,82`), which can resume inside the `await reloadSqliteFromDisk()` window and re-dirty the in-memory DB mid-restore. These paths SHALL route through the same guard. If retention is ever meant to be exempt, that exemption SHALL be explicit via an `allowDuringLifecycle` option mirroring `markVectorSync` (`sqlite.ts:647`) plus a comment — never an undocumented hole.
+
+5. (Audit follow-up, 2026-06-05) Verification must exercise the real timer-cancel path, not a mock.
+- The current backup-restore tests mock `SqliteStore` (`src/backup/index.test.ts:24-259`), so `cancelDeferredFlush()` inside the real `reloadFromDisk`/`beginLifecycleOperation` (`sqlite.ts:287,1097`) is never run; serialization passes only because the mock never throws. The signature "pending deferred flush during restore" scenario SHALL be covered by a real-`SqliteStore` integration test that drives an actual pending timer through `restore` and asserts both no stale write and restored-data visibility.
+
 ## Risks / Trade-offs
 
 - [Restore briefly blocks traffic] -> Mitigation: keep the critical section narrow and surface structured busy errors.

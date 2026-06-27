@@ -119,9 +119,30 @@ export class MemoryLifecycleService {
     };
   }
 
-  extendExpiry(tier: RetentionTier, now: Date): string | null {
-    if (this.config.retention?.sliding_window_enabled === false) return null;
-    return this.computeExpiry(tier, now);
+  /**
+   * Determines the expiry value to write during an access update, using a
+   * tri-state contract so "preserve existing expiry" is distinct from "clear":
+   *   - a timestamp string -> set this new expiry,
+   *   - `null`            -> clear expiry (the resolved tier has no TTL),
+   *   - `undefined`       -> preserve the existing expiry unchanged (no write).
+   *
+   * Promotion is a policy state change, so the promoted tier's lifecycle policy
+   * (including a recomputed expiry) is applied regardless of sliding-window
+   * configuration. When the tier is unchanged and sliding-window extension is
+   * disabled, the existing deadline is preserved rather than removed.
+   */
+  nextExpiryForAccess(
+    currentTier: RetentionTier,
+    promotedTier: RetentionTier,
+    now: Date,
+  ): string | null | undefined {
+    if (promotedTier !== currentTier) {
+      return this.computeExpiry(promotedTier, now);
+    }
+    if (this.config.retention?.sliding_window_enabled === false) {
+      return undefined;
+    }
+    return this.computeExpiry(currentTier, now);
   }
 
   private hasT0Signal(tags: Set<string>, content: string): boolean {

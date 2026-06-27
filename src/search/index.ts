@@ -25,6 +25,7 @@ export class SearchService {
     private storage: StorageManager,
     private embedding: EmbeddingProvider,
     private metrics?: MetricsCollector,
+    private logger?: { warn: (obj: Record<string, unknown>) => void },
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
   }
@@ -35,6 +36,10 @@ export class SearchService {
     collection: string | undefined,
     mode: SearchMode,
     limit: number,
+    // Optional per-call out-parameter: hybrid mode sets `degraded = true` when it
+    // falls back to fulltext-only, so callers can distinguish a degraded result
+    // from a healthy one without changing the SearchResult[] contract.
+    signal?: { degraded?: boolean },
   ): Promise<SearchResult[]> {
     const start = Date.now();
     try {
@@ -44,7 +49,7 @@ export class SearchService {
         case 'fulltext':
           return this.fulltextSearch(query, namespace, collection, limit);
         case 'hybrid':
-          return await this.hybridSearch(query, namespace, collection, limit);
+          return await this.hybridSearch(query, namespace, collection, limit, signal);
       }
       const unsupportedMode: never = mode;
       throw new Error(`Unsupported search mode: ${unsupportedMode}`);
@@ -109,6 +114,7 @@ export class SearchService {
     namespace: string,
     collection: string | undefined,
     limit: number,
+    signal?: { degraded?: boolean },
   ): Promise<SearchResult[]> {
     const weights = this.config.search.hybrid_weights;
 
@@ -122,8 +128,18 @@ export class SearchService {
         namespace, collection, vector, limit * 2,
       );
       semanticItems = qdrantResults.map(r => ({ id: r.id, score: r.score }));
-    } catch {
-      // Embedding unavailable: fall back to fulltext only
+    } catch (err) {
+      // Embedding/vector store unavailable: degrade to fulltext-only, but make the
+      // degradation observable instead of silent (dependency outages are signal in
+      // this project). Semantic mode raises EMBEDDING_UNAVAILABLE; hybrid stays
+      // graceful but emits a metric + warning so operators can see it.
+      this.metrics?.incCounter('search_embedding_degraded');
+      this.logger?.warn({
+        event: 'embedding_degraded',
+        degraded: 'fulltext_only',
+        message: (err as Error).message,
+      });
+      if (signal) signal.degraded = true;
     }
 
     // Build RRF fusion
@@ -250,7 +266,9 @@ export class SearchService {
   ): AccessUpdate {
     const nextAccessCount = mem.access_count + 1;
     const promotedTier = this.lifecycle.shouldPromote(mem.retention_tier, nextAccessCount) ?? mem.retention_tier;
-    const nextExpiry = this.lifecycle.extendExpiry(promotedTier, now);
+    // Tri-state: a string sets a new expiry, `null` clears it, `undefined` preserves
+    // the existing deadline (e.g. non-sliding mode with an unchanged tier).
+    const nextExpiry = this.lifecycle.nextExpiryForAccess(mem.retention_tier, promotedTier, now);
     const nextReviewDue = promotedTier === 'T1'
       ? this.lifecycle.computeExpiry('T1', now)
       : undefined;
@@ -258,7 +276,7 @@ export class SearchService {
       id: mem.id,
       access_count: nextAccessCount,
       last_accessed: nowIso,
-      expires_at: nextExpiry === null ? null : nextExpiry,
+      expires_at: nextExpiry,
       retention_tier: promotedTier !== mem.retention_tier ? promotedTier : undefined,
       review_due: nextReviewDue,
     };

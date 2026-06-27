@@ -20,6 +20,24 @@ Each of these is either on a critical path (auth, embedding, HTTP routing) or is
 - Add a `src/cli/index.test.ts` or integration smoke test covering CLI transport flag routing and config validation error exit codes.
 - Expand `src/health/index.test.ts` to cover degraded sub-component scenarios (Qdrant unavailable, embedding degraded, SQLite initialized).
 
+### Audit follow-ups (2026-06-05)
+
+The audit (`codeaudit/expand-test-coverage-2026-06-05-02-19.md`) found the implementation
+largely complete (>80% line coverage on all six modules) but flagged gaps and one design
+deviation, now folded back in (see tasks group "Audit follow-ups (2026-06-05)"):
+
+- Implement the skipped `MetricsCollector` tests — counter accumulation (3.1), custom-amount
+  counter (3.2), gauge overwrite (3.5), and disabled-collector → `[]` (3.6) — which currently
+  leave `incCounter`, `setGauge`, and the disabled branch uncovered (`metrics.ts:85-86,
+  100-101, 107-108`).
+- Finish partial items: assert `BoundedBuffer` wrap directly (3.4), assert the metric `type`
+  field (3.7), time-assert the 30s health cache boundary with fake timers (5.4), and cover the
+  `degraded`→200 `/health` path (2.3).
+- Fix the HTTP suite to match the design: `src/transport/http.test.ts` binds a real socket via
+  `app.listen(0)` + `fetch`, contradicting the design's supertest/in-process decision and its
+  "never call `.listen()` in tests" mitigation. Rewrite it in-process (or amend the design if
+  real-port binding is deliberately chosen).
+
 ## Capabilities
 
 ### New Capabilities

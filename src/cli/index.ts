@@ -38,7 +38,7 @@ async function createContext(): Promise<ToolContext> {
   const storage = new StorageManager(sqlite, qdrant, embedding);
 
   const pipeline = new WritePipeline(config, storage, embedding);
-  const searchService = new SearchService(config, storage, embedding, metrics);
+  const searchService = new SearchService(config, storage, embedding, metrics, logger);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {
     [getEmbeddingBreakerKey(config.embedding.provider)]: embeddingBreaker,
@@ -52,7 +52,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
   const program = new Command()
     .name('bhgbrain')
     .description('BHGBrain companion CLI for managing persistent memory')
-    .version('1.0.0');
+    .version('1.4.0');
 
   program
     .command('list')

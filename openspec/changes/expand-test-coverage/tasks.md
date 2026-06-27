@@ -15,7 +15,7 @@
 
 - [x] 2.1 Create a minimal `BrainConfig` fixture and stub `ToolContext` / `ResourceHandler` / `HealthService`
 - [x] 2.2 Assert `GET /health` returns 200 with a health body when no auth token is provided (unauthenticated)
-- [x] 2.3 Assert `GET /health` returns 503 when the health stub reports `status: 'unhealthy'`
+- [x] 2.3 Assert `GET /health` returns 503 when the health stub reports `status: 'unhealthy'` (audit 2026-06-05: partial — `unhealthy`→503 covered; `degraded`→200 path at `http.ts:31` untested)
 - [x] 2.4 Assert `POST /tool/:name` returns 401 when `Authorization` header is absent (auth is configured)
 - [x] 2.5 Assert `POST /tool/:name` returns 401 when an invalid bearer token is provided
 - [x] 2.6 Assert `POST /tool/:name` with a valid bearer token calls `handleTool` and returns its result
@@ -26,13 +26,13 @@
 
 ## 3. MetricsCollector Tests (`src/health/metrics.test.ts`)
 
-- [x] 3.1 Assert `incCounter` accumulates correctly across multiple calls
-- [x] 3.2 Assert `incCounter` with custom `amount` adds the correct increment
+- [ ] 3.1 Assert `incCounter` accumulates correctly across multiple calls (audit 2026-06-05: not implemented — `incCounter` never called in `src/health/metrics.test.ts`; `metrics.ts:85-86` uncovered)
+- [ ] 3.2 Assert `incCounter` with custom `amount` adds the correct increment (audit 2026-06-05: not implemented)
 - [x] 3.3 Assert `recordHistogram` stores values and `getMetrics` returns correct `_avg` and `_count`
-- [x] 3.4 Assert `BoundedBuffer` wraps correctly at capacity: after `capacity + N` pushes, `values()` returns exactly `capacity` items and `_avg` reflects the most recent window
-- [x] 3.5 Assert `setGauge` overwrites previous value; `getMetrics` returns the latest value
-- [x] 3.6 Assert a disabled `MetricsCollector` (`metrics_enabled: false`) silently ignores all record calls and returns `[]` from `getMetrics`
-- [x] 3.7 Assert `getMetrics` returns entries with correct `name`, `type`, and `value` shape
+- [x] 3.4 Assert `BoundedBuffer` wraps correctly at capacity: after `capacity + N` pushes, `values()` returns exactly `capacity` items and `_avg` reflects the most recent window (audit 2026-06-05: partial — wrap verified indirectly via percentile count cap; `values()`/`_avg` window not asserted directly)
+- [ ] 3.5 Assert `setGauge` overwrites previous value; `getMetrics` returns the latest value (audit 2026-06-05: not implemented — `setGauge` never called; `metrics.ts:100-101` uncovered)
+- [ ] 3.6 Assert a disabled `MetricsCollector` (`metrics_enabled: false`) silently ignores all record calls and returns `[]` from `getMetrics` (audit 2026-06-05: not implemented — disabled-collector path/`metrics.ts:107-108` uncovered)
+- [x] 3.7 Assert `getMetrics` returns entries with correct `name`, `type`, and `value` shape (audit 2026-06-05: partial — `name`/`value` asserted; `type` field never asserted)
 
 ## 4. Logger / Redaction Tests (`src/health/logger.test.ts`)
 
@@ -49,7 +49,7 @@
 - [x] 5.1 Assert health check returns `status: 'degraded'` when embedding provider is in degraded mode but SQLite and Qdrant are healthy
 - [x] 5.2 Assert health check returns `status: 'degraded'` when Qdrant is unavailable but SQLite is healthy
 - [x] 5.3 Assert health check returns `status: 'unhealthy'` when SQLite is unavailable
-- [x] 5.4 Assert health check result is cached for 30 seconds (second call within window does not re-invoke sub-checks)
+- [x] 5.4 Assert health check result is cached for 30 seconds (second call within window does not re-invoke sub-checks) (audit 2026-06-05: partial — within-window caching proven by call count; 30s TTL boundary not time-asserted, no fake-timer advance past expiry)
 
 ## 6. CLI Smoke Test (`src/cli/index.test.ts`)
 
@@ -63,3 +63,20 @@
 - [x] 7.2 Run coverage report and confirm all six target modules have meaningful coverage (>80% line)
 - [x] 7.3 Commit with message: `test: add coverage for embedding, http transport, metrics, logger, health, and cli (codereview2)`
 - [x] 7.4 Push to active branch
+
+## Audit follow-ups (2026-06-05)
+
+Source: `codeaudit/expand-test-coverage-2026-06-05-02-19.md`. These items close the gaps
+and design deviations the audit found. No production code under `src/` changes — test
+files only.
+
+- [ ] 8.1 Implement task 3.1 — `incCounter('c'); incCounter('c')` then assert `getMetrics()` contains `{ name: 'c', type: 'counter', value: 2 }` (covers `metrics.ts:85-86`)
+- [ ] 8.2 Implement task 3.2 — `incCounter('c', 3)` adds the custom amount; assert accumulated value reflects the increment
+- [ ] 8.3 Implement task 3.5 — `setGauge('g', 1); setGauge('g', 2)` then assert `getMetrics()` reports the latest value `2` (covers `metrics.ts:100-101`)
+- [ ] 8.4 Implement task 3.6 — construct `new MetricsCollector(createConfig(false))`, issue record/counter/gauge calls, then assert `getMetrics()` deep-equals `[]` (covers the disabled branch / `metrics.ts:107-108`)
+- [ ] 8.5 Finish Partial 3.4 — assert `BoundedBuffer` wrap directly: after `capacity + N` pushes, `values()` returns exactly `capacity` items and `_avg` reflects the most-recent window (not only via percentile count cap)
+- [ ] 8.6 Finish Partial 3.7 — assert the `type` field on `getMetrics()` entries (e.g. `_count`→`'counter'`, `_avg`/`_p95`→`'histogram'`, gauge→`'gauge'`)
+- [ ] 8.7 Finish Partial 5.4 — add a `vi.useFakeTimers()` variant that advances past the 30s cache window and asserts sub-checks (`embedding.healthCheck`) are re-invoked after expiry, confirming both cache hit and TTL boundary
+- [ ] 8.8 Finish Partial 2.3 — assert `GET /health` returns 200 when the health stub reports `status: 'degraded'` (covers `http.ts:31`)
+- [ ] 8.9 FIX HTTP suite drift from design — rewrite `src/transport/http.test.ts` to drive the Express app in-process via `supertest(app)` with no real socket bind; remove `app.listen(0)` + `fetch`, the `closeIdleConnections`/`closeAllConnections`/`close` teardown plumbing, and the bumped 15s timeout, per design Decision "Use `supertest` ... never call `.listen()` in tests". (If real-port binding is instead chosen deliberately, the design must be amended to record that decision rather than leaving code and design contradictory.)
+- [ ] 8.10 Re-run `npm test` and coverage; confirm `metrics.ts` branch coverage rises (counter/gauge/disabled branches covered) and all suites stay green

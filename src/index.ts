@@ -26,10 +26,7 @@ import { ResourceHandler, MCP_RESOURCE_DEFINITIONS, MCP_RESOURCE_TEMPLATES } fro
 import { handleTool, type ToolContext } from './tools/index.js';
 import { MCP_TOOL_DEFINITIONS } from './tools/schemas.js';
 import { createHttpServer } from './transport/http.js';
-
-function isErrorEnvelope(value: unknown): value is { error: unknown } {
-  return value != null && typeof value === 'object' && 'error' in value;
-}
+import { buildToolCallResponse } from './transport/mcp-response.js';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -75,7 +72,7 @@ async function main() {
 
   // Initialize services
   const pipeline = new WritePipeline(config, storage, embedding);
-  const searchService = new SearchService(config, storage, embedding, metrics);
+  const searchService = new SearchService(config, storage, embedding, metrics, logger);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {
     [getEmbeddingBreakerKey(config.embedding.provider)]: embeddingBreaker,
@@ -93,7 +90,7 @@ async function main() {
   if (isStdio || !config.transport.http.enabled) {
     // MCP stdio transport
     const server = new Server(
-      { name: 'bhgbrain', version: '1.0.0' },
+      { name: 'bhgbrain', version: '1.4.0' },
       { capabilities: { tools: {}, resources: {} } },
     );
 
@@ -104,13 +101,7 @@ async function main() {
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: toolArgs } = request.params;
       const result = await handleTool(ctx, name, toolArgs);
-
-      // Detect error envelopes and signal via MCP isError
-      const isError = isErrorEnvelope(result);
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        ...(isError ? { isError: true } : {}),
-      };
+      return buildToolCallResponse(result);
     });
 
     server.setRequestHandler(ListResourcesRequestSchema, async () => ({

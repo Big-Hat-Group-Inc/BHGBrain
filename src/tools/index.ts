@@ -144,12 +144,15 @@ async function handleForget(ctx: ToolContext, args: unknown, clientId: string): 
   return { deleted, id: input.id };
 }
 
-async function handleSearch(ctx: ToolContext, args: unknown): Promise<{ results: SearchResult[] }> {
+async function handleSearch(ctx: ToolContext, args: unknown): Promise<{ results: SearchResult[]; degraded: boolean }> {
   const input = parseInput(SearchInputSchema, args);
+  const signal: { degraded?: boolean } = {};
   const results = await ctx.search.search(
-    input.query, input.namespace, input.collection, input.mode, input.limit,
+    input.query, input.namespace, input.collection, input.mode, input.limit, signal,
   );
-  return { results };
+  // `degraded` is true when hybrid mode fell back to fulltext-only (embedding /
+  // vector store unavailable), so callers can tell it from a healthy result.
+  return { results, degraded: signal.degraded ?? false };
 }
 
 async function handleTag(ctx: ToolContext, args: unknown): Promise<{ id: string; tags: string[] }> {
