@@ -2,6 +2,7 @@
 
 import { Command } from 'commander';
 import { fileURLToPath } from 'node:url';
+import { realpathSync } from 'node:fs';
 import { loadConfig, ensureDataDir } from '../config/index.js';
 import { SqliteStore } from '../storage/sqlite.js';
 import { QdrantStore } from '../storage/qdrant.js';
@@ -52,7 +53,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
   const program = new Command()
     .name('bhgbrain')
     .description('BHGBrain companion CLI for managing persistent memory')
-    .version('1.4.0');
+    .version('1.4.1');
 
   program
     .command('list')
@@ -426,6 +427,22 @@ export async function runCli(argv = process.argv): Promise<void> {
   }
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+function isMainModule(): boolean {
+  const invoked = process.argv[1];
+  if (!invoked) return false;
+  const here = fileURLToPath(import.meta.url);
+  // Resolve through symlinks/junctions so a linked or globally-installed bin
+  // (which may be reached via a junction on Windows) still matches.
+  const resolve = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  return resolve(here) === resolve(invoked);
+}
+
+if (isMainModule()) {
   void runCli();
 }
