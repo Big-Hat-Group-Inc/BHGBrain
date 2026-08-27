@@ -5,6 +5,26 @@ import { hostname } from 'node:os';
 
 const DEVICE_ID_RE = /^[a-zA-Z0-9._-]{1,64}$/;
 
+/**
+ * Canonical set of embedding models supported across both providers, keyed by
+ * dimension constraint. `fixedDimensions` means the model only accepts that
+ * exact dimension count; `maxDimensions` means any positive value up to the
+ * cap is accepted. This is the single source of truth referenced by config
+ * validation so the supported-model list can never drift from the dimension
+ * caps enforced at startup.
+ */
+export const SUPPORTED_EMBEDDING_MODELS = {
+  'text-embedding-ada-002': { fixedDimensions: 1536 },
+  'text-embedding-3-small': { maxDimensions: 1536 },
+  'text-embedding-3-large': { maxDimensions: 3072 },
+} as const satisfies Record<string, { fixedDimensions?: number; maxDimensions?: number }>;
+
+export type SupportedEmbeddingModel = keyof typeof SUPPORTED_EMBEDDING_MODELS;
+
+function isSupportedEmbeddingModel(model: string): model is SupportedEmbeddingModel {
+  return Object.prototype.hasOwnProperty.call(SUPPORTED_EMBEDDING_MODELS, model);
+}
+
 const AzureEmbeddingSchema = z.object({
   resource_name: z.string()
     .trim()
@@ -39,30 +59,31 @@ const ConfigSchema = z.object({
       });
     }
 
-    if (value.provider === 'azure-foundry') {
-      if (value.model === 'text-embedding-ada-002' && value.dimensions !== 1536) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'text-embedding-ada-002 requires dimensions = 1536',
-          path: ['dimensions'],
-        });
-      }
+    // Supported-model validation applies to both providers: the constraint is
+    // a property of the model, not of which API serves it.
+    if (!isSupportedEmbeddingModel(value.model)) {
+      const supported = Object.keys(SUPPORTED_EMBEDDING_MODELS).join(', ');
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Unsupported embedding model '${value.model}'. Supported models: ${supported}`,
+        path: ['model'],
+      });
+      return;
+    }
 
-      if (value.model === 'text-embedding-3-small' && value.dimensions > 1536) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'text-embedding-3-small supports at most 1536 dimensions',
-          path: ['dimensions'],
-        });
-      }
-
-      if (value.model === 'text-embedding-3-large' && value.dimensions > 3072) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'text-embedding-3-large supports at most 3072 dimensions',
-          path: ['dimensions'],
-        });
-      }
+    const constraint = SUPPORTED_EMBEDDING_MODELS[value.model];
+    if ('fixedDimensions' in constraint && value.dimensions !== constraint.fixedDimensions) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `${value.model} requires dimensions = ${constraint.fixedDimensions}`,
+        path: ['dimensions'],
+      });
+    } else if ('maxDimensions' in constraint && value.dimensions > constraint.maxDimensions) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `${value.model} supports at most ${constraint.maxDimensions} dimensions`,
+        path: ['dimensions'],
+      });
     }
   }).default({}),
   qdrant: z.object({

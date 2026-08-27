@@ -86,6 +86,60 @@ describe('loadConfig Azure embedding validation', () => {
 
     expect(() => loadConfig(configPath)).toThrow('text-embedding-ada-002 requires dimensions = 1536');
   });
+
+  it('rejects an unsupported/typo\'d model for azure-foundry', () => {
+    const configPath = writeConfig({
+      embedding: {
+        provider: 'azure-foundry',
+        model: 'text-embedding-4-ultra',
+        azure: {
+          resource_name: 'test-resource',
+        },
+      },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow(
+      "Unsupported embedding model 'text-embedding-4-ultra'. Supported models: text-embedding-ada-002, text-embedding-3-small, text-embedding-3-large",
+    );
+  });
+
+  it('rejects an unsupported/typo\'d model for openai', () => {
+    const configPath = writeConfig({
+      embedding: {
+        provider: 'openai',
+        model: 'text-embbeding-3-small',
+      },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow("Unsupported embedding model 'text-embbeding-3-small'");
+  });
+
+  it('rejects text-embedding-3-large with dimensions above its cap for openai', () => {
+    const configPath = writeConfig({
+      embedding: {
+        provider: 'openai',
+        model: 'text-embedding-3-large',
+        dimensions: 4096,
+      },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow('text-embedding-3-large supports at most 3072 dimensions');
+  });
+
+  it('accepts a supported model and resolves effective dimensions', () => {
+    const configPath = writeConfig({
+      embedding: {
+        provider: 'openai',
+        model: 'text-embedding-3-large',
+        dimensions: 3072,
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.embedding.model).toBe('text-embedding-3-large');
+    expect(config.embedding.dimensions).toBe(3072);
+  });
 });
 
 const ENV_KEYS = [

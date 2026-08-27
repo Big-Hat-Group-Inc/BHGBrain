@@ -99,7 +99,10 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
 
   async healthCheck(): Promise<boolean> {
     try {
-      const response = await this.requestWithRetry(['health check'], false);
+      // Single-shot, bounded probe (respects requestTimeoutMs via the abort
+      // controller in executeSingleRequest) — no retry/backoff loop, mirroring
+      // OpenAIEmbeddingProvider.healthCheck().
+      const response = await this.executeSingleRequest(['health check'], false);
       await this.parseEmbeddingsResponse(response);
       return true;
     } catch {

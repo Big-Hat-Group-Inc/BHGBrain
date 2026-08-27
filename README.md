@@ -189,6 +189,8 @@ Set `qdrant.mode` to `external` in your config and point `external_url` at your 
 
 For Azure, `embedding.model` is the deployment name sent upstream, not the public model-family label. Azure credentials are loaded once at startup from `AZURE_FOUNDRY_API_KEY`; rotating that secret requires a restart or explicit config reload.
 
+`embedding.model` MUST be one of the supported models — `text-embedding-ada-002`, `text-embedding-3-small`, or `text-embedding-3-large` — for **both** `openai` and `azure-foundry`. This is enforced at startup: an unsupported or typo'd model (or a deployment name that doesn't match a supported model family, for Azure) fails config validation immediately with an error listing the supported models, rather than starting and silently producing wrong-dimension vectors.
+
 > **Provisioning from scratch?** The PowerShell scripts in [`scripts/azure/`](./scripts/azure/README.md) stand up an Azure AI Foundry / Azure OpenAI resource, deploy an embedding model (with the deployment name set to match the model name, as required), and wire BHGBrain's `config.json` + `AZURE_FOUNDRY_API_KEY` for you — starting from nothing but an Azure subscription.
 
 ---
@@ -250,7 +252,10 @@ The file is created automatically on first run with all defaults applied. Edit i
   "embedding": {
     // Provider: "openai" or "azure-foundry"
     "provider": "openai",
-    // Model name (for OpenAI) or Azure deployment name (for Azure)
+    // Model name (for OpenAI) or Azure deployment name (for Azure).
+    // Must be one of the supported models: "text-embedding-ada-002",
+    // "text-embedding-3-small", "text-embedding-3-large". An unsupported
+    // value fails config validation at startup for either provider.
     "model": "text-embedding-3-small",
     // Vector dimensions produced by the model. Must match the model's output.
     // IMPORTANT: Changing this after collections are created requires recreating collections.
@@ -2670,6 +2675,7 @@ As of v1.4, restore acquires a fail-safe guard (`beginRestoreOperation()`) so co
 - Embedding-dependent operations (semantic search, memory ingestion) return `EMBEDDING_UNAVAILABLE` at request time.
 - Fulltext search and category reads still work in degraded mode.
 - Health probes report embedding status as `degraded` without making real API calls.
+- When a provider is configured, its embedding health probe is a **single-shot, bounded request** (respecting `embedding.request_timeout_ms`) with no retry/backoff — consistent across `openai` and `azure-foundry`. The probe bypasses the circuit breaker and reports a boolean; it does not run the production retry loop, so it reflects current provider health quickly instead of blocking for several seconds during an outage.
 
 ### MCP Response Contracts
 
@@ -2704,6 +2710,8 @@ Collections lock their embedding model and dimensions at creation time. If you c
 - **Azure Foundry**: The `embedding.model` field specifies the Azure deployment name. The `embedding.dimensions` must match the output dimensions configured for that deployment.
 
 Make sure to set `embedding.provider` to `"openai"` or `"azure-foundry"` accordingly.
+
+**Supported models and fail-fast validation:** `embedding.model` is validated at startup against a fixed supported-model set — `text-embedding-ada-002` (fixed 1536 dimensions), `text-embedding-3-small` (up to 1536 dimensions), `text-embedding-3-large` (up to 3072 dimensions) — for both providers. An unsupported model, or `dimensions` outside the chosen model's cap, fails config validation before the server starts, with an error naming the configured model and listing the supported set. For Azure, the deployment name configured in `embedding.model` must match one of these supported model families; deployments named after unsupported models will not start. This replaced silent behavior where an unrecognized model could produce vectors with the wrong dimensionality against the Qdrant collection.
 
 **Migration guidance:**
 - Use a canary namespace or collection before switching production traffic to Azure.

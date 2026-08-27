@@ -234,7 +234,9 @@ BHGBrain 从以下位置加载配置文件：
   "embedding": {
     // 目前仅支持 "openai"
     "provider": "openai",
-    // 用于嵌入的 OpenAI 模型
+    // 用于嵌入的 OpenAI 模型。必须是受支持的模型之一："text-embedding-ada-002"、
+    // "text-embedding-3-small"、"text-embedding-3-large"。不受支持的模型会在启动时
+    // 导致配置校验失败。
     "model": "text-embedding-3-small",
     // 保存 OpenAI API key 的环境变量名称
     "api_key_env": "OPENAI_API_KEY",
@@ -2361,6 +2363,7 @@ bhgbrain backup create
 - 依赖嵌入的操作（语义搜索、记忆摄入）在请求时返回 `EMBEDDING_UNAVAILABLE`。
 - 全文搜索和类别读取在降级模式下仍正常工作。
 - 健康探针在不发起真实 API 调用的情况下将嵌入状态报告为 `degraded`。
+- 当配置了提供商时，其嵌入健康探针是一次**单次、有限时的请求**（遵循 `embedding.request_timeout_ms`），不进行重试/退避——在 `openai` 和 `azure-foundry` 之间保持一致。探针绕过熔断器并返回布尔值，从而快速反映提供商当前的健康状况，而不是在故障期间阻塞数秒。
 
 ### MCP 响应契约
 
@@ -2389,6 +2392,8 @@ bhgbrain backup create
 ### 嵌入模型兼容性
 
 集合在创建时锁定其嵌入模型和维度。如果你在配置中更改 `embedding.model` 或 `embedding.dimensions`，现有集合中的新记忆将被拒绝并返回 `CONFLICT` 错误，直到你创建新集合。这防止了在同一 Qdrant 索引中混用不兼容的嵌入空间。
+
+**受支持的模型与启动时校验：** `embedding.model` 会在启动时针对固定的受支持模型集合进行校验——`text-embedding-ada-002`（固定 1536 维）、`text-embedding-3-small`（最多 1536 维）、`text-embedding-3-large`（最多 3072 维）。不受支持的模型，或超出所选模型上限的 `dimensions`，会在服务器启动前导致配置校验失败，错误信息会指出配置的模型并列出受支持的模型集合。
 
 ### 密钥检测
 

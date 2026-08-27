@@ -1,6 +1,6 @@
 {
   "name": "@kkaminsk/bhgbrain",
-  "version": "1.4.5",
+  "version": "1.4.6",
   "description": "Persistent, vector-backed memory for MCP clients",
   "type": "module",
   "main": "dist/index.js",

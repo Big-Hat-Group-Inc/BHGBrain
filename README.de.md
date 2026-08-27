@@ -234,7 +234,9 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
   "embedding": {
     // Derzeit wird nur "openai" unterstützt
     "provider": "openai",
-    // OpenAI-Modell für Einbettungen
+    // OpenAI-Modell für Einbettungen. Muss eines der unterstützten Modelle sein:
+    // "text-embedding-ada-002", "text-embedding-3-small", "text-embedding-3-large".
+    // Ein nicht unterstütztes Modell führt beim Start zu einem Konfigurationsfehler.
     "model": "text-embedding-3-small",
     // Name der Umgebungsvariable mit dem OpenAI API-Schlüssel
     "api_key_env": "OPENAI_API_KEY",

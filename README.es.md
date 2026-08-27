@@ -234,7 +234,9 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
   "embedding": {
     // Solo se admite "openai" actualmente
     "provider": "openai",
-    // Modelo de OpenAI a usar para embeddings
+    // Modelo de OpenAI a usar para embeddings. Debe ser uno de los modelos admitidos:
+    // "text-embedding-ada-002", "text-embedding-3-small", "text-embedding-3-large".
+    // Un modelo no admitido provoca un error de validación de configuración al iniciar.
     "model": "text-embedding-3-small",
     // Nombre de la variable de entorno que contiene la clave API de OpenAI
     "api_key_env": "OPENAI_API_KEY",
@@ -2365,6 +2367,7 @@ La copia de seguridad se almacena en el directorio de datos (`%LOCALAPPDATA%\BHG
 - Las operaciones que dependen de embeddings (búsqueda semántica, ingesta de memorias) devuelven `EMBEDDING_UNAVAILABLE` en el momento de la solicitud.
 - La búsqueda de texto completo y las lecturas de categorías siguen funcionando en modo degradado.
 - Las sondas de salud informan el estado del embedding como `degraded` sin realizar llamadas reales a la API.
+- Cuando hay un proveedor configurado, su sonda de salud de embeddings es una **solicitud única y acotada** (respetando `embedding.request_timeout_ms`), sin reintentos ni backoff, de forma consistente entre `openai` y `azure-foundry`. La sonda omite el circuit breaker e informa un valor booleano, reflejando el estado actual del proveedor rápidamente en lugar de bloquearse varios segundos durante una interrupción.
 
 ### Contratos de Respuesta MCP
 

@@ -299,6 +299,30 @@ describe('AzureFoundryEmbeddingProvider', () => {
     await expect(provider.healthCheck()).resolves.toBe(false);
   });
 
+  it('healthCheck issues a single request with no retry/backoff on a retryable failure', async () => {
+    process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
+    const fetchMock = vi.fn(async () => new Response('', { status: 503 })); // retryable in embedBatch, but health should not retry
+    vi.stubGlobal('fetch', fetchMock);
+
+    const config = createConfig();
+    config.embedding.retry.max_attempts = 3;
+    config.embedding.retry.backoff_ms = 1;
+    const provider = new AzureFoundryEmbeddingProvider(config);
+
+    await expect(provider.healthCheck()).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('healthCheck does not throw and returns false when the request itself rejects', async () => {
+    process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('network down');
+    }));
+
+    const provider = new AzureFoundryEmbeddingProvider(createConfig());
+    await expect(provider.healthCheck()).resolves.toBe(false);
+  });
+
   it('records embedding_embed_batch_ms in finally', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
     const metrics = {

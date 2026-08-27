@@ -234,7 +234,10 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
   "embedding": {
     // Seul "openai" est pris en charge actuellement
     "provider": "openai",
-    // Modèle OpenAI à utiliser pour les embeddings
+    // Modèle OpenAI à utiliser pour les embeddings. Doit être l'un des modèles pris
+    // en charge : "text-embedding-ada-002", "text-embedding-3-small",
+    // "text-embedding-3-large". Un modèle non pris en charge provoque un échec de
+    // validation de la configuration au démarrage.
     "model": "text-embedding-3-small",
     // Nom de la variable d'environnement contenant la clé API OpenAI
     "api_key_env": "OPENAI_API_KEY",
@@ -2366,6 +2369,7 @@ La sauvegarde est stockée dans le répertoire de données (`%LOCALAPPDATA%\BHGB
 - Les opérations dépendant de l'embedding (recherche sémantique, ingestion de souvenirs) renvoient `EMBEDDING_UNAVAILABLE` au moment de la requête.
 - La recherche plein texte et les lectures de catégories fonctionnent toujours en mode dégradé.
 - Les sondes de santé signalent l'état de l'embedding comme `degraded` sans effectuer de vrais appels API.
+- Lorsqu'un fournisseur est configuré, sa sonde de santé d'embedding est une **requête unique et bornée** (respectant `embedding.request_timeout_ms`), sans retry/backoff — cohérent entre `openai` et `azure-foundry`. La sonde contourne le circuit breaker et renvoie un booléen, reflétant rapidement l'état actuel du fournisseur au lieu de bloquer plusieurs secondes lors d'une panne.
 
 ### Contrats de réponse MCP
 
@@ -2394,6 +2398,8 @@ Lorsqu'un souvenir T0 (fondamental) est mis à jour, la version précédente est
 ### Compatibilité du modèle d'embedding
 
 Les collections verrouillent leur modèle d'embedding et leurs dimensions au moment de la création. Si vous modifiez `embedding.model` ou `embedding.dimensions` dans la configuration, les nouveaux souvenirs dans les collections existantes seront rejetés avec une erreur `CONFLICT` jusqu'à ce que vous créiez une nouvelle collection. Cela empêche le mélange d'espaces d'embedding incompatibles dans le même index Qdrant.
+
+**Modèles pris en charge et validation au démarrage :** `embedding.model` est validé au démarrage par rapport à un ensemble fixe de modèles pris en charge — `text-embedding-ada-002` (1536 dimensions fixes), `text-embedding-3-small` (jusqu'à 1536 dimensions), `text-embedding-3-large` (jusqu'à 3072 dimensions). Un modèle non pris en charge, ou des `dimensions` hors du plafond du modèle choisi, provoque un échec de validation de la configuration avant le démarrage du serveur, avec une erreur nommant le modèle configuré et listant les modèles pris en charge.
 
 ### Détection de secrets
 
