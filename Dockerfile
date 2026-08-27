@@ -1,5 +1,9 @@
 # Stage 1: Build
-FROM node:20-slim AS builder
+# Pinned by digest for reproducible, supply-chain-safe builds. This is the
+# multi-arch manifest-list digest for node:20-slim (Debian bookworm-slim base);
+# Docker resolves the correct per-platform image from it automatically. To bump:
+# `docker buildx imagetools inspect node:20-slim` and update both FROM lines.
+FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS builder
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -10,7 +14,7 @@ COPY src/ src/
 RUN npm run build
 
 # Stage 2: Runtime
-FROM node:20-slim
+FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0
 WORKDIR /app
 
 COPY package.json package-lock.json ./

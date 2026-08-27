@@ -31,9 +31,11 @@
 
 ## 3. Pin base and sidecar images
 
-- [ ] 3.1 Pin the Dockerfile base image by digest (e.g. `node:20-slim@sha256:...`)
-  for both stages. _(2026-06-05: left as the major-pinned `node:20-slim` tag — a digest could not
-  be resolved offline in this environment. Resolve and pin the digest before release. Remaining.)_
+- [x] 3.1 Pin the Dockerfile base image by digest (e.g. `node:20-slim@sha256:...`)
+  for both stages. _(2026-08-27: resolved via Docker Hub registry API —
+  `node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0`
+  (multi-arch manifest-list digest, current as of this date). Pinned on both the
+  `builder` and runtime `FROM` lines with a comment on how to bump it.)_
 - [x] 3.2 Pin the `qdrant/qdrant` image in `docker-compose.yml` to a fixed version
   instead of `:latest`. _(pinned to `qdrant/qdrant:v1.12.4` — **verify/adjust the tag** for your
   deployment; this service is opt-in via the `self-hosted` profile.)_
@@ -57,4 +59,11 @@
   verify a default `docker compose up` starts securely. _(2026-06-06: lint clean, 259 tests
   pass, build OK; **entrypoint shell + compose validated by syntax check, but the image build /
   `docker compose up` could NOT be run — Docker is unavailable in this environment.** Remaining:
+  build-verify before release. 2026-08-27 re-check: still holds — `docker`/`docker compose` are
+  not installed in this environment (`docker --version` → command not found), so the `FROM
+  node:20-slim@sha256:...` digest pin, `qdrant/qdrant:v1.12.4` pin, and the full image
+  build/`docker compose up` path remain unverified end-to-end. Re-ran `npm run lint` (tsc +
+  eslint, clean), `npm test` (29 files / 415 tests pass), and `npm run build` (tsc, clean) —
+  all green. Digest was resolved live against the Docker Hub registry API (not guessed) and is
+  syntactically valid, but pulling/building with it has not been confirmed. Remaining:
   build-verify before release.)_
