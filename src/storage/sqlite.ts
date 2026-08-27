@@ -679,6 +679,7 @@ export class SqliteStore implements SqliteStorage {
   }
 
   markStale(memoryId: string): void {
+    this.assertMutableAllowed();
     this.db.run(`UPDATE memories SET stale = 1 WHERE id = ?`, [memoryId]);
     this.markDirty();
   }
@@ -913,6 +914,7 @@ export class SqliteStore implements SqliteStorage {
   }
 
   archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void {
+    this.assertMutableAllowed();
     this.db.run(
       `INSERT INTO memory_archive (memory_id, summary, tier, namespace, created_at, expired_at, access_count, tags)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,

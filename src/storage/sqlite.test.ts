@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SqliteStore } from './sqlite.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -300,6 +300,87 @@ describe('SqliteStore', () => {
     const after = store.getMemoryById(mem.id)!;
     expect(after.access_count).toBe(before.access_count);
     store.endLifecycleOperation('restore');
+  });
+
+  // -- Restore/flush race coverage (real SqliteStore, not mocked) --
+  //
+  // src/backup/index.test.ts stubs SqliteStore entirely (beginLifecycleOperation /
+  // endLifecycleOperation / reloadSqliteFromDisk are all vi.fn()), so the real
+  // cancelDeferredFlush() call inside beginLifecycleOperation/reloadFromDisk is
+  // never exercised there. These tests drive the real timer and real reload path
+  // directly against SqliteStore to close that gap.
+
+  it('cancels a pending deferred flush before restore bytes land, so the stale write never overwrites them', async () => {
+    vi.useFakeTimers();
+    try {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      store.flush(); // baseline bytes on disk contain `mem`
+
+      // Dirty the in-memory DB without flushing, then arm the real deferred
+      // flush timer -- this is the "pending deferred flush" race scenario.
+      store.touchMemory(mem.id);
+      store.scheduleDeferredFlush();
+
+      // Mirrors BackupService.beginRestoreOperation(): acquiring the restore
+      // lifecycle lock must cancel the pending timer synchronously, before any
+      // restored bytes are written to disk.
+      store.beginLifecycleOperation('restore');
+
+      // Simulate the restore write: different bytes land on disk directly
+      // (bypassing this store's flush()), exactly as atomicWriteFileSync does
+      // in BackupService.restore before reloadFromDisk() is called.
+      const restoredDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-restored-'));
+      const restoredStore = new SqliteStore(restoredDir);
+      await restoredStore.init();
+      const restoredMem = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440099', checksum: 'restored-chk' };
+      restoredStore.insertMemory(restoredMem);
+      restoredStore.flush();
+      const restoredBytes = readFileSync(restoredStore.getDatabasePath());
+      restoredStore.close();
+      rmSync(restoredDir, { recursive: true, force: true });
+
+      writeFileSync(store.getDatabasePath(), restoredBytes);
+
+      // Advance well past the deferred-flush delay. If the timer had survived
+      // (i.e. cancelDeferredFlush() were not actually called), its callback
+      // would flush the stale pre-restore in-memory state over the just-written
+      // restored bytes.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(readFileSync(store.getDatabasePath()).equals(restoredBytes)).toBe(true);
+
+      // The real reload path: reads afterward observe the restored dataset.
+      await store.reloadFromDisk();
+      store.endLifecycleOperation('restore');
+
+      expect(store.getMemoryById(mem.id)).toBeNull();
+      expect(store.getMemoryById(restoredMem.id)).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects markStale, archiveMemory, and ordinary mutations while a restore reload is in flight', async () => {
+    const mem = sampleMemory();
+    store.insertMemory(mem);
+    store.flush();
+
+    store.beginLifecycleOperation('restore');
+    const reloadPromise = store.reloadFromDisk();
+
+    // While the reload is in flight -- mirroring the window between
+    // BackupService's beginRestoreOperation() and endRestoreLifecycleLock() --
+    // every state-mutating path is rejected, including the retention-driven
+    // paths (markStale/archiveMemory) that used to bypass the guard.
+    expect(() => store.markStale(mem.id)).toThrow(/lifecycle operation/);
+    expect(() => store.archiveMemory(mem, new Date().toISOString())).toThrow(/lifecycle operation/);
+    expect(() => store.insertMemory({ ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440098', checksum: 'racer' })).toThrow(/lifecycle operation/);
+
+    await reloadPromise;
+    store.endLifecycleOperation('restore');
+
+    // Guard lifted once the lifecycle operation ends.
+    expect(() => store.markStale(mem.id)).not.toThrow();
   });
 
   // -- upsertMemoryFromPayload (bootstrap) --
