@@ -153,6 +153,20 @@ export const MCP_TOOL_DEFINITIONS = [
     },
   },
   {
+    name: 'revisions',
+    description: 'List a memory\'s revision history, or revert its content to a prior revision.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: { type: 'string', enum: ['list', 'revert'] },
+        id: { type: 'string', format: 'uuid', description: 'The memory ID' },
+        revision: { type: 'number', description: 'Revision number to revert to (required for revert)' },
+      },
+      required: ['action', 'id'],
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'repair',
     description: 'Repair local state from external sources. mode: "from-qdrant" (default) recovers memories from Qdrant that are missing in SQLite. mode: "re-embed" migrates memories whose embedding stamp differs from the active embedding model/provider (run after changing embedding.provider or embedding.model).',
     inputSchema: {

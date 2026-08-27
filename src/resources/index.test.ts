@@ -109,6 +109,79 @@ describe('resource pagination bounds', () => {
     expect(result.error.code).toBe('NOT_FOUND');
   });
 
+  it('returns revisions newest-first via memory://{id}/revisions', async () => {
+    const mem = {
+      id: '550e8400-e29b-41d4-a716-446655440006',
+      retention_tier: 'T0',
+      expires_at: null,
+      decay_eligible: false,
+    };
+    const revisions = [
+      { id: 2, memory_id: mem.id, revision: 2, content: 'newer', updated_at: '2026-01-02T00:00:00.000Z', updated_by: null },
+      { id: 1, memory_id: mem.id, revision: 1, content: 'older', updated_at: '2026-01-01T00:00:00.000Z', updated_by: null },
+    ];
+    const storage = {
+      sqlite: {
+        getMemoryById: () => mem,
+        listRevisions: () => revisions,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global' } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+
+    const result = await handler.handle(`memory://${mem.id}/revisions`) as { id: string; revisions: unknown[] };
+    expect(result.id).toBe(mem.id);
+    expect(result.revisions).toEqual(revisions);
+  });
+
+  it('returns an empty revision list for a memory with no updates', async () => {
+    const mem = {
+      id: '550e8400-e29b-41d4-a716-446655440007',
+      retention_tier: 'T0',
+      expires_at: null,
+      decay_eligible: false,
+    };
+    const storage = {
+      sqlite: {
+        getMemoryById: () => mem,
+        listRevisions: () => [],
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global' } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+
+    const result = await handler.handle(`memory://${mem.id}/revisions`) as { id: string; revisions: unknown[] };
+    expect(result.revisions).toEqual([]);
+  });
+
+  it('returns NOT_FOUND for memory://{id}/revisions on an unknown or expired memory', async () => {
+    const storage = {
+      sqlite: {
+        getMemoryById: () => null,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global' } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+
+    const result = await handler.handle('memory://550e8400-e29b-41d4-a716-446655440008/revisions') as ResourceResult;
+    expect(result.error.code).toBe('NOT_FOUND');
+  });
+
   it('keeps an expired T1 memory visible through memory://{id} (only T2/T3 are filtered)', async () => {
     const expiredT1 = {
       id: '550e8400-e29b-41d4-a716-446655440003',
@@ -268,6 +341,7 @@ describe('MCP resource template discovery', () => {
   it('templates cover memory, category, and collection by-id patterns', () => {
     const templates = MCP_RESOURCE_TEMPLATES.map(t => t.uriTemplate);
     expect(templates).toContain('memory://{id}');
+    expect(templates).toContain('memory://{id}/revisions');
     expect(templates).toContain('category://{name}');
     expect(templates).toContain('collection://{name}');
   });

@@ -5,6 +5,7 @@ import type { QdrantStore } from './qdrant.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MemoryRecord } from '../domain/types.js';
 import type { MetricsCollector } from '../health/metrics.js';
+import { embeddingUnavailable } from '../errors/index.js';
 
 type StoredMemory = Omit<MemoryRecord, 'embedding'>;
 type MockSqliteStore = SqliteStore & {
@@ -14,6 +15,9 @@ type MockSqliteStore = SqliteStore & {
   listMemoriesNeedingVectorSync: ReturnType<typeof vi.fn>;
   listMemoryChecksums: ReturnType<typeof vi.fn>;
   markVectorsSyncBatch: ReturnType<typeof vi.fn>;
+  listRevisions: ReturnType<typeof vi.fn>;
+  insertRevision: ReturnType<typeof vi.fn>;
+  insertAudit: ReturnType<typeof vi.fn>;
 };
 type MockQdrantStore = QdrantStore & {
   upsert: ReturnType<typeof vi.fn>;
@@ -251,6 +255,67 @@ describe('StorageManager cross-store consistency', () => {
 
       expect(sqlite.insertRevision).not.toHaveBeenCalled();
       expect(sqlite.insertAudit).not.toHaveBeenCalledWith(expect.objectContaining({ operation: 'REVISE' }));
+    });
+  });
+
+  describe('revertMemory', () => {
+    it('restores the target revision, re-embeds, bumps history by one, and emits a distinct REVISE audit event', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory({ ...baseMem, retention_tier: 'T0' }, [1, 2, 3]);
+      sqlite.listRevisions.mockReturnValue([
+        { id: 1, memory_id: 'mem-1', revision: 1, content: 'original content', updated_at: '2026-01-01T00:00:00.000Z', updated_by: null },
+      ]);
+
+      const result = await storage.revertMemory('mem-1', 1, 'client-x');
+
+      expect(result.content).toBe('original content');
+      expect(embedding.embed).toHaveBeenCalledWith('original content');
+      // updateMemory's own T0-content-change gate is what appends the
+      // pre-revert content as a new history entry (append-only, not rewritten).
+      expect(sqlite.insertRevision).toHaveBeenCalledTimes(1);
+      expect(sqlite.insertRevision).toHaveBeenCalledWith('mem-1', 2, 'test content', expect.any(String));
+      expect(sqlite.insertAudit).toHaveBeenCalledWith(expect.objectContaining({
+        operation: 'REVISE',
+        memory_id: 'mem-1',
+        client_id: 'client-x',
+        details: expect.stringContaining('"source_revision":1'),
+      }));
+    });
+
+    it('throws NOT_FOUND when the target revision does not exist, without touching the memory', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory({ ...baseMem, retention_tier: 'T0' }, [1, 2, 3]);
+      sqlite.listRevisions.mockReturnValue([]);
+
+      await expect(storage.revertMemory('mem-1', 99, 'client-x')).rejects.toMatchObject({ code: 'NOT_FOUND' });
+      expect(sqlite.updateMemory).not.toHaveBeenCalled();
+      expect(embedding.embed).not.toHaveBeenCalled();
+    });
+
+    it('throws EMBEDDING_UNAVAILABLE and leaves the row unchanged when the embedding provider is down', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      embedding.embed = vi.fn(async () => { throw embeddingUnavailable('provider down'); });
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory({ ...baseMem, retention_tier: 'T0' }, [1, 2, 3]);
+      sqlite.listRevisions.mockReturnValue([
+        { id: 1, memory_id: 'mem-1', revision: 1, content: 'original content', updated_at: '2026-01-01T00:00:00.000Z', updated_by: null },
+      ]);
+
+      await expect(storage.revertMemory('mem-1', 1, 'client-x')).rejects.toMatchObject({ code: 'EMBEDDING_UNAVAILABLE' });
+      expect(sqlite.updateMemory).not.toHaveBeenCalled();
+      expect(sqlite.insertRevision).not.toHaveBeenCalled();
+      expect(sqlite.insertAudit).not.toHaveBeenCalled();
     });
   });
 

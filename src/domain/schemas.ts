@@ -82,6 +82,15 @@ export const BackupInputSchema = z.object({
   path: z.string().optional(),
 }).strict();
 
+export const RevisionsInputSchema = z.object({
+  action: z.enum(['list', 'revert']),
+  id: z.string().uuid(),
+  revision: z.number().int().positive().optional(),
+}).strict().refine(
+  data => data.action !== 'revert' || data.revision !== undefined,
+  { message: 'revision is required for revert', path: ['revision'] },
+);
+
 export const RepairInputSchema = z.object({
   // 'from-qdrant' (default): the pre-existing behavior — recover memories
   // missing from SQLite by scrolling Qdrant payloads. 're-embed': the
@@ -114,3 +123,4 @@ export type CollectionsInput = z.infer<typeof CollectionsInputSchema>;
 export type CategoryInput = z.infer<typeof CategoryInputSchema>;
 export type BackupInput = z.infer<typeof BackupInputSchema>;
 export type RepairInput = z.infer<typeof RepairInputSchema>;
+export type RevisionsInput = z.infer<typeof RevisionsInputSchema>;

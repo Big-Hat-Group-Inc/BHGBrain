@@ -1360,6 +1360,8 @@ memory_revisions {
 
 Seuls les souvenirs T0 ont un historique de révisions. L'embedding vectoriel dans Qdrant reflète toujours uniquement le contenu actuel.
 
+L'historique des révisions est consultable via l'outil `revisions` (`action: "list"`) ou la ressource `memory://{id}/revisions`, du plus récent au plus ancien. `revisions` (`action: "revert"`) restaure le contenu d'un souvenir à une révision antérieure choisie — en ré-embeddant, en ré-upsertant le vecteur, et en ajoutant (sans réécrire) le revert lui-même comme une nouvelle entrée d'historique — et enregistre un événement d'audit `REVISE` portant la révision source. Voir [Référence des outils MCP](#référence-des-outils-mcp) et [Ressources MCP](#ressources-mcp).
+
 #### Marquage de péremption (passage de consolidation)
 
 La commande `bhgbrain gc --consolidate` (ou `RetentionService.runConsolidation()`) effectue un passage secondaire qui marque les souvenirs comme **périmés** candidats :
@@ -1970,6 +1972,7 @@ BHGBrain expose des ressources MCP (lisibles via `ReadResource`) en plus des out
 | Modèle URI | Nom | Description |
 |---|---|---|
 | `memory://{id}` | Détails du souvenir | Enregistrement de souvenir complet par UUID |
+| `memory://{id}/revisions` | Révisions du souvenir | Historique des révisions d'un souvenir, du plus récent au plus ancien |
 | `category://{name}` | Catégorie | Contenu complet de la catégorie par nom |
 | `collection://{name}` | Collection | Souvenirs dans une collection spécifique |
 
@@ -2017,6 +2020,23 @@ Réponse :
 ```
 
 Accéder à un souvenir via `memory://{id}` incrémente son nombre d'accès et planifie une vidange différée.
+
+### `memory://{id}/revisions` — Historique des révisions
+
+Renvoie l'historique des révisions enregistré d'un souvenir, du plus récent au plus ancien, sous les mêmes règles de visibilité que `memory://{id}` (`NOT_FOUND` pour un souvenir inconnu ou exclu par la visibilité). Seuls les souvenirs T0 accumulent des révisions (voir [Historique des révisions T0](#historique-des-révisions-t0)), les autres niveaux renvoient donc une liste vide.
+
+Réponse :
+```json
+{
+  "id": "<uuid>",
+  "revisions": [
+    { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+Pour un client stdio sans support des ressources, utilisez plutôt l'action `list` de l'outil `revisions` (mêmes données — voir [Référence des outils MCP](#référence-des-outils-mcp)).
 
 ---
 
@@ -2123,7 +2143,7 @@ bhgbrain server token                 # Générer un nouveau token Bearer aléat
 
 ## Référence des outils MCP
 
-BHGBrain expose 9 outils MCP. Tous les outils valident les entrées avec des schémas Zod et renvoient du JSON structuré. Les erreurs utilisent une enveloppe cohérente :
+BHGBrain expose 10 outils MCP. Tous les outils valident les entrées avec des schémas Zod et renvoient du JSON structuré. Les erreurs utilisent une enveloppe cohérente :
 
 ```json
 {
@@ -2456,6 +2476,50 @@ Créer, lister ou restaurer des sauvegardes de mémoire.
 }
 ```
 `vector_reconciliation.state` vaut `"reconciled"` quand aucun vecteur n'a réellement dérivé (rien à réintégrer), ou `"reconciling"` tant qu'une tâche d'arrière-plan bornée réintègre le sous-ensemble en dérive ou manquant. Voir [Restauration depuis une sauvegarde](#restauration-depuis-une-sauvegarde).
+
+---
+
+### `revisions` — Lister ou restaurer l'historique des révisions d'un souvenir
+
+Liste l'historique des révisions d'un souvenir, ou restaure son contenu à une révision antérieure. La visibilité par espace de noms est résolue comme pour `forget` et `tag` (le souvenir est d'abord recherché par ID). Seuls les souvenirs T0 accumulent des révisions — voir [Historique des révisions T0](#historique-des-révisions-t0).
+
+**Entrée :**
+
+| Paramètre | Type | Requis | Défaut | Description |
+|---|---|---|---|---|
+| `action` | `"list" \| "revert"` | **Oui** | - | Opération à effectuer. |
+| `id` | `string (UUID)` | **Oui** | - | L'ID du souvenir. |
+| `revision` | `number` | Requis pour `revert` | - | Le numéro de révision à restaurer. |
+
+**Sortie (`action: "list"`) :**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revisions": [
+    { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+Un souvenir sans changement de contenu renvoie un tableau `revisions` vide, pas une erreur.
+
+**Sortie (`action: "revert"`) :**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revision": 1,
+  "content": "le contenu restauré"
+}
+```
+
+**Notes :**
+- La restauration applique le contenu de la révision cible via le même chemin que le chemin de déduplication UPDATE de `remember` : nouveau checksum, vecteur ré-embeddé, ré-upserté dans Qdrant. Le contenu précédant la restauration est conservé comme une nouvelle entrée d'historique ajoutée (l'historique n'est jamais réécrit).
+- Un événement d'audit `REVISE` enregistre le numéro de révision source, distinguable du REVISE générique que le pipeline d'écriture enregistre lors des changements de contenu T0 ordinaires.
+- La restauration nécessite le fournisseur d'embedding — s'il est indisponible, elle échoue avec `EMBEDDING_UNAVAILABLE` et le souvenir reste totalement inchangé (pas d'écriture partielle, pas de désynchronisation du vecteur).
+- Restaurer vers un numéro de révision qui n'existe pas pour le souvenir renvoie `NOT_FOUND`.
 
 ---
 

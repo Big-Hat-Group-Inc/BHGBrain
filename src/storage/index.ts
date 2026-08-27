@@ -5,7 +5,8 @@ import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MemoryRecord, WriteOperation, AuditEntry, LifecycleAuditDetails } from '../domain/types.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { BrainConfig } from '../config/index.js';
-import { internal, conflict } from '../errors/index.js';
+import { internal, conflict, notFound } from '../errors/index.js';
+import { computeChecksum, generateSummary } from '../domain/normalize.js';
 
 type MemoryRecordWithoutEmbedding = Omit<MemoryRecord, 'embedding'>;
 
@@ -232,6 +233,55 @@ export class StorageManager {
     }
 
     this.sqlite.flushIfDirty();
+  }
+
+  /**
+   * Reverts a memory's content to a prior revision: re-embeds the target
+   * revision's content and applies it through `updateMemory` (new checksum,
+   * re-upserted vector, append-only history), then records a distinct
+   * REVISE audit entry carrying the source revision number so it is
+   * distinguishable from `updateMemory`'s own generic T0-snapshot REVISE.
+   *
+   * The re-embed happens before any write so an embedding-provider outage
+   * (`EMBEDDING_UNAVAILABLE`) leaves the memory completely unchanged rather
+   * than landing a partial write or desyncing the vector store.
+   */
+  async revertMemory(
+    id: string,
+    revision: number,
+    clientId = 'unknown',
+  ): Promise<MemoryRecordWithoutEmbedding> {
+    const existing = this.sqlite.getMemoryById(id);
+    if (!existing) throw notFound(`Memory ${id} not found`);
+
+    const target = this.sqlite.listRevisions(id).find(r => r.revision === revision);
+    if (!target) throw notFound(`Revision ${revision} not found for memory ${id}`);
+
+    const vector = await this.embedding.embed(target.content);
+
+    await this.updateMemory(id, {
+      content: target.content,
+      summary: generateSummary(target.content),
+      checksum: computeChecksum(target.content),
+      last_operation: 'UPDATE',
+      updated_at: new Date().toISOString(),
+    }, vector);
+
+    this.logAudit('REVISE', id, existing.namespace, clientId, {
+      details: {
+        memory_id: id,
+        prior_tier: existing.retention_tier,
+        new_tier: existing.retention_tier,
+        actor: clientId,
+        timestamp: new Date().toISOString(),
+        action: 'revise',
+        source_revision: revision,
+      },
+    });
+
+    const updated = this.sqlite.getMemoryById(id);
+    if (!updated) throw internal(`Memory ${id} disappeared during revert`);
+    return updated;
   }
 
   async deleteMemory(id: string, options?: { flush?: boolean }): Promise<boolean> {

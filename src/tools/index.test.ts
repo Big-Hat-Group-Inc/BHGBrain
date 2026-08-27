@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { handleTool, type ToolContext } from './index.js';
 import type { BrainErrorEnvelope } from '../errors/index.js';
+import { embeddingUnavailable } from '../errors/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { WritePipeline } from '../pipeline/index.js';
@@ -120,6 +121,72 @@ describe('collections delete semantics', () => {
 
     expect(result.error.code).toBe('INTERNAL');
     expect(storage.sqlite.deleteCollection).not.toHaveBeenCalled();
+  });
+});
+
+type RevisionsListResult = { id: string; revisions: Array<{ revision: number; content: string }> };
+type RevisionsRevertResult = { id: string; revision: number; content: string };
+type RevisionsResult = RevisionsListResult | RevisionsRevertResult | BrainErrorEnvelope;
+
+describe('revisions tool', () => {
+  const UUID = '550e8400-e29b-41d4-a716-446655440009';
+  let ctx: ToolContext;
+  let storage: StorageManager & { revertMemory: ReturnType<typeof vi.fn> };
+
+  beforeEach(() => {
+    storage = {
+      sqlite: {
+        getMemoryById: vi.fn(() => ({ id: UUID, namespace: 'global' })),
+        listRevisions: vi.fn(() => [
+          { id: 2, memory_id: UUID, revision: 2, content: 'newer', updated_at: '2026-01-02T00:00:00.000Z', updated_by: null },
+          { id: 1, memory_id: UUID, revision: 1, content: 'older', updated_at: '2026-01-01T00:00:00.000Z', updated_by: null },
+        ]),
+      },
+      revertMemory: vi.fn(async (_id: string, revision: number) => ({ id: UUID, content: revision === 1 ? 'older' : 'newer' })),
+    } as unknown as StorageManager & { revertMemory: ReturnType<typeof vi.fn> };
+
+    ctx = {
+      config: {} as ToolContext['config'],
+      storage,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  });
+
+  it('lists revisions newest-first for the resolved memory', async () => {
+    const result = await handleTool(ctx, 'revisions', { action: 'list', id: UUID }, 'c1') as RevisionsResult;
+    expect(result.id).toBe(UUID);
+    expect(result.revisions.map(r => r.revision)).toEqual([2, 1]);
+  });
+
+  it('returns NOT_FOUND when the memory does not exist', async () => {
+    storage.sqlite.getMemoryById = vi.fn(() => null);
+    const result = await handleTool(ctx, 'revisions', { action: 'list', id: UUID }, 'c1') as BrainErrorEnvelope;
+    expect(result.error.code).toBe('NOT_FOUND');
+  });
+
+  it('rejects revert without a revision number', async () => {
+    const result = await handleTool(ctx, 'revisions', { action: 'revert', id: UUID }, 'c1') as BrainErrorEnvelope;
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(storage.revertMemory).not.toHaveBeenCalled();
+  });
+
+  it('reverts through StorageManager.revertMemory and returns the restored content', async () => {
+    const result = await handleTool(ctx, 'revisions', { action: 'revert', id: UUID, revision: 1 }, 'c1') as RevisionsRevertResult;
+    expect(storage.revertMemory).toHaveBeenCalledWith(UUID, 1, 'c1');
+    expect(result.content).toBe('older');
+    expect(result.revision).toBe(1);
+  });
+
+  it('surfaces EMBEDDING_UNAVAILABLE from a failed revert without masking the error code', async () => {
+    storage.revertMemory = vi.fn(async () => { throw embeddingUnavailable('provider down'); });
+    const result = await handleTool(ctx, 'revisions', { action: 'revert', id: UUID, revision: 1 }, 'c1') as BrainErrorEnvelope;
+    expect(result.error.code).toBe('EMBEDDING_UNAVAILABLE');
   });
 });
 
@@ -311,6 +378,7 @@ describe('tool input contracts', () => {
     { tool: 'recall', unknownField: { query: 'hi', bogus: 1 }, outOfBounds: { query: 'hi', limit: 21 } },
     { tool: 'search', unknownField: { query: 'hi', bogus: 1 }, outOfBounds: { query: 'hi', limit: 51 } },
     { tool: 'tag', unknownField: { id: UUID, bogus: 1 }, outOfBounds: { id: 'not-a-uuid' } },
+    { tool: 'revisions', unknownField: { action: 'list', id: UUID, bogus: 1 }, outOfBounds: { action: 'list', id: 'not-a-uuid' } },
     { tool: 'category', unknownField: { action: 'list', bogus: 1 }, outOfBounds: { action: 'bogus' } },
     { tool: 'backup', unknownField: { action: 'list', bogus: 1 }, outOfBounds: { action: 'bogus' } },
   ];

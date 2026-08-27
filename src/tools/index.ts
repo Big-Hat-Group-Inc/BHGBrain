@@ -11,9 +11,10 @@ import {
   RememberInputSchema, RecallInputSchema, ForgetInputSchema,
   SearchInputSchema, TagInputSchema, CollectionsInputSchema,
   CategoryInputSchema, BackupInputSchema, RepairInputSchema,
+  RevisionsInputSchema,
   type RepairInput,
 } from '../domain/schemas.js';
-import type { WriteResult, SearchResult, MemoryRecord, RecallFilter } from '../domain/types.js';
+import type { WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter } from '../domain/types.js';
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
 import { computeChecksum } from '../domain/normalize.js';
 import { handleImport } from './import.js';
@@ -119,6 +120,7 @@ async function dispatch(
     case 'backup': return handleBackup(ctx, args);
     case 'bootstrap': return handleBootstrap(ctx, args, logCtx);
     case 'import': return handleImport(ctx, args, logCtx);
+    case 'revisions': return handleRevisions(ctx, args, clientId, logCtx);
     case 'repair': return handleRepair(ctx, args);
     default:
       throw invalidInput(`Unknown tool: ${toolName}`);
@@ -254,6 +256,23 @@ async function handleTag(
   ctx.storage.sqlite.flushIfDirty();
 
   return { id: input.id, tags };
+}
+
+async function handleRevisions(
+  ctx: ToolContext, args: unknown, clientId: string, logCtx: ToolLogContext,
+): Promise<{ id: string; revisions: MemoryRevisionRecord[] } | { id: string; revision: number; content: string }> {
+  const input = parseInput(RevisionsInputSchema, args);
+  const mem = ctx.storage.sqlite.getMemoryById(input.id);
+  if (!mem) throw notFound(`Memory ${input.id} not found`);
+  logCtx.namespace = mem.namespace;
+
+  if (input.action === 'list') {
+    return { id: input.id, revisions: ctx.storage.sqlite.listRevisions(input.id) };
+  }
+
+  // 'revert' — schema's refine already guarantees `revision` is present here.
+  const updated = await ctx.storage.revertMemory(input.id, input.revision!, clientId);
+  return { id: input.id, revision: input.revision!, content: updated.content };
 }
 
 async function handleCollections(

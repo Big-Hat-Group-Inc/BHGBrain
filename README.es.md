@@ -1356,6 +1356,8 @@ memory_revisions {
 
 Solo las memorias T0 tienen historial de revisiones. El embedding vectorial en Qdrant siempre refleja solo el contenido actual.
 
+El historial de revisiones se puede leer con la herramienta `revisions` (`action: "list"`) o el recurso `memory://{id}/revisions`, más reciente primero. `revisions` (`action: "revert"`) restaura el contenido de una memoria a una revisión anterior elegida — re-generando el embedding, re-insertando el vector, y anexando (sin reescribir) el propio revert como una nueva entrada del historial — y registra un evento de auditoría `REVISE` con la revisión de origen. Vea [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp) y [Recursos MCP](#recursos-mcp).
+
 #### Marcado de Obsolescencia (Paso de Consolidación)
 
 El comando `bhgbrain gc --consolidate` (o `RetentionService.runConsolidation()`) realiza un segundo paso que marca memorias como candidatas **obsoletas**:
@@ -1966,6 +1968,7 @@ BHGBrain expone recursos MCP (legibles vía `ReadResource`) además de las herra
 | Plantilla URI | Nombre | Descripción |
 |---|---|---|
 | `memory://{id}` | Detalles de Memoria | Registro completo de memoria por UUID |
+| `memory://{id}/revisions` | Revisiones de Memoria | Historial de revisiones de una memoria, más reciente primero |
 | `category://{name}` | Categoría | Contenido completo de categoría por nombre |
 | `collection://{name}` | Colección | Memorias en una colección específica |
 
@@ -2013,6 +2016,23 @@ Respuesta:
 ```
 
 Acceder a una memoria vía `memory://{id}` incrementa su recuento de accesos y programa un volcado diferido.
+
+### `memory://{id}/revisions` — Historial de Revisiones
+
+Devuelve el historial de revisiones registrado de una memoria, más reciente primero, bajo las mismas reglas de visibilidad que `memory://{id}` (`NOT_FOUND` para una memoria desconocida o excluida por visibilidad). Solo las memorias T0 acumulan revisiones (ver [Historial de Revisiones T0](#historial-de-revisiones-t0)), por lo que otras capas devuelven una lista vacía.
+
+Respuesta:
+```json
+{
+  "id": "<uuid>",
+  "revisions": [
+    { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+Para un cliente stdio sin soporte de recursos, use en su lugar la acción `list` de la herramienta `revisions` (los mismos datos — ver [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)).
 
 ---
 
@@ -2120,7 +2140,7 @@ bhgbrain server token                 # Generar un nuevo bearer token aleatorio
 
 ## Referencia de Herramientas MCP
 
-BHGBrain expone 9 herramientas MCP. Todas las herramientas validan la entrada con esquemas Zod y devuelven JSON estructurado. Los errores usan un sobre consistente:
+BHGBrain expone 10 herramientas MCP. Todas las herramientas validan la entrada con esquemas Zod y devuelven JSON estructurado. Los errores usan un sobre consistente:
 
 ```json
 {
@@ -2453,6 +2473,50 @@ Crea, lista o restaura copias de seguridad de memorias.
 }
 ```
 `vector_reconciliation.state` es `"reconciled"` cuando ningún vector tuvo drift real (nada que reincrustar), o `"reconciling"` mientras una tarea de fondo acotada reincrusta el subconjunto con drift o faltante. Ver [Restauración desde una Copia de Seguridad](#restauración-desde-una-copia-de-seguridad).
+
+---
+
+### `revisions` — Listar o Revertir Historial de Revisiones de una Memoria
+
+Lista el historial de revisiones de una memoria, o revierte su contenido a una revisión anterior. La visibilidad por namespace se resuelve igual que en `forget` y `tag` (la memoria se busca primero por ID). Solo las memorias T0 acumulan revisiones — ver [Historial de Revisiones T0](#historial-de-revisiones-t0).
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Predeterminado | Descripción |
+|---|---|---|---|---|
+| `action` | `"list" \| "revert"` | **Sí** | - | Operación a realizar. |
+| `id` | `string (UUID)` | **Sí** | - | El ID de la memoria. |
+| `revision` | `number` | Requerido para `revert` | - | El número de revisión al que revertir. |
+
+**Salida (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revisions": [
+    { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+Una memoria sin cambios de contenido devuelve un array `revisions` vacío, no un error.
+
+**Salida (`action: "revert"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revision": 1,
+  "content": "el contenido restaurado"
+}
+```
+
+**Notas:**
+- El revert restaura el contenido de la revisión objetivo por la misma ruta que usa el flujo UPDATE de deduplicación de `remember`: nuevo checksum, vector re-generado, reinsertado en Qdrant. El contenido previo al revert se conserva como una nueva entrada de historial añadida (el historial nunca se reescribe).
+- Un evento de auditoría `REVISE` registra el número de revisión de origen, distinguible del REVISE genérico que el pipeline de escritura registra en cambios de contenido T0 ordinarios.
+- El revert requiere el proveedor de embeddings — si no está disponible, el revert falla con `EMBEDDING_UNAVAILABLE` y la memoria queda completamente sin cambios (sin escritura parcial, sin desincronización del vector).
+- Revertir a un número de revisión que no existe para la memoria devuelve `NOT_FOUND`.
 
 ---
 

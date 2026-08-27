@@ -2,7 +2,7 @@ import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { SearchService } from '../search/index.js';
 import type { HealthService } from '../health/index.js';
-import type { InjectPayload, PaginatedResult, MemoryRecord } from '../domain/types.js';
+import type { InjectPayload, PaginatedResult, MemoryRecord, MemoryRevisionRecord } from '../domain/types.js';
 import type { CategoryHeader } from '../storage/sqlite.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 
@@ -69,6 +69,11 @@ export class ResourceHandler {
       return this.listMemories(namespace, parsedLimit, cursor);
     }
 
+    // memory://{id}/revisions
+    if (path && url.pathname === '/revisions') {
+      return this.handleMemoryRevisions(path);
+    }
+
     // memory://{id}
     const id = path;
     if (id) {
@@ -82,6 +87,14 @@ export class ResourceHandler {
     }
 
     return { error: { code: 'NOT_FOUND', message: 'Invalid memory resource URI', retryable: false } };
+  }
+
+  private handleMemoryRevisions(id: string): { id: string; revisions: MemoryRevisionRecord[] } | { error: { code: 'NOT_FOUND'; message: string; retryable: false } } {
+    const mem = this.storage.sqlite.getMemoryById(id);
+    if (!mem || this.isExpiredForResource(mem)) {
+      return { error: { code: 'NOT_FOUND', message: `Memory ${id} not found`, retryable: false } };
+    }
+    return { id, revisions: this.storage.sqlite.listRevisions(id) };
   }
 
   private listMemories(
@@ -296,6 +309,7 @@ export const MCP_RESOURCE_DEFINITIONS = [
 /** Parameterized URI templates for ListResourceTemplates */
 export const MCP_RESOURCE_TEMPLATES = [
   { uriTemplate: 'memory://{id}', name: 'Memory Details', description: 'Full memory details by ID' },
+  { uriTemplate: 'memory://{id}/revisions', name: 'Memory Revisions', description: 'Revision history for a memory, newest first' },
   { uriTemplate: 'category://{name}', name: 'Category', description: 'Full category content' },
   { uriTemplate: 'collection://{name}', name: 'Collection', description: 'Memories in a collection' },
 ];

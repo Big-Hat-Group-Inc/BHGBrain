@@ -14,11 +14,11 @@ embedding providers and how config/env resolve), testing, and common gotchas.
 
 **Tools** — schemas live in `src/tools/schemas.ts` (plus `bootstrap.ts` / `import.ts`),
 handlers in `src/tools/index.ts`. Registered: `remember`, `recall`, `forget`, `search`,
-`tag`, `collections`, `category`, `backup`, `bootstrap`, `import`, `repair`.
+`tag`, `collections`, `category`, `backup`, `bootstrap`, `import`, `repair`, `revisions`.
 
 **Resources** — `src/resources/index.ts`. Static: `memory://list`, `memory://inject`,
 `category://list`, `collection://list`, `health://status`. Templates: `memory://{id}`,
-`category://{name}`, `collection://{name}`.
+`memory://{id}/revisions`, `category://{name}`, `collection://{name}`.
 
 Changing either surface means updating the schema/handler *and* `README.md`
 (§ "MCP Tools Reference") in the same change.

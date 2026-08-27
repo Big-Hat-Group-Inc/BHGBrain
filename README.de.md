@@ -1356,6 +1356,8 @@ memory_revisions {
 
 Nur T0-Erinnerungen haben einen Revisionsverlauf. Die Vektoreinbettung in Qdrant spiegelt immer nur den aktuellen Inhalt wider.
 
+Der Revisionsverlauf ist über das Tool `revisions` (`action: "list"`) oder die Ressource `memory://{id}/revisions` lesbar, neueste zuerst. `revisions` (`action: "revert"`) stellt den Inhalt einer Erinnerung auf eine gewählte vorherige Revision zurück — mit erneutem Embedding, erneutem Upsert des Vektors und dem Anhängen (nicht Überschreiben) des Reverts selbst als neuer Verlaufseintrag — und protokolliert ein `REVISE`-Audit-Ereignis mit der Quellrevision. Siehe [MCP-Tools-Referenz](#mcp-tools-referenz) und [MCP-Ressourcen](#mcp-ressourcen).
+
 #### Stale-Markierung (Konsolidierungsdurchgang)
 
 Der Befehl `bhgbrain gc --consolidate` (oder `RetentionService.runConsolidation()`) führt einen sekundären Durchgang durch, der Erinnerungen als **Stale**-Kandidaten markiert:
@@ -1965,6 +1967,7 @@ BHGBrain stellt zusätzlich zu Tools MCP-Ressourcen (lesbar über `ReadResource`
 | URI-Template | Name | Beschreibung |
 |---|---|---|
 | `memory://{id}` | Erinnerungsdetails | Vollständiger Erinnerungsdatensatz per UUID |
+| `memory://{id}/revisions` | Erinnerungsrevisionen | Revisionsverlauf einer Erinnerung, neueste zuerst |
 | `category://{name}` | Kategorie | Vollständiger Kategorieninhalt nach Name |
 | `collection://{name}` | Sammlung | Erinnerungen in einer bestimmten Sammlung |
 
@@ -2012,6 +2015,23 @@ Antwort:
 ```
 
 Das Berühren einer Erinnerung über `memory://{id}` erhöht deren Zugriffsanzahl und plant einen verzögerten Flush.
+
+### `memory://{id}/revisions` — Revisionsverlauf
+
+Liefert den aufgezeichneten Revisionsverlauf einer Erinnerung, neueste zuerst, unter denselben Sichtbarkeitsregeln wie `memory://{id}` (`NOT_FOUND` bei unbekannter oder durch Sichtbarkeitsregeln ausgeschlossener Erinnerung). Nur T0-Erinnerungen sammeln Revisionen (siehe [T0-Revisionsverlauf](#t0-revisionsverlauf)), andere Stufen liefern eine leere Liste.
+
+Antwort:
+```json
+{
+  "id": "<uuid>",
+  "revisions": [
+    { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+Für stdio-Clients ohne Ressourcen-Unterstützung liefert die Aktion `list` des `revisions`-Tools dieselben Daten (siehe [MCP-Tools-Referenz](#mcp-tools-referenz)).
 
 ---
 
@@ -2119,7 +2139,7 @@ bhgbrain server token                 # Neues zufälliges Bearer-Token generiere
 
 ## MCP-Tools-Referenz
 
-BHGBrain stellt 9 MCP-Tools bereit. Alle Tools validieren Eingaben mit Zod-Schemas und geben strukturiertes JSON zurück. Fehler verwenden einen konsistenten Umschlag:
+BHGBrain stellt 10 MCP-Tools bereit. Alle Tools validieren Eingaben mit Zod-Schemas und geben strukturiertes JSON zurück. Fehler verwenden einen konsistenten Umschlag:
 
 ```json
 {
@@ -2452,6 +2472,50 @@ Speichersicherungen erstellen, auflisten oder wiederherstellen.
 }
 ```
 `vector_reconciliation.state` ist `"reconciled"`, wenn kein Vektor tatsächlich abgewichen ist (nichts erneut einzubetten), oder `"reconciling"`, während eine begrenzte Hintergrundaufgabe die abweichende/fehlende Teilmenge erneut einbettet. Siehe [Aus Sicherung wiederherstellen](#aus-sicherung-wiederherstellen).
+
+---
+
+### `revisions` — Revisionsverlauf auflisten oder zurücksetzen
+
+Listet den Revisionsverlauf einer Erinnerung auf oder setzt deren Inhalt auf eine vorherige Revision zurück. Die Namensraum-Sichtbarkeit wird wie bei `forget` und `tag` aufgelöst (die Erinnerung wird zuerst per ID nachgeschlagen). Nur T0-Erinnerungen sammeln Revisionen — siehe [T0-Revisionsverlauf](#t0-revisionsverlauf).
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `action` | `"list" \| "revert"` | **Ja** | - | Auszuführende Operation. |
+| `id` | `string (UUID)` | **Ja** | - | Die Erinnerungs-ID. |
+| `revision` | `number` | Erforderlich für `revert` | - | Die Revisionsnummer, auf die zurückgesetzt werden soll. |
+
+**Ausgabe (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revisions": [
+    { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+Eine Erinnerung ohne Inhaltsänderungen liefert ein leeres `revisions`-Array, keinen Fehler.
+
+**Ausgabe (`action: "revert"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revision": 1,
+  "content": "der wiederhergestellte Inhalt"
+}
+```
+
+**Hinweise:**
+- Der Revert stellt den Inhalt der Zielrevision über denselben Pfad wieder her, den auch der UPDATE-Deduplizierungspfad von `remember` nutzt: neue Prüfsumme, neu eingebetteter Vektor, erneutes Upsert in Qdrant. Der Inhalt vor dem Revert wird als neuer, anhängender Verlaufseintrag erhalten (der Verlauf wird nie überschrieben).
+- Ein `REVISE`-Audit-Ereignis protokolliert die Quellrevisionsnummer, unterscheidbar vom generischen REVISE, das die Schreib-Pipeline bei gewöhnlichen T0-Inhaltsänderungen protokolliert.
+- Der Revert benötigt den Embedding-Provider — ist dieser nicht verfügbar, schlägt der Revert mit `EMBEDDING_UNAVAILABLE` fehl und die Erinnerung bleibt vollständig unverändert (kein Teil-Schreibvorgang, keine Vektor-Desynchronisierung).
+- Ein Revert auf eine nicht existierende Revisionsnummer liefert `NOT_FOUND`.
 
 ---
 

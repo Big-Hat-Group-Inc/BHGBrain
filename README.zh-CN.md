@@ -1333,6 +1333,8 @@ memory_revisions {
 
 只有 T0 记忆有版本历史。Qdrant 中的向量嵌入始终反映当前内容。
 
+可以通过 `revisions` 工具（`action: "list"`）或 `memory://{id}/revisions` 资源读取版本历史，按最新优先排列。`revisions`（`action: "revert"`）会将记忆内容恢复到所选的历史版本——重新生成嵌入、重新写入向量存储，并将回退操作本身作为一条新的历史记录追加（而非覆盖历史）——同时记录一条携带来源版本号的 `REVISE` 审计事件。参见[MCP 工具参考](#mcp-工具参考)和[MCP 资源](#mcp-资源)。
+
 #### 过期标记（整合阶段）
 
 `bhgbrain gc --consolidate` 命令（或 `RetentionService.runConsolidation()`）执行一个辅助阶段，将记忆标记为**过期**候选：
@@ -1940,6 +1942,7 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 | URI 模板 | 名称 | 说明 |
 |---|---|---|
 | `memory://{id}` | 记忆详情 | 通过 UUID 获取完整记忆记录 |
+| `memory://{id}/revisions` | 记忆版本历史 | 某条记忆的版本历史，最新优先 |
 | `category://{name}` | 类别 | 通过名称获取完整类别内容 |
 | `collection://{name}` | 集合 | 特定集合中的记忆 |
 
@@ -1987,6 +1990,23 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 ```
 
 通过 `memory://{id}` 访问记忆会增加其访问次数并安排延迟刷写。
+
+### `memory://{id}/revisions`——版本历史
+
+返回某条记忆记录的版本历史，最新优先，遵循与 `memory://{id}` 相同的可见性规则（未知或因可见性规则被排除的记忆返回 `NOT_FOUND`）。只有 T0 记忆会累积版本（参见 [T0 版本历史](#t0-版本历史)），其他层级返回空列表。
+
+响应：
+```json
+{
+  "id": "<uuid>",
+  "revisions": [
+    { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+对于不支持资源的 stdio 客户端，可改用 `revisions` 工具的 `list` 动作读取相同数据（参见 [MCP 工具参考](#mcp-工具参考)）。
 
 ---
 
@@ -2092,7 +2112,7 @@ bhgbrain server token                 # 生成新的随机 Bearer token
 
 ## MCP 工具参考
 
-BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并返回结构化 JSON。错误使用统一的信封格式：
+BHGBrain 暴露 10 个 MCP 工具。所有工具使用 Zod schema 验证输入并返回结构化 JSON。错误使用统一的信封格式：
 
 ```json
 {
@@ -2425,6 +2445,50 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 }
 ```
 当没有向量真正发生漂移（无需重新嵌入）时，`vector_reconciliation.state` 为 `"reconciled"`；当一个有边界的后台任务正在重新嵌入漂移或缺失的子集时，为 `"reconciling"`。参见[从备份恢复](#从备份恢复)。
+
+---
+
+### `revisions`——列出或回退记忆版本历史
+
+列出某条记忆的版本历史，或将其内容回退到某个历史版本。命名空间可见性的解析方式与 `forget`、`tag` 相同（先按 ID 查找该记忆）。只有 T0 记忆会累积版本——参见 [T0 版本历史](#t0-版本历史)。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `action` | `"list" \| "revert"` | **是** | - | 要执行的操作。 |
+| `id` | `string (UUID)` | **是** | - | 记忆 ID。 |
+| `revision` | `number` | `revert` 时必需 | - | 要回退到的版本号。 |
+
+**输出（`action: "list"`）：**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revisions": [
+    { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+从未发生过内容变更的记忆会返回空的 `revisions` 数组，而不是错误。
+
+**输出（`action: "revert"`）：**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revision": 1,
+  "content": "恢复后的内容"
+}
+```
+
+**说明：**
+- 回退通过与 `remember` 的 UPDATE 去重路径相同的流程恢复目标版本的内容：生成新的校验和、重新嵌入向量、重新写入 Qdrant。回退前的内容会作为一条新的历史记录追加保留（历史记录只追加，不会被覆盖）。
+- `REVISE` 审计事件会记录来源版本号，与写入管道在普通 T0 内容变更时记录的通用 REVISE 事件相区分。
+- 回退需要嵌入提供方可用——如果不可用，回退会以 `EMBEDDING_UNAVAILABLE` 失败，且记忆保持完全不变（不会发生部分写入，也不会造成向量不同步）。
+- 回退到该记忆不存在的版本号会返回 `NOT_FOUND`。
 
 ---
 

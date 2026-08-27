@@ -189,6 +189,11 @@ export interface LifecycleAuditDetails {
   actor: string;
   timestamp: string;
   action: 'promote' | 'archive' | 'revise' | 'delete' | 'restore';
+  // Present only on the explicit `revisions` tool `revert` action's REVISE
+  // audit entry — the revision number the memory was reverted to. Absent on
+  // the generic T0-snapshot REVISE that `StorageManager.updateMemory` emits
+  // on every T0 content change, so the two are distinguishable in the log.
+  source_revision?: number;
 }
 
 export interface PaginatedResult<T> {

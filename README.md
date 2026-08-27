@@ -1396,6 +1396,8 @@ memory_revisions {
 
 Only T0 memories have revision history. The vector embedding in Qdrant always reflects the current content only.
 
+Revision history is readable via the `revisions` tool (`action: "list"`) or the `memory://{id}/revisions` resource, newest first. `revisions` (`action: "revert"`) restores a memory's content to a chosen prior revision — re-embedding, re-upserting the vector, and appending (not rewriting) the revert itself as a new history entry — and records a `REVISE` audit event naming the source revision. See [MCP Tools Reference](#mcp-tools-reference) and [MCP Resources](#mcp-resources).
+
 #### Stale Marking (Consolidation Pass)
 
 The `bhgbrain gc --consolidate` command (or `RetentionService.runConsolidation()`) performs a secondary pass that marks memories as **stale** candidates:
@@ -2009,6 +2011,7 @@ BHGBrain exposes MCP resources (readable via `ReadResource`) in addition to tool
 | URI Template | Name | Description |
 |---|---|---|
 | `memory://{id}` | Memory Details | Full memory record by UUID |
+| `memory://{id}/revisions` | Memory Revisions | Revision history for a memory, newest first |
 | `category://{name}` | Category | Full category content by name |
 | `collection://{name}` | Collection | Memories in a specific collection |
 
@@ -2056,6 +2059,23 @@ Response:
 ```
 
 Touching a memory via `memory://{id}` increments its access count and schedules a deferred flush.
+
+### `memory://{id}/revisions` - Revision History
+
+Returns the recorded revision history for a memory, newest first, under the same visibility rules as `memory://{id}` (`NOT_FOUND` for an unknown or expired-and-visibility-excluded memory). Only T0 memories accumulate revisions (see [T0 Revision History](#t0-revision-history)), so other tiers return an empty list.
+
+Response:
+```json
+{
+  "id": "<uuid>",
+  "revisions": [
+    { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+To read this from a stdio client that lacks resource support, use the `revisions` tool's `list` action instead (same data — see [MCP Tools Reference](#mcp-tools-reference)).
 
 ---
 
@@ -2192,7 +2212,7 @@ bhgbrain server token                 # Generate a new random bearer token
 
 ## MCP Tools Reference
 
-BHGBrain exposes 11 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
+BHGBrain exposes 12 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
 
 ```json
 {
@@ -2599,6 +2619,53 @@ Import a structured profile or freeform document as discrete memories in one sho
 - Deduplication applies via the existing write pipeline — safe to re-import.
 - `dry_run: true` returns memory previews with zero writes.
 - Headings numbered outside the 10 storage-mapped sections (e.g. a document written against an older 12-section template) are not silently dropped — their numbers are reported in `sections_ignored` so you know content was skipped instead of losing it without notice.
+
+---
+
+### `revisions` - List or Revert Memory Revision History
+
+List a memory's revision history, or revert its content to a prior revision. Namespace
+visibility is resolved the same way `forget` and `tag` do (the memory is looked up by
+ID first). Only T0 memories accumulate revisions — see
+[T0 Revision History](#t0-revision-history).
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `action` | `"list" \| "revert"` | **Yes** | - | Which operation to perform. |
+| `id` | `string (UUID)` | **Yes** | - | The memory ID. |
+| `revision` | `number` | Required for `revert` | - | The revision number to revert to. |
+
+**Output (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revisions": [
+    { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+A memory with no content changes returns an empty `revisions` array, not an error.
+
+**Output (`action: "revert"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revision": 1,
+  "content": "the restored content"
+}
+```
+
+**Notes:**
+- Revert restores the target revision's content through the same path `remember`'s UPDATE dedup path uses: new checksum, re-embedded vector, re-upserted into Qdrant. The pre-revert content is preserved as a new, append-only history entry (history is never rewritten).
+- A `REVISE` audit event records the source revision number, distinguishable from the generic REVISE the write pipeline logs on ordinary T0 content changes.
+- Reverting requires the embedding provider — if it is unavailable the revert fails with `EMBEDDING_UNAVAILABLE` and the memory is left completely unchanged (no partial write, no vector desync).
+- Reverting to a revision number that does not exist for the memory returns `NOT_FOUND`.
 
 ---
 
