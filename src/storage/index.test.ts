@@ -312,5 +312,76 @@ describe('StorageManager cross-store consistency', () => {
       await storage.bootstrapFromQdrant(logger);
       expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({ event: 'bootstrap' }));
     });
+
+    it('continues hydrating remaining points when one point throws, and does not count it', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => ['bhgbrain_global_general']);
+      (qdrant as unknown as Record<string, unknown>).scrollAll = vi.fn(async () => [
+        { id: 'p1', payload: { content: 'c1' } },
+        { id: 'bad', payload: { content: 'bad' } },
+        { id: 'p2', payload: { content: 'c2' } },
+      ]);
+      const upsertMock = vi.fn((id: string) => {
+        if (id === 'bad') throw new Error('constraint violation');
+        return true;
+      });
+      (sqlite as unknown as Record<string, unknown>).upsertMemoryFromPayload = upsertMock;
+      const logger = { info: vi.fn(), warn: vi.fn() };
+
+      const total = await storage.bootstrapFromQdrant(logger);
+
+      expect(total).toBe(2); // p1 and p2 counted; bad is not
+      expect(upsertMock).toHaveBeenCalledTimes(3); // all three attempted
+      expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'bootstrap_hydration_failed',
+        point_id: 'bad',
+      }));
+    });
+
+    it('scopes hydration to the given device_id by default, skipping other devices\' points', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => ['bhgbrain_global_general']);
+      (qdrant as unknown as Record<string, unknown>).scrollAll = vi.fn(async () => [
+        { id: 'mine', payload: { content: 'c1', device_id: 'device-a' } },
+        { id: 'theirs', payload: { content: 'c2', device_id: 'device-b' } },
+        { id: 'unowned', payload: { content: 'c3' } },
+      ]);
+      const upsertMock = vi.fn(() => true);
+      (sqlite as unknown as Record<string, unknown>).upsertMemoryFromPayload = upsertMock;
+
+      const total = await storage.bootstrapFromQdrant(undefined, { deviceId: 'device-a' });
+
+      expect(total).toBe(1);
+      expect(upsertMock).toHaveBeenCalledTimes(1);
+      expect(upsertMock).toHaveBeenCalledWith('mine', expect.objectContaining({ device_id: 'device-a' }));
+    });
+
+    it('--all-devices hydrates every device regardless of deviceId', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => ['bhgbrain_global_general']);
+      (qdrant as unknown as Record<string, unknown>).scrollAll = vi.fn(async () => [
+        { id: 'mine', payload: { content: 'c1', device_id: 'device-a' } },
+        { id: 'theirs', payload: { content: 'c2', device_id: 'device-b' } },
+      ]);
+      const upsertMock = vi.fn(() => true);
+      (sqlite as unknown as Record<string, unknown>).upsertMemoryFromPayload = upsertMock;
+
+      const total = await storage.bootstrapFromQdrant(undefined, { deviceId: 'device-a', allDevices: true });
+
+      expect(total).toBe(2);
+      expect(upsertMock).toHaveBeenCalledTimes(2);
+    });
   });
 });

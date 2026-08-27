@@ -1899,6 +1899,10 @@ bhgbrain gc --force-compact           # Qdrant-Segment-Kompaktierung nach GC erz
 # Audit-Protokoll
 bhgbrain audit                        # Aktuelle Audit-Einträge anzeigen
 
+# Reparatur (Multi-Geräte-Wiederherstellung)
+bhgbrain repair --from-qdrant                # Lokale SQLite aus Qdrant wiederherstellen (standardmäßig nur Erinnerungen des aktuellen Geräts)
+bhgbrain repair --from-qdrant --all-devices  # Aus den Erinnerungen aller Geräte wiederherstellen, nicht nur des aktuellen
+
 # Kategorieverwaltung
 bhgbrain category list                # Alle Kategorien auflisten
 bhgbrain category get <name>          # Kategorieninhalt anzeigen

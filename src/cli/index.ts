@@ -378,6 +378,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .command('repair')
     .description('Repair local state from external sources')
     .option('--from-qdrant', 'Hydrate local SQLite from Qdrant Cloud payloads')
+    .option('--all-devices', 'Hydrate memories from every device, not just the current one (default: current device only)')
     .action(async (opts) => {
       if (!opts.fromQdrant) {
         console.error('Please specify a repair source. Available: --from-qdrant');
@@ -386,7 +387,14 @@ export function createProgram(createContextImpl: typeof createContext = createCo
       }
       const ctx = await createContextImpl();
       console.log('[repair] scanning Qdrant collections...');
-      const hydrated = await ctx.storage.bootstrapFromQdrant();
+      const deviceId = ctx.config.device?.id ?? null;
+      const allDevices = Boolean(opts.allDevices);
+      if (allDevices) {
+        console.log('[repair] scope: all devices');
+      } else if (deviceId) {
+        console.log(`[repair] scope: current device only (device_id=${deviceId}); use --all-devices to hydrate every device`);
+      }
+      const hydrated = await ctx.storage.bootstrapFromQdrant(undefined, { deviceId, allDevices });
       console.log(`[repair] hydrated ${hydrated} memories from Qdrant`);
       ctx.storage.sqlite.close();
     });

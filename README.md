@@ -1983,6 +1983,10 @@ bhgbrain gc --force-compact           # Force Qdrant segment compaction after GC
 # Audit log
 bhgbrain audit                        # Show recent audit entries
 
+# Repair (multi-device recovery)
+bhgbrain repair --from-qdrant                # Hydrate local SQLite from Qdrant (current device's memories only, by default)
+bhgbrain repair --from-qdrant --all-devices  # Hydrate from every device's memories, not just the current one
+
 # Category management
 bhgbrain category list                # List all categories
 bhgbrain category get <name>          # Show category content
@@ -2521,7 +2525,7 @@ The `/data` volume persists the SQLite database, resolved `config.json`, and bac
 
 ### Bootstrap on First Run
 
-When a container starts with an empty `/data` volume and connects to a Qdrant instance that already has memories, BHGBrain automatically hydrates the local SQLite database from Qdrant via `bootstrapFromQdrant()`. No manual `repair` step is needed.
+When a container starts with an empty `/data` volume and connects to a Qdrant instance that already has memories, BHGBrain automatically hydrates the local SQLite database from Qdrant via `bootstrapFromQdrant()`. No manual `repair` step is needed. This automatic hydration is intentionally unscoped by device — it recovers every device's memories onto the fresh, empty database. Running `bhgbrain repair --from-qdrant` manually afterward defaults to the current device's memories only (pass `--all-devices` to widen it); see [CLI Reference](#cli-reference).
 
 ### Building the Image
 

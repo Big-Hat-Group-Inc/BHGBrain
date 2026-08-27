@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync, renameSync, statSync } from 'n
 import { join } from 'node:path';
 import type {
   MemoryRecord,
+  MemoryType,
   CategoryRecord,
   AuditEntry,
   ArchiveRecord,
@@ -10,6 +11,12 @@ import type {
   RetentionTier,
   TierStats,
 } from '../domain/types.js';
+
+const ALLOWED_MEMORY_TYPES: readonly MemoryType[] = ['episodic', 'semantic', 'procedural'];
+
+function isAllowedMemoryType(value: string): value is MemoryType {
+  return (ALLOWED_MEMORY_TYPES as readonly string[]).includes(value);
+}
 
 type SqlValue = string | number | null | Uint8Array;
 export type SqlParams = SqlValue[];
@@ -387,7 +394,12 @@ export class SqliteStore implements SqliteStorage {
     const summary = typeof payload.summary === 'string' ? payload.summary : '';
     const namespace = typeof payload.namespace === 'string' ? payload.namespace : 'global';
     const collection = typeof payload.collection === 'string' ? payload.collection : 'general';
-    const type = typeof payload.type === 'string' ? payload.type : 'semantic';
+    // Validate against the `memories.type` CHECK constraint before it ever reaches the
+    // insert — a Qdrant payload with an out-of-enum `type` must be normalized to the
+    // documented default rather than silently dropped by INSERT OR IGNORE.
+    const type: MemoryType = typeof payload.type === 'string' && isAllowedMemoryType(payload.type)
+      ? payload.type
+      : 'semantic';
     const tags: string[] = Array.isArray(payload.tags) ? payload.tags.filter((t): t is string => typeof t === 'string') : [];
     const importance = typeof payload.importance === 'number' ? payload.importance : 0.5;
     const retentionTier = typeof payload.retention_tier === 'string' ? payload.retention_tier : 'T2';
@@ -411,23 +423,35 @@ export class SqliteStore implements SqliteStorage {
       return false;
     }
 
-    this.db.run(
-      `INSERT OR IGNORE INTO memories (
-        id, namespace, collection, type, category, content, summary, tags, source, checksum,
-        importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
-        last_operation, merged_from, stale, archived, vector_synced, device_id, created_at, updated_at, last_accessed
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id, namespace, collection, type, category, content, summary,
-        JSON.stringify(tags), source, checksum, importance, retentionTier,
-        expiresAt, decayEligible ? 1 : 0, null, 0,
-        'ADD', null, 0, 0, 1, deviceId, createdAt, now, now,
-      ],
-    );
-    this.db.run(
-      `INSERT OR IGNORE INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
-      [id, namespace, content, summary, tags.join(' ')],
-    );
+    // Hydration must be atomic per memory: the `memories` insert and its
+    // `memories_fts` companion either both apply or neither does. A plain (non-`OR
+    // IGNORE`) insert into `memories` fails loudly on a constraint violation instead
+    // of being swallowed, and the surrounding transaction guarantees no orphan FTS
+    // row survives a rolled-back memories insert.
+    this.db.run('BEGIN TRANSACTION');
+    try {
+      this.db.run(
+        `INSERT INTO memories (
+          id, namespace, collection, type, category, content, summary, tags, source, checksum,
+          importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
+          last_operation, merged_from, stale, archived, vector_synced, device_id, created_at, updated_at, last_accessed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id, namespace, collection, type, category, content, summary,
+          JSON.stringify(tags), source, checksum, importance, retentionTier,
+          expiresAt, decayEligible ? 1 : 0, null, 0,
+          'ADD', null, 0, 0, 1, deviceId, createdAt, now, now,
+        ],
+      );
+      this.db.run(
+        `INSERT OR IGNORE INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
+        [id, namespace, content, summary, tags.join(' ')],
+      );
+      this.db.run('COMMIT');
+    } catch (err) {
+      this.db.run('ROLLBACK');
+      throw err;
+    }
     this.markDirty();
     return true;
   }

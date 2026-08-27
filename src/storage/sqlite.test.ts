@@ -327,6 +327,57 @@ describe('SqliteStore', () => {
     expect(results.some(r => r.id === 'fts-id')).toBe(true);
   });
 
+  // -- upsertMemoryFromPayload atomicity regression (audit follow-up 7.x) --
+
+  it('upsertMemoryFromPayload normalizes an out-of-enum type instead of silently dropping the row', () => {
+    // A payload whose `type` violates the `memories.type` CHECK constraint must be
+    // normalized to the documented default ('semantic'), not silently dropped by
+    // INSERT OR IGNORE while an orphan memories_fts row survives.
+    const inserted = store.upsertMemoryFromPayload('bad-type-id', {
+      content: 'payload with an invalid type field',
+      summary: 'invalid type summary',
+      type: 'not-a-real-type',
+      checksum: 'bad-type-chk',
+    });
+
+    expect(inserted).toBe(true);
+
+    const mem = store.getMemoryById('bad-type-id');
+    expect(mem).not.toBeNull();
+    expect(mem!.type).toBe('semantic');
+
+    // No orphan FTS row: the memory is discoverable via full-text search exactly
+    // because the backing `memories` row exists.
+    const results = store.fullTextSearch('global', 'invalid type summary', 10);
+    expect(results.some(r => r.id === 'bad-type-id')).toBe(true);
+  });
+
+  it('upsertMemoryFromPayload rolls back the memories insert if the FTS insert fails, leaving no orphan row and no over-reported success', () => {
+    const dbInternal = (store as unknown as { db: { run: (sql: string, params?: unknown[]) => void } }).db;
+    const originalRun = dbInternal.run.bind(dbInternal);
+    dbInternal.run = (sql: string, params?: unknown[]) => {
+      if (sql.includes('INSERT OR IGNORE INTO memories_fts')) {
+        throw new Error('simulated fts insert failure');
+      }
+      return originalRun(sql, params);
+    };
+
+    try {
+      expect(() => store.upsertMemoryFromPayload('atomic-fail-id', {
+        content: 'should not persist',
+        summary: 'should not persist',
+        checksum: 'atomic-fail-chk',
+      })).toThrow('simulated fts insert failure');
+    } finally {
+      dbInternal.run = originalRun;
+    }
+
+    // The transaction must have rolled back: no orphan `memories` row either.
+    expect(store.getMemoryById('atomic-fail-id')).toBeNull();
+    const results = store.fullTextSearch('global', 'should not persist', 10);
+    expect(results.some(r => r.id === 'atomic-fail-id')).toBe(false);
+  });
+
   it('fullTextSearch ranks by term-frequency relevance instead of a constant', () => {
     // Low relevance: one body mention.
     store.insertMemory({

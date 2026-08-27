@@ -1897,6 +1897,10 @@ bhgbrain gc --force-compact           # Forcer la compaction de segments Qdrant 
 # Journal d'audit
 bhgbrain audit                        # Afficher les entrées d'audit récentes
 
+# Réparation (récupération multi-appareils)
+bhgbrain repair --from-qdrant                # Hydrater le SQLite local depuis Qdrant (mémoires de l'appareil actuel uniquement, par défaut)
+bhgbrain repair --from-qdrant --all-devices  # Hydrater à partir des mémoires de tous les appareils, pas seulement de l'appareil actuel
+
 # Gestion des catégories
 bhgbrain category list                # Lister toutes les catégories
 bhgbrain category get <name>          # Afficher le contenu d'une catégorie

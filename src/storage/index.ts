@@ -172,10 +172,27 @@ export class StorageManager {
     return affected;
   }
 
-  async bootstrapFromQdrant(logger?: { info: (obj: Record<string, unknown>) => void }): Promise<number> {
+  async bootstrapFromQdrant(
+    logger?: { info: (obj: Record<string, unknown>) => void; warn?: (obj: Record<string, unknown>) => void },
+    options?: { deviceId?: string | null; allDevices?: boolean },
+  ): Promise<number> {
     const log = (msg: string, data?: Record<string, unknown>) => {
       if (logger) logger.info({ event: 'bootstrap', message: msg, ...data });
     };
+    const logFailure = (msg: string, data?: Record<string, unknown>) => {
+      if (logger?.warn) {
+        logger.warn({ event: 'bootstrap_hydration_failed', message: msg, ...data });
+      } else if (logger) {
+        logger.info({ event: 'bootstrap_hydration_failed', message: msg, ...data });
+      }
+    };
+
+    // Device-scoping is opt-in via `options` so the automatic startup hook (which
+    // exists precisely to recover *other* devices' memories onto an empty local
+    // SQLite) keeps its unfiltered behavior, while `repair --from-qdrant` — a
+    // command whose contract is single-sourced with `device-namespace-partitioning`
+    // — defaults to the current device and only widens on `--all-devices`.
+    const deviceFilter = options?.allDevices ? null : (options?.deviceId ?? null);
 
     const collections = await this.qdrant.listAllCollections();
     log(`[bootstrap] hydrating from qdrant: found ${collections.length} collections`, { collections_count: collections.length });
@@ -185,8 +202,25 @@ export class StorageManager {
       const points = await this.qdrant.scrollAll(collectionName);
       let hydrated = 0;
       for (const point of points) {
-        const inserted = this.sqlite.upsertMemoryFromPayload(point.id, point.payload);
-        if (inserted) hydrated++;
+        if (deviceFilter) {
+          const pointDeviceId = typeof point.payload.device_id === 'string' ? point.payload.device_id : null;
+          if (pointDeviceId !== deviceFilter) {
+            continue;
+          }
+        }
+        // Hydration is best-effort across the whole scan: one point that fails a
+        // SQLite constraint (fails loudly, atomically — see upsertMemoryFromPayload)
+        // must not silently succeed, but it also must not abort the remaining points
+        // in this collection or in later collections.
+        try {
+          const inserted = this.sqlite.upsertMemoryFromPayload(point.id, point.payload);
+          if (inserted) hydrated++;
+        } catch (err) {
+          logFailure(`[bootstrap] failed to hydrate point ${point.id} in ${collectionName}: ${(err as Error).message}`, {
+            collection: collectionName,
+            point_id: point.id,
+          });
+        }
       }
       this.sqlite.flushIfDirty();
       log(`[bootstrap] collection ${collectionName}: ${hydrated} points hydrated`, { collection: collectionName, hydrated });

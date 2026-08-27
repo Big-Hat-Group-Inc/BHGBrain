@@ -1892,6 +1892,10 @@ bhgbrain gc --force-compact           # GC 后强制 Qdrant 分段压缩
 # 审计日志
 bhgbrain audit                        # 显示最近的审计条目
 
+# 修复（多设备恢复）
+bhgbrain repair --from-qdrant                # 从 Qdrant 恢复本地 SQLite（默认仅恢复当前设备的记忆）
+bhgbrain repair --from-qdrant --all-devices  # 恢复所有设备的记忆，而不仅仅是当前设备
+
 # 类别管理
 bhgbrain category list                # 列出所有类别
 bhgbrain category get <name>          # 显示类别内容
