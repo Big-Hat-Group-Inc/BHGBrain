@@ -7,6 +7,17 @@ import type { RecallFilter } from '../domain/types.js';
 
 const COLLECTION_PREFIX = 'bhgbrain_';
 
+// Narrows Qdrant's `ScoredPoint.vector` (unnamed dense vector | named vectors |
+// sparse | null | undefined per the client's OpenAPI types) down to the plain
+// `number[]` this codebase's dense, unnamed vectors always are. Named/sparse
+// shapes are foreign to this project's collections, so they narrow to
+// `undefined` rather than being guessed at.
+function extractDenseVector(value: unknown): number[] | undefined {
+  return Array.isArray(value) && value.every(v => typeof v === 'number')
+    ? (value as number[])
+    : undefined;
+}
+
 export class QdrantStore {
   private client: QdrantClient;
   private dimensions: number;
@@ -151,8 +162,12 @@ export class QdrantStore {
     collection: string | undefined,
     vector: number[],
     limit: number,
-    filters?: RecallFilter & { minScore?: number },
-  ): Promise<Array<{ id: string; score: number; payload: Record<string, unknown> }>> {
+    // `withVector`: relevance-conditioned inject's near-duplicate suppression
+    // needs the raw vectors behind the semantic leg's results; every other
+    // caller omits it, so `with_vector` stays `false` (its pre-existing
+    // implicit default) and behavior is unchanged for them.
+    filters?: RecallFilter & { minScore?: number; withVector?: boolean },
+  ): Promise<Array<{ id: string; score: number; payload: Record<string, unknown>; vector?: number[] }>> {
     const must: Array<Record<string, unknown>> = [
       { key: 'namespace', match: { value: namespace } },
     ];
@@ -194,6 +209,7 @@ export class QdrantStore {
         filter: must.length > 0 ? { must } : undefined,
         score_threshold: filters?.minScore,
         with_payload: true,
+        with_vector: filters?.withVector ?? false,
       })).then(response => response.points).catch((err: unknown) => {
         // A target collection that no longer exists simply contributes no results.
         if (this.isNotFoundError(err)) return [];
@@ -205,6 +221,7 @@ export class QdrantStore {
       id: r.id as string,
       score: r.score,
       payload: (r.payload ?? {}) as Record<string, unknown>,
+      vector: extractDenseVector(r.vector),
     }));
     // Top-K across the merged candidate set when fanning out over collections.
     if (targets.length > 1) {

@@ -38,6 +38,7 @@ interface RankedItem {
   fulltextRank?: number;
   semanticScore?: number;
   fulltextScore?: number;
+  vector?: number[];
 }
 
 export class SearchService {
@@ -149,21 +150,33 @@ export class SearchService {
     limit: number,
     signal?: { degraded?: boolean },
     filter?: RecallFilter,
+    // Relevance-conditioned inject's near-duplicate suppression needs the raw
+    // vectors behind the semantic leg; every other caller leaves this false, so
+    // `storage.qdrant.search` gets no `withVector` option and behaves exactly
+    // as before this parameter existed.
+    withVectors = false,
   ): Promise<SearchResult[]> {
     const weights = this.config.search.hybrid_weights;
 
     // Run both searches in parallel where possible
-    let semanticItems: Array<{ id: string; score: number }> = [];
+    let semanticItems: Array<{ id: string; score: number; vector?: number[] }> = [];
     const fulltextItems = filter
       ? this.storage.sqlite.fullTextSearch(namespace, query, limit * 2, collection, filter)
       : this.storage.sqlite.fullTextSearch(namespace, query, limit * 2, collection);
 
     try {
       const vector = await this.embedding.embed(query);
-      const qdrantResults = filter
-        ? await this.storage.qdrant.search(namespace, collection, vector, limit * 2, filter)
+      // Preserve exact call arity for every pre-existing caller: `filter` is
+      // passed through untouched (same reference, no `withVector` key added)
+      // unless vectors were actually requested, and the options argument is
+      // omitted entirely (not even `undefined`) when neither is needed.
+      const qdrantFilter: (RecallFilter & { withVector?: boolean }) | undefined = withVectors
+        ? { ...(filter ?? {}), withVector: true }
+        : filter;
+      const qdrantResults = qdrantFilter
+        ? await this.storage.qdrant.search(namespace, collection, vector, limit * 2, qdrantFilter)
         : await this.storage.qdrant.search(namespace, collection, vector, limit * 2);
-      semanticItems = qdrantResults.map(r => ({ id: r.id, score: r.score }));
+      semanticItems = qdrantResults.map(r => ({ id: r.id, score: r.score, vector: r.vector }));
     } catch (err) {
       // Embedding/vector store unavailable: degrade to fulltext-only, but make the
       // degradation observable instead of silent (dependency outages are signal in
@@ -185,6 +198,7 @@ export class SearchService {
       const existing = itemMap.get(item.id) ?? { id: item.id };
       existing.semanticRank = idx + 1;
       existing.semanticScore = item.score;
+      existing.vector = item.vector;
       itemMap.set(item.id, existing);
     });
 
@@ -217,8 +231,26 @@ export class SearchService {
         score: item.rrfScore,
         semantic_score: item.semanticScore,
         fulltext_score: item.fulltextScore,
+        vector: item.vector,
       })),
     );
+  }
+
+  /**
+   * Hybrid search variant for relevance-conditioned inject
+   * (`memory://inject/{hint}`): identical composite/RRF ranking, expiry
+   * filtering, and access recording to a normal hybrid search, but also
+   * requests vectors from the semantic leg so the caller can suppress
+   * near-duplicate memories before injecting them. Candidates that only
+   * matched via fulltext carry no vector and are therefore never suppressed.
+   */
+  async searchForInject(
+    hint: string,
+    namespace: string,
+    limit: number,
+    signal?: { degraded?: boolean },
+  ): Promise<SearchResult[]> {
+    return this.hybridSearch(hint, namespace, undefined, limit, signal, undefined, true);
   }
 
   // Composite ranking prior: final = relevance × (w_base + w_imp·importance +
@@ -252,7 +284,7 @@ export class SearchService {
   }
 
   private buildSearchResults(
-    ranked: Array<{ id: string; score: number; semantic_score?: number; fulltext_score?: number; qdrantPayload?: Record<string, unknown> }>,
+    ranked: Array<{ id: string; score: number; semantic_score?: number; fulltext_score?: number; qdrantPayload?: Record<string, unknown>; vector?: number[] }>,
   ): SearchResult[] {
     const now = new Date();
     const nowIso = now.toISOString();
@@ -293,6 +325,9 @@ export class SearchService {
         device_id: mem.device_id ?? null,
         created_at: mem.created_at,
         last_accessed: nowIso,
+        // `undefined` for every caller except `searchForInject`; JSON.stringify
+        // drops undefined-valued keys, so this never appears in tool responses.
+        vector: item.vector,
       });
     }
 

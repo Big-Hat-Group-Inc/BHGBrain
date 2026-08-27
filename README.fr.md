@@ -412,12 +412,29 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     "trust_proxy": false
   },
 
-  // Budget de charge utile d'injection automatique (pour la ressource memory://inject)
+  // Budget de charge utile d'injection automatique (pour memory://inject et memory://inject/{hint})
   "auto_inject": {
-    // Nombre maximum de caractères inclus dans la charge utile d'injection
+    // Quantité du budget, interprétée selon budget_unit ci-dessous
     "max_chars": 30000,
     // Budget de tokens (null = illimité, le budget en caractères s'applique)
-    "max_tokens": null
+    "max_tokens": null,
+    // Fraction du budget réservée à la section des souvenirs, afin que le
+    // contenu des catégories ne puisse plus consommer toute la charge
+    // utile avant qu'un seul souvenir soit injecté. 0 restaure le
+    // comportement préexistant où les catégories peuvent utiliser tout
+    // le budget.
+    "memory_budget_fraction": 0.4,
+    // 'chars' (par défaut) : max_chars est un budget de caractères,
+    // inchangé par rapport à avant cette option. 'tokens' : max_chars est
+    // traité comme un budget de tokens estimé (caractères/4, sans
+    // dépendance à un tokenizer), multipliant par 4 le budget de
+    // caractères effectif de chaque section.
+    "budget_unit": "chars",
+    // Suppression gloutonne des quasi-doublons dans la section des
+    // souvenirs sélectionnée par indice : un candidat dont la similarité
+    // dépasse deduplication.similarity_threshold par rapport à un
+    // souvenir déjà sélectionné est ignoré.
+    "dedup_suppression": true
   },
 
   // Paramètres d'observabilité
@@ -1975,6 +1992,7 @@ BHGBrain expose des ressources MCP (lisibles via `ReadResource`) en plus des out
 |---|---|---|
 | `memory://{id}` | Détails du souvenir | Enregistrement de souvenir complet par UUID |
 | `memory://{id}/revisions` | Révisions du souvenir | Historique des révisions d'un souvenir, du plus récent au plus ancien |
+| `memory://inject/{hint}` | Injection de session (avec indice) | Bloc de contexte budgété dont la section de souvenirs est sélectionnée par pertinence hybride à l'indice, plutôt que par récence |
 | `category://{name}` | Catégorie | Contenu complet de la catégorie par nom |
 | `collection://{name}` | Collection | Souvenirs dans une collection spécifique |
 
@@ -2003,9 +2021,20 @@ La pagination utilise des curseurs composites (`created_at|id`) pour un ordre st
 
 La ressource d'injection construit une charge utile textuelle budgétée pour l'injection dans une fenêtre de contexte LLM :
 
-1. Tout le contenu des catégories est préfixé en premier (contenu complet, dans l'ordre).
-2. Les meilleurs souvenirs récents sont ajoutés (contenu ou résumé selon l'espace disponible).
-3. La charge utile est tronquée à `auto_inject.max_chars` (par défaut 30 000 caractères).
+1. Le contenu des catégories est préfixé en premier (contenu complet, dans l'ordre),
+   plafonné à sa part réservée du budget :
+   `(1 - auto_inject.memory_budget_fraction) × budget`. Ce que les catégories
+   laissent inutilisé passe à la section des souvenirs ci-dessous (aucun gaspillage).
+2. Les souvenirs sont ajoutés dans le budget restant (contenu ou résumé selon
+   l'espace disponible) — toujours au moins `auto_inject.memory_budget_fraction ×
+   budget` lorsque des souvenirs existent, afin que le contenu des catégories ne
+   puisse plus affamer la section des souvenirs.
+   - `memory://inject` (sans indice) : meilleurs souvenirs par **récence**,
+     inchangé par rapport à avant cette option.
+   - `memory://inject/{hint}` : meilleurs souvenirs par **pertinence hybride** à
+     l'indice (voir ci-dessous).
+3. La charge utile est tronquée à `auto_inject.max_chars`, interprété selon
+   `auto_inject.budget_unit` (par défaut 30 000 caractères).
 
 Paramètres de requête :
 - `namespace` — espace de noms depuis lequel injecter (par défaut : `global`)
@@ -2022,6 +2051,35 @@ Réponse :
 ```
 
 Accéder à un souvenir via `memory://{id}` incrémente son nombre d'accès et planifie une vidange différée.
+
+### `memory://inject/{hint}` — Injection de session conditionnée par la pertinence
+
+Une variante paramétrée de `memory://inject` qui sélectionne la section des
+souvenirs par **pertinence hybride à un indice** fourni par l'appelant (une phrase
+de tâche, un nom de dépôt ou un sujet) plutôt que par récence :
+
+- L'indice est un segment de chemin URI : décodé une fois, découpé et plafonné à
+  500 caractères (la même limite que `search`/`recall` appliquent à une requête),
+  avant de piloter la recherche hybride sur l'espace de noms résolu.
+- La sélection réutilise le même classement composite/RRF, le même filtrage
+  d'expiration et la même limite top-K (`defaults.auto_inject_limit`) qu'un appel
+  normal à `search`/`recall`. Contrairement au chemin sans indice, une lecture avec
+  indice **enregistre l'accès** sur les souvenirs sélectionnés — c'est un recall à
+  tous égards pertinents.
+- Si le fournisseur d'embeddings est indisponible, la sélection dégrade avec
+  élégance vers la branche plein texte — la charge utile est tout de même produite,
+  simplement sans la contribution sémantique.
+- Un indice vide (vide après découpage) revient au comportement de récence décrit
+  ci-dessus.
+- **Suppression des quasi-doublons** : lorsque `auto_inject.dedup_suppression` est
+  `true` (par défaut), un candidat dont la similarité vectorielle avec un souvenir
+  déjà sélectionné dépasse `deduplication.similarity_threshold` est ignoré, et le
+  budget libéré revient au candidat distinct suivant.
+
+Exemple : `memory://inject/deploy%20to%20production` conditionne la sélection sur
+"deploy to production".
+
+La forme de la réponse est identique à `memory://inject`.
 
 ### `memory://{id}/revisions` — Historique des révisions
 
@@ -2698,7 +2756,7 @@ Une fois la vérification de dérive terminée, le verrou est libéré — le r�
 
 - Les réponses aux appels d'outils incluent des charges utiles JSON structurées.
 - Les réponses d'erreur définissent `isError: true` dans le protocole MCP pour le routage côté client.
-- Les ressources paramétrées (`memory://{id}`, `category://{name}`, `collection://{name}`) sont exposées comme modèles de ressources MCP via `resources/templates/list`.
+- Les ressources paramétrées (`memory://{id}`, `memory://inject/{hint}`, `category://{name}`, `collection://{name}`) sont exposées comme modèles de ressources MCP via `resources/templates/list`.
 
 ### Recherche et pagination
 

@@ -405,12 +405,22 @@ BHGBrain 从以下位置加载配置文件：
     "trust_proxy": false
   },
 
-  // 自动注入载荷预算（用于 memory://inject 资源）
+  // 自动注入载荷预算（用于 memory://inject 和 memory://inject/{hint}）
   "auto_inject": {
-    // 注入载荷中包含的最大字符数
+    // 预算数值，依据下方 budget_unit 解释
     "max_chars": 30000,
     // Token 预算（null = 无限制，使用字符预算）
-    "max_tokens": null
+    "max_tokens": null,
+    // 为记忆部分保留的预算比例，使类别内容不再能在注入任何一条记忆之前
+    // 就耗尽整个载荷预算。设为 0 可恢复此前类别可占用全部预算的行为。
+    "memory_budget_fraction": 0.4,
+    // 'chars'（默认）：max_chars 为字符预算，与引入此选项前完全一致。
+    // 'tokens'：将 max_chars 视为估算的 token 预算（字符数/4，无需依赖
+    // 分词器），使每个部分的有效字符预算按 4 倍放大。
+    "budget_unit": "chars",
+    // 在按提示选出的记忆部分内进行贪心近重复抑制：若某候选与已选记忆的
+    // 相似度超过 deduplication.similarity_threshold，则跳过该候选。
+    "dedup_suppression": true
   },
 
   // 可观测性设置
@@ -1945,6 +1955,7 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 |---|---|---|
 | `memory://{id}` | 记忆详情 | 通过 UUID 获取完整记忆记录 |
 | `memory://{id}/revisions` | 记忆版本历史 | 某条记忆的版本历史，最新优先 |
+| `memory://inject/{hint}` | 会话注入（带提示） | 预算上下文块，其记忆部分依据与提示的混合相关性而非最近程度来选取 |
 | `category://{name}` | 类别 | 通过名称获取完整类别内容 |
 | `collection://{name}` | 集合 | 特定集合中的记忆 |
 
@@ -1973,9 +1984,16 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 
 注入资源构建一个预算文本载荷，用于注入到 LLM 上下文窗口：
 
-1. 所有类别内容优先插入（完整内容，按顺序）。
-2. 顶部近期记忆随后附加（根据空间决定使用内容或摘要）。
-3. 载荷在 `auto_inject.max_chars`（默认 30,000 字符）处截断。
+1. 类别内容优先插入（完整内容，按顺序），并限制在其保留的预算份额内：
+   `(1 - auto_inject.memory_budget_fraction) × 预算`。类别未用完的部分会滚入
+   下方的记忆部分（不浪费）。
+2. 记忆在剩余预算内附加（根据空间决定使用内容或摘要）——只要存在记忆，
+   记忆部分始终至少能获得 `auto_inject.memory_budget_fraction × 预算`，
+   使类别内容不再能耗尽记忆部分的空间。
+   - `memory://inject`（无提示）：按**最近程度**选取顶部记忆，与引入此选项前一致。
+   - `memory://inject/{hint}`：按与提示的**混合相关性**选取顶部记忆（见下文）。
+3. 载荷在 `auto_inject.max_chars` 处截断，依据 `auto_inject.budget_unit` 解释
+   （默认 30,000 字符）。
 
 查询参数：
 - `namespace`——要注入的命名空间（默认：`global`）
@@ -1992,6 +2010,29 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 ```
 
 通过 `memory://{id}` 访问记忆会增加其访问次数并安排延迟刷写。
+
+### `memory://inject/{hint}`——相关性条件会话注入
+
+`memory://inject` 的参数化变体，依据调用方提供的**提示**（任务短语、仓库名或
+主题）与记忆的混合相关性选取记忆部分，而非按最近程度：
+
+- 提示是一个 URI 路径片段：先解码一次，再去除首尾空白并截断到 500 字符
+  （与 `search`/`recall` 对查询施加的限制相同），然后据此在已解析的命名空间上
+  驱动混合搜索。
+- 选取复用与普通 `search`/`recall` 调用相同的复合/RRF 排序、过期过滤和
+  Top-K 限制（`defaults.auto_inject_limit`）。与无提示路径不同，带提示的读取
+  会**记录访问**——在各方面意义上它都是一次 recall。
+- 若嵌入提供方不可用，选取会优雅降级到全文检索分支——载荷仍会生成，
+  只是没有语义部分的贡献。
+- 空提示（去除首尾空白后为空）会回退到上述最近程度行为。
+- **近重复抑制**：当 `auto_inject.dedup_suppression` 为 `true`（默认）时，
+  若某候选与已选记忆的向量相似度超过 `deduplication.similarity_threshold`，
+  则跳过该候选，释放出的预算用于下一个不同的候选。
+
+示例：`memory://inject/deploy%20to%20production` 将选取条件设为
+"deploy to production"。
+
+响应结构与 `memory://inject` 相同。
 
 ### `memory://{id}/revisions`——版本历史
 
@@ -2664,7 +2705,7 @@ bhgbrain backup create
 
 - 工具调用响应包含结构化 JSON 载荷。
 - 错误响应在 MCP 协议中设置 `isError: true` 以便客户端路由。
-- 参数化资源（`memory://{id}`、`category://{name}`、`collection://{name}`）通过 `resources/templates/list` 作为 MCP 资源模板暴露。
+- 参数化资源（`memory://{id}`、`memory://inject/{hint}`、`category://{name}`、`collection://{name}`）通过 `resources/templates/list` 作为 MCP 资源模板暴露。
 
 ### 搜索与分页
 

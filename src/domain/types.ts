@@ -96,6 +96,11 @@ export interface SearchResult {
   device_id?: string | null;
   created_at: string;
   last_accessed: string;
+  // Populated only by `SearchService.searchForInject` (the semantic leg's raw
+  // vector, when available) so relevance-conditioned inject can suppress
+  // near-duplicate memories. Never populated by the public `search`/`recall`
+  // tools, so it never appears in their JSON responses.
+  vector?: number[];
 }
 
 export interface WriteResult {

@@ -18,7 +18,7 @@ handlers in `src/tools/index.ts`. Registered: `remember`, `recall`, `forget`, `s
 
 **Resources** — `src/resources/index.ts`. Static: `memory://list`, `memory://inject`,
 `category://list`, `collection://list`, `health://status`. Templates: `memory://{id}`,
-`memory://{id}/revisions`, `category://{name}`, `collection://{name}`.
+`memory://{id}/revisions`, `memory://inject/{hint}`, `category://{name}`, `collection://{name}`.
 
 Changing either surface means updating the schema/handler *and* `README.md`
 (§ "MCP Tools Reference") in the same change.

@@ -2,13 +2,17 @@ import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { SearchService } from '../search/index.js';
 import type { HealthService } from '../health/index.js';
-import type { InjectPayload, PaginatedResult, MemoryRecord, MemoryRevisionRecord } from '../domain/types.js';
+import type { InjectPayload, PaginatedResult, MemoryRecord, MemoryRevisionRecord, SearchResult } from '../domain/types.js';
 import type { CategoryHeader } from '../storage/sqlite.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 
 export class ResourceHandler {
   private static readonly LIST_LIMIT_MIN = 1;
   private static readonly LIST_LIMIT_MAX = 100;
+  // `memory://inject/{hint}` caps the hint to the same length the `search`/
+  // `recall` tools enforce on a query (`schemas.ts`), so an oversized hint
+  // can't blow up the hybrid search behind it.
+  private static readonly HINT_MAX_LENGTH = 500;
   private lifecycle: MemoryLifecycleService;
 
   constructor(
@@ -56,7 +60,7 @@ export class ResourceHandler {
 
     if (path === 'inject') {
       const namespace = url.searchParams.get('namespace') ?? this.config.defaults.namespace;
-      return this.buildInjectPayload(namespace);
+      return this.buildInjectPayload(namespace, this.extractInjectHint(url));
     }
 
     if (path === 'list') {
@@ -147,41 +151,102 @@ export class ResourceHandler {
     return parsed;
   }
 
-  private async buildInjectPayload(namespace: string): Promise<InjectPayload> {
-    const maxChars = this.config.auto_inject.max_chars;
+  // `memory://inject` has no hint segment (`url.pathname` is '' or '/');
+  // `memory://inject/{hint}` carries it as the path remainder. Decoded once,
+  // trimmed, and length-capped so a hint typo or an oversized value can't
+  // reach the hybrid search underneath unbounded.
+  private extractInjectHint(url: URL): string | undefined {
+    const rawSegment = url.pathname && url.pathname !== '/' ? url.pathname.slice(1) : '';
+    if (!rawSegment) return undefined;
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(rawSegment);
+    } catch {
+      decoded = rawSegment;
+    }
+    const trimmed = decoded.trim();
+    return trimmed ? trimmed.slice(0, ResourceHandler.HINT_MAX_LENGTH) : undefined;
+  }
+
+  private cosineSimilarity(a: number[], b: number[]): number {
+    if (a.length !== b.length || a.length === 0) return 0;
+    let dot = 0;
+    let magA = 0;
+    let magB = 0;
+    for (let i = 0; i < a.length; i++) {
+      const va = a[i]!;
+      const vb = b[i]!;
+      dot += va * vb;
+      magA += va * va;
+      magB += vb * vb;
+    }
+    if (magA === 0 || magB === 0) return 0;
+    return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+  }
+
+  // Greedy near-duplicate suppression over relevance-ranked candidates: a
+  // candidate is dropped once it exceeds the dedup threshold's similarity to
+  // an already-selected memory. Candidates with no vector (fulltext-only
+  // matches, or the cross-device Qdrant-payload fallback) are never
+  // suppressed — there is nothing to compare them against.
+  private suppressNearDuplicates(candidates: SearchResult[]): SearchResult[] {
+    const threshold = this.config.deduplication.similarity_threshold;
+    const selected: SearchResult[] = [];
+    for (const candidate of candidates) {
+      const vector = candidate.vector;
+      const isDuplicate = vector !== undefined && selected.some(sel =>
+        sel.vector !== undefined && this.cosineSimilarity(vector, sel.vector) > threshold,
+      );
+      if (!isDuplicate) selected.push(candidate);
+    }
+    return selected;
+  }
+
+  private async buildInjectPayload(namespace: string, hint?: string): Promise<InjectPayload> {
+    const { max_chars, budget_unit, memory_budget_fraction, dedup_suppression } = this.config.auto_inject;
+    // `budget_unit: 'tokens'` estimates 1 token ~= 4 chars; scaling the char
+    // budget by 4 keeps every length comparison below in chars unchanged, so
+    // `budget_unit: 'chars'` (the default) is byte-for-byte identical to the
+    // arithmetic that existed before this option did.
+    const budgetChars = budget_unit === 'tokens' ? max_chars * 4 : max_chars;
+    // Categories draw from their reserved share only; whatever they leave
+    // unused rolls into the memory section's remaining budget below, so a
+    // light category set doesn't waste the reservation (no fixed carve-out).
+    const categoryBudget = budgetChars * (1 - memory_budget_fraction);
+
     const parts: string[] = [];
     let totalChars = 0;
     let truncated = false;
-    const appendBlock = (block: string): boolean => {
-      if (totalChars >= maxChars) {
+    const appendBlock = (block: string, cap: number): boolean => {
+      if (totalChars >= cap) {
         truncated = true;
         return false;
       }
-      const remaining = maxChars - totalChars;
+      const remaining = cap - totalChars;
       if (block.length <= remaining) {
         parts.push(block);
         totalChars += block.length;
         return true;
       }
       parts.push(block.slice(0, remaining));
-      totalChars = maxChars;
+      totalChars = cap;
       truncated = true;
       return false;
     };
 
-    // 1. All category content (full)
+    // 1. All category content (full, capped to the reserved category share)
     const categoryHeaders = this.storage.sqlite.listCategoryHeaders();
     let categoriesCount = 0;
     for (const cat of categoryHeaders) {
-      if (totalChars >= maxChars) {
+      if (totalChars >= categoryBudget) {
         truncated = true;
         break;
       }
 
       const prefix = `## ${cat.name} (${cat.slot})\n`;
-      if (!appendBlock(prefix)) break;
+      if (!appendBlock(prefix, categoryBudget)) break;
 
-      const remainingForContent = maxChars - totalChars - 2;
+      const remainingForContent = categoryBudget - totalChars - 2;
       if (remainingForContent <= 0) {
         truncated = true;
         break;
@@ -193,7 +258,7 @@ export class ResourceHandler {
       // cat.content_length) rather than JS UTF-16 `.length`, so multibyte/astral
       // content near the budget boundary is not mis-classified as fully included.
       const fullyIncluded = (slice?.length ?? 0) >= cat.content_length;
-      if (!appendBlock(`${content}\n\n`)) break;
+      if (!appendBlock(`${content}\n\n`, categoryBudget)) break;
       if (!fullyIncluded) {
         truncated = true;
         break;
@@ -201,19 +266,29 @@ export class ResourceHandler {
       categoriesCount++;
     }
 
-    // 2. Top-K relevant memories
+    // 2. Memory section: hybrid-relevance selection when a hint is given
+    // (access recorded and expiry-filtered identically to a normal search,
+    // near-duplicate suppressed), recency fallback otherwise — unchanged
+    // from what `memory://inject` always did.
     const topK = this.config.defaults.auto_inject_limit;
-    const memories = this.storage.sqlite.listMemories(namespace, topK);
+    const trimmedHint = hint?.trim();
+    let memories: Array<Pick<MemoryRecord | SearchResult, 'type' | 'content' | 'summary'>>;
+    if (trimmedHint) {
+      const candidates = await this.search.searchForInject(trimmedHint, namespace, topK);
+      memories = dedup_suppression ? this.suppressNearDuplicates(candidates) : candidates;
+    } else {
+      memories = this.storage.sqlite.listMemories(namespace, topK);
+    }
     let memoriesCount = 0;
 
     for (const mem of memories) {
-      if (totalChars >= maxChars) break;
+      if (totalChars >= budgetChars) break;
 
-      const remaining = maxChars - totalChars;
+      const remaining = budgetChars - totalChars;
       const contentBlock = mem.content.length + 50 <= remaining
         ? `- [${mem.type}] ${mem.content}\n`
         : `- [${mem.type}] ${mem.summary}\n`;
-      if (appendBlock(contentBlock)) {
+      if (appendBlock(contentBlock, budgetChars)) {
         memoriesCount++;
       } else {
         break;
@@ -310,6 +385,7 @@ export const MCP_RESOURCE_DEFINITIONS = [
 export const MCP_RESOURCE_TEMPLATES = [
   { uriTemplate: 'memory://{id}', name: 'Memory Details', description: 'Full memory details by ID' },
   { uriTemplate: 'memory://{id}/revisions', name: 'Memory Revisions', description: 'Revision history for a memory, newest first' },
+  { uriTemplate: 'memory://inject/{hint}', name: 'Session Inject (Hinted)', description: 'Budgeted session context block whose memory section is selected by hybrid relevance to the hint, instead of recency' },
   { uriTemplate: 'category://{name}', name: 'Category', description: 'Full category content' },
   { uriTemplate: 'collection://{name}', name: 'Collection', description: 'Memories in a collection' },
 ];

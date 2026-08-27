@@ -456,12 +456,26 @@ The file is created automatically on first run with all defaults applied. Edit i
     "trust_proxy": false
   },
 
-  // Auto-inject payload budget (for memory://inject resource)
+  // Auto-inject payload budget (for memory://inject and memory://inject/{hint})
   "auto_inject": {
-    // Maximum characters included in the inject payload
+    // Budget quantity, interpreted per budget_unit below
     "max_chars": 30000,
     // Token budget (null = unlimited, character budget applies)
-    "max_tokens": null
+    "max_tokens": null,
+    // Fraction of the budget reserved for the memory section, so category
+    // content can no longer consume the entire payload before a single
+    // memory is injected. 0 restores the pre-existing behavior where
+    // categories may use the whole budget.
+    "memory_budget_fraction": 0.4,
+    // 'chars' (default): max_chars is a character budget, unchanged from
+    // before this option existed. 'tokens': max_chars is treated as an
+    // estimated token budget (chars/4, no tokenizer dependency), scaling
+    // every section's effective character budget by 4x.
+    "budget_unit": "chars",
+    // Greedy near-duplicate suppression within the hint-selected memory
+    // section: a candidate exceeding deduplication.similarity_threshold
+    // similarity to an already-selected memory is skipped.
+    "dedup_suppression": true
   },
 
   // Observability settings
@@ -2014,6 +2028,7 @@ BHGBrain exposes MCP resources (readable via `ReadResource`) in addition to tool
 |---|---|---|
 | `memory://{id}` | Memory Details | Full memory record by UUID |
 | `memory://{id}/revisions` | Memory Revisions | Revision history for a memory, newest first |
+| `memory://inject/{hint}` | Session Inject (Hinted) | Budgeted context block whose memory section is selected by hybrid relevance to the hint, instead of recency |
 | `category://{name}` | Category | Full category content by name |
 | `collection://{name}` | Collection | Memories in a specific collection |
 
@@ -2042,9 +2057,18 @@ Pagination uses composite cursors (`created_at|id`) for stable ordering. Ties at
 
 The inject resource builds a budgeted text payload for injecting into an LLM context window:
 
-1. All category content is prepended first (full content, in order).
-2. Top recent memories are appended (content or summary depending on space).
-3. The payload is truncated at `auto_inject.max_chars` (default 30,000 characters).
+1. Category content is prepended first (full content, in order), capped to its
+   reserved share of the budget: `(1 - auto_inject.memory_budget_fraction) × budget`.
+   Whatever categories leave unused rolls into the memory section below (no waste).
+2. Memories are appended (content or summary depending on space) into the remaining
+   budget — always at least `auto_inject.memory_budget_fraction × budget` when
+   memories exist, so category content can no longer starve the memory section.
+   - `memory://inject` (no hint): top memories by **recency**, unchanged from before
+     this option existed.
+   - `memory://inject/{hint}`: top memories by **hybrid relevance** to the hint (see
+     below).
+3. The payload is truncated at `auto_inject.max_chars`, interpreted per
+   `auto_inject.budget_unit` (default 30,000 characters).
 
 Query parameters:
 - `namespace` - namespace to inject from (default: `global`)
@@ -2061,6 +2085,33 @@ Response:
 ```
 
 Touching a memory via `memory://{id}` increments its access count and schedules a deferred flush.
+
+### `memory://inject/{hint}` - Relevance-Conditioned Session Injection
+
+A parameterized variant of `memory://inject` that selects the memory section by
+**hybrid relevance to a caller-provided hint** (a task phrase, repo name, or topic)
+instead of recency:
+
+- The hint is a URI path segment: URI-decoded once, trimmed, and capped to 500
+  characters (the same limit `search`/`recall` enforce on a query) before it drives
+  hybrid search over the resolved namespace.
+- Selection reuses the same composite/RRF ranking, expiry filtering, and top-K limit
+  (`defaults.auto_inject_limit`) as a normal `search`/`recall` call. Unlike the
+  hintless path, a hinted read **records access** on the selected memories — it's a
+  recall in every meaningful sense.
+- If the embedding provider is unavailable, selection degrades gracefully to the
+  fulltext leg — the payload still gets produced, just without the semantic
+  contribution.
+- An empty hint (blank after trimming) falls back to the recency behavior above.
+- **Near-duplicate suppression**: when `auto_inject.dedup_suppression` is `true`
+  (default), a candidate whose vector similarity to an already-selected memory
+  exceeds `deduplication.similarity_threshold` is skipped, and the freed budget goes
+  to the next distinct candidate.
+
+Example: `memory://inject/deploy%20to%20production` conditions selection on
+"deploy to production".
+
+The response shape is identical to `memory://inject`.
 
 ### `memory://{id}/revisions` - Revision History
 
@@ -2986,7 +3037,7 @@ Once the drift check finishes, the guard is released — re-embedding the drifte
 
 - Tool call responses include structured JSON payloads.
 - Error responses set `isError: true` in the MCP protocol for client-side routing.
-- Parameterized resources (`memory://{id}`, `category://{name}`, `collection://{name}`) are exposed as MCP resource templates via `resources/templates/list`.
+- Parameterized resources (`memory://{id}`, `memory://inject/{hint}`, `category://{name}`, `collection://{name}`) are exposed as MCP resource templates via `resources/templates/list`.
 
 ### Search and Pagination
 

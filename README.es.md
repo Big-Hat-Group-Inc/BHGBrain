@@ -411,12 +411,27 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     "trust_proxy": false
   },
 
-  // Presupuesto del payload de auto-inject (para el recurso memory://inject)
+  // Presupuesto del payload de auto-inject (para memory://inject y memory://inject/{hint})
   "auto_inject": {
-    // Número máximo de caracteres incluidos en el payload de inject
+    // Cantidad del presupuesto, interpretada según budget_unit más abajo
     "max_chars": 30000,
     // Presupuesto de tokens (null = ilimitado, se aplica el presupuesto de caracteres)
-    "max_tokens": null
+    "max_tokens": null,
+    // Fracción del presupuesto reservada para la sección de memorias, para
+    // que el contenido de categorías ya no pueda consumir todo el payload
+    // antes de inyectar una sola memoria. 0 restaura el comportamiento
+    // previo donde las categorías pueden usar todo el presupuesto.
+    "memory_budget_fraction": 0.4,
+    // 'chars' (predeterminado): max_chars es un presupuesto de caracteres,
+    // sin cambios respecto a antes de esta opción. 'tokens': max_chars se
+    // trata como un presupuesto de tokens estimado (caracteres/4, sin
+    // dependencia de un tokenizador), escalando por 4 el presupuesto de
+    // caracteres efectivo de cada sección.
+    "budget_unit": "chars",
+    // Supresión voraz de casi-duplicados dentro de la sección de memorias
+    // seleccionada por hint: se omite un candidato cuya similitud con una
+    // memoria ya seleccionada supere deduplication.similarity_threshold.
+    "dedup_suppression": true
   },
 
   // Configuración de observabilidad
@@ -1971,6 +1986,7 @@ BHGBrain expone recursos MCP (legibles vía `ReadResource`) además de las herra
 |---|---|---|
 | `memory://{id}` | Detalles de Memoria | Registro completo de memoria por UUID |
 | `memory://{id}/revisions` | Revisiones de Memoria | Historial de revisiones de una memoria, más reciente primero |
+| `memory://inject/{hint}` | Inject de Sesión (con pista) | Bloque de contexto con presupuesto cuya sección de memorias se selecciona por relevancia híbrida a la pista, en lugar de recencia |
 | `category://{name}` | Categoría | Contenido completo de categoría por nombre |
 | `collection://{name}` | Colección | Memorias en una colección específica |
 
@@ -1999,9 +2015,20 @@ La paginación usa cursores compuestos (`created_at|id`) para un orden estable. 
 
 El recurso inject construye un payload de texto con presupuesto para inyectar en una ventana de contexto LLM:
 
-1. Todo el contenido de categorías se antepone primero (contenido completo, en orden).
-2. Las memorias recientes principales se añaden a continuación (contenido o resumen dependiendo del espacio).
-3. El payload se trunca en `auto_inject.max_chars` (predeterminado 30.000 caracteres).
+1. El contenido de categorías se antepone primero (contenido completo, en orden),
+   limitado a su parte reservada del presupuesto:
+   `(1 - auto_inject.memory_budget_fraction) × presupuesto`. Lo que las categorías
+   dejen sin usar pasa a la sección de memorias siguiente (sin desperdicio).
+2. Las memorias se añaden dentro del presupuesto restante (contenido o resumen
+   según el espacio) — siempre al menos `auto_inject.memory_budget_fraction ×
+   presupuesto` cuando existen memorias, de modo que el contenido de categorías ya
+   no puede dejar sin espacio a la sección de memorias.
+   - `memory://inject` (sin pista): memorias principales por **recencia**, sin
+     cambios respecto a antes de esta opción.
+   - `memory://inject/{hint}`: memorias principales por **relevancia híbrida** a la
+     pista (ver más abajo).
+3. El payload se trunca en `auto_inject.max_chars`, interpretado según
+   `auto_inject.budget_unit` (predeterminado 30.000 caracteres).
 
 Parámetros de consulta:
 - `namespace` — namespace desde el que inyectar (predeterminado: `global`)
@@ -2018,6 +2045,35 @@ Respuesta:
 ```
 
 Acceder a una memoria vía `memory://{id}` incrementa su recuento de accesos y programa un volcado diferido.
+
+### `memory://inject/{hint}` — Inyección de Sesión Condicionada por Relevancia
+
+Una variante parametrizada de `memory://inject` que selecciona la sección de
+memorias por **relevancia híbrida a una pista** proporcionada por el llamador (una
+frase de tarea, nombre de repo o tema) en lugar de por recencia:
+
+- La pista es un segmento de ruta URI: decodificada una vez, recortada y limitada a
+  500 caracteres (el mismo límite que `search`/`recall` aplican a una consulta),
+  antes de dirigir la búsqueda híbrida sobre el namespace resuelto.
+- La selección reutiliza el mismo ranking compuesto/RRF, el mismo filtrado de
+  expiración y el mismo límite top-K (`defaults.auto_inject_limit`) que una llamada
+  normal a `search`/`recall`. A diferencia de la ruta sin pista, una lectura con
+  pista **registra acceso** en las memorias seleccionadas — es un recall en todo
+  sentido relevante.
+- Si el proveedor de embeddings no está disponible, la selección degrada con
+  elegancia a la rama de texto completo — el payload igual se produce, solo sin la
+  contribución semántica.
+- Una pista vacía (en blanco tras recortarla) recae en el comportamiento de
+  recencia descrito arriba.
+- **Supresión de casi-duplicados**: cuando `auto_inject.dedup_suppression` es
+  `true` (predeterminado), se omite un candidato cuya similitud vectorial con una
+  memoria ya seleccionada supere `deduplication.similarity_threshold`, y el
+  presupuesto liberado pasa al siguiente candidato distinto.
+
+Ejemplo: `memory://inject/deploy%20to%20production` condiciona la selección a
+"deploy to production".
+
+La forma de la respuesta es idéntica a `memory://inject`.
 
 ### `memory://{id}/revisions` — Historial de Revisiones
 
@@ -2695,7 +2751,7 @@ Una vez que termina la comprobación de drift, se libera el bloqueo — la reinc
 
 - Las respuestas de llamadas a herramientas incluyen payloads JSON estructurados.
 - Las respuestas de error establecen `isError: true` en el protocolo MCP para el enrutamiento del lado del cliente.
-- Los recursos parametrizados (`memory://{id}`, `category://{name}`, `collection://{name}`) se exponen como plantillas de recursos MCP vía `resources/templates/list`.
+- Los recursos parametrizados (`memory://{id}`, `memory://inject/{hint}`, `category://{name}`, `collection://{name}`) se exponen como plantillas de recursos MCP vía `resources/templates/list`.
 
 ### Búsqueda y Paginación
 

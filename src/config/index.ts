@@ -190,6 +190,18 @@ const ConfigSchema = z.object({
   auto_inject: z.object({
     max_chars: z.number().int().positive().default(30000),
     max_tokens: z.number().int().positive().nullable().default(null),
+    // Fraction of the inject budget reserved for the memory section so category
+    // content can no longer consume the entire budget before a memory is
+    // injected (see relevance-conditioned-inject). 0 restores the pre-existing
+    // "categories can starve memories" behavior.
+    memory_budget_fraction: z.number().min(0).max(1).default(0.4),
+    // 'tokens' scales the char budget by a chars/4 estimate (no tokenizer
+    // dependency); 'chars' (default) is byte-for-byte identical to the
+    // pre-existing budget arithmetic.
+    budget_unit: z.enum(['chars', 'tokens']).default('chars'),
+    // Greedy near-duplicate suppression within the hint-selected memory
+    // section, reusing `deduplication.similarity_threshold`.
+    dedup_suppression: z.boolean().default(true),
   }).default({}),
   observability: z.object({
     metrics_enabled: z.boolean().default(false),

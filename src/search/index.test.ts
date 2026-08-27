@@ -373,6 +373,36 @@ describe('SearchService', () => {
     });
   });
 
+  describe('searchForInject (relevance-conditioned inject)', () => {
+    it('requests vectors from the semantic leg and attaches them to hybrid results', async () => {
+      const { service, storage } = createSearchService();
+      storage.qdrant.search.mockResolvedValue([
+        { id: 'mem-1', score: 0.9, payload: {}, vector: [1, 2, 3] },
+      ]);
+
+      const results = await service.searchForInject('deployment task', 'global', 5);
+
+      expect(storage.qdrant.search).toHaveBeenCalledWith(
+        'global', undefined, [1, 2, 3], 10, { withVector: true },
+      );
+      expect(results).toHaveLength(1);
+      expect(results[0]!.vector).toEqual([1, 2, 3]);
+    });
+
+    it('degrades to a fulltext-only selection when embeddings are unavailable, with no vectors', async () => {
+      const { service, embedding, storage } = createSearchService();
+      (embedding.embed as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('embeddings down'));
+      const signal: { degraded?: boolean } = {};
+
+      const results = await service.searchForInject('deployment task', 'global', 5, signal);
+
+      expect(signal.degraded).toBe(true);
+      expect(storage.qdrant.search).not.toHaveBeenCalled();
+      expect(results.length).toBeGreaterThan(0);
+      expect(results[0]!.vector).toBeUndefined();
+    });
+  });
+
   describe('composite ranking (add-composite-recall-ranking)', () => {
     const makeMem = (id: string, overrides: Partial<StoredMemory> = {}): StoredMemory => ({
       id, namespace: 'global', collection: 'general', type: 'semantic',

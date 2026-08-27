@@ -410,12 +410,28 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "trust_proxy": false
   },
 
-  // Auto-Inject-Payload-Budget (für die memory://inject-Ressource)
+  // Auto-Inject-Payload-Budget (für memory://inject und memory://inject/{hint})
   "auto_inject": {
-    // Maximale im Inject-Payload enthaltene Zeichenanzahl
+    // Budgetmenge, interpretiert gemäß budget_unit unten
     "max_chars": 30000,
     // Token-Budget (null = unbegrenzt, Zeichenbudget gilt)
-    "max_tokens": null
+    "max_tokens": null,
+    // Anteil des Budgets, der für den Erinnerungsabschnitt reserviert ist,
+    // damit Kategorieninhalt nicht mehr das gesamte Payload verbrauchen
+    // kann, bevor eine einzige Erinnerung injiziert wird. 0 stellt das
+    // bisherige Verhalten wieder her, bei dem Kategorien das gesamte
+    // Budget nutzen können.
+    "memory_budget_fraction": 0.4,
+    // 'chars' (Standard): max_chars ist ein Zeichenbudget, unverändert
+    // gegenüber vor dieser Option. 'tokens': max_chars wird als
+    // geschätztes Token-Budget behandelt (Zeichen/4, keine
+    // Tokenizer-Abhängigkeit), wodurch das effektive Zeichenbudget jedes
+    // Abschnitts mit 4 multipliziert wird.
+    "budget_unit": "chars",
+    // Gierige Near-Duplicate-Unterdrückung innerhalb des hint-basierten
+    // Erinnerungsabschnitts: Ein Kandidat, der deduplication.similarity_threshold
+    // gegenüber einer bereits ausgewählten Erinnerung überschreitet, wird übersprungen.
+    "dedup_suppression": true
   },
 
   // Observability-Einstellungen
@@ -1970,6 +1986,7 @@ BHGBrain stellt zusätzlich zu Tools MCP-Ressourcen (lesbar über `ReadResource`
 |---|---|---|
 | `memory://{id}` | Erinnerungsdetails | Vollständiger Erinnerungsdatensatz per UUID |
 | `memory://{id}/revisions` | Erinnerungsrevisionen | Revisionsverlauf einer Erinnerung, neueste zuerst |
+| `memory://inject/{hint}` | Sitzungs-Inject (mit Hinweis) | Budgetierter Kontextblock, dessen Erinnerungsabschnitt per hybrider Relevanz zum Hinweis statt nach Aktualität ausgewählt wird |
 | `category://{name}` | Kategorie | Vollständiger Kategorieninhalt nach Name |
 | `collection://{name}` | Sammlung | Erinnerungen in einer bestimmten Sammlung |
 
@@ -1998,9 +2015,20 @@ Die Paginierung verwendet zusammengesetzte Cursor (`created_at|id`) für stabile
 
 Die Inject-Ressource erstellt einen budgetierten Text-Payload für die Einbettung in ein LLM-Kontextfenster:
 
-1. Alle Kategorieninhalte werden zuerst vorangestellt (vollständiger Inhalt, in Reihenfolge).
-2. Die top aktuellen Erinnerungen werden angehängt (Inhalt oder Zusammenfassung je nach verfügbarem Platz).
-3. Der Payload wird bei `auto_inject.max_chars` (Standard 30.000 Zeichen) abgeschnitten.
+1. Kategorieninhalte werden zuerst vorangestellt (vollständiger Inhalt, in Reihenfolge),
+   begrenzt auf ihren reservierten Budgetanteil:
+   `(1 - auto_inject.memory_budget_fraction) × Budget`. Was Kategorien ungenutzt
+   lassen, fließt in den Erinnerungsabschnitt unten (keine Verschwendung).
+2. Erinnerungen werden in das verbleibende Budget angehängt (Inhalt oder
+   Zusammenfassung je nach verfügbarem Platz) — immer mindestens
+   `auto_inject.memory_budget_fraction × Budget`, sofern Erinnerungen existieren,
+   sodass Kategorieninhalt den Erinnerungsabschnitt nicht mehr aushungern kann.
+   - `memory://inject` (ohne Hinweis): oberste Erinnerungen nach **Aktualität**,
+     unverändert gegenüber vor dieser Option.
+   - `memory://inject/{hint}`: oberste Erinnerungen nach **hybrider Relevanz** zum
+     Hinweis (siehe unten).
+3. Der Payload wird bei `auto_inject.max_chars` abgeschnitten, interpretiert gemäß
+   `auto_inject.budget_unit` (Standard 30.000 Zeichen).
 
 Abfrageparameter:
 - `namespace` — Namensraum für den Inject (Standard: `global`)
@@ -2017,6 +2045,34 @@ Antwort:
 ```
 
 Das Berühren einer Erinnerung über `memory://{id}` erhöht deren Zugriffsanzahl und plant einen verzögerten Flush.
+
+### `memory://inject/{hint}` — Relevanzbasierte Sitzungsinjektion
+
+Eine parametrisierte Variante von `memory://inject`, die den Erinnerungsabschnitt per
+**hybrider Relevanz zu einem übergebenen Hinweis** (Aufgabenphrase, Repo-Name oder
+Thema) statt nach Aktualität auswählt:
+
+- Der Hinweis ist ein URI-Pfadsegment: einmal URI-dekodiert, getrimmt und auf 500
+  Zeichen begrenzt (dasselbe Limit wie `search`/`recall` für eine Abfrage), bevor er
+  die hybride Suche über den aufgelösten Namensraum steuert.
+- Die Auswahl verwendet dasselbe Composite-/RRF-Ranking, dieselbe
+  Ablauffilterung und dasselbe Top-K-Limit (`defaults.auto_inject_limit`) wie ein
+  normaler `search`/`recall`-Aufruf. Anders als der Pfad ohne Hinweis
+  **zeichnet ein Lesevorgang mit Hinweis Zugriffe auf** — er ist in jeder relevanten
+  Hinsicht ein Recall.
+- Ist der Embedding-Anbieter nicht verfügbar, degradiert die Auswahl elegant auf den
+  Volltext-Zweig — das Payload wird trotzdem erzeugt, nur ohne den semantischen Beitrag.
+- Ein leerer Hinweis (nach dem Trimmen leer) fällt auf das oben beschriebene
+  Aktualitätsverhalten zurück.
+- **Near-Duplicate-Unterdrückung**: Ist `auto_inject.dedup_suppression` `true`
+  (Standard), wird ein Kandidat übersprungen, dessen Vektorähnlichkeit zu einer
+  bereits ausgewählten Erinnerung `deduplication.similarity_threshold` überschreitet;
+  das freigewordene Budget geht an den nächsten unterschiedlichen Kandidaten.
+
+Beispiel: `memory://inject/deploy%20to%20production` bedingt die Auswahl auf
+"deploy to production".
+
+Die Antwortstruktur ist identisch zu `memory://inject`.
 
 ### `memory://{id}/revisions` — Revisionsverlauf
 
@@ -2693,7 +2749,7 @@ Sobald die Drift-Prüfung abgeschlossen ist, wird die Sperre freigegeben — das
 
 - Tool-Aufruf-Antworten enthalten strukturierte JSON-Payloads.
 - Fehlerantworten setzen `isError: true` im MCP-Protokoll für clientseitiges Routing.
-- Parametrisierte Ressourcen (`memory://{id}`, `category://{name}`, `collection://{name}`) werden als MCP-Ressource-Templates über `resources/templates/list` bereitgestellt.
+- Parametrisierte Ressourcen (`memory://{id}`, `memory://inject/{hint}`, `category://{name}`, `collection://{name}`) werden als MCP-Ressource-Templates über `resources/templates/list` bereitgestellt.
 
 ### Suche und Paginierung
 

@@ -1,13 +1,14 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { ResourceHandler, MCP_RESOURCE_DEFINITIONS, MCP_RESOURCE_TEMPLATES } from './index.js';
 import type { BrainConfig } from '../config/index.js';
 import type { HealthService } from '../health/index.js';
 import type { SearchService } from '../search/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { BrainErrorEnvelope, ErrorEnvelope } from '../errors/index.js';
+import type { SearchResult } from '../domain/types.js';
 
 type ListResult = { items: unknown[]; total_results: number };
-type InjectResult = { content: string; truncated: boolean };
+type InjectResult = { content: string; truncated: boolean; memories_count: number; categories_count: number };
 type ResourceResult = ListResult | InjectResult | ErrorEnvelope;
 
 describe('resource pagination bounds', () => {
@@ -256,7 +257,10 @@ describe('resource pagination bounds', () => {
   it('builds inject payload within budget without concatenating all category content', async () => {
     const config = {
       defaults: { namespace: 'global', auto_inject_limit: 5 },
-      auto_inject: { max_chars: 24 },
+      // fraction 0 preserves this test's original intent (category truncation
+      // math in isolation) under the reserved-memory-budget feature.
+      auto_inject: { max_chars: 24, memory_budget_fraction: 0, budget_unit: 'chars', dedup_suppression: true },
+      deduplication: { similarity_threshold: 0.92 },
     } as unknown as BrainConfig;
     const storage = {
       sqlite: {
@@ -294,7 +298,8 @@ describe('resource pagination bounds', () => {
     // included". Comparing SQLite-counted lengths on both sides must not.
     const config = {
       defaults: { namespace: 'global', auto_inject_limit: 5 },
-      auto_inject: { max_chars: 500 },
+      auto_inject: { max_chars: 500, memory_budget_fraction: 0, budget_unit: 'chars', dedup_suppression: true },
+      deduplication: { similarity_threshold: 0.92 },
     } as unknown as BrainConfig;
     const storage = {
       sqlite: {
@@ -323,6 +328,174 @@ describe('resource pagination bounds', () => {
   });
 });
 
+describe('relevance-conditioned inject (memory://inject/{hint})', () => {
+  const baseConfig = {
+    defaults: { namespace: 'global', auto_inject_limit: 5 },
+    auto_inject: { max_chars: 500, memory_budget_fraction: 0.4, budget_unit: 'chars', dedup_suppression: true },
+    deduplication: { similarity_threshold: 0.9 },
+  } as unknown as BrainConfig;
+
+  const healthy = { check: async () => ({ status: 'healthy' }) } as HealthService;
+
+  function makeStorage(overrides: Record<string, unknown> = {}) {
+    return {
+      sqlite: {
+        listCategoryHeaders: () => [],
+        getCategoryContentSlice: () => ({ content: '', length: 0 }),
+        listMemories: () => [],
+        countMemories: () => 0,
+        getMemoryById: () => null,
+        touchMemory: () => undefined,
+        scheduleDeferredFlush: () => undefined,
+        listCategories: () => [],
+        listCollections: () => [],
+        getCategory: () => null,
+        ...overrides,
+      },
+    } as unknown as StorageManager;
+  }
+
+  const mkResult = (id: string, content: string, vector?: number[]): SearchResult => ({
+    id, content, summary: id, type: 'semantic', tags: [], score: 0.9,
+    retention_tier: 'T2', created_at: '2026-01-01T00:00:00Z', last_accessed: '2026-01-01T00:00:00Z',
+    vector,
+  });
+
+  it('selects memories by hint relevance instead of recency (5.1)', async () => {
+    const searchForInject = vi.fn(async () => [mkResult('r1', 'deployment runbook')]);
+    const search = { searchForInject } as unknown as SearchService;
+    const storage = makeStorage({
+      listMemories: () => { throw new Error('recency path must not run when a hint is given'); },
+    });
+    const handler = new ResourceHandler(baseConfig, storage, search, healthy);
+
+    const result = await handler.handle('memory://inject/deploy%20task') as InjectResult;
+
+    expect(searchForInject).toHaveBeenCalledWith('deploy task', 'global', 5);
+    expect(result.content).toContain('deployment runbook');
+    expect(result.memories_count).toBe(1);
+  });
+
+  it('falls back to recency selection when no hint is given', async () => {
+    const searchForInject = vi.fn();
+    const search = { searchForInject } as unknown as SearchService;
+    const storage = makeStorage({
+      listMemories: () => [{ type: 'semantic', content: 'recent memory', summary: 'recent' }],
+    });
+    const handler = new ResourceHandler(baseConfig, storage, search, healthy);
+
+    const result = await handler.handle('memory://inject') as InjectResult;
+
+    expect(searchForInject).not.toHaveBeenCalled();
+    expect(result.content).toContain('recent memory');
+  });
+
+  it('reserves the memory section its configured fraction when categories are oversized (5.2)', async () => {
+    const search = { searchForInject: vi.fn() } as unknown as SearchService;
+    const config = {
+      ...baseConfig,
+      auto_inject: { max_chars: 100, memory_budget_fraction: 0.4, budget_unit: 'chars', dedup_suppression: true },
+    } as unknown as BrainConfig;
+    const storage = makeStorage({
+      listCategoryHeaders: () => [{ name: 'Policy', slot: 'custom', revision: 1, updated_at: '2026-01-01T00:00:00Z', content_length: 1000 }],
+      getCategoryContentSlice: (_name: string, maxChars: number) => ({ content: 'x'.repeat(maxChars), length: maxChars }),
+      listMemories: () => [{ type: 'semantic', content: 'a memory that fits', summary: 'mem' }],
+    });
+    const handler = new ResourceHandler(config, storage, search, healthy);
+
+    const result = await handler.handle('memory://inject') as InjectResult;
+
+    // Oversized categories still leave the memory section its reserved share.
+    expect(result.truncated).toBe(true);
+    expect(result.memories_count).toBe(1);
+  });
+
+  it('fraction 0 restores the pre-existing starvation behavior (5.2)', async () => {
+    const search = { searchForInject: vi.fn() } as unknown as SearchService;
+    const config = {
+      ...baseConfig,
+      auto_inject: { max_chars: 100, memory_budget_fraction: 0, budget_unit: 'chars', dedup_suppression: true },
+    } as unknown as BrainConfig;
+    const storage = makeStorage({
+      listCategoryHeaders: () => [{ name: 'Policy', slot: 'custom', revision: 1, updated_at: '2026-01-01T00:00:00Z', content_length: 1000 }],
+      getCategoryContentSlice: (_name: string, maxChars: number) => ({ content: 'x'.repeat(maxChars), length: maxChars }),
+      listMemories: () => [{ type: 'semantic', content: 'a memory that fits', summary: 'mem' }],
+    });
+    const handler = new ResourceHandler(config, storage, search, healthy);
+
+    const result = await handler.handle('memory://inject') as InjectResult;
+
+    expect(result.memories_count).toBe(0);
+    expect(result.truncated).toBe(true);
+  });
+
+  it('budget_unit: tokens scales the char budget by the chars/4 estimate (5.3)', async () => {
+    const search = { searchForInject: vi.fn() } as unknown as SearchService;
+    const storage = makeStorage({
+      listMemories: () => [{ type: 'semantic', content: 'irrelevant, summary is used instead', summary: 's' }],
+    });
+    const tokensConfig = {
+      ...baseConfig,
+      auto_inject: { max_chars: 3, memory_budget_fraction: 0, budget_unit: 'tokens', dedup_suppression: true },
+    } as unknown as BrainConfig;
+    const charsConfig = {
+      ...baseConfig,
+      auto_inject: { max_chars: 3, memory_budget_fraction: 0, budget_unit: 'chars', dedup_suppression: true },
+    } as unknown as BrainConfig;
+
+    const tokensResult = await new ResourceHandler(tokensConfig, storage, search, healthy)
+      .handle('memory://inject') as InjectResult;
+    const charsResult = await new ResourceHandler(charsConfig, storage, search, healthy)
+      .handle('memory://inject') as InjectResult;
+
+    // Same numeric config value; 'tokens' interprets it as 4x the char capacity.
+    expect(tokensResult.content.length).toBe(12);
+    expect(charsResult.content.length).toBe(3);
+  });
+
+  it('suppresses a near-duplicate candidate above the dedup threshold (5.4)', async () => {
+    const a = mkResult('a', 'first version', [1, 0, 0]);
+    const b = mkResult('b', 'near duplicate version', [0.999, Math.sqrt(1 - 0.999 ** 2), 0]); // cos sim ~0.999
+    const search = { searchForInject: vi.fn(async () => [a, b]) } as unknown as SearchService;
+    const storage = makeStorage();
+    const handler = new ResourceHandler(baseConfig, storage, search, healthy);
+
+    const result = await handler.handle('memory://inject/task') as InjectResult;
+
+    expect(result.memories_count).toBe(1);
+    expect(result.content).toContain('first version');
+    expect(result.content).not.toContain('near duplicate version');
+  });
+
+  it('candidates without a vector (fulltext-only) are never suppressed', async () => {
+    const withVector = mkResult('a', 'has a vector', [1, 0, 0]);
+    const withoutVector = mkResult('b', 'no vector at all', undefined);
+    const search = { searchForInject: vi.fn(async () => [withVector, withoutVector]) } as unknown as SearchService;
+    const storage = makeStorage();
+    const handler = new ResourceHandler(baseConfig, storage, search, healthy);
+
+    const result = await handler.handle('memory://inject/task') as InjectResult;
+
+    expect(result.memories_count).toBe(2);
+  });
+
+  it('dedup_suppression: false keeps near-duplicates', async () => {
+    const a = mkResult('a', 'first version', [1, 0, 0]);
+    const b = mkResult('b', 'near duplicate version', [0.999, Math.sqrt(1 - 0.999 ** 2), 0]);
+    const search = { searchForInject: vi.fn(async () => [a, b]) } as unknown as SearchService;
+    const config = {
+      ...baseConfig,
+      auto_inject: { max_chars: 500, memory_budget_fraction: 0.4, budget_unit: 'chars', dedup_suppression: false },
+    } as unknown as BrainConfig;
+    const storage = makeStorage();
+    const handler = new ResourceHandler(config, storage, search, healthy);
+
+    const result = await handler.handle('memory://inject/task') as InjectResult;
+
+    expect(result.memories_count).toBe(2);
+  });
+});
+
 describe('MCP resource template discovery', () => {
   it('concrete resources do not include parameterized URIs', () => {
     for (const r of MCP_RESOURCE_DEFINITIONS) {
@@ -342,6 +515,7 @@ describe('MCP resource template discovery', () => {
     const templates = MCP_RESOURCE_TEMPLATES.map(t => t.uriTemplate);
     expect(templates).toContain('memory://{id}');
     expect(templates).toContain('memory://{id}/revisions');
+    expect(templates).toContain('memory://inject/{hint}');
     expect(templates).toContain('category://{name}');
     expect(templates).toContain('collection://{name}');
   });
