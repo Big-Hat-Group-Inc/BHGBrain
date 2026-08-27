@@ -276,6 +276,27 @@ describe('AzureFoundryEmbeddingProvider', () => {
     expect(breaker.execute).toHaveBeenCalledTimes(1);
   });
 
+  it('records at most one breaker failure per embedBatch even when retries are exhausted', async () => {
+    process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
+    const breaker = {
+      execute: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
+    } as unknown as CircuitBreaker;
+
+    // Every attempt fails with a retryable 5xx.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 502 })));
+
+    const config = createConfig();
+    config.embedding.retry.max_attempts = 3;
+    config.embedding.retry.backoff_ms = 1;
+    const provider = new AzureFoundryEmbeddingProvider(config, breaker);
+
+    await expect(provider.embed('hello')).rejects.toThrow();
+
+    // requestWithRetry wraps the whole retry loop in a single breaker.execute
+    // call, so exhausting 3 attempts still counts as one logical failure.
+    expect(breaker.execute).toHaveBeenCalledTimes(1);
+  });
+
   it('healthCheck bypasses circuit breaker', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
     const breaker = {

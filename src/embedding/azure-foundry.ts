@@ -101,8 +101,9 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
     try {
       // Single-shot, bounded probe (respects requestTimeoutMs via the abort
       // controller in executeSingleRequest) — no retry/backoff loop, mirroring
-      // OpenAIEmbeddingProvider.healthCheck().
-      const response = await this.executeSingleRequest(['health check'], false);
+      // OpenAIEmbeddingProvider.healthCheck(). Bypasses the breaker entirely,
+      // same as requestWithRetry(..., false).
+      const response = await this.executeSingleRequest(['health check']);
       await this.parseEmbeddingsResponse(response);
       return true;
     } catch {
@@ -110,10 +111,13 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
     }
   }
 
+  // Wraps the whole logical operation (all retry attempts) in a single breaker
+  // call so one `embedBatch` records at most one breaker failure, regardless of
+  // how many attempts `retry.max_attempts` allows internally.
   private async requestWithRetry(texts: string[], useBreaker: boolean): Promise<Response> {
     const executeRequest = async (attempt: number): Promise<Response> => {
       try {
-        const response = await this.executeSingleRequest(texts, useBreaker);
+        const response = await this.executeSingleRequest(texts);
         if (response.ok) {
           return response;
         }
@@ -153,38 +157,34 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
       }
     };
 
+    if (useBreaker && this.breaker) {
+      return this.breaker.execute(() => executeRequest(1));
+    }
+
     return executeRequest(1);
   }
 
-  private async executeSingleRequest(texts: string[], useBreaker: boolean): Promise<Response> {
-    const executeFetch = () => {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+  private async executeSingleRequest(texts: string[]): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.requestTimeoutMs);
 
-      const body: AzureEmbeddingsRequestBody = {
-        model: this.model,
-        input: texts,
-      };
-      if (shouldIncludeDimensions(this.model)) {
-        body.dimensions = this.dimensions;
-      }
-
-      return fetch(`${this.baseUrl}/embeddings`, {
-        method: 'POST',
-        headers: {
-          'api-key': this.apiKey,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      }).finally(() => clearTimeout(timeoutId));
+    const body: AzureEmbeddingsRequestBody = {
+      model: this.model,
+      input: texts,
     };
-
-    if (useBreaker && this.breaker) {
-      return this.breaker.execute(executeFetch);
+    if (shouldIncludeDimensions(this.model)) {
+      body.dimensions = this.dimensions;
     }
 
-    return executeFetch();
+    return fetch(`${this.baseUrl}/embeddings`, {
+      method: 'POST',
+      headers: {
+        'api-key': this.apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeoutId));
   }
 
   private async parseEmbeddingsResponse(response: Response): Promise<number[][]> {

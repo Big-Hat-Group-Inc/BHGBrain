@@ -49,8 +49,9 @@ async function main() {
     openWindowMs: config.resilience.circuit_breaker.open_window_ms,
     halfOpenProbeCount: config.resilience.circuit_breaker.half_open_probe_count,
   };
-  const embeddingBreaker = new CircuitBreaker(breakerOptions);
-  const qdrantBreaker = new CircuitBreaker(breakerOptions);
+  const embeddingBreakerKey = getEmbeddingBreakerKey(config.embedding.provider);
+  const embeddingBreaker = new CircuitBreaker({ ...breakerOptions, key: embeddingBreakerKey, logger });
+  const qdrantBreaker = new CircuitBreaker({ ...breakerOptions, key: 'qdrant', logger });
   const metrics = new MetricsCollector(config);
   const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
@@ -76,7 +77,7 @@ async function main() {
   const searchService = new SearchService(config, storage, embedding, metrics, logger);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {
-    [getEmbeddingBreakerKey(config.embedding.provider)]: embeddingBreaker,
+    [embeddingBreakerKey]: embeddingBreaker,
     qdrant: qdrantBreaker,
   });
 
