@@ -148,6 +148,8 @@ export interface SqliteStorage {
   getBootstrapSession(namespace: string): BootstrapSectionRow[];
   updateBootstrapSection(namespace: string, sectionNumber: number, status: 'pending' | 'complete', memoryIds: string[]): void;
   resetBootstrapSection(namespace: string, sectionNumber: number): string[];
+  getBootstrapSectionMemoryIds(namespace: string, sectionNumber: number): string[];
+  clearBootstrapSection(namespace: string, sectionNumber: number): void;
   bootstrapSessionExists(namespace: string): boolean;
 }
 
@@ -1427,6 +1429,18 @@ export class SqliteStore implements SqliteStorage {
   }
 
   resetBootstrapSection(namespace: string, sectionNumber: number): string[] {
+    const memoryIds = this.getBootstrapSectionMemoryIds(namespace, sectionNumber);
+    this.clearBootstrapSection(namespace, sectionNumber);
+    return memoryIds;
+  }
+
+  /**
+   * Reads the memory IDs tracked for a section WITHOUT clearing them. Callers that need to
+   * delete the underlying memories (including their Qdrant vectors) before the section's
+   * tracking is cleared should use this together with `clearBootstrapSection`, so the
+   * recovery list survives a mid-deletion failure (see `clearBootstrapSection`).
+   */
+  getBootstrapSectionMemoryIds(namespace: string, sectionNumber: number): string[] {
     const stmt = this.db.prepare(`SELECT memory_ids FROM bootstrap_sessions WHERE namespace = ? AND section_number = ?`);
     stmt.bind([namespace, sectionNumber]);
     let memoryIds: string[] = [];
@@ -1435,7 +1449,17 @@ export class SqliteStore implements SqliteStorage {
       memoryIds = JSON.parse(this.getString(row, 'memory_ids')) as string[];
     }
     stmt.free();
+    return memoryIds;
+  }
 
+  /**
+   * Clears a section's tracked memory IDs and marks it pending. Callers deleting the
+   * underlying memories first (see `getBootstrapSectionMemoryIds`) should only call this
+   * AFTER every deletion succeeds, so a failed deletion leaves `memory_ids` intact and the
+   * section recoverable/re-resettable rather than orphaning Qdrant vectors with no tracked
+   * recovery list.
+   */
+  clearBootstrapSection(namespace: string, sectionNumber: number): void {
     const now = new Date().toISOString();
     this.db.run(
       `UPDATE bootstrap_sessions SET status = 'pending', memory_ids = '[]', updated_at = ? WHERE namespace = ? AND section_number = ?`,
@@ -1443,7 +1467,6 @@ export class SqliteStore implements SqliteStorage {
     );
     this.dirty = true;
     this.scheduleDeferredFlush();
-    return memoryIds;
   }
 
   bootstrapSessionExists(namespace: string): boolean {

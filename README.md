@@ -1942,7 +1942,7 @@ The tool returns the next section's questions after each submission, so the agen
 If you already have a completed profile document (from a previous bootstrap, a wiki, or structured notes), use the `import` tool to ingest it in one shot:
 
 ```json
-// Import a 12-section bootstrap profile
+// Import a 10-section bootstrap profile
 { "name": "import", "arguments": { "format": "profile", "content": "## 1. Identity & Role\n..." } }
 
 // Import arbitrary markdown as memories
@@ -2422,7 +2422,7 @@ Import a structured profile or freeform document as discrete memories in one sho
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `format` | `"profile" \| "freeform"` | **Yes** | - | `"profile"` for 12-section bootstrap output, `"freeform"` for arbitrary markdown. |
+| `format` | `"profile" \| "freeform"` | **Yes** | - | `"profile"` for 10-section bootstrap output, `"freeform"` for arbitrary markdown. |
 | `content` | `string` | **Yes** | - | The document text to import. Max 500,000 characters. |
 | `namespace` | `string` | No | `"profile"` | Namespace scope. |
 | `dry_run` | `boolean` | No | `false` | When `true`, returns a preview of what would be stored without writing. |
@@ -2445,6 +2445,7 @@ Import a structured profile or freeform document as discrete memories in one sho
 - `format: "freeform"` splits by headings and paragraph boundaries with default metadata (collection: `general`, tier: `T2`).
 - Deduplication applies via the existing write pipeline — safe to re-import.
 - `dry_run: true` returns memory previews with zero writes.
+- Headings numbered outside the 10 storage-mapped sections (e.g. a document written against an older 12-section template) are not silently dropped — their numbers are reported in `sections_ignored` so you know content was skipped instead of losing it without notice.
 
 ---
 

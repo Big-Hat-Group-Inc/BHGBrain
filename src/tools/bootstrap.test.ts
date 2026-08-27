@@ -133,6 +133,38 @@ describe('bootstrap tool', () => {
       expect(deleteMemory).not.toHaveBeenCalled();
     });
 
+    it('preserves the memory_ids recovery list when a deletion fails mid-reset', async () => {
+      await handleTool(ctx, 'bootstrap', { action: 'start' });
+      await handleTool(ctx, 'bootstrap', {
+        action: 'submit', section: 1, answers: 'Jane Doe, CTO.\n\nSecond fact about Jane.',
+      });
+
+      // First delete fails (e.g. Qdrant unavailable) — reset must not clear tracking.
+      deleteMemory.mockImplementationOnce(async () => {
+        throw new Error('Qdrant delete failed');
+      });
+
+      const resetResult = await handleTool(ctx, 'bootstrap', {
+        action: 'reset', section: 1,
+      }) as Record<string, unknown>;
+
+      expect(resetResult.error).toBeDefined();
+
+      // Section must remain complete with both memory IDs still tracked, so the reset
+      // is retryable and no Qdrant vector is orphaned without a recovery list.
+      const status = await handleTool(ctx, 'bootstrap', { action: 'status' }) as Record<string, unknown>;
+      const sections = status.sections as Array<Record<string, unknown>>;
+      const sec1 = sections.find(s => s.section === 1)!;
+      expect(sec1.status).toBe('complete');
+      expect(sec1.memory_count).toBe(2);
+
+      // Retrying reset (now that deletes succeed) clears it normally.
+      const retryResult = await handleTool(ctx, 'bootstrap', {
+        action: 'reset', section: 1,
+      }) as Record<string, unknown>;
+      expect(retryResult.memories_removed).toBe(2);
+    });
+
     it('allows re-submission after reset', async () => {
       await handleTool(ctx, 'bootstrap', { action: 'start' });
       await handleTool(ctx, 'bootstrap', {

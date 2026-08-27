@@ -206,14 +206,19 @@ async function handleReset(ctx: ToolContext, sessionMgr: BootstrapSessionManager
     };
   }
 
-  const memoryIds = sessionMgr.resetSection(input.namespace, sectionNumber);
+  // Read the tracked memory IDs WITHOUT clearing them yet. Delete the underlying memories
+  // (including their Qdrant vectors) first; only clear the SQLite tracking once every
+  // deletion has succeeded. If a deletion throws, memory_ids is never touched, so the
+  // section stays recoverable and the reset can be retried instead of orphaning vectors.
+  const memoryIds = sessionMgr.getSectionMemoryIds(input.namespace, sectionNumber);
 
-  // Delete the tracked memories
   let deleted = 0;
   for (const id of memoryIds) {
     const removed = await ctx.storage.deleteMemory(id);
     if (removed) deleted++;
   }
+
+  sessionMgr.clearSection(input.namespace, sectionNumber);
 
   return {
     section: sectionNumber,

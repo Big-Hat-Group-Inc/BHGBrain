@@ -35,7 +35,7 @@ describe('import tool', () => {
     };
   });
 
-  it('imports a full 12-section profile and calls pipeline for each memory', async () => {
+  it('imports a full 10-section profile and calls pipeline for each memory', async () => {
     const content = SECTION_MAPPINGS.map(
       m => `## ${m.section}. ${m.title}\n\nContent for section ${m.section}.`,
     ).join('\n\n');
@@ -81,6 +81,21 @@ Owns architecture decisions.`;
 
     expect(result.memories_created).toBe(1);
     expect(result.duplicates_skipped).toBe(1);
+  });
+
+  it('surfaces sections outside the 10 storage-mapped ones as sections_ignored', async () => {
+    const content = `## 1. Identity & Role
+
+Jane Doe, CTO.
+
+## 11. Legacy Section
+
+Content from an old 12-section template.`;
+
+    const result = await handleTool(ctx, 'import', { format: 'profile', content }) as Record<string, unknown>;
+
+    expect(result.sections_processed).toBe(1);
+    expect(result.sections_ignored).toEqual([11]);
   });
 
   it('imports freeform document', async () => {

@@ -81,7 +81,7 @@ Decision types: technical architecture, hiring, vendor selection.`;
       expect(sectionsProcessed).toHaveLength(0);
     });
 
-    it('ignores sections beyond the 10 storage-mapped ones', () => {
+    it('surfaces sections beyond the 10 storage-mapped ones instead of silently dropping them', () => {
       const content = `## 1. Identity & Role
 
 Jane Doe.
@@ -94,10 +94,11 @@ Some rules.
 
 Some questions.`;
 
-      const { memories, sectionsProcessed } = parser.parseProfile(content);
+      const { memories, sectionsProcessed, sectionsIgnored } = parser.parseProfile(content);
 
       expect(sectionsProcessed).toEqual([1]);
       expect(memories).toHaveLength(1);
+      expect(sectionsIgnored).toEqual([11, 12]);
     });
   });
 

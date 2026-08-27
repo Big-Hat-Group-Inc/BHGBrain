@@ -56,6 +56,24 @@ export class BootstrapSessionManager {
     return memoryIds;
   }
 
+  /**
+   * Reads a section's tracked memory IDs without clearing them. Pair with `clearSection`,
+   * called only after every memory has been deleted, so the tracking list stays intact
+   * (and the section stays recoverable) if a deletion fails partway through.
+   */
+  getSectionMemoryIds(namespace: string, sectionNumber: number): string[] {
+    return this.sqlite.getBootstrapSectionMemoryIds(namespace, sectionNumber);
+  }
+
+  /**
+   * Clears a section's tracked memory IDs and marks it pending. Must only be called after
+   * every memory returned by `getSectionMemoryIds` has been successfully deleted.
+   */
+  clearSection(namespace: string, sectionNumber: number): void {
+    this.sqlite.clearBootstrapSection(namespace, sectionNumber);
+    this.sqlite.flushIfDirty();
+  }
+
   exists(namespace: string): boolean {
     return this.sqlite.bootstrapSessionExists(namespace);
   }
