@@ -1465,7 +1465,7 @@ BHGBrain 提供两种具有不同语义的记忆检索工具：
 | **预期调用方** | 执行任务时的 AI 智能体 | 进行调查的人类或管理智能体 |
 
 **recall 中的得分过滤：**
-`min_score` 参数（默认 0.6）作为质量关卡——只有余弦相似度 ≥ 0.6 的记忆才会被返回。这防止了不相关的结果。你可以降低 `min_score` 以获取更多结果，但会牺牲精确性。
+`min_score` 参数（默认 0.6）作为质量关卡——它作用于 `semantic_score` 字段（余弦相似度），而不是融合/分层加成后的 `score`，因为 `recall` 运行在语义模式下——只有余弦相似度 ≥ 0.6 的记忆才会被返回。这防止了不相关的结果。你可以降低 `min_score` 以获取更多结果，但会牺牲精确性。
 
 ```json
 // Recall 示例——语义搜索，按类型和标签过滤
@@ -1491,15 +1491,15 @@ BHGBrain 提供两种具有不同语义的记忆检索工具：
 - 在语义搜索中，搜索 Qdrant 集合 `bhgbrain_{namespace}_general`（命名空间的默认集合）。
 - 在全文搜索中，搜索命名空间内的所有记忆，不限集合。
 
-**类型过滤（仅 `recall`）：** 传入 `"type": "episodic"` | `"semantic"` | `"procedural"` 以将结果限制为单一记忆类型。过滤在语义搜索后应用，因此从 Qdrant 先检索完整候选集。
+**类型过滤（仅 `recall`）：** 传入 `"type": "episodic"` | `"semantic"` | `"procedural"` 以将结果限制为单一记忆类型。过滤条件被下推到存储层（语义路径上是 Qdrant 负载过滤器，全文路径上是 SQL 谓词），因此 `limit` 计算的是匹配的记忆数量，而不是在过滤生效前被不匹配的候选项消耗掉。检索后仍会运行一次防御性复查，稳态下应为空操作；一旦它移除了存储层已返回的结果，`recall_zero_after_filter` 计数器就会递增，使过滤饥饿问题保持可观测。
 
-**标签过滤（仅 `recall`）：** 传入 `"tags": ["auth", "security"]` 以将结果限制为具有至少一个指定标签的记忆。过滤在检索后应用。
+**标签过滤（仅 `recall`）：** 传入 `"tags": ["auth", "security"]` 以将结果限制为具有至少一个指定标签的记忆（任意匹配）。与类型过滤一样，这也被下推到存储层，而不是仅在检索后应用。
 
 ---
 
 ### 得分阈值与层级加权
 
-**`min_score`（仅 recall）：** 0 到 1 之间的最低余弦相似度得分。低于此阈值的记忆从 `recall` 结果中排除。默认：0.6。
+**`min_score`（仅 recall）：** 0 到 1 之间的最低余弦相似度得分，专门作用于 `semantic_score` 字段——而非融合/分层加成后的 `score`——因为 `recall` 固定使用语义模式，且 `min_score` 的默认值是针对余弦相似度范围校准的，而非混合 RRF 得分。低于此阈值的记忆从 `recall` 结果中排除。默认：0.6。
 
 **过期记忆排除：** Qdrant 的向量搜索过滤器排除满足 `decay_eligible = true AND expires_at < now()` 的记忆。T0/T1 记忆（decay_eligible = false）永远不会被向量侧过滤器排除。在 SQLite 侧，生命周期服务对从向量库返回的任何记忆重新检查过期状态。
 
@@ -1719,6 +1719,7 @@ GET /metrics
 | `bhgbrain_memory_count` | gauge | 当前总记忆数量（写入/删除时更新） |
 | `bhgbrain_rate_limit_buckets` | gauge | 活跃的速率限制追踪桶 |
 | `bhgbrain_rate_limited_total` | counter | 被速率限制的请求总数 |
+| `recall_zero_after_filter` | counter | 当 `recall` 检索后的类型/标签防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
 
 例如：
 
@@ -2076,10 +2077,10 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 | `query` | `string` | **是** | — | 召回查询。最多 500 字符。 |
 | `namespace` | `string` | 否 | `"global"` | 要搜索的命名空间。 |
 | `collection` | `string` | 否 | — | 过滤到特定集合。省略则搜索默认集合。 |
-| `type` | `"episodic" \| "semantic" \| "procedural"` | 否 | — | 将结果过滤到特定记忆类型。在检索后应用。 |
-| `tags` | `string[]` | 否 | — | 过滤到具有至少一个匹配标签的记忆。在检索后应用。 |
+| `type` | `"episodic" \| "semantic" \| "procedural"` | 否 | — | 将结果过滤到特定记忆类型。下推到存储层，因此 `limit` 计算的是匹配的记忆数量。 |
+| `tags` | `string[]` | 否 | — | 过滤到具有至少一个匹配标签的记忆（任意匹配）。下推到存储层，因此 `limit` 计算的是匹配的记忆数量。 |
 | `limit` | `integer (1–20)` | 否 | `5` | 最大结果数量。 |
-| `min_score` | `number (0–1)` | 否 | `0.6` | 最低余弦相似度得分。低于此阈值的结果被排除。 |
+| `min_score` | `number (0–1)` | 否 | `0.6` | 最低余弦相似度得分，作用于 `semantic_score`（而非融合/调整后的 `score`）。低于此阈值的结果被排除。 |
 
 **输出：**
 

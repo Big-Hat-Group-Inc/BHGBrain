@@ -1473,7 +1473,7 @@ BHGBrain expose deux outils de récupération de mémoire avec des sémantiques 
 | **Appelant prévu** | Agents IA lors de l'exécution de tâches | Humains ou agents administrateurs faisant une investigation |
 
 **Filtrage par score dans recall :**
-Le paramètre `min_score` (par défaut 0,6) agit comme un filtre de qualité — seuls les souvenirs avec une similarité cosinus ≥ 0,6 sont renvoyés. Cela évite les résultats non pertinents. Vous pouvez abaisser `min_score` pour récupérer plus de résultats au détriment de la précision.
+Le paramètre `min_score` (par défaut 0,6) agit comme un filtre de qualité — il est appliqué au champ `semantic_score` (similarité cosinus), et non au `score` fusionné/majoré par palier, puisque `recall` s'exécute en mode sémantique — seuls les souvenirs avec une similarité cosinus ≥ 0,6 sont renvoyés. Cela évite les résultats non pertinents. Vous pouvez abaisser `min_score` pour récupérer plus de résultats au détriment de la précision.
 
 ```json
 // Exemple de recall — sémantique, filtré par type et tags
@@ -1499,15 +1499,15 @@ Le paramètre `min_score` (par défaut 0,6) agit comme un filtre de qualité —
 - En recherche sémantique, la collection Qdrant `bhgbrain_{namespace}_general` est recherchée (la collection par défaut pour l'espace de noms).
 - En recherche plein texte, tous les souvenirs dans l'espace de noms sont recherchés indépendamment de la collection.
 
-**Filtrage par type (`recall` uniquement) :** Passez `"type": "episodic"` | `"semantic"` | `"procedural"` pour restreindre les résultats à un seul type de mémoire. Le filtrage est appliqué après la recherche sémantique, donc l'ensemble complet de candidats est d'abord récupéré depuis Qdrant.
+**Filtrage par type (`recall` uniquement) :** Passez `"type": "episodic"` | `"semantic"` | `"procedural"` pour restreindre les résultats à un seul type de mémoire. Le filtre est propagé jusque dans le magasin (un filtre de payload Qdrant sur le chemin sémantique, un prédicat SQL sur le chemin plein texte), afin que `limit` compte les mémoires correspondantes au lieu d'être consommé par des candidats non correspondants avant que le filtrage n'intervienne. Une revérification défensive après récupération continue de s'exécuter et devrait rester un no-op en régime stable ; si elle supprime un jour un résultat renvoyé par le magasin, un compteur `recall_zero_after_filter` est incrémenté afin que la famine de filtrage reste observable.
 
-**Filtrage par tags (`recall` uniquement) :** Passez `"tags": ["auth", "security"]` pour restreindre les résultats aux souvenirs ayant au moins l'un des tags spécifiés. Le filtrage est appliqué après la récupération.
+**Filtrage par tags (`recall` uniquement) :** Passez `"tags": ["auth", "security"]` pour restreindre les résultats aux souvenirs ayant au moins l'un des tags spécifiés (correspondance sur l'un quelconque). Comme le filtrage par type, ceci est propagé jusque dans le magasin plutôt qu'appliqué seulement après récupération.
 
 ---
 
 ### Seuils de score et boosts par niveau
 
-**`min_score` (recall uniquement) :** Un score de similarité cosinus minimal entre 0 et 1. Les souvenirs en dessous de ce seuil sont exclus des résultats de `recall`. Par défaut : 0,6.
+**`min_score` (recall uniquement) :** Un score de similarité cosinus minimal entre 0 et 1, appliqué spécifiquement au champ `semantic_score` — et non au `score` fusionné/majoré par palier — car `recall` impose le mode sémantique et la valeur par défaut de `min_score` est calibrée pour une plage de similarité cosinus, pas pour des scores RRF hybrides. Les souvenirs en dessous de ce seuil sont exclus des résultats de `recall`. Par défaut : 0,6.
 
 **Exclusion des souvenirs expirés :** Le filtre de recherche vectorielle de Qdrant exclut les souvenirs où `decay_eligible = true ET expires_at < maintenant()`. Les souvenirs T0/T1 (decay_eligible = false) ne sont jamais exclus par le filtre côté vecteur. Côté SQLite, le service de cycle de vie revérifie l'expiration sur tout souvenir renvoyé par le magasin vectoriel.
 
@@ -1728,6 +1728,7 @@ rétrocompatible avec le format précédent sans étiquette).
 | `bhgbrain_memory_count` | jauge | Nombre total actuel de souvenirs (mis à jour à l'écriture/suppression) |
 | `bhgbrain_rate_limit_buckets` | jauge | Compartiments de suivi de la limitation de débit actifs |
 | `bhgbrain_rate_limited_total` | compteur | Total des requêtes avec limitation de débit |
+| `recall_zero_after_filter` | compteur | Incrémenté lorsque la revérification défensive de type/tags après récupération de `recall` supprime un résultat que le magasin avait déjà déclaré correspondant — un signal de famine de filtrage qui devrait rester à 0 en régime stable |
 
 Par exemple :
 
@@ -2088,10 +2089,10 @@ Récupère les souvenirs les plus pertinents pour une requête en utilisant la r
 | `query` | `string` | **Oui** | — | Requête de rappel. Max 500 caractères. |
 | `namespace` | `string` | Non | `"global"` | Espace de noms à rechercher. |
 | `collection` | `string` | Non | — | Filtrer sur une collection spécifique. Omettre pour rechercher dans la collection par défaut. |
-| `type` | `"episodic" \| "semantic" \| "procedural"` | Non | — | Filtrer les résultats sur un type de mémoire spécifique. Appliqué après la récupération. |
-| `tags` | `string[]` | Non | — | Filtrer sur les souvenirs ayant au moins un tag correspondant. Appliqué après la récupération. |
+| `type` | `"episodic" \| "semantic" \| "procedural"` | Non | — | Filtrer les résultats sur un type de mémoire spécifique. Propagé jusque dans le magasin, afin que `limit` compte les mémoires correspondantes. |
+| `tags` | `string[]` | Non | — | Filtrer sur les souvenirs ayant au moins un tag correspondant (correspondance sur l'un quelconque). Propagé jusque dans le magasin, afin que `limit` compte les mémoires correspondantes. |
 | `limit` | `integer (1–20)` | Non | `5` | Nombre maximum de résultats. |
-| `min_score` | `number (0–1)` | Non | `0,6` | Score de similarité cosinus minimal. Les résultats en dessous de ce seuil sont exclus. |
+| `min_score` | `number (0–1)` | Non | `0,6` | Score de similarité cosinus minimal, appliqué à `semantic_score` (et non au `score` fusionné/ajusté). Les résultats en dessous de ce seuil sont exclus. |
 
 **Sortie :**
 

@@ -1520,7 +1520,7 @@ BHGBrain exposes two tools for memory retrieval with different semantics:
 | **Intended caller** | AI agents during task execution | Humans or admin agents doing investigation |
 
 **Score filtering in recall:**
-The `min_score` parameter (default 0.6) acts as a quality gate - only memories with cosine similarity ≥ 0.6 are returned. This prevents irrelevant results. You can lower `min_score` to retrieve more results at the cost of precision.
+The `min_score` parameter (default 0.6) acts as a quality gate - it is applied to the `semantic_score` field (cosine similarity), not the fused/tier-boosted `score`, since `recall` runs in semantic mode - only memories with cosine similarity ≥ 0.6 are returned. This prevents irrelevant results. You can lower `min_score` to retrieve more results at the cost of precision.
 
 ```json
 // Recall example - semantic, filtered by type and tags
@@ -1546,15 +1546,15 @@ Both `recall` and `search` support namespace and collection scoping. `recall` ad
 - In semantic search, the Qdrant collection `bhgbrain_{namespace}_general` is searched (the default collection for the namespace).
 - In fulltext search, all memories in the namespace are searched regardless of collection.
 
-**Type filtering (`recall` only):** Pass `"type": "episodic"` | `"semantic"` | `"procedural"` to restrict results to a single memory type. Filtering is applied after semantic search, so the full candidate set is retrieved from Qdrant first.
+**Type filtering (`recall` only):** Pass `"type": "episodic"` | `"semantic"` | `"procedural"` to restrict results to a single memory type. The filter is pushed down into the store (a Qdrant payload filter on the semantic path, a SQL predicate on the fulltext path) so `limit` counts matching memories instead of being spent on non-matching candidates before filtering runs. A defensive post-retrieval re-check still runs and is expected to be a no-op in steady state; if it ever removes a store-returned result, a `recall_zero_after_filter` counter increments so filter starvation stays observable.
 
-**Tag filtering (`recall` only):** Pass `"tags": ["auth", "security"]` to restrict results to memories that have at least one of the specified tags. Filtering is applied post-retrieval.
+**Tag filtering (`recall` only):** Pass `"tags": ["auth", "security"]` to restrict results to memories that have at least one of the specified tags (match-any). Like type filtering, this is pushed down into the store rather than applied only after retrieval.
 
 ---
 
 ### Score Thresholds and Tier Boosts
 
-**`min_score` (recall only):** A minimum cosine similarity score between 0 and 1. Memories below this threshold are excluded from `recall` results. Default: 0.6.
+**`min_score` (recall only):** A minimum cosine-similarity score between 0 and 1, applied to the `semantic_score` field specifically - not the fused/tier-boosted `score` - since `recall` hardcodes semantic mode and `min_score`'s default is calibrated for a cosine-similarity range, not hybrid RRF scores. Memories below this threshold are excluded from `recall` results. Default: 0.6.
 
 **Expired memory exclusion:** Qdrant's vector search filter excludes memories where `decay_eligible = true AND expires_at < now()`. T0/T1 memories (decay_eligible = false) are never excluded by the vector-side filter. SQLite-side, the lifecycle service re-checks expiry on any memory returned from the vector store.
 
@@ -1780,6 +1780,7 @@ label-less format).
 | `bhgbrain_memory_count` | gauge | Current total memory count (updated on write/delete) |
 | `bhgbrain_rate_limit_buckets` | gauge | Active rate limit tracking buckets |
 | `bhgbrain_rate_limited_total` | counter | Total rate-limited requests |
+| `recall_zero_after_filter` | counter | Incremented when `recall`'s defensive post-retrieval type/tags re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
 
 For example:
 
@@ -2168,10 +2169,10 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
 | `query` | `string` | **Yes** | - | Recall query. Max 500 characters. |
 | `namespace` | `string` | No | `"global"` | Namespace to search. |
 | `collection` | `string` | No | - | Filter to a specific collection. Omit to search the default collection. |
-| `type` | `"episodic" \| "semantic" \| "procedural"` | No | - | Filter results to a specific memory type. Applied post-retrieval. |
-| `tags` | `string[]` | No | - | Filter to memories with at least one matching tag. Applied post-retrieval. |
+| `type` | `"episodic" \| "semantic" \| "procedural"` | No | - | Filter results to a specific memory type. Pushed down into the store so `limit` counts matching memories. |
+| `tags` | `string[]` | No | - | Filter to memories with at least one matching tag (match-any). Pushed down into the store so `limit` counts matching memories. |
 | `limit` | `integer (1-20)` | No | `5` | Maximum number of results. |
-| `min_score` | `number (0-1)` | No | `0.6` | Minimum cosine similarity score. Results below this threshold are excluded. |
+| `min_score` | `number (0-1)` | No | `0.6` | Minimum cosine-similarity score, applied to `semantic_score` (not the fused/adjusted `score`). Results below this threshold are excluded. |
 
 **Output:**
 

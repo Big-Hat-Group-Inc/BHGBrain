@@ -1473,7 +1473,7 @@ BHGBrain bietet zwei Tools für den Speicherabruf mit unterschiedlicher Semantik
 | **Beabsichtigter Aufrufer** | KI-Agenten während der Aufgabenausführung | Menschen oder Admin-Agenten bei Untersuchungen |
 
 **Score-Filterung bei Recall:**
-Der Parameter `min_score` (Standard 0.6) fungiert als Qualitätssicherung – nur Erinnerungen mit einer Kosinus-Ähnlichkeit ≥ 0.6 werden zurückgegeben. Dies verhindert irrelevante Ergebnisse. Sie können `min_score` senken, um mehr Ergebnisse auf Kosten der Präzision abzurufen.
+Der Parameter `min_score` (Standard 0.6) fungiert als Qualitätssicherung – er wird auf das Feld `semantic_score` (Kosinus-Ähnlichkeit) angewendet, nicht auf den fusionierten/stufenverstärkten `score`, da `recall` im semantischen Modus läuft – nur Erinnerungen mit einer Kosinus-Ähnlichkeit ≥ 0.6 werden zurückgegeben. Dies verhindert irrelevante Ergebnisse. Sie können `min_score` senken, um mehr Ergebnisse auf Kosten der Präzision abzurufen.
 
 ```json
 // Recall-Beispiel – semantisch, gefiltert nach Typ und Tags
@@ -1499,15 +1499,15 @@ Sowohl `recall` als auch `search` unterstützen Namensraum- und Sammlungs-Scopin
 - Bei der semantischen Suche wird die Qdrant-Sammlung `bhgbrain_{namespace}_general` durchsucht (die Standard-Sammlung für den Namensraum).
 - Bei der Volltextsuche werden alle Erinnerungen im Namensraum unabhängig von der Sammlung durchsucht.
 
-**Typ-Filterung (nur `recall`):** Übergeben Sie `"type": "episodic"` | `"semantic"` | `"procedural"`, um Ergebnisse auf einen einzelnen Speichertyp zu beschränken. Die Filterung wird nach der semantischen Suche angewendet, sodass der vollständige Kandidatensatz zuerst aus Qdrant abgerufen wird.
+**Typ-Filterung (nur `recall`):** Übergeben Sie `"type": "episodic"` | `"semantic"` | `"procedural"`, um Ergebnisse auf einen einzelnen Speichertyp zu beschränken. Der Filter wird in den Speicher hinuntergereicht (ein Qdrant-Payload-Filter auf dem semantischen Pfad, ein SQL-Prädikat auf dem Volltext-Pfad), sodass `limit` passende Erinnerungen zählt, statt für nicht passende Kandidaten verbraucht zu werden, bevor die Filterung greift. Eine defensive Nachprüfung nach dem Abruf läuft weiterhin und sollte im Normalfall wirkungslos bleiben; entfernt sie doch einmal ein vom Speicher zurückgegebenes Ergebnis, erhöht sich ein `recall_zero_after_filter`-Zähler, damit Filter-Aushungerung beobachtbar bleibt.
 
-**Tag-Filterung (nur `recall`):** Übergeben Sie `"tags": ["auth", "security"]`, um Ergebnisse auf Erinnerungen zu beschränken, die mindestens einen der angegebenen Tags haben. Die Filterung wird nach dem Abruf angewendet.
+**Tag-Filterung (nur `recall`):** Übergeben Sie `"tags": ["auth", "security"]`, um Ergebnisse auf Erinnerungen zu beschränken, die mindestens einen der angegebenen Tags haben (beliebige Übereinstimmung). Wie bei der Typ-Filterung wird dies in den Speicher hinuntergereicht, statt erst nach dem Abruf angewendet zu werden.
 
 ---
 
 ### Score-Schwellenwerte und Stufenverstärkungen
 
-**`min_score` (nur recall):** Ein Mindestkosinus-Ähnlichkeitsscore zwischen 0 und 1. Erinnerungen unter diesem Schwellenwert werden aus `recall`-Ergebnissen ausgeschlossen. Standard: 0.6.
+**`min_score` (nur recall):** Ein Mindestkosinus-Ähnlichkeitsscore zwischen 0 und 1, angewendet speziell auf das Feld `semantic_score` – nicht auf den fusionierten/stufenverstärkten `score` – da `recall` fest im semantischen Modus arbeitet und der Standardwert von `min_score` auf einen Kosinus-Ähnlichkeitsbereich kalibriert ist, nicht auf hybride RRF-Scores. Erinnerungen unter diesem Schwellenwert werden aus `recall`-Ergebnissen ausgeschlossen. Standard: 0.6.
 
 **Ausschluss abgelaufener Erinnerungen:** Qdrants Vektorsuchfilter schließt Erinnerungen aus, bei denen `decay_eligible = true UND expires_at < now()`. T0/T1-Erinnerungen (decay_eligible = false) werden nie durch den vektorseitigen Filter ausgeschlossen. Auf der SQLite-Seite überprüft der Lifecycle-Service den Ablauf jeder aus dem Vektorspeicher zurückgegebenen Erinnerung erneut.
 
@@ -1728,6 +1728,7 @@ Metriken ohne Labels, sodass die Ausgabe abwärtskompatibel zum vorherigen label
 | `bhgbrain_memory_count` | Messuhr | Aktuelle Gesamt-Erinnerungsanzahl (bei Schreiben/Löschen aktualisiert) |
 | `bhgbrain_rate_limit_buckets` | Messuhr | Aktive Rate-Limit-Verfolgungseimer |
 | `bhgbrain_rate_limited_total` | Zähler | Gesamt rate-limitierte Anfragen |
+| `recall_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive Nachprüfung von `recall` (Typ/Tags) nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
 
 Zum Beispiel:
 
@@ -2088,10 +2089,10 @@ Die relevantesten Erinnerungen für eine Abfrage mithilfe semantischer (Vektor-)
 | `query` | `string` | **Ja** | — | Recall-Abfrage. Max. 500 Zeichen. |
 | `namespace` | `string` | Nein | `"global"` | Zu durchsuchender Namensraum. |
 | `collection` | `string` | Nein | — | Auf eine bestimmte Sammlung beschränken. Weglassen, um die Standard-Sammlung zu durchsuchen. |
-| `type` | `"episodic" \| "semantic" \| "procedural"` | Nein | — | Ergebnisse auf einen bestimmten Speichertyp filtern. Wird nach dem Abruf angewendet. |
-| `tags` | `string[]` | Nein | — | Auf Erinnerungen mit mindestens einem übereinstimmenden Tag filtern. Wird nach dem Abruf angewendet. |
+| `type` | `"episodic" \| "semantic" \| "procedural"` | Nein | — | Ergebnisse auf einen bestimmten Speichertyp filtern. In den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
+| `tags` | `string[]` | Nein | — | Auf Erinnerungen mit mindestens einem übereinstimmenden Tag filtern (beliebige Übereinstimmung). In den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
 | `limit` | `integer (1–20)` | Nein | `5` | Maximale Anzahl der Ergebnisse. |
-| `min_score` | `number (0–1)` | Nein | `0.6` | Mindestkosinus-Ähnlichkeitsscore. Ergebnisse unter diesem Schwellenwert werden ausgeschlossen. |
+| `min_score` | `number (0–1)` | Nein | `0.6` | Mindestkosinus-Ähnlichkeitsscore, angewendet auf `semantic_score` (nicht auf den fusionierten/angepassten `score`). Ergebnisse unter diesem Schwellenwert werden ausgeschlossen. |
 
 **Ausgabe:**
 

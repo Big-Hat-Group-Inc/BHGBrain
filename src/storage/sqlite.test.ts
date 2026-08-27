@@ -528,6 +528,48 @@ describe('SqliteStore', () => {
     expect(results[0]!.rank).toBeGreaterThan(results[1]!.rank);
   });
 
+  it('fullTextSearch type filter returns up to limit matching rows instead of starving on higher-ranked non-matches', () => {
+    // push-down-recall-filters regression: three higher-relevance 'episodic'
+    // rows outrank three lower-relevance 'procedural' rows. A limit of 3 with
+    // no filter would return only the episodic rows; pushing the type
+    // predicate into the query must return the 3 procedural rows instead of
+    // zero (the pre-push-down post-filter would have discarded all 3
+    // episodic winners and returned nothing).
+    for (let i = 0; i < 3; i++) {
+      store.insertMemory({
+        ...sampleMemory(), id: `00000000-0000-0000-0000-0000000000c${i}`, checksum: `starve-hi-${i}`,
+        type: 'episodic', content: 'widget widget widget widget configuration', summary: 'widget', tags: [],
+      });
+    }
+    for (let i = 0; i < 3; i++) {
+      store.insertMemory({
+        ...sampleMemory(), id: `00000000-0000-0000-0000-0000000000d${i}`, checksum: `starve-lo-${i}`,
+        type: 'procedural', content: 'a single mention of widget configuration', summary: 'widget setup', tags: [],
+      });
+    }
+
+    const unfiltered = store.fullTextSearch('global', 'widget', 3);
+    expect(unfiltered.every(r => r.id.includes('-0000000000c'))).toBe(true);
+
+    const filtered = store.fullTextSearch('global', 'widget', 3, undefined, { type: 'procedural' });
+    expect(filtered).toHaveLength(3);
+    expect(filtered.every(r => r.id.includes('-0000000000d'))).toBe(true);
+  });
+
+  it('fullTextSearch tags filter matches delimiter-aware, not by substring', () => {
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000e1', checksum: 'tag-exact',
+      content: 'quarterly budget review notes', summary: 'budget notes', tags: ['finance'],
+    });
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000e2', checksum: 'tag-substr',
+      content: 'quarterly budget review notes', summary: 'budget notes', tags: ['finance-legacy'],
+    });
+
+    const filtered = store.fullTextSearch('global', 'budget', 10, undefined, { tags: ['finance'] });
+    expect(filtered.map(r => r.id)).toEqual(['00000000-0000-0000-0000-0000000000e1']);
+  });
+
   it('getMemoryByChecksum scopes to collection when provided', () => {
     const inGeneral = { ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000b1', collection: 'general', checksum: 'dup-chk' };
     const inWork = { ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000b2', collection: 'work', checksum: 'dup-chk' };

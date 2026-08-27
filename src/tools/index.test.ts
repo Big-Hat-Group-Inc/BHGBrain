@@ -8,6 +8,7 @@ import type { SearchService } from '../search/index.js';
 import type { BackupService } from '../backup/index.js';
 import type { HealthService } from '../health/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
+import type { SearchResult } from '../domain/types.js';
 import type pino from 'pino';
 
 type CollectionDeleteResult = { ok: true; deleted_memory_count: number };
@@ -339,5 +340,104 @@ describe('tool-handler latency recording (record-tool-latency-on-all-paths)', ()
       expect.any(Number),
       { tool: 'category', status: 'ok' },
     );
+  });
+});
+
+describe('handleRecall filter pushdown and score semantics (push-down-recall-filters)', () => {
+  let ctx: ToolContext;
+  let searchMock: ReturnType<typeof vi.fn>;
+
+  function makeResult(overrides: Partial<SearchResult> & { id: string }): SearchResult {
+    return {
+      content: 'content',
+      summary: 'summary',
+      type: 'semantic',
+      tags: [],
+      score: 0.9,
+      retention_tier: 'T2',
+      expires_at: null,
+      expiring_soon: false,
+      device_id: null,
+      created_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    searchMock = vi.fn(async () => [] as SearchResult[]);
+    ctx = {
+      config: {} as ToolContext['config'],
+      storage: {} as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: { search: searchMock } as unknown as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  });
+
+  it('pushes a type filter into the search call and over-fetches beyond limit', async () => {
+    await handleTool(ctx, 'recall', { query: 'q', type: 'procedural', limit: 5 }, 'c1');
+    expect(searchMock).toHaveBeenCalledWith(
+      'q', 'global', undefined, 'semantic', 10, undefined, { type: 'procedural', tags: undefined },
+    );
+  });
+
+  it('does not pass a filter argument when neither type nor tags are requested', async () => {
+    await handleTool(ctx, 'recall', { query: 'q', limit: 5 }, 'c1');
+    expect(searchMock).toHaveBeenCalledWith('q', 'global', undefined, 'semantic', 10, undefined, undefined);
+  });
+
+  it('returns up to limit matching results instead of starving on non-matching top candidates (regression)', async () => {
+    // Simulates the store already having pushed the type filter down: all
+    // returned candidates match, so the caller's limit counts matches, not
+    // unfiltered top-K survivors.
+    const matches = Array.from({ length: 5 }, (_, i) =>
+      makeResult({ id: `m${i}`, type: 'procedural', score: 0.9 - i * 0.01, semantic_score: 0.9 - i * 0.01 }));
+    searchMock.mockResolvedValue(matches);
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', type: 'procedural', limit: 5 }, 'c1') as { results: SearchResult[] };
+
+    expect(result.results).toHaveLength(5);
+    expect(result.results.every(r => r.type === 'procedural')).toBe(true);
+  });
+
+  it('applies min_score to semantic_score, not a mode-adjusted score (guard: task 2.3)', async () => {
+    // A result whose fused/T0-boosted `score` clears min_score but whose
+    // semantic_score does not must still be dropped: min_score is calibrated
+    // for cosine similarity, and recall hardcodes semantic mode.
+    searchMock.mockResolvedValue([
+      makeResult({ id: 'boosted-but-not-similar', score: 0.75, semantic_score: 0.4 }),
+      makeResult({ id: 'genuinely-similar', score: 0.75, semantic_score: 0.75 }),
+    ]);
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', min_score: 0.6, limit: 5 }, 'c1') as { results: SearchResult[] };
+
+    expect(result.results.map(r => r.id)).toEqual(['genuinely-similar']);
+  });
+
+  it('increments recall_zero_after_filter when the defensive re-check removes a store-returned result', async () => {
+    // The store claimed a match but the payload disagrees (e.g. drift) —
+    // exactly the filter-starvation symptom this metric exists to surface.
+    searchMock.mockResolvedValue([
+      makeResult({ id: 'wrong-type', type: 'episodic', score: 0.9, semantic_score: 0.9 }),
+    ]);
+
+    await handleTool(ctx, 'recall', { query: 'q', type: 'procedural', limit: 5 }, 'c1');
+
+    expect(ctx.metrics.incCounter).toHaveBeenCalledWith('recall_zero_after_filter');
+  });
+
+  it('does not increment recall_zero_after_filter when the store already returned only matching results', async () => {
+    searchMock.mockResolvedValue([
+      makeResult({ id: 'right-type', type: 'procedural', score: 0.9, semantic_score: 0.9 }),
+    ]);
+
+    await handleTool(ctx, 'recall', { query: 'q', type: 'procedural', limit: 5 }, 'c1');
+
+    expect(ctx.metrics.incCounter).not.toHaveBeenCalledWith('recall_zero_after_filter');
   });
 });

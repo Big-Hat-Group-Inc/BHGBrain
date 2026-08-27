@@ -1,7 +1,7 @@
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
-import type { SearchMode, SearchResult, MemoryRecord, MemoryType, RetentionTier } from '../domain/types.js';
+import type { SearchMode, SearchResult, MemoryRecord, MemoryType, RetentionTier, RecallFilter } from '../domain/types.js';
 import type { AccessUpdate } from '../storage/sqlite.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
@@ -63,16 +63,22 @@ export class SearchService {
     // falls back to fulltext-only, so callers can distinguish a degraded result
     // from a healthy one without changing the SearchResult[] contract.
     signal?: { degraded?: boolean },
+    // Optional type/tags predicate pushed down into the stores (see
+    // `push-down-recall-filters`) so `limit` counts matching memories.
+    // Omitted entirely (not passed to the stores) when undefined, so
+    // unfiltered callers see identical behavior to before this parameter
+    // existed.
+    filter?: RecallFilter,
   ): Promise<SearchResult[]> {
     const start = Date.now();
     try {
       switch (mode) {
         case 'semantic':
-          return await this.semanticSearch(query, namespace, collection, limit);
+          return await this.semanticSearch(query, namespace, collection, limit, filter);
         case 'fulltext':
-          return this.fulltextSearch(query, namespace, collection, limit);
+          return this.fulltextSearch(query, namespace, collection, limit, filter);
         case 'hybrid':
-          return await this.hybridSearch(query, namespace, collection, limit, signal);
+          return await this.hybridSearch(query, namespace, collection, limit, signal, filter);
       }
       const unsupportedMode: never = mode;
       throw new Error(`Unsupported search mode: ${unsupportedMode}`);
@@ -86,6 +92,7 @@ export class SearchService {
     namespace: string,
     collection: string | undefined,
     limit: number,
+    filter?: RecallFilter,
   ): Promise<SearchResult[]> {
     let vector: number[];
     try {
@@ -96,9 +103,9 @@ export class SearchService {
 
     let results: Array<{ id: string; score: number; payload: Record<string, unknown> }>;
     try {
-      results = await this.storage.qdrant.search(
-        namespace, collection, vector, limit,
-      );
+      results = filter
+        ? await this.storage.qdrant.search(namespace, collection, vector, limit, filter)
+        : await this.storage.qdrant.search(namespace, collection, vector, limit);
     } catch (err) {
       throw internal(`Semantic search failed: vector store unavailable — ${(err as Error).message}`);
     }
@@ -118,8 +125,11 @@ export class SearchService {
     namespace: string,
     collection: string | undefined,
     limit: number,
+    filter?: RecallFilter,
   ): SearchResult[] {
-    const ftsResults = this.storage.sqlite.fullTextSearch(namespace, query, limit, collection);
+    const ftsResults = filter
+      ? this.storage.sqlite.fullTextSearch(namespace, query, limit, collection, filter)
+      : this.storage.sqlite.fullTextSearch(namespace, query, limit, collection);
     return this.buildSearchResults(
       ftsResults.map(r => {
         const normalizedScore = Math.min(1, Math.abs(r.rank) / 10);
@@ -138,18 +148,21 @@ export class SearchService {
     collection: string | undefined,
     limit: number,
     signal?: { degraded?: boolean },
+    filter?: RecallFilter,
   ): Promise<SearchResult[]> {
     const weights = this.config.search.hybrid_weights;
 
     // Run both searches in parallel where possible
     let semanticItems: Array<{ id: string; score: number }> = [];
-    const fulltextItems = this.storage.sqlite.fullTextSearch(namespace, query, limit * 2, collection);
+    const fulltextItems = filter
+      ? this.storage.sqlite.fullTextSearch(namespace, query, limit * 2, collection, filter)
+      : this.storage.sqlite.fullTextSearch(namespace, query, limit * 2, collection);
 
     try {
       const vector = await this.embedding.embed(query);
-      const qdrantResults = await this.storage.qdrant.search(
-        namespace, collection, vector, limit * 2,
-      );
+      const qdrantResults = filter
+        ? await this.storage.qdrant.search(namespace, collection, vector, limit * 2, filter)
+        : await this.storage.qdrant.search(namespace, collection, vector, limit * 2);
       semanticItems = qdrantResults.map(r => ({ id: r.id, score: r.score }));
     } catch (err) {
       // Embedding/vector store unavailable: degrade to fulltext-only, but make the

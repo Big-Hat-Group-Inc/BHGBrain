@@ -324,6 +324,44 @@ describe('SearchService', () => {
       service.search('hello', 'global', undefined, 'semantic', 10),
     ).rejects.toThrow('vector store unavailable');
   });
+
+  describe('push-down-recall-filters: filter plumbing', () => {
+    it('pushes a type/tags filter down to the vector store in semantic mode', async () => {
+      const { service, storage } = createSearchService();
+      await service.search('hello', 'global', undefined, 'semantic', 10, undefined, { type: 'procedural', tags: ['ops'] });
+      expect(storage.qdrant.search).toHaveBeenCalledWith(
+        'global', undefined, [1, 2, 3], 10, { type: 'procedural', tags: ['ops'] },
+      );
+    });
+
+    it('pushes a type/tags filter down to fulltext search', async () => {
+      const { service, storage } = createSearchService();
+      await service.search('hello', 'global', 'my-col', 'fulltext', 10, undefined, { type: 'episodic' });
+      expect(storage.sqlite.fullTextSearch).toHaveBeenCalledWith(
+        'global', 'hello', 10, 'my-col', { type: 'episodic' },
+      );
+    });
+
+    it('pushes a type/tags filter down to both stores in hybrid mode', async () => {
+      const { service, storage } = createSearchService();
+      await service.search('hello', 'global', 'my-col', 'hybrid', 5, undefined, { tags: ['x'] });
+      expect(storage.sqlite.fullTextSearch).toHaveBeenCalledWith(
+        'global', 'hello', 10, 'my-col', { tags: ['x'] },
+      );
+      expect(storage.qdrant.search).toHaveBeenCalledWith(
+        'global', 'my-col', [1, 2, 3], 10, { tags: ['x'] },
+      );
+    });
+
+    it('does not pass a filter argument to either store when none is provided', async () => {
+      // Unfiltered calls must be identical to pre-change behavior: no extra
+      // (even undefined) argument reaching the store mocks.
+      const { service, storage } = createSearchService();
+      await service.search('hello', 'global', 'my-col', 'hybrid', 5);
+      expect(storage.sqlite.fullTextSearch).toHaveBeenCalledWith('global', 'hello', 10, 'my-col');
+      expect(storage.qdrant.search).toHaveBeenCalledWith('global', 'my-col', [1, 2, 3], 10);
+    });
+  });
 });
 
 describe('Pagination stability', () => {

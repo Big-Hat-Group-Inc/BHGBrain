@@ -3,6 +3,7 @@ import type { BrainConfig } from '../config/index.js';
 import type { CircuitBreaker } from '../resilience/index.js';
 import { CircuitOpenError } from '../resilience/index.js';
 import { internal } from '../errors/index.js';
+import type { RecallFilter } from '../domain/types.js';
 
 const COLLECTION_PREFIX = 'bhgbrain_';
 
@@ -150,17 +151,19 @@ export class QdrantStore {
     collection: string | undefined,
     vector: number[],
     limit: number,
-    filters?: {
-      type?: string;
-      tags?: string[];
-      minScore?: number;
-    },
+    filters?: RecallFilter & { minScore?: number },
   ): Promise<Array<{ id: string; score: number; payload: Record<string, unknown> }>> {
     const must: Array<Record<string, unknown>> = [
       { key: 'namespace', match: { value: namespace } },
     ];
     if (filters?.type) {
       must.push({ key: 'type', match: { value: filters.type } });
+    }
+    if (filters?.tags && filters.tags.length > 0) {
+      // Match-any: a point matches if its `tags` payload array contains at
+      // least one of the requested tags (mirrors recall's pre-existing OR
+      // semantics over provided tags).
+      must.push({ key: 'tags', match: { any: filters.tags } });
     }
     must.push({
       should: [

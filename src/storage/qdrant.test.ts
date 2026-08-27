@@ -107,6 +107,50 @@ describe('QdrantStore.search collection fan-out', () => {
   });
 });
 
+describe('QdrantStore.search type/tags filter pushdown', () => {
+  // push-down-recall-filters: type/tags filters are translated to a Qdrant
+  // `must` clause so they narrow the candidate set inside the store, rather
+  // than being discovered only after `limit` results are already spent.
+  it('translates a type filter into a must-match clause', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10, { type: 'procedural' });
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    expect(call.filter?.must).toEqual(expect.arrayContaining([
+      { key: 'type', match: { value: 'procedural' } },
+    ]));
+  });
+
+  it('translates a tags filter into a match-any clause', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10, { tags: ['urgent', 'billing'] });
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    expect(call.filter?.must).toEqual(expect.arrayContaining([
+      { key: 'tags', match: { any: ['urgent', 'billing'] } },
+    ]));
+  });
+
+  it('omits type/tags clauses when no filter is provided', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10);
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    const keys = call.filter?.must.map(m => m.key);
+    expect(keys).not.toContain('type');
+    expect(keys).not.toContain('tags');
+  });
+});
+
 describe('QdrantStore.searchSimilar', () => {
   it('returns mapped results from a populated query response', async () => {
     const client: MockClient = {

@@ -14,6 +14,17 @@ export type HealthStatus = 'healthy' | 'degraded' | 'unhealthy';
 
 export type VectorReconciliationState = 'reconciled' | 'reconciling' | 'pending';
 
+/**
+ * Type/tags predicate pushed down into the vector and fulltext stores so a
+ * recall's `limit` counts matching memories instead of unfiltered top-K
+ * candidates (see `push-down-recall-filters`). Tag matching is OR (match
+ * any provided tag), matching the pre-existing recall semantics.
+ */
+export interface RecallFilter {
+  type?: MemoryType;
+  tags?: string[];
+}
+
 export type ErrorCode =
   | 'INVALID_INPUT'
   | 'NOT_FOUND'

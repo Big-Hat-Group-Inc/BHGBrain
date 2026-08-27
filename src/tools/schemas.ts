@@ -31,7 +31,7 @@ export const MCP_TOOL_DEFINITIONS = [
         type: { type: 'string', enum: ['episodic', 'semantic', 'procedural'] },
         tags: { type: 'array', items: { type: 'string' }, maxItems: 20 },
         limit: { type: 'number', minimum: 1, maximum: 20, default: 5 },
-        min_score: { type: 'number', minimum: 0, maximum: 1, default: 0.6 },
+        min_score: { type: 'number', minimum: 0, maximum: 1, default: 0.6, description: 'Cosine-similarity threshold applied to the semantic score, not the fused/adjusted score' },
       },
       required: ['query'],
       additionalProperties: false,

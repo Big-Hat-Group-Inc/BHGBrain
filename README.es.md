@@ -1471,7 +1471,7 @@ BHGBrain expone dos herramientas para la recuperación de memorias con diferente
 | **Llamador previsto** | Agentes de IA durante la ejecución de tareas | Humanos o agentes administrativos haciendo investigación |
 
 **Filtrado por puntuación en recall:**
-El parámetro `min_score` (predeterminado 0.6) actúa como una compuerta de calidad — solo se devuelven memorias con similitud coseno ≥ 0.6. Esto previene resultados irrelevantes. Puedes reducir `min_score` para recuperar más resultados a expensas de la precisión.
+El parámetro `min_score` (predeterminado 0.6) actúa como una compuerta de calidad — se aplica al campo `semantic_score` (similitud coseno), no al `score` fusionado/potenciado por nivel, ya que `recall` se ejecuta en modo semántico — solo se devuelven memorias con similitud coseno ≥ 0.6. Esto previene resultados irrelevantes. Puedes reducir `min_score` para recuperar más resultados a expensas de la precisión.
 
 ```json
 // Ejemplo de recall — semántico, filtrado por tipo y etiquetas
@@ -1497,15 +1497,15 @@ Tanto `recall` como `search` admiten alcance por namespace y colección. `recall
 - En búsqueda semántica, se busca en la colección de Qdrant `bhgbrain_{namespace}_general` (la colección predeterminada para el namespace).
 - En búsqueda de texto completo, se buscan todas las memorias en el namespace independientemente de la colección.
 
-**Filtrado por tipo (solo `recall`):** Pasa `"type": "episodic"` | `"semantic"` | `"procedural"` para restringir los resultados a un solo tipo de memoria. El filtrado se aplica después de la búsqueda semántica, por lo que el conjunto completo de candidatos se recupera primero de Qdrant.
+**Filtrado por tipo (solo `recall`):** Pasa `"type": "episodic"` | `"semantic"` | `"procedural"` para restringir los resultados a un solo tipo de memoria. El filtro se empuja hacia el almacén (un filtro de payload de Qdrant en la ruta semántica, un predicado SQL en la ruta de texto completo), de modo que `limit` cuenta memorias coincidentes en lugar de gastarse en candidatos no coincidentes antes de que se aplique el filtrado. Una revalidación defensiva posterior a la recuperación sigue ejecutándose y se espera que sea un no-op en estado estable; si alguna vez elimina un resultado devuelto por el almacén, se incrementa un contador `recall_zero_after_filter` para que la inanición de filtros siga siendo observable.
 
-**Filtrado por etiquetas (solo `recall`):** Pasa `"tags": ["auth", "security"]` para restringir los resultados a memorias que tienen al menos una de las etiquetas especificadas. El filtrado se aplica después de la recuperación.
+**Filtrado por etiquetas (solo `recall`):** Pasa `"tags": ["auth", "security"]` para restringir los resultados a memorias que tienen al menos una de las etiquetas especificadas (coincidencia de cualquiera). Al igual que el filtrado por tipo, esto se empuja hacia el almacén en lugar de aplicarse solo después de la recuperación.
 
 ---
 
 ### Umbrales de Puntuación y Bonificaciones por Nivel
 
-**`min_score` (solo recall):** Una puntuación mínima de similitud coseno entre 0 y 1. Las memorias por debajo de este umbral se excluyen de los resultados de `recall`. Predeterminado: 0.6.
+**`min_score` (solo recall):** Una puntuación mínima de similitud coseno entre 0 y 1, aplicada específicamente al campo `semantic_score` — no al `score` fusionado/potenciado por nivel — ya que `recall` fija el modo semántico y el valor predeterminado de `min_score` está calibrado para un rango de similitud coseno, no para puntuaciones RRF híbridas. Las memorias por debajo de este umbral se excluyen de los resultados de `recall`. Predeterminado: 0.6.
 
 **Exclusión de memorias expiradas:** El filtro de búsqueda vectorial de Qdrant excluye memorias donde `decay_eligible = true AND expires_at < now()`. Las memorias T0/T1 (decay_eligible = false) nunca son excluidas por el filtro del lado vectorial. En el lado de SQLite, el servicio de ciclo de vida re-verifica la expiración en cualquier memoria devuelta desde el almacén de vectores.
 
@@ -1726,6 +1726,7 @@ con el formato anterior sin etiquetas).
 | `bhgbrain_memory_count` | medidor | Recuento total de memorias actual (actualizado en escritura/eliminación) |
 | `bhgbrain_rate_limit_buckets` | medidor | Cubos de seguimiento de límite de tasa activos |
 | `bhgbrain_rate_limited_total` | contador | Total de solicitudes con límite de tasa excedido |
+| `recall_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva de tipo/etiquetas posterior a la recuperación de `recall` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
 
 Por ejemplo:
 
@@ -2087,10 +2088,10 @@ Recupera las memorias más relevantes para una consulta usando búsqueda de simi
 | `query` | `string` | **Sí** | — | Consulta de recall. Máx. 500 caracteres. |
 | `namespace` | `string` | No | `"global"` | Namespace en el que buscar. |
 | `collection` | `string` | No | — | Filtrar a una colección específica. Omitir para buscar en la colección predeterminada. |
-| `type` | `"episodic" \| "semantic" \| "procedural"` | No | — | Filtrar resultados a un tipo de memoria específico. Se aplica después de la recuperación. |
-| `tags` | `string[]` | No | — | Filtrar a memorias con al menos una etiqueta coincidente. Se aplica después de la recuperación. |
+| `type` | `"episodic" \| "semantic" \| "procedural"` | No | — | Filtrar resultados a un tipo de memoria específico. Empujado hacia el almacén, de modo que `limit` cuenta memorias coincidentes. |
+| `tags` | `string[]` | No | — | Filtrar a memorias con al menos una etiqueta coincidente (coincidencia de cualquiera). Empujado hacia el almacén, de modo que `limit` cuenta memorias coincidentes. |
 | `limit` | `integer (1–20)` | No | `5` | Número máximo de resultados. |
-| `min_score` | `number (0–1)` | No | `0.6` | Puntuación mínima de similitud coseno. Los resultados por debajo de este umbral se excluyen. |
+| `min_score` | `number (0–1)` | No | `0.6` | Puntuación mínima de similitud coseno, aplicada a `semantic_score` (no al `score` fusionado/ajustado). Los resultados por debajo de este umbral se excluyen. |
 
 **Salida:**
 

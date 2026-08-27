@@ -10,6 +10,7 @@ import type {
   MemoryRevisionRecord,
   RetentionTier,
   TierStats,
+  RecallFilter,
 } from '../domain/types.js';
 
 const ALLOWED_MEMORY_TYPES: readonly MemoryType[] = ['episodic', 'semantic', 'procedural'];
@@ -82,7 +83,7 @@ export interface SqliteStorage {
   listMemoriesInCollection(namespace: string, collection: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
   countMemories(namespace?: string): number;
   countMemoriesInCollection(namespace: string, collection: string): number;
-  fullTextSearch(namespace: string, query: string, limit: number, collection?: string): Array<{ id: string; rank: number }>;
+  fullTextSearch(namespace: string, query: string, limit: number, collection?: string, filter?: RecallFilter): Array<{ id: string; rank: number }>;
   markStale(memoryId: string): void;
   getStaleMemories(importanceBelow: number, limit: number): MemoryRecordWithoutEmbedding[];
   listStaleCandidateIds(cutoffIso: string): string[];
@@ -647,7 +648,7 @@ export class SqliteStore implements SqliteStorage {
     return row.cnt;
   }
 
-  fullTextSearch(namespace: string, query: string, limit: number, collection?: string): Array<{ id: string; rank: number }> {
+  fullTextSearch(namespace: string, query: string, limit: number, collection?: string, filter?: RecallFilter): Array<{ id: string; rank: number }> {
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
     if (terms.length === 0) return [];
 
@@ -664,6 +665,28 @@ export class SqliteStore implements SqliteStorage {
       const like = `%${term}%`;
       params.push(like, like, like);
     }
+
+    // Push type/tags predicates down so `limit` counts matching memories (see
+    // `push-down-recall-filters`). These are appended to `conditions` (not
+    // `collectionJoin`) and their params pushed after the term LIKEs above,
+    // so their `?` placeholders land in the same relative order in both the
+    // SQL text and the bound params array.
+    if (filter?.type) {
+      conditions.push('m.type = ?');
+      params.push(filter.type);
+    }
+    if (filter?.tags && filter.tags.length > 0) {
+      // Delimiter-aware match against the JSON-serialized `m.tags` column
+      // (`["foo","bar"]`): each tag is wrapped in double quotes by
+      // JSON.stringify, so `%"tag"%` cannot match a differently-named tag
+      // that merely shares a substring (e.g. "foo" vs. "foobar"). OR over
+      // provided tags, mirroring recall's pre-existing "match any" semantics.
+      conditions.push(`(${filter.tags.map(() => 'm.tags LIKE ?').join(' OR ')})`);
+      for (const tag of filter.tags) {
+        params.push(`%"${tag}"%`);
+      }
+    }
+
     // Over-fetch a bounded candidate pool so the relevance ranker below has rows to
     // order; the matching predicate is non-sargable LIKE, so keep the cap modest.
     const candidateLimit = Math.min(Math.max(limit * 5, 50), 500);

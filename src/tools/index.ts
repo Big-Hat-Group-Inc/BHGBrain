@@ -12,7 +12,7 @@ import {
   SearchInputSchema, TagInputSchema, CollectionsInputSchema,
   CategoryInputSchema, BackupInputSchema, RepairInputSchema,
 } from '../domain/schemas.js';
-import type { WriteResult, SearchResult, MemoryRecord } from '../domain/types.js';
+import type { WriteResult, SearchResult, MemoryRecord, RecallFilter } from '../domain/types.js';
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
 import { computeChecksum } from '../domain/normalize.js';
 import { handleImport } from './import.js';
@@ -152,20 +152,50 @@ async function handleRecall(
 ): Promise<{ results: SearchResult[] }> {
   const input = parseInput(RecallInputSchema, args);
   logCtx.namespace = input.namespace;
+
+  // Push type/tags down into the store instead of discovering the mismatch
+  // only after `limit` candidates are already spent (push-down-recall-filters):
+  // omitted entirely when neither filter is requested, so an unfiltered
+  // recall's store call is identical to before this parameter existed.
+  const filter: RecallFilter | undefined = (input.type !== undefined || (input.tags?.length ?? 0) > 0)
+    ? { type: input.type, tags: input.tags }
+    : undefined;
+
+  // Over-fetch modestly beyond `limit` so the expired-memory exclusion inside
+  // `buildSearchResults` cannot starve the caller's limit even once the
+  // store already narrows candidates down to matching memories. Capped so a
+  // filtered recall never asks the store for an unbounded candidate pool.
+  const fetchLimit = Math.min(input.limit * 2, 40);
+
   const results = await ctx.search.search(
-    input.query, input.namespace, input.collection, 'semantic', input.limit,
+    input.query, input.namespace, input.collection, 'semantic', fetchLimit, undefined, filter,
   );
 
-  // Filter by min_score and type
-  let filtered = results.filter(r => r.score >= input.min_score);
+  // Defensive post-retrieval re-check for type/tags: the store is now the
+  // primary filtering mechanism, so this should be a no-op in steady state.
+  // It only fires on payload drift (e.g. Qdrant points written before
+  // type/tags existed in the payload) or an inconsistent store — a
+  // filter-starvation symptom worth surfacing, so its removals are counted.
+  const beforeDefensiveCheck = results.length;
+  let filtered = results;
   if (input.type) {
     filtered = filtered.filter(r => r.type === input.type);
   }
   if (input.tags && input.tags.length > 0) {
     filtered = filtered.filter(r => input.tags!.some(t => r.tags.includes(t)));
   }
+  if (filtered.length < beforeDefensiveCheck) {
+    ctx.metrics.incCounter('recall_zero_after_filter');
+  }
 
-  return { results: filtered };
+  // min_score is calibrated for cosine similarity, so it is applied to
+  // `semantic_score` explicitly (falling back to `score` only when
+  // `semantic_score` is unavailable) rather than the mode-adjusted `score`
+  // field recall previously thresholded — `handleRecall` hardcodes semantic
+  // mode, but this keeps the comparison correct if that ever changes.
+  filtered = filtered.filter(r => (r.semantic_score ?? r.score) >= input.min_score);
+
+  return { results: filtered.slice(0, input.limit) };
 }
 
 async function handleForget(
