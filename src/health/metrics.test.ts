@@ -132,6 +132,22 @@ describe('MetricsCollector', () => {
     expect(entries.latency_ms_count).toBe('counter');
   });
 
+  it('buckets a labeled histogram separately per distinct label set (record-tool-latency-on-all-paths task 2)', () => {
+    const metrics = new MetricsCollector(createConfig());
+    metrics.recordHistogram('bhgbrain_tool_handler_ms', 10, { tool: 'recall', status: 'ok' });
+    metrics.recordHistogram('bhgbrain_tool_handler_ms', 20, { tool: 'recall', status: 'ok' });
+    metrics.recordHistogram('bhgbrain_tool_handler_ms', 100, { tool: 'remember', status: 'error' });
+
+    const entries = metrics.getMetrics();
+    const recallAvg = entries.find(e => e.name === 'bhgbrain_tool_handler_ms_avg' && e.labels?.tool === 'recall');
+    const rememberAvg = entries.find(e => e.name === 'bhgbrain_tool_handler_ms_avg' && e.labels?.tool === 'remember');
+
+    expect(recallAvg?.value).toBe(15);
+    expect(recallAvg?.labels).toEqual({ tool: 'recall', status: 'ok' });
+    expect(rememberAvg?.value).toBe(100);
+    expect(rememberAvg?.labels).toEqual({ tool: 'remember', status: 'error' });
+  });
+
   it('computes percentiles for empty, single-value, and known distributions', () => {
     expect(computePercentile([], 50)).toBe(0);
     expect(computePercentile([7], 95)).toBe(7);

@@ -1692,18 +1692,37 @@ Wenn `observability.metrics_enabled: true`, ist ein Metriken-Endpunkt verfügbar
 GET /metrics
 ```
 
-Gibt Nur-Text-Schlüssel-Wert-Metriken zurück (Prometheus-kompatibles Format):
+Gibt Metriken im Prometheus-Textformat zurück: eine `# TYPE <name> <counter|gauge|histogram>`-Zeile
+einmal pro Metrikname, gefolgt von `name{label="value",...} value`-Zeilen (der `{...}`-Teil entfällt bei
+Metriken ohne Labels, sodass die Ausgabe abwärtskompatibel zum vorherigen labellosen Format bleibt).
 
 | Metrik | Typ | Beschreibung |
 |---|---|---|
 | `bhgbrain_tool_calls_total` | Zähler | Gesamte Tool-Aufrufe |
-| `bhgbrain_tool_duration_seconds_avg` | Histogramm | Durchschnittliche Tool-Aufruf-Dauer |
-| `bhgbrain_tool_duration_seconds_count` | Zähler | Anzahl der Tool-Aufruf-Dauermessungen |
+| `bhgbrain_tool_handler_ms_avg` | Histogramm | Durchschnittliche Tool-Handler-Latenz in Millisekunden, mit den Labels `tool` (Tool-Name) und `status` (`ok`/`error`). Wird bei jedem Aufruf erfasst, auch bei Fehlern. |
+| `bhgbrain_tool_handler_ms_p50` | Histogramm | 50. Perzentil der Tool-Handler-Latenz, mit den Labels `tool` und `status` |
+| `bhgbrain_tool_handler_ms_p95` | Histogramm | 95. Perzentil der Tool-Handler-Latenz, mit den Labels `tool` und `status` |
+| `bhgbrain_tool_handler_ms_p99` | Histogramm | 99. Perzentil der Tool-Handler-Latenz, mit den Labels `tool` und `status` |
+| `bhgbrain_tool_handler_ms_count` | Zähler | Anzahl der Tool-Handler-Latenzmessungen, mit den Labels `tool` und `status` |
+| `embedding_embed_batch_ms_p95` | Histogramm | 95. Perzentil der Embedding-Batch-Latenz |
+| `search_total_ms_p95` | Histogramm | 95. Perzentil der End-to-End-Suchlatenz |
 | `bhgbrain_memory_count` | Messuhr | Aktuelle Gesamt-Erinnerungsanzahl (bei Schreiben/Löschen aktualisiert) |
 | `bhgbrain_rate_limit_buckets` | Messuhr | Aktive Rate-Limit-Verfolgungseimer |
 | `bhgbrain_rate_limited_total` | Zähler | Gesamt rate-limitierte Anfragen |
 
-Histogramme verwenden einen begrenzten Ringpuffer der letzten 1.000 Messungen. Metriken sind nur im Prozess – es gibt keinen externen Push.
+Zum Beispiel:
+
+```
+# TYPE bhgbrain_tool_handler_ms_p95 histogram
+bhgbrain_tool_handler_ms_p95{tool="recall",status="ok"} 12
+bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
+```
+
+Histogramme verwenden einen begrenzten Ringpuffer der letzten 1.000 Messungen **pro Label-Kombination**
+(jede Tool-/Status-Kombination erhält also ihr eigenes 1.000-Messungen-Fenster). Metriken sind nur im
+Prozess – es gibt keinen externen Push. Da Fehler jetzt in `bhgbrain_tool_handler_ms` enthalten sind,
+spiegeln p95/p99 den langsamen Fehler-Tail wider (Timeouts, geöffnete Circuit-Breaker usw.) und können
+höher ausfallen als bevor diese Metrik Fehler erfasste.
 
 ---
 

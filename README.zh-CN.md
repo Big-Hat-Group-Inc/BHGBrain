@@ -1684,18 +1684,36 @@ bhgbrain health
 GET /metrics
 ```
 
-返回纯文本键值指标（Prometheus 兼容格式）：
+以 Prometheus 文本暴露格式返回指标：每个指标名称输出一行 `# TYPE <name>
+<counter|gauge|histogram>`，随后是 `name{label="value",...} value` 形式的行（对于没有标签的指标，会省略
+`{...}` 部分，从而保持与之前无标签格式的向后兼容）。
 
 | 指标 | 类型 | 说明 |
 |---|---|---|
 | `bhgbrain_tool_calls_total` | counter | 工具调用总次数 |
-| `bhgbrain_tool_duration_seconds_avg` | histogram | 平均工具调用时长 |
-| `bhgbrain_tool_duration_seconds_count` | counter | 工具调用时长样本数量 |
+| `bhgbrain_tool_handler_ms_avg` | histogram | 工具处理程序的平均延迟（毫秒），带有 `tool`（工具名称）和 `status`（`ok`/`error`）标签。每次调用都会记录，包括失败的调用。 |
+| `bhgbrain_tool_handler_ms_p50` | histogram | 工具处理程序延迟的第 50 百分位，带有 `tool` 和 `status` 标签 |
+| `bhgbrain_tool_handler_ms_p95` | histogram | 工具处理程序延迟的第 95 百分位，带有 `tool` 和 `status` 标签 |
+| `bhgbrain_tool_handler_ms_p99` | histogram | 工具处理程序延迟的第 99 百分位，带有 `tool` 和 `status` 标签 |
+| `bhgbrain_tool_handler_ms_count` | counter | 工具处理程序延迟样本数量，带有 `tool` 和 `status` 标签 |
+| `embedding_embed_batch_ms_p95` | histogram | 嵌入批处理延迟的第 95 百分位 |
+| `search_total_ms_p95` | histogram | 端到端搜索延迟的第 95 百分位 |
 | `bhgbrain_memory_count` | gauge | 当前总记忆数量（写入/删除时更新） |
 | `bhgbrain_rate_limit_buckets` | gauge | 活跃的速率限制追踪桶 |
 | `bhgbrain_rate_limited_total` | counter | 被速率限制的请求总数 |
 
-直方图使用最后 1,000 个样本的有界循环缓冲区。指标仅在进程内——不进行外部推送。
+例如：
+
+```
+# TYPE bhgbrain_tool_handler_ms_p95 histogram
+bhgbrain_tool_handler_ms_p95{tool="recall",status="ok"} 12
+bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
+```
+
+直方图对**每种标签组合**使用最后 1,000 个样本的有界循环缓冲区（即每个 工具/状态 组合都拥有自己的
+1,000 个样本窗口）。指标仅在进程内——不进行外部推送。由于失败现在也会计入
+`bhgbrain_tool_handler_ms`，其 p95/p99 会反映缓慢的失败尾部（超时、熔断器打开等），因此可能比该指标
+开始记录失败之前更高。
 
 ---
 

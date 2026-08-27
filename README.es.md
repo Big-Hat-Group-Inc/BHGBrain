@@ -1689,18 +1689,39 @@ Si `observability.metrics_enabled: true`, hay un endpoint de métricas disponibl
 GET /metrics
 ```
 
-Devuelve métricas de valor clave en texto plano (formato compatible con Prometheus):
+Devuelve métricas en formato de exposición de texto de Prometheus: una línea `# TYPE <name>
+<counter|gauge|histogram>` una vez por nombre de métrica, seguida de líneas `name{label="value",...}
+value` (el segmento `{...}` se omite en las métricas sin etiquetas, manteniendo la salida compatible
+con el formato anterior sin etiquetas).
 
 | Métrica | Tipo | Descripción |
 |---|---|---|
 | `bhgbrain_tool_calls_total` | contador | Total de invocaciones de herramientas |
-| `bhgbrain_tool_duration_seconds_avg` | histograma | Duración promedio de llamadas a herramientas |
-| `bhgbrain_tool_duration_seconds_count` | contador | Número de muestras de duración de llamadas a herramientas |
+| `bhgbrain_tool_handler_ms_avg` | histograma | Latencia promedio del manejador de herramientas en milisegundos, etiquetada con `tool` (nombre de la herramienta) y `status` (`ok`/`error`). Se registra en cada llamada, incluidos los fallos. |
+| `bhgbrain_tool_handler_ms_p50` | histograma | Percentil 50 de la latencia del manejador de herramientas, etiquetada con `tool` y `status` |
+| `bhgbrain_tool_handler_ms_p95` | histograma | Percentil 95 de la latencia del manejador de herramientas, etiquetada con `tool` y `status` |
+| `bhgbrain_tool_handler_ms_p99` | histograma | Percentil 99 de la latencia del manejador de herramientas, etiquetada con `tool` y `status` |
+| `bhgbrain_tool_handler_ms_count` | contador | Número de muestras de latencia del manejador de herramientas, etiquetada con `tool` y `status` |
+| `embedding_embed_batch_ms_p95` | histograma | Percentil 95 de la latencia del lote de embeddings |
+| `search_total_ms_p95` | histograma | Percentil 95 de la latencia de búsqueda de extremo a extremo |
 | `bhgbrain_memory_count` | medidor | Recuento total de memorias actual (actualizado en escritura/eliminación) |
 | `bhgbrain_rate_limit_buckets` | medidor | Cubos de seguimiento de límite de tasa activos |
 | `bhgbrain_rate_limited_total` | contador | Total de solicitudes con límite de tasa excedido |
 
-Los histogramas usan un búfer circular acotado de las últimas 1.000 muestras. Las métricas son solo en proceso — no hay push externo.
+Por ejemplo:
+
+```
+# TYPE bhgbrain_tool_handler_ms_p95 histogram
+bhgbrain_tool_handler_ms_p95{tool="recall",status="ok"} 12
+bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
+```
+
+Los histogramas usan un búfer circular acotado de las últimas 1.000 muestras **por combinación de
+etiquetas** (cada par herramienta/estado tiene su propia ventana de 1.000 muestras). Las métricas son
+solo en proceso — no hay push externo. Dado que los fallos ahora se incluyen en
+`bhgbrain_tool_handler_ms`, sus p95/p99 reflejan la cola lenta de fallos (tiempos de espera agotados,
+aperturas de disyuntor de circuito, etc.) y pueden mostrar valores más altos que antes de que esta
+métrica registrara fallos.
 
 ---
 

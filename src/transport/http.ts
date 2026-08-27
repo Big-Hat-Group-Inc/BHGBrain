@@ -11,7 +11,43 @@ import {
   validateExternalAuthBinding,
   deriveTrustedClientId,
 } from './middleware.js';
+import type { MetricEntry } from '../health/metrics.js';
 import type pino from 'pino';
+
+// Prometheus text-exposition label-value escaping: backslash, then quote,
+// then newline (order matters so a literal backslash isn't re-escaped).
+function escapeLabelValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+}
+
+function formatLabels(labels: Record<string, string> | undefined): string {
+  if (!labels) return '';
+  const keys = Object.keys(labels);
+  if (keys.length === 0) return '';
+  const pairs = keys.map(k => `${k}="${escapeLabelValue(labels[k]!)}"`);
+  return `{${pairs.join(',')}}`;
+}
+
+/**
+ * Renders metrics in Prometheus text-exposition form: a `# TYPE` line once
+ * per metric name, followed by `name{label="value",...} value` lines (the
+ * `{...}` segment omitted when a metric has no labels). Additive relative to
+ * the prior plain `name value` output — unlabeled lines are unchanged.
+ */
+export function renderPrometheusText(metrics: MetricEntry[]): string {
+  const lines: string[] = [];
+  const typedNames = new Set<string>();
+
+  for (const m of metrics) {
+    if (!typedNames.has(m.name)) {
+      lines.push(`# TYPE ${m.name} ${m.type}`);
+      typedNames.add(m.name);
+    }
+    lines.push(`${m.name}${formatLabels(m.labels)} ${m.value}`);
+  }
+
+  return lines.join('\n');
+}
 
 export function createHttpServer(
   config: BrainConfig,
@@ -73,8 +109,7 @@ export function createHttpServer(
     app.get('/metrics', (_req, res) => {
       // Histogram families emit `_avg`, `_p50`, `_p95`, `_p99`, and `_count` lines.
       const metrics = ctx.metrics.getMetrics();
-      const lines = metrics.map(m => `${m.name} ${m.value}`);
-      res.type('text/plain').send(lines.join('\n'));
+      res.type('text/plain').send(renderPrometheusText(metrics));
     });
   }
 

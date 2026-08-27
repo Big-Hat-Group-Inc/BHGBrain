@@ -227,6 +227,45 @@ describe('createHttpServer', () => {
     expect(enabledResponse.text).toContain('bhgbrain_tool_handler_ms_p95 12');
   });
 
+  it('renders labels in Prometheus form and emits # TYPE lines (task 4.3)', async () => {
+    const enabled = await buildApp(createConfig(true, true), {
+      metrics: {
+        getMetrics: vi.fn(() => [
+          { name: 'bhgbrain_tool_calls_total', type: 'counter', value: 7 },
+          {
+            name: 'bhgbrain_tool_handler_ms_p95',
+            type: 'histogram',
+            value: 12,
+            labels: { tool: 'recall', status: 'ok' },
+          },
+          {
+            name: 'bhgbrain_tool_handler_ms_p95',
+            type: 'histogram',
+            value: 40,
+            labels: { tool: 'remember', status: 'error' },
+          },
+        ] as never),
+      },
+    });
+
+    const response = await request(enabled.app)
+      .get('/metrics')
+      .set('Authorization', 'Bearer secret-token');
+
+    expect(response.status).toBe(200);
+    const lines = response.text.split('\n');
+
+    // One # TYPE line per metric name, not per label set.
+    expect(lines).toContain('# TYPE bhgbrain_tool_calls_total counter');
+    expect(lines).toContain('# TYPE bhgbrain_tool_handler_ms_p95 histogram');
+    expect(lines.filter(l => l === '# TYPE bhgbrain_tool_handler_ms_p95 histogram')).toHaveLength(1);
+
+    // Labels render as Prometheus `name{k="v",...} value` form.
+    expect(lines).toContain('bhgbrain_tool_calls_total 7');
+    expect(lines).toContain('bhgbrain_tool_handler_ms_p95{tool="recall",status="ok"} 12');
+    expect(lines).toContain('bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 40');
+  });
+
   it('ignores X-Forwarded-For for rate-limit identity when trust_proxy is disabled', async () => {
     const { app } = await buildApp(
       createConfig(false, true, { trustProxy: false, rateLimitRpm: 1 }),

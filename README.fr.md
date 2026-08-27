@@ -1691,18 +1691,39 @@ Si `observability.metrics_enabled: true`, un point de terminaison de métriques 
 GET /metrics
 ```
 
-Renvoie des métriques en paires clé-valeur en texte brut (format compatible Prometheus) :
+Renvoie des métriques au format d'exposition texte de Prometheus : une ligne `# TYPE <name>
+<counter|gauge|histogram>` une fois par nom de métrique, suivie de lignes `name{label="value",...}
+value` (le segment `{...}` est omis pour les métriques sans étiquette, ce qui garde la sortie
+rétrocompatible avec le format précédent sans étiquette).
 
 | Métrique | Type | Description |
 |---|---|---|
 | `bhgbrain_tool_calls_total` | compteur | Total des invocations d'outils |
-| `bhgbrain_tool_duration_seconds_avg` | histogramme | Durée moyenne des appels d'outils |
-| `bhgbrain_tool_duration_seconds_count` | compteur | Nombre d'échantillons de durée d'appels d'outils |
+| `bhgbrain_tool_handler_ms_avg` | histogramme | Latence moyenne du gestionnaire d'outil en millisecondes, étiquetée `tool` (nom de l'outil) et `status` (`ok`/`error`). Enregistrée à chaque appel, y compris les échecs. |
+| `bhgbrain_tool_handler_ms_p50` | histogramme | 50e centile de la latence du gestionnaire d'outil, étiquetée `tool` et `status` |
+| `bhgbrain_tool_handler_ms_p95` | histogramme | 95e centile de la latence du gestionnaire d'outil, étiquetée `tool` et `status` |
+| `bhgbrain_tool_handler_ms_p99` | histogramme | 99e centile de la latence du gestionnaire d'outil, étiquetée `tool` et `status` |
+| `bhgbrain_tool_handler_ms_count` | compteur | Nombre d'échantillons de latence du gestionnaire d'outil, étiquetée `tool` et `status` |
+| `embedding_embed_batch_ms_p95` | histogramme | 95e centile de la latence des lots d'embeddings |
+| `search_total_ms_p95` | histogramme | 95e centile de la latence de recherche de bout en bout |
 | `bhgbrain_memory_count` | jauge | Nombre total actuel de souvenirs (mis à jour à l'écriture/suppression) |
 | `bhgbrain_rate_limit_buckets` | jauge | Compartiments de suivi de la limitation de débit actifs |
 | `bhgbrain_rate_limited_total` | compteur | Total des requêtes avec limitation de débit |
 
-Les histogrammes utilisent un tampon circulaire limité des 1 000 derniers échantillons. Les métriques sont en cours de processus uniquement — il n'y a pas de poussée externe.
+Par exemple :
+
+```
+# TYPE bhgbrain_tool_handler_ms_p95 histogram
+bhgbrain_tool_handler_ms_p95{tool="recall",status="ok"} 12
+bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
+```
+
+Les histogrammes utilisent un tampon circulaire limité des 1 000 derniers échantillons **par
+combinaison d'étiquettes** (chaque paire outil/statut a sa propre fenêtre de 1 000 échantillons). Les
+métriques sont en cours de processus uniquement — il n'y a pas de poussée externe. Comme les échecs
+sont désormais inclus dans `bhgbrain_tool_handler_ms`, ses p95/p99 reflètent la traîne lente des échecs
+(délais d'attente, ouvertures de disjoncteur, etc.) et peuvent afficher des valeurs plus élevées
+qu'avant que cette métrique n'enregistre les échecs.
 
 ---
 

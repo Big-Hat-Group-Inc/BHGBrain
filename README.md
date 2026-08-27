@@ -1744,23 +1744,37 @@ If `observability.metrics_enabled: true`, a metrics endpoint is available:
 GET /metrics
 ```
 
-Returns plain-text key-value metrics (Prometheus-compatible format):
+Returns plain-text metrics in Prometheus text-exposition format: a `# TYPE <name> <counter|gauge|histogram>`
+line once per metric name, followed by `name{label="value",...} value` lines (the `{...}` segment is
+omitted for metrics with no labels, keeping the output backward-compatible with the previous
+label-less format).
 
 | Metric | Type | Description |
 |---|---|---|
 | `bhgbrain_tool_calls_total` | counter | Total tool invocations |
-| `bhgbrain_tool_handler_ms_avg` | histogram | Average tool handler latency in milliseconds |
-| `bhgbrain_tool_handler_ms_p50` | histogram | 50th percentile tool handler latency |
-| `bhgbrain_tool_handler_ms_p95` | histogram | 95th percentile tool handler latency |
-| `bhgbrain_tool_handler_ms_p99` | histogram | 99th percentile tool handler latency |
-| `bhgbrain_tool_handler_ms_count` | counter | Number of tool handler latency samples |
+| `bhgbrain_tool_handler_ms_avg` | histogram | Average tool handler latency in milliseconds, labeled `tool` (tool name) and `status` (`ok`/`error`). Recorded on every call, including failures. |
+| `bhgbrain_tool_handler_ms_p50` | histogram | 50th percentile tool handler latency, labeled `tool` and `status` |
+| `bhgbrain_tool_handler_ms_p95` | histogram | 95th percentile tool handler latency, labeled `tool` and `status` |
+| `bhgbrain_tool_handler_ms_p99` | histogram | 99th percentile tool handler latency, labeled `tool` and `status` |
+| `bhgbrain_tool_handler_ms_count` | counter | Number of tool handler latency samples, labeled `tool` and `status` |
 | `embedding_embed_batch_ms_p95` | histogram | 95th percentile embedding batch latency |
 | `search_total_ms_p95` | histogram | 95th percentile end-to-end search latency |
 | `bhgbrain_memory_count` | gauge | Current total memory count (updated on write/delete) |
 | `bhgbrain_rate_limit_buckets` | gauge | Active rate limit tracking buckets |
 | `bhgbrain_rate_limited_total` | counter | Total rate-limited requests |
 
-Histograms use a bounded circular buffer of the last 1,000 samples. Metrics are in-process only - there is no external push.
+For example:
+
+```
+# TYPE bhgbrain_tool_handler_ms_p95 histogram
+bhgbrain_tool_handler_ms_p95{tool="recall",status="ok"} 12
+bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
+```
+
+Histograms use a bounded circular buffer of the last 1,000 samples **per label combination** (e.g. each
+tool/status pair gets its own 1,000-sample window). Metrics are in-process only - there is no external push.
+Because failures are now included in `bhgbrain_tool_handler_ms`, its p95/p99 reflect the slow failure tail
+(timeouts, circuit-breaker opens, etc.) and may read higher than before this metric recorded failures.
 
 ---
 

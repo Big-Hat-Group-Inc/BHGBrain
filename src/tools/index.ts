@@ -62,18 +62,24 @@ export async function handleTool(
   const start = Date.now();
   ctx.metrics.incCounter('bhgbrain_tool_calls_total');
   const logCtx: ToolLogContext = {};
+  // Hoisted so the `finally` block below can record the tool-handler latency
+  // histogram exactly once, on every path (success, BrainError, and
+  // unexpected error) — see `record-tool-latency-on-all-paths`. Logging stays
+  // in the try/catch branches, each computing `duration` once per branch.
+  let duration = 0;
+  let status: 'ok' | 'error' = 'ok';
 
   try {
     const result = await dispatch(ctx, toolName, args, clientId, logCtx);
-    const duration = Date.now() - start;
-    ctx.metrics.recordHistogram('bhgbrain_tool_handler_ms', duration);
+    duration = Date.now() - start;
     ctx.logger.info({
       event: 'tool_call', tool: toolName, duration_ms: duration, client_id: clientId,
       namespace: logCtx.namespace ?? null,
     });
     return result;
   } catch (err) {
-    const duration = Date.now() - start;
+    status = 'error';
+    duration = Date.now() - start;
     if (err instanceof BrainError) {
       ctx.logger.warn({
         event: 'tool_error', tool: toolName, error_code: err.code, duration_ms: duration, client_id: clientId,
@@ -86,6 +92,11 @@ export async function handleTool(
       namespace: logCtx.namespace ?? null,
     });
     return { error: { code: 'INTERNAL', message: 'An unexpected error occurred', retryable: true } };
+  } finally {
+    // Per-tool identification via a `tool` label (design decision 2), plus an
+    // `ok`/`error` status label so the success/failure split is preserved
+    // without excluding failures from the latency histogram itself.
+    ctx.metrics.recordHistogram('bhgbrain_tool_handler_ms', duration, { tool: toolName, status });
   }
 }
 

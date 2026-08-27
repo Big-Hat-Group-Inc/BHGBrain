@@ -258,3 +258,86 @@ describe('tool input contracts', () => {
     });
   }
 });
+
+describe('tool-handler latency recording (record-tool-latency-on-all-paths)', () => {
+  // A bare ctx is enough: dispatch fails validation/lookup before touching
+  // storage, embedding, etc. — same rationale as `tool input contracts` above.
+  function createCtx(overrides?: { storage?: Partial<StorageManager> }): ToolContext {
+    return {
+      config: {} as ToolContext['config'],
+      storage: (overrides?.storage ?? {}) as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('records a tool-handler latency sample when dispatch throws a BrainError (task 4.1)', async () => {
+    const ctx = createCtx();
+
+    const result = await handleTool(ctx, 'unknown_tool', {}, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(ctx.metrics.recordHistogram).toHaveBeenCalledWith(
+      'bhgbrain_tool_handler_ms',
+      expect.any(Number),
+      { tool: 'unknown_tool', status: 'error' },
+    );
+  });
+
+  it('records a tool-handler latency sample when dispatch throws an unexpected error (task 4.1)', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        getCategory: () => { throw new Error('boom'); },
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    const result = await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INTERNAL');
+    expect(ctx.metrics.recordHistogram).toHaveBeenCalledWith(
+      'bhgbrain_tool_handler_ms',
+      expect.any(Number),
+      { tool: 'category', status: 'error' },
+    );
+  });
+
+  it('identifies latency per tool so two different tools produce distinguishable entries (task 4.2)', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        listCategories: () => [],
+        listCollections: () => [],
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    await handleTool(ctx, 'category', { action: 'list' }, 'c1');
+    await handleTool(ctx, 'collections', { action: 'list', namespace: 'global' }, 'c1');
+
+    const recordHistogram = ctx.metrics.recordHistogram as ReturnType<typeof vi.fn>;
+    const toolLabels = recordHistogram.mock.calls
+      .filter(call => call[0] === 'bhgbrain_tool_handler_ms')
+      .map(call => (call[2] as { tool: string }).tool);
+
+    expect(toolLabels).toContain('category');
+    expect(toolLabels).toContain('collections');
+    expect(new Set(toolLabels).size).toBe(2);
+  });
+
+  it('records a tool-handler latency sample on the success path with an "ok" status label', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: { listCategories: () => [] } } as unknown as Partial<StorageManager>,
+    });
+
+    await handleTool(ctx, 'category', { action: 'list' }, 'c1');
+
+    expect(ctx.metrics.recordHistogram).toHaveBeenCalledWith(
+      'bhgbrain_tool_handler_ms',
+      expect.any(Number),
+      { tool: 'category', status: 'ok' },
+    );
+  });
+});
