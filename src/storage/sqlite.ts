@@ -130,6 +130,7 @@ export interface SqliteStorage {
   insertRevision(memoryId: string, revision: number, content: string, updatedAt: string, updatedBy?: string): void;
   listRevisions(memoryId: string): MemoryRevisionRecord[];
   getDbSizeBytes(): number;
+  isFts5Available(): boolean;
   setCategory(name: string, slot: string, content: string): CategoryRecord;
   getCategory(name: string): CategoryRecord | null;
   listCategories(): CategoryRecord[];
@@ -338,6 +339,16 @@ export class SqliteStore implements SqliteStorage {
   private deferredFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private lifecycleOperation: string | null = null;
   private static readonly DEFERRED_FLUSH_MS = 5_000;
+  // Startup FTS5 capability probe result (openspec/changes/upgrade-fulltext-to-fts5,
+  // task 1.1). The pinned sql.js distribution (sql.js@^1.12.0, verified against the
+  // resolved 1.14.1 build) does NOT compile in the `fts5` virtual table module — its
+  // wasm binary carries no `fts5`/`SQLITE_ENABLE_FTS5` symbols and
+  // `CREATE VIRTUAL TABLE ... USING fts5` throws "no such module: fts5" — so this
+  // probes rather than assumes availability, per design.md. Consumed by
+  // HealthService to surface the (today: always-on) legacy fulltext fallback
+  // visibly rather than silently, per the "Missing FTS5 support SHALL degrade
+  // gracefully and visibly" requirement.
+  private ftsAvailable = false;
 
   constructor(private dataDir: string) {
     this.dbPath = join(dataDir, 'brain.db');
@@ -355,6 +366,7 @@ export class SqliteStore implements SqliteStorage {
     // that reference retention_tier don't fail on an existing DB that predates the column.
     this.ensureMemoryColumns();
     this.db.run(SCHEMA_SQL);
+    this.ftsAvailable = this.probeFts5Support();
     this.flush();
   }
 
@@ -372,7 +384,37 @@ export class SqliteStore implements SqliteStorage {
     this.db = new SQL.Database(buffer);
     this.ensureMemoryColumns();
     this.db.run(SCHEMA_SQL);
+    this.ftsAvailable = this.probeFts5Support();
     this.dirty = false;
+  }
+
+  /**
+   * Attempts to create (and immediately drop) a scratch FTS5 virtual table in the
+   * temp schema, so its result never touches the persisted database image.
+   * openspec/changes/upgrade-fulltext-to-fts5 task 1.1 — the engine-level FTS5
+   * fulltext path (table DDL, migration, BM25 query) is gated behind this probe and
+   * is not implemented yet (the pinned sql.js build has no fts5 module to exercise
+   * or verify it against; see the `ftsAvailable` comment above). The probe itself is
+   * real and generic: it will correctly report `true` the day the underlying sql.js
+   * build (or a swapped-in SQLite binding) compiles fts5 in.
+   */
+  private probeFts5Support(): boolean {
+    try {
+      this.db.run(`CREATE VIRTUAL TABLE temp.__fts5_probe USING fts5(x)`);
+      this.db.run(`DROP TABLE temp.__fts5_probe`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Whether this SQLite build supports FTS5 (openspec/changes/upgrade-fulltext-to-fts5).
+   * Always `false` today against the pinned sql.js dependency — see `ftsAvailable`.
+   * Consumed by HealthService to surface the legacy-fulltext-fallback condition.
+   */
+  isFts5Available(): boolean {
+    return this.ftsAvailable;
   }
 
   flush(): void {

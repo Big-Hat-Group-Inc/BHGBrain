@@ -45,6 +45,15 @@ async function main() {
   // Initialize storage
   const sqlite = new SqliteStore(config.data_dir!);
   await sqlite.init();
+  // openspec/changes/upgrade-fulltext-to-fts5, task 3.3 (visibility half): a
+  // structured log (in addition to the health `sqlite` component message) so the
+  // legacy-fulltext-fallback condition is visible in logs without polling /health.
+  if (!sqlite.isFts5Available()) {
+    logger.warn({
+      event: 'fts5_unavailable',
+      message: 'SQLite build has no fts5 module; fulltext search is running the legacy LIKE-based matcher.',
+    });
+  }
 
   const breakerOptions = {
     failureThreshold: config.resilience.circuit_breaker.failure_threshold,

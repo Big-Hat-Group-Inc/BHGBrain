@@ -1806,6 +1806,8 @@ Renvoie un `HealthSnapshot` :
 
 `components.retention` passe également à `"degraded"` (avec un message) lorsque la dernière exécution de GC — planifiée ou manuelle — a signalé un échec partiel (une étape d'archivage ou de suppression a échoué), indépendamment de la pression de capacité par niveau. Il revient à `"healthy"` à la prochaine exécution de GC propre.
 
+`components.sqlite` reste `"healthy"` mais porte un `message` lorsque la version de SQLite en cours d'exécution n'a pas de module `fts5` : la recherche plein texte s'exécute alors avec l'ancien comparateur basé sur `LIKE` (voir [Recherche plein texte](#recherche-plein-texte)) plutôt qu'un index FTS5/BM25. Ceci est également journalisé une fois au démarrage (`event: "fts5_unavailable"`).
+
 **Logique de statut global :**
 - `unhealthy` — si SQLite ou Qdrant est défaillant
 - `degraded` — si l'embedding est dégradé/défaillant, OU si la rétention est dégradée (surcapacité ou vecteurs non synchronisés)

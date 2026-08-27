@@ -212,6 +212,15 @@ openspec list --json
 6. **Memory Types**: Use correct type (`episodic`/`semantic`/`procedural`)
 7. **Embedding Dimensions**: Must match Qdrant configuration
 8. **Zod Validation**: All config must pass Zod schema validation
+9. **sql.js has no FTS5**: the pinned `sql.js` distribution (`^1.12.0`, currently
+   resolving 1.14.1) does **not** compile in the SQLite `fts5` virtual-table module —
+   `CREATE VIRTUAL TABLE ... USING fts5` throws `no such module: fts5`, and the wasm
+   binary carries no `fts5`/`SQLITE_ENABLE_FTS5` symbols. `SqliteStore.isFts5Available()`
+   probes this at startup (always `false` today) and `HealthService` surfaces the
+   fallback in the `sqlite` health component's `message`; fulltext search
+   (`fullTextSearch` in `src/storage/sqlite.ts`) still runs the legacy `LIKE`-based
+   matcher unconditionally. See `openspec/changes/upgrade-fulltext-to-fts5` before
+   assuming an FTS5/BM25 index exists — it doesn't, on this dependency.
 
 ## Quick Start for New Features
 

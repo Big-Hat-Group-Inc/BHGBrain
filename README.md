@@ -1845,6 +1845,8 @@ Returns a `HealthSnapshot`:
 
 `components.retention` also goes `"degraded"` (with a message) when the most recent GC run — scheduled or manual — reported a partial failure (an archive or delete step failed), independent of tier-capacity pressure. It clears back to `"healthy"` on the next clean GC run.
 
+`components.sqlite` stays `"healthy"` but carries a `message` when the running SQLite build has no `fts5` module: fulltext search runs on the legacy `LIKE`-based matcher (see [Fulltext Search](#fulltext-search)) rather than an FTS5/BM25 index. This is also logged once at startup (`event: "fts5_unavailable"`).
+
 **Overall status logic:**
 - `unhealthy` - if SQLite or Qdrant is unhealthy
 - `degraded` - if embedding is degraded/unhealthy, OR retention is degraded (over capacity or unsynced vectors)

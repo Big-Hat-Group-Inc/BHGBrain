@@ -83,6 +83,7 @@ describe('HealthService', () => {
     return {
       sqlite: {
         healthCheck: vi.fn(() => true),
+        isFts5Available: vi.fn(() => true),
         countMemories: vi.fn(() => 42),
         getDbSizeBytes: vi.fn(() => 1024),
         countByTier: vi.fn(() => ({ T0: 0, T1: 0, T2: 0, T3: 0 })),
@@ -293,6 +294,35 @@ describe('HealthService', () => {
 
     expect(result.status).toBe('unhealthy');
     expect(result.components.sqlite.status).toBe('unhealthy');
+  });
+
+  // openspec/changes/upgrade-fulltext-to-fts5, task 4.5: with the FTS5 capability
+  // probe forced to fail, fulltext still works via the (unchanged) legacy path and
+  // health carries a message describing the fallback — the sqlite component stays
+  // healthy (this is today's expected steady state, not a fault) but is no longer
+  // silent about it.
+  it('surfaces the FTS5 fallback in the sqlite health message when the probe failed', async () => {
+    const storage = createStorage();
+    storage.sqlite.isFts5Available = vi.fn(() => false);
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.status).toBe('healthy');
+    expect(result.components.sqlite).toEqual({
+      status: 'healthy',
+      message: 'Fulltext search is running the legacy LIKE-based matcher: this SQLite build has no fts5 module.',
+    });
+  });
+
+  it('omits the FTS5 fallback message when the probe succeeded', async () => {
+    const storage = createStorage();
+    storage.sqlite.isFts5Available = vi.fn(() => true);
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.components.sqlite).toEqual({ status: 'healthy' });
   });
 
   it('reports degraded when vectors still need reconciliation after restore', async () => {

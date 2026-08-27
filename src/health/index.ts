@@ -62,9 +62,23 @@ export class HealthService {
   private checkSqlite(): ComponentHealth {
     try {
       const ok = this.storage.sqlite.healthCheck();
-      return ok
-        ? { status: 'healthy' }
-        : { status: 'unhealthy', message: 'SQLite health check failed' };
+      if (!ok) {
+        return { status: 'unhealthy', message: 'SQLite health check failed' };
+      }
+      // openspec/changes/upgrade-fulltext-to-fts5, task 3.3 (visibility half):
+      // when the SQLite build lacks the fts5 module, fulltext search runs on the
+      // legacy LIKE-based matcher instead of the (not yet implemented) FTS5/BM25
+      // path. Surface that here rather than silently — the "Missing FTS5 support
+      // SHALL degrade gracefully and visibly" spec requirement — while keeping the
+      // component healthy: today, on the pinned sql.js dependency, this is the
+      // expected steady state, not a fault.
+      if (!this.storage.sqlite.isFts5Available()) {
+        return {
+          status: 'healthy',
+          message: 'Fulltext search is running the legacy LIKE-based matcher: this SQLite build has no fts5 module.',
+        };
+      }
+      return { status: 'healthy' };
     } catch (err) {
       return { status: 'unhealthy', message: (err as Error).message };
     }

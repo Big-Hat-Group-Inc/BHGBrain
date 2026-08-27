@@ -1779,6 +1779,8 @@ bhgbrain health
 
 当最近一次 GC 运行（定时或手动）报告部分失败（某个归档或删除步骤失败）时，`components.retention` 也会变为 `"degraded"`（附带说明信息），与层级容量压力无关。下一次干净的 GC 运行会将其恢复为 `"healthy"`。
 
+当运行中的 SQLite 编译版本没有 `fts5` 模块时，`components.sqlite` 仍保持 `"healthy"`，但会附带一条 `message`：全文搜索此时运行的是旧版基于 `LIKE` 的匹配器（参见[全文搜索](#全文搜索)），而不是 FTS5/BM25 索引。启动时也会记录一次相应日志（`event: "fts5_unavailable"`）。
+
 **整体状态逻辑：**
 - `unhealthy`——如果 SQLite 或 Qdrant 不健康
 - `degraded`——如果嵌入已降级/不健康，或保留系统已降级（超容量或向量未同步）

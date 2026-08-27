@@ -67,6 +67,18 @@ describe('SqliteStore', () => {
     expect(store.getMemoryById(mem.id)).toBeNull();
   });
 
+  // openspec/changes/upgrade-fulltext-to-fts5, task 1.1: the startup FTS5
+  // capability probe. This is a canary, not just a smoke test — it is pinned
+  // `false` because the pinned sql.js dependency (sql.js@^1.12.0) does not compile
+  // in the `fts5` virtual table module (verified: `CREATE VIRTUAL TABLE ... USING
+  // fts5` throws "no such module: fts5"). If this ever starts failing because the
+  // probe now returns `true`, that is good news — it means sql.js has started
+  // shipping fts5, and the engine-level FTS5/BM25 fulltext path (not implemented
+  // in this change — see tasks.md notes) can finally be built and tested.
+  it('reports FTS5 unavailable against the pinned sql.js build', () => {
+    expect(store.isFts5Available()).toBe(false);
+  });
+
   it('counts memories', () => {
     expect(store.countMemories()).toBe(0);
     store.insertMemory(sampleMemory());
