@@ -416,7 +416,11 @@ The file is created automatically on first run with all defaults applied. Edit i
     // Max requests per minute per client IP for HTTP transport
     "rate_limit_rpm": 100,
     // Maximum HTTP request body size in bytes
-    "max_request_size_bytes": 1048576
+    "max_request_size_bytes": 1048576,
+    // Express "trust proxy" setting. false (default) = req.ip is the direct
+    // socket peer (loopback-accurate); true = honor X-Forwarded-For from the
+    // reverse proxy in front of the server. Only enable behind a trusted proxy.
+    "trust_proxy": false
   },
 
   // Auto-inject payload budget (for memory://inject resource)
@@ -1767,6 +1771,8 @@ Authorization: Bearer <your-token>
 
 The token value is read from the environment variable named in `transport.http.bearer_token_env` (default: `BHGBRAIN_TOKEN`). If the environment variable is not set, all HTTP requests are allowed through (a warning is logged but auth is not enforced - for loopback-only bindings this is acceptable).
 
+The supplied token is compared against the configured secret using a constant-time comparison (`crypto.timingSafeEqual`), so a mismatch does not leak timing information about which byte differs. Tokens of a different length than the configured secret fail closed immediately without attempting the constant-time comparison.
+
 **Fail-closed for external bindings:** If the HTTP host is non-loopback (not `127.0.0.1`, `localhost`, or `::1`) and no token is configured, the server **refuses to start**:
 
 ```
@@ -1798,15 +1804,28 @@ To bind to a non-loopback address (e.g., for remote clients on a LAN):
 
 Make sure `BHGBRAIN_TOKEN` is set in this configuration.
 
+### Proxy Trust
+
+`security.trust_proxy` (default `false`) is passed directly to Express's `app.set('trust proxy', ...)`, which controls how `req.ip` is derived and therefore which identity the rate limiter keys on:
+
+- **Disabled (default):** `req.ip` is the direct socket peer. This is accurate for the documented loopback-only deployment. If a reverse proxy sits in front of the server anyway, every proxied client collapses into the proxy's single IP and caller-supplied `X-Forwarded-For` headers are ignored (so they cannot be spoofed to split or evade rate limits).
+- **Enabled:** `req.ip` honors `X-Forwarded-For` set by the immediate peer. Only enable this behind a reverse proxy you trust to set that header correctly — enabling it without a trusted proxy in front lets any client spoof its rate-limit identity.
+
+```json
+{ "security": { "trust_proxy": true } }
+```
+
 ### Rate Limiting
 
 HTTP requests are rate-limited per client IP address:
 
 - Default: 100 requests per minute (`security.rate_limit_rpm`)
-- Rate limit state is keyed on the trusted IP (not the `x-client-id` header)
+- Rate limit state is keyed on the trusted IP as derived per `security.trust_proxy` above (not the `x-client-id` header)
 - Exceeded clients receive HTTP 429 with `{ error: { code: "RATE_LIMITED", retryable: true } }`
+- Requests with no derivable client IP fail closed with HTTP 400 (`INVALID_INPUT`) rather than sharing a single fallback bucket
 - Response headers include `X-RateLimit-Limit` and `X-RateLimit-Remaining`
 - Expired rate limit buckets are swept every 30 seconds
+- Rate-limit state is scoped per server/middleware instance, so independent instances (e.g. in tests) never share buckets
 
 ### Request Size Limiting
 

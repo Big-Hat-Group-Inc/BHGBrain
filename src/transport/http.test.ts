@@ -9,7 +9,11 @@ vi.mock('../tools/index.js', () => ({
 }));
 
 describe('createHttpServer', () => {
-  function createConfig(metricsEnabled = false, authRequired = true): BrainConfig {
+  function createConfig(
+    metricsEnabled = false,
+    authRequired = true,
+    overrides?: { trustProxy?: boolean; rateLimitRpm?: number },
+  ): BrainConfig {
     return {
       data_dir: 'test-data',
       embedding: { provider: 'openai', model: 'test-model', api_key_env: 'OPENAI_API_KEY', dimensions: 3 },
@@ -53,8 +57,9 @@ describe('createHttpServer', () => {
         require_loopback_http: true,
         allow_unauthenticated_http: !authRequired,
         log_redaction: true,
-        rate_limit_rpm: 100,
+        rate_limit_rpm: overrides?.rateLimitRpm ?? 100,
         max_request_size_bytes: 1048576,
+        trust_proxy: overrides?.trustProxy ?? false,
       },
       auto_inject: { max_chars: 30000, max_tokens: null },
       observability: { metrics_enabled: metricsEnabled, structured_logging: true, log_level: 'info' },
@@ -227,5 +232,74 @@ describe('createHttpServer', () => {
     expect(enabledResponse.status).toBe(200);
     expect(await enabledResponse.text()).toContain('bhgbrain_tool_handler_ms_p95 12');
     await closeServer(enabled.server);
+  });
+
+  it('ignores X-Forwarded-For for rate-limit identity when trust_proxy is disabled', async () => {
+    const { baseUrl, server } = await startServer(
+      createConfig(false, true, { trustProxy: false, rateLimitRpm: 1 }),
+    );
+
+    const first = await fetch(`${baseUrl}/tool/remember`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer secret-token',
+        'X-Forwarded-For': '203.0.113.1',
+      },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+    expect(first.status).toBe(200);
+    await first.json();
+
+    // Different spoofed forwarding header, but with trust proxy disabled the
+    // limiter must key on the real loopback socket peer for both requests,
+    // so this second request from the "same" real client is rate-limited.
+    const second = await fetch(`${baseUrl}/tool/remember`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer secret-token',
+        'X-Forwarded-For': '203.0.113.2',
+      },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+    expect(second.status).toBe(429);
+    await second.json();
+
+    await closeServer(server);
+  });
+
+  it('derives rate-limit identity from X-Forwarded-For when trust_proxy is enabled', async () => {
+    const { baseUrl, server } = await startServer(
+      createConfig(false, true, { trustProxy: true, rateLimitRpm: 1 }),
+    );
+
+    const clientA = await fetch(`${baseUrl}/tool/remember`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer secret-token',
+        'X-Forwarded-For': '203.0.113.10',
+      },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+    expect(clientA.status).toBe(200);
+    await clientA.json();
+
+    // Distinct forwarded client identity is tracked in a distinct bucket, so
+    // it is not rate-limited by client A's request.
+    const clientB = await fetch(`${baseUrl}/tool/remember`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer secret-token',
+        'X-Forwarded-For': '203.0.113.20',
+      },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+    expect(clientB.status).toBe(200);
+    await clientB.json();
+
+    await closeServer(server);
   });
 });

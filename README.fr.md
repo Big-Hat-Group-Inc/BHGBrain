@@ -370,7 +370,11 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     // Nombre maximum de requêtes par minute par IP client pour le transport HTTP
     "rate_limit_rpm": 100,
     // Taille maximale du corps de requête HTTP en octets
-    "max_request_size_bytes": 1048576
+    "max_request_size_bytes": 1048576,
+    // Paramètre "trust proxy" d'Express. false (par défaut) = req.ip est le pair
+    // socket direct (précis pour loopback) ; true = respecte X-Forwarded-For envoyé
+    // par le proxy inverse en amont. À activer uniquement derrière un proxy de confiance.
+    "trust_proxy": false
   },
 
   // Budget de charge utile d'injection automatique (pour la ressource memory://inject)
@@ -1709,6 +1713,8 @@ Authorization: Bearer <votre-token>
 
 La valeur du token est lue depuis la variable d'environnement nommée dans `transport.http.bearer_token_env` (par défaut : `BHGBRAIN_TOKEN`). Si la variable d'environnement n'est pas définie, toutes les requêtes HTTP sont autorisées (un avertissement est journalisé mais l'authentification n'est pas appliquée — pour les liaisons loopback uniquement, c'est acceptable).
 
+Le token fourni est comparé au secret configuré à l'aide d'une comparaison en temps constant (`crypto.timingSafeEqual`), de sorte qu'une non-correspondance ne divulgue pas d'information temporelle sur l'octet qui diffère. Les tokens dont la longueur diffère de celle du secret configuré échouent immédiatement en mode fermé, sans tenter la comparaison en temps constant.
+
 **Sécurité fermée pour les liaisons externes :** Si l'hôte HTTP est non-loopback (ni `127.0.0.1`, ni `localhost`, ni `::1`) et qu'aucun token n'est configuré, le serveur **refuse de démarrer** :
 
 ```
@@ -1740,15 +1746,28 @@ Pour lier à une adresse non-loopback (ex. pour des clients distants sur un rés
 
 Assurez-vous que `BHGBRAIN_TOKEN` est défini dans cette configuration.
 
+### Confiance envers le proxy
+
+`security.trust_proxy` (par défaut `false`) est transmis directement à `app.set('trust proxy', ...)` d'Express, ce qui contrôle la façon dont `req.ip` est dérivé et donc l'identité utilisée par le limiteur de débit :
+
+- **Désactivé (par défaut) :** `req.ip` est le pair socket direct. C'est précis pour le déploiement loopback uniquement documenté. Si un proxy inverse se trouve tout de même en amont, tous les clients proxifiés s'effondrent vers l'IP unique du proxy, et les en-têtes `X-Forwarded-For` fournis par l'appelant sont ignorés (ils ne peuvent donc pas être falsifiés pour scinder ou contourner les limites de débit).
+- **Activé :** `req.ip` respecte `X-Forwarded-For` défini par le pair immédiat. À activer uniquement derrière un proxy inverse en qui vous avez confiance pour définir correctement cet en-tête — l'activer sans proxy de confiance en amont permet à tout client de falsifier son identité de limitation de débit.
+
+```json
+{ "security": { "trust_proxy": true } }
+```
+
 ### Limitation de débit
 
 Les requêtes HTTP sont limitées en débit par adresse IP client :
 
 - Par défaut : 100 requêtes par minute (`security.rate_limit_rpm`)
-- L'état de limitation de débit est indexé sur l'IP de confiance (pas l'en-tête `x-client-id`)
+- L'état de limitation de débit est indexé sur l'IP de confiance, dérivée selon `security.trust_proxy` ci-dessus (pas l'en-tête `x-client-id`)
 - Les clients dépassant la limite reçoivent HTTP 429 avec `{ error: { code: "RATE_LIMITED", retryable: true } }`
+- Les requêtes sans IP client dérivable échouent en mode fermé avec HTTP 400 (`INVALID_INPUT`) plutôt que de partager un compartiment de repli unique
 - Les en-têtes de réponse incluent `X-RateLimit-Limit` et `X-RateLimit-Remaining`
 - Les compartiments de limitation de débit expirés sont balayés toutes les 30 secondes
+- L'état de limitation de débit est propre à chaque instance de serveur/middleware, de sorte que des instances indépendantes (par ex. dans les tests) ne partagent jamais de compartiments
 
 ### Limitation de la taille des requêtes
 

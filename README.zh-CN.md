@@ -369,7 +369,10 @@ BHGBrain 从以下位置加载配置文件：
     // HTTP 传输下每个客户端 IP 每分钟的最大请求数
     "rate_limit_rpm": 100,
     // HTTP 请求体的最大字节数
-    "max_request_size_bytes": 1048576
+    "max_request_size_bytes": 1048576,
+    // Express 的 "trust proxy" 设置。false（默认）= req.ip 为直接 socket 对端（回环精确）；
+    // true = 采信前置反向代理设置的 X-Forwarded-For。仅在受信任的代理之后启用。
+    "trust_proxy": false
   },
 
   // 自动注入载荷预算（用于 memory://inject 资源）
@@ -1703,6 +1706,8 @@ Authorization: Bearer <your-token>
 
 token 值从 `transport.http.bearer_token_env`（默认：`BHGBRAIN_TOKEN`）命名的环境变量中读取。如果环境变量未设置，所有 HTTP 请求都会被放行（会记录警告，但不强制认证——对于仅回环绑定这是可接受的）。
 
+提交的 token 会使用恒定时间比较（`crypto.timingSafeEqual`）与配置的密钥进行比对，因此不匹配时不会泄露关于首个差异字节位置的时间信息。长度与配置密钥不同的 token 会立即安全失败关闭，不会尝试恒定时间比较。
+
 **外部绑定的安全失败关闭：** 如果 HTTP 主机为非回环地址（非 `127.0.0.1`、`localhost` 或 `::1`）且未配置 token，服务器**拒绝启动**：
 
 ```
@@ -1734,15 +1739,28 @@ SECURITY: HTTP binding to "0.0.0.0" is externally reachable but no bearer token 
 
 确保在此配置中设置了 `BHGBRAIN_TOKEN`。
 
+### 代理信任
+
+`security.trust_proxy`（默认 `false`）会直接传给 Express 的 `app.set('trust proxy', ...)`，从而控制 `req.ip` 的推导方式，也就决定了速率限制器所依据的身份：
+
+- **禁用（默认）：** `req.ip` 为直接 socket 对端地址。这对文档中仅回环的部署方式是精确的。如果前面仍然放置了反向代理，所有被代理的客户端都会被合并为代理的单一 IP，并且调用方提交的 `X-Forwarded-For` 头会被忽略（因此无法被伪造来拆分或规避速率限制）。
+- **启用：** `req.ip` 会采信直接对端设置的 `X-Forwarded-For`。仅应在您信任其正确设置该头部的反向代理之后启用——在没有受信任代理的情况下启用会让任何客户端伪造其速率限制身份。
+
+```json
+{ "security": { "trust_proxy": true } }
+```
+
 ### 速率限制
 
 HTTP 请求按客户端 IP 地址进行速率限制：
 
 - 默认：每分钟 100 次请求（`security.rate_limit_rpm`）
-- 速率限制状态以受信任的 IP 为键（而非 `x-client-id` 头部）
+- 速率限制状态以受信任的 IP 为键（依据上方 `security.trust_proxy` 推导，而非 `x-client-id` 头部）
 - 超出限制的客户端收到 HTTP 429 和 `{ error: { code: "RATE_LIMITED", retryable: true } }`
+- 无法推导出客户端 IP 的请求会以 HTTP 400（`INVALID_INPUT`）安全失败关闭，而不是共享单一的兜底桶
 - 响应头包含 `X-RateLimit-Limit` 和 `X-RateLimit-Remaining`
 - 每 30 秒清扫一次过期的速率限制桶
+- 速率限制状态按服务器/中间件实例隔离，因此独立实例（例如测试中）永远不会共享桶
 
 ### 请求大小限制
 

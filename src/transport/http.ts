@@ -23,6 +23,11 @@ export function createHttpServer(
 
   const app = express();
 
+  // Controls how `req.ip` / `req.ips` are derived from `X-Forwarded-For`.
+  // Default `false` means the direct socket peer is used (loopback-accurate);
+  // enable only behind a trusted reverse proxy that sets forwarding headers.
+  app.set('trust proxy', config.security.trust_proxy);
+
   app.use(express.json({ limit: config.security.max_request_size_bytes }));
 
   // Health endpoint (no auth required)

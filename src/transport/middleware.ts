@@ -1,8 +1,24 @@
+import { timingSafeEqual } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import type { BrainConfig } from '../config/index.js';
 import { redactToken } from '../health/logger.js';
 import type pino from 'pino';
 import type { MetricsCollector } from '../health/metrics.js';
+
+/**
+ * Constant-time comparison of two strings. Returns false immediately (without
+ * calling into `timingSafeEqual`) when the lengths differ, since
+ * `timingSafeEqual` throws on unequal-length buffers. The length itself is an
+ * inherent, low-value signal that this guard does not attempt to hide.
+ */
+function constantTimeEquals(a: string, b: string): boolean {
+  const bufferA = Buffer.from(a, 'utf8');
+  const bufferB = Buffer.from(b, 'utf8');
+  if (bufferA.length !== bufferB.length) {
+    return false;
+  }
+  return timingSafeEqual(bufferA, bufferB);
+}
 
 // -- Bearer auth middleware --
 
@@ -31,7 +47,7 @@ export function createAuthMiddleware(config: BrainConfig, logger: pino.Logger) {
     }
 
     const match = authHeader.match(/^Bearer\s+(.+)$/i);
-    if (!match || match[1] !== expectedToken) {
+    if (!match || !constantTimeEquals(match[1], expectedToken)) {
       logger.warn({ event: 'auth_failed', token_preview: match?.[1] ? redactToken(match[1]) : 'none' });
       res.status(401).json({
         error: { code: 'AUTH_REQUIRED', message: 'Invalid bearer token', retryable: false },
@@ -45,22 +61,32 @@ export function createAuthMiddleware(config: BrainConfig, logger: pino.Logger) {
 
 // -- Rate limiting middleware --
 
-const clientBuckets = new Map<string, { count: number; resetAt: number }>();
-let lastRateLimitSweepAt = 0;
+export type RateLimitMiddleware = ((req: Request, res: Response, next: NextFunction) => void) & {
+  /** Instance-scoped reset hook for tests. Clears only this middleware's buckets. */
+  resetForTests(): void;
+};
 
-export function resetRateLimitStateForTests(): void {
-  clientBuckets.clear();
-  lastRateLimitSweepAt = 0;
+/**
+ * Derive the client identity used for rate limiting. `req.ip` reflects
+ * Express's `trust proxy` setting (see `createHttpServer`): with proxy trust
+ * disabled it is the direct socket peer, and with it enabled it honors
+ * `X-Forwarded-For` from the trusted proxy. When no IP can be derived at all,
+ * the caller fails closed rather than collapsing into a shared bucket.
+ */
+function deriveRateLimitClientId(req: Request): string | undefined {
+  return req.ip || undefined;
 }
 
 export function createRateLimitMiddleware(
   config: BrainConfig,
   logger?: pino.Logger,
   metrics?: MetricsCollector,
-) {
+): RateLimitMiddleware {
   const maxRpm = config.security.rate_limit_rpm;
+  const clientBuckets = new Map<string, { count: number; resetAt: number }>();
+  let lastRateLimitSweepAt = 0;
 
-  return (req: Request, res: Response, next: NextFunction): void => {
+  const middleware = ((req: Request, res: Response, next: NextFunction): void => {
     const now = Date.now();
     const windowMs = 60_000;
     const sweepEveryMs = 30_000;
@@ -74,8 +100,20 @@ export function createRateLimitMiddleware(
       lastRateLimitSweepAt = now;
     }
 
-    const trustedClientId = req.ip ?? 'unknown';
     const clientHint = req.headers['x-client-id'] as string | undefined;
+    const trustedClientId = deriveRateLimitClientId(req);
+
+    if (!trustedClientId) {
+      logger?.warn({ event: 'rate_limit_identity_missing', client_hint: clientHint });
+      res.status(400).json({
+        error: {
+          code: 'INVALID_INPUT',
+          message: 'Unable to determine client identity for rate limiting',
+          retryable: false,
+        },
+      });
+      return;
+    }
 
     let bucket = clientBuckets.get(trustedClientId);
     if (!bucket || now >= bucket.resetAt) {
@@ -103,7 +141,14 @@ export function createRateLimitMiddleware(
     res.setHeader('X-RateLimit-Limit', maxRpm.toString());
     res.setHeader('X-RateLimit-Remaining', Math.max(0, maxRpm - bucket.count).toString());
     next();
+  }) as RateLimitMiddleware;
+
+  middleware.resetForTests = (): void => {
+    clientBuckets.clear();
+    lastRateLimitSweepAt = 0;
   };
+
+  return middleware;
 }
 
 // -- Request size limit middleware --

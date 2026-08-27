@@ -369,7 +369,11 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     // Número máximo de solicitudes por minuto por IP de cliente para transporte HTTP
     "rate_limit_rpm": 100,
     // Tamaño máximo del cuerpo de solicitudes HTTP en bytes
-    "max_request_size_bytes": 1048576
+    "max_request_size_bytes": 1048576,
+    // Configuración "trust proxy" de Express. false (predeterminado) = req.ip es el
+    // peer de socket directo (preciso para loopback); true = respeta X-Forwarded-For
+    // del proxy inverso frente al servidor. Actívalo solo detrás de un proxy confiable.
+    "trust_proxy": false
   },
 
   // Presupuesto del payload de auto-inject (para el recurso memory://inject)
@@ -1707,6 +1711,8 @@ Authorization: Bearer <your-token>
 
 El valor del token se lee desde la variable de entorno nombrada en `transport.http.bearer_token_env` (predeterminado: `BHGBRAIN_TOKEN`). Si la variable de entorno no está configurada, todas las solicitudes HTTP pasan (se registra una advertencia pero la autenticación no se aplica — para enlaces solo de loopback esto es aceptable).
 
+El token proporcionado se compara con el secreto configurado usando una comparación de tiempo constante (`crypto.timingSafeEqual`), de modo que una discrepancia no filtra información temporal sobre qué byte difiere. Los tokens con una longitud distinta a la del secreto configurado fallan de forma cerrada inmediatamente, sin intentar la comparación de tiempo constante.
+
 **Fail-closed para enlaces externos:** Si el host HTTP es no-loopback (no `127.0.0.1`, `localhost` o `::1`) y no se ha configurado ningún token, el servidor **se niega a iniciar**:
 
 ```
@@ -1738,15 +1744,28 @@ Para enlazarse a una dirección no-loopback (p.ej., para clientes remotos en una
 
 Asegúrate de que `BHGBRAIN_TOKEN` esté configurado en esta configuración.
 
+### Confianza de Proxy
+
+`security.trust_proxy` (predeterminado `false`) se pasa directamente a `app.set('trust proxy', ...)` de Express, lo que controla cómo se deriva `req.ip` y, por lo tanto, qué identidad usa el limitador de tasa:
+
+- **Deshabilitado (predeterminado):** `req.ip` es el peer de socket directo. Esto es preciso para el despliegue solo-loopback documentado. Si de todos modos hay un proxy inverso delante, todos los clientes proxied colapsan en la única IP del proxy, y los encabezados `X-Forwarded-For` suministrados por el llamador se ignoran (por lo que no pueden falsificarse para dividir o evadir límites de tasa).
+- **Habilitado:** `req.ip` respeta `X-Forwarded-For` establecido por el peer inmediato. Habilítalo solo detrás de un proxy inverso en el que confíes para establecer ese encabezado correctamente — habilitarlo sin un proxy confiable delante permite que cualquier cliente falsifique su identidad de límite de tasa.
+
+```json
+{ "security": { "trust_proxy": true } }
+```
+
 ### Límite de Tasa
 
 Las solicitudes HTTP tienen límite de tasa por dirección IP de cliente:
 
 - Predeterminado: 100 solicitudes por minuto (`security.rate_limit_rpm`)
-- El estado del límite de tasa se basa en la IP confiable (no en el encabezado `x-client-id`)
+- El estado del límite de tasa se basa en la IP confiable, derivada según `security.trust_proxy` arriba (no en el encabezado `x-client-id`)
 - Los clientes que exceden el límite reciben HTTP 429 con `{ error: { code: "RATE_LIMITED", retryable: true } }`
+- Las solicitudes sin IP de cliente derivable fallan de forma cerrada con HTTP 400 (`INVALID_INPUT`) en lugar de compartir un único cubo de reserva
 - Los encabezados de respuesta incluyen `X-RateLimit-Limit` y `X-RateLimit-Remaining`
 - Los cubos de límite de tasa expirados se barren cada 30 segundos
+- El estado del límite de tasa está delimitado por instancia de servidor/middleware, de modo que instancias independientes (p. ej. en pruebas) nunca comparten cubos
 
 ### Límite de Tamaño de Solicitud
 

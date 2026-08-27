@@ -158,6 +158,10 @@ const ConfigSchema = z.object({
     log_redaction: z.boolean().default(true),
     rate_limit_rpm: z.number().int().positive().default(100),
     max_request_size_bytes: z.number().int().positive().default(1048576),
+    // Passed directly to Express `app.set('trust proxy', ...)`. Default `false`
+    // means `req.ip` is the direct socket peer (loopback-accurate); enable only
+    // behind a trusted reverse proxy that sets `X-Forwarded-For` correctly.
+    trust_proxy: z.boolean().default(false),
   }).default({}),
   auto_inject: z.object({
     max_chars: z.number().int().positive().default(30000),

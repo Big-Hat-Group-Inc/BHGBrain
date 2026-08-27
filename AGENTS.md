@@ -162,8 +162,14 @@ Selected via `embedding.provider` in `config.json`:
 
 ## Security Considerations
 
-- **Authentication**: Bearer token for HTTP transport
-- **Rate Limiting**: IP-based with configurable limits
+- **Authentication**: Bearer token for HTTP transport, compared with a constant-time
+  check (`crypto.timingSafeEqual`) to avoid leaking timing information about the secret
+- **Rate Limiting**: IP-based with configurable limits, keyed on `req.ip` as derived per
+  `security.trust_proxy` (default `false` — direct socket peer, loopback-accurate;
+  `true` — honors `X-Forwarded-For`, only safe behind a trusted reverse proxy).
+  Limiter state is scoped per middleware/server instance, not module-global, so
+  independent instances (including in tests) never share buckets. A request with no
+  derivable client IP fails closed (HTTP 400) rather than sharing a fallback bucket.
 - **Input Validation**: Size limits, sanitization
 - **Network Binding**: Loopback-only by default
 - **Audit Logging**: All operations logged

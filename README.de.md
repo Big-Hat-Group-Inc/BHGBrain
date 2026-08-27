@@ -369,7 +369,11 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Maximale Anfragen pro Minute pro Client-IP für den HTTP-Transport
     "rate_limit_rpm": 100,
     // Maximale HTTP-Anfrage-Body-Größe in Bytes
-    "max_request_size_bytes": 1048576
+    "max_request_size_bytes": 1048576,
+    // Express-Einstellung "trust proxy". false (Standard) = req.ip ist der direkte
+    // Socket-Peer (Loopback-genau); true = X-Forwarded-For vom vorgeschalteten
+    // Reverse-Proxy berücksichtigen. Nur hinter einem vertrauenswürdigen Proxy aktivieren.
+    "trust_proxy": false
   },
 
   // Auto-Inject-Payload-Budget (für die memory://inject-Ressource)
@@ -1710,6 +1714,8 @@ Authorization: Bearer <your-token>
 
 Der Token-Wert wird aus der in `transport.http.bearer_token_env` genannten Umgebungsvariable gelesen (Standard: `BHGBRAIN_TOKEN`). Wenn die Umgebungsvariable nicht gesetzt ist, werden alle HTTP-Anfragen durchgelassen (eine Warnung wird protokolliert, aber Auth wird nicht durchgesetzt – für nur-Loopback-Bindungen ist dies akzeptabel).
 
+Das übermittelte Token wird mit einem zeitkonstanten Vergleich (`crypto.timingSafeEqual`) gegen das konfigurierte Geheimnis geprüft, sodass eine Abweichung keine Zeitinformationen darüber preisgibt, welches Byte abweicht. Tokens mit einer anderen Länge als das konfigurierte Geheimnis schlagen sofort fehl (fail-closed), ohne den zeitkonstanten Vergleich zu versuchen.
+
 **Fail-Closed für externe Bindungen:** Wenn der HTTP-Host nicht Loopback ist (nicht `127.0.0.1`, `localhost` oder `::1`) und kein Token konfiguriert ist, **verweigert der Server den Start**:
 
 ```
@@ -1741,15 +1747,28 @@ Um an eine nicht-Loopback-Adresse zu binden (z. B. für Remote-Clients in einem 
 
 Stellen Sie sicher, dass `BHGBRAIN_TOKEN` in dieser Konfiguration gesetzt ist.
 
+### Proxy-Vertrauen
+
+`security.trust_proxy` (Standard `false`) wird direkt an Express' `app.set('trust proxy', ...)` übergeben und bestimmt damit, wie `req.ip` abgeleitet wird und auf welche Identität der Rate-Limiter sich stützt:
+
+- **Deaktiviert (Standard):** `req.ip` ist der direkte Socket-Peer. Das ist für die dokumentierte, nur-Loopback-Bereitstellung korrekt. Steht dennoch ein Reverse-Proxy davor, werden alle proxierten Clients auf die einzelne IP des Proxys zusammengefasst, und vom Aufrufer gesetzte `X-Forwarded-For`-Header werden ignoriert (sie können also nicht zum Aufsplitten oder Umgehen von Rate-Limits gefälscht werden).
+- **Aktiviert:** `req.ip` berücksichtigt das vom direkten Peer gesetzte `X-Forwarded-For`. Nur hinter einem Reverse-Proxy aktivieren, dem Sie vertrauen, diesen Header korrekt zu setzen – ohne einen solchen vertrauenswürdigen Proxy davor kann jeder Client seine Rate-Limit-Identität fälschen.
+
+```json
+{ "security": { "trust_proxy": true } }
+```
+
 ### Rate Limiting
 
 HTTP-Anfragen werden pro Client-IP-Adresse rate-limitiert:
 
 - Standard: 100 Anfragen pro Minute (`security.rate_limit_rpm`)
-- Rate-Limit-Status ist auf die vertrauenswürdige IP geknüpft (nicht den `x-client-id`-Header)
+- Rate-Limit-Status ist auf die vertrauenswürdige IP geknüpft, wie oben über `security.trust_proxy` abgeleitet (nicht den `x-client-id`-Header)
 - Überschreitende Clients erhalten HTTP 429 mit `{ error: { code: "RATE_LIMITED", retryable: true } }`
+- Anfragen ohne ableitbare Client-IP schlagen fail-closed mit HTTP 400 (`INVALID_INPUT`) fehl, statt sich einen gemeinsamen Ausweich-Bucket zu teilen
 - Antwortheader enthalten `X-RateLimit-Limit` und `X-RateLimit-Remaining`
 - Abgelaufene Rate-Limit-Eimer werden alle 30 Sekunden bereinigt
+- Der Rate-Limit-Status ist pro Server-/Middleware-Instanz gekapselt, sodass unabhängige Instanzen (z. B. in Tests) sich nie Buckets teilen
 
 ### Begrenzung der Anfragegröße
 
