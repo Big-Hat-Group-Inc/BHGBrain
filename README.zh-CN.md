@@ -2,7 +2,7 @@
 
 为 MCP 客户端（Claude、Codex、OpenClaw 等）提供持久化的向量记忆存储。
 
-BHGBrain 将记忆存储在 SQLite（元数据 + 全文搜索）和 Qdrant（语义向量）中，通过 Model Context Protocol (MCP) 以 stdio 或 HTTP 方式对外暴露。其设计目标是为 AI 智能体提供一个持久化、可搜索的"第二大脑"，能够跨会话保留知识——具备完整的生命周期管理、自动去重、分层保留策略以及混合搜索能力。
+BHGBrain 将记忆存储在 SQLite（元数据 + 全文搜索）和 Qdrant（语义向量）中，通过 Model Context Protocol (MCP) 以 stdio 方式对外暴露，并额外提供基于 HTTP 的 REST API。其设计目标是为 AI 智能体提供一个持久化、可搜索的"第二大脑"，能够跨会话保留知识——具备完整的生命周期管理、自动去重、分层保留策略以及混合搜索能力。
 
 ---
 
@@ -64,7 +64,7 @@ graph TD
     subgraph Client["MCP Client<br/><i>Claude Desktop / OpenClaw / Codex</i>"]
     end
 
-    Client -->|"MCP (stdio or HTTP)"| Server
+    Client -->|"MCP (stdio) or REST (HTTP)"| Server
 
     subgraph Server["BHGBrain Server"]
         WP["Write Pipeline"]
@@ -121,7 +121,7 @@ graph TD
 | 要求 | 版本 | 说明 |
 |---|---|---|
 | Node.js | ≥ 20.0.0 | 推荐使用 LTS 版本 |
-| Qdrant | ≥ 1.9 | 必须在启动 BHGBrain 之前运行 |
+| Qdrant | ≥ 1.10 | 必须在启动 BHGBrain 之前运行。内置客户端（`@qdrant/js-client-rest` `~1.19.0`）调用 Qdrant 1.10 引入的 `query` API；较旧的服务器在语义搜索时会失败。 |
 | OpenAI API key | — | 用于嵌入（默认使用 `text-embedding-3-small`）。如果缺失，服务器将以降级模式启动。 |
 
 ---
@@ -446,6 +446,9 @@ node dist/index.js --stdio --config=/path/to/config.json
 
 ### HTTP 模式
 
+> 该传输是供脚本、健康探针和 CLI 使用的普通 REST API，**未**实现 MCP Streamable HTTP。
+> MCP 客户端请改用 stdio（参见「MCP 客户端配置」）。
+
 HTTP 默认在 `127.0.0.1:3721` 上启用。如需认证访问，启动前请设置 `BHGBRAIN_TOKEN`：
 
 ```bash
@@ -514,31 +517,19 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter（HTTP 传输）
+### OpenClaw / mcporter（stdio 传输）
 
-```json
-{
-  "mcpServers": {
-    "bhgbrain": {
-      "transport": "http",
-      "url": "http://127.0.0.1:3721",
-      "headers": {
-        "Authorization": "Bearer <your-token>"
-      }
-    }
-  }
-}
-```
-
-或者在 mcporter 支持环境变量查找时使用：
+BHGBrain **仅通过 stdio** 提供 MCP 服务。「HTTP 模式」一节描述的 HTTP 服务器是普通的
+REST API（`POST /tool/:name`、`GET /resource`），**不是** MCP Streamable HTTP 端点，
+因此 MCP 客户端无法连接它。请改为指向 `bhgbrain-server` 可执行文件：
 
 ```json
 {
   "mcpServers": {
     "bhgbrain": {
       "transport": "stdio",
-      "command": "node",
-      "args": ["C:/Temp/GitHub/BHGBrain/dist/index.js"],
+      "command": "bhgbrain-server",
+      "args": ["--stdio"],
       "env": {
         "OPENAI_API_KEY": "sk-...",
         "QDRANT_API_KEY": "..."
@@ -547,6 +538,28 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
   }
 }
 ```
+
+或者使用源码检出目录，而非全局安装的可执行文件：
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["/path/to/BHGBrain/dist/index.js", "--stdio"],
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "QDRANT_API_KEY": "..."
+      }
+    }
+  }
+}
+```
+
+> **在 WSL 或容器中运行 OpenClaw？** BHGBrain 必须安装在同一环境中。stdio 意味着客户端
+> 将服务器作为子进程启动，因此服务器不能位于另一个发行版或容器中。若要跨环境共享记忆，
+> 请让每个安装拥有各自的 SQLite，并将它们全部指向同一个 Qdrant 集群（参见「多设备记忆」）。
 
 ---
 

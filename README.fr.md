@@ -2,7 +2,7 @@
 
 Mémoire persistante avec indexation vectorielle pour les clients MCP (Claude, Codex, OpenClaw, etc.).
 
-BHGBrain stocke les souvenirs dans SQLite (métadonnées + recherche plein texte) et Qdrant (vecteurs sémantiques), et les expose via le Model Context Protocol (MCP) en mode stdio ou HTTP. Il est conçu pour offrir aux agents IA un second cerveau durable et consultable, persistant d'une session à l'autre — avec gestion complète du cycle de vie, déduplication automatique, rétention par niveaux et recherche hybride.
+BHGBrain stocke les souvenirs dans SQLite (métadonnées + recherche plein texte) et Qdrant (vecteurs sémantiques), et les expose via le Model Context Protocol (MCP) en mode stdio, complété par une API REST sur HTTP. Il est conçu pour offrir aux agents IA un second cerveau durable et consultable, persistant d'une session à l'autre — avec gestion complète du cycle de vie, déduplication automatique, rétention par niveaux et recherche hybride.
 
 ---
 
@@ -64,7 +64,7 @@ graph TD
     subgraph Client["MCP Client<br/><i>Claude Desktop / OpenClaw / Codex</i>"]
     end
 
-    Client -->|"MCP (stdio or HTTP)"| Server
+    Client -->|"MCP (stdio) or REST (HTTP)"| Server
 
     subgraph Server["BHGBrain Server"]
         WP["Write Pipeline"]
@@ -121,7 +121,7 @@ graph TD
 | Prérequis | Version | Notes |
 |---|---|---|
 | Node.js | ≥ 20.0.0 | LTS recommandé |
-| Qdrant | ≥ 1.9 | Doit être en cours d'exécution avant de démarrer BHGBrain |
+| Qdrant | ≥ 1.10 | Doit être en cours d'exécution avant de démarrer BHGBrain. Le client fourni (`@qdrant/js-client-rest` `~1.19.0`) appelle l'API `query` introduite dans Qdrant 1.10 ; les serveurs plus anciens échoueront lors de la recherche sémantique. |
 | Clé API OpenAI | — | Pour les embeddings (`text-embedding-3-small` par défaut). Le serveur démarre en mode dégradé en cas d'absence. |
 
 ---
@@ -446,6 +446,10 @@ node dist/index.js --stdio --config=/chemin/vers/config.json
 
 ### Mode HTTP
 
+> Ce transport est une simple API REST pour les scripts, les sondes de santé et la CLI.
+> Il n'implémente **pas** MCP Streamable HTTP — les clients MCP doivent utiliser stdio
+> à la place (voir « Configuration des clients MCP »).
+
 HTTP est activé par défaut sur `127.0.0.1:3721`. Définissez `BHGBRAIN_TOKEN` avant de démarrer si vous souhaitez un accès authentifié :
 
 ```bash
@@ -514,31 +518,20 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter (transport HTTP)
+### OpenClaw / mcporter (transport stdio)
 
-```json
-{
-  "mcpServers": {
-    "bhgbrain": {
-      "transport": "http",
-      "url": "http://127.0.0.1:3721",
-      "headers": {
-        "Authorization": "Bearer <votre-token>"
-      }
-    }
-  }
-}
-```
-
-Ou en utilisant la recherche de variable d'environnement si votre mcporter le prend en charge :
+BHGBrain parle MCP **uniquement via stdio**. Le serveur HTTP décrit dans « Mode HTTP »
+est une simple API REST (`POST /tool/:name`, `GET /resource`) : ce n'est *pas* un
+point de terminaison MCP Streamable HTTP, les clients MCP ne peuvent donc pas s'y
+connecter. Pointez-les plutôt vers le binaire `bhgbrain-server` :
 
 ```json
 {
   "mcpServers": {
     "bhgbrain": {
       "transport": "stdio",
-      "command": "node",
-      "args": ["C:/Temp/GitHub/BHGBrain/dist/index.js"],
+      "command": "bhgbrain-server",
+      "args": ["--stdio"],
       "env": {
         "OPENAI_API_KEY": "sk-...",
         "QDRANT_API_KEY": "..."
@@ -547,6 +540,31 @@ Ou en utilisant la recherche de variable d'environnement si votre mcporter le pr
   }
 }
 ```
+
+Ou sur une copie des sources plutôt que sur le binaire installé globalement :
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["/chemin/vers/BHGBrain/dist/index.js", "--stdio"],
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "QDRANT_API_KEY": "..."
+      }
+    }
+  }
+}
+```
+
+> **OpenClaw tourne dans WSL ou dans un conteneur ?** BHGBrain doit être installé dans
+> ce même environnement. stdio signifie que le client lance le serveur comme processus
+> enfant : le serveur ne peut donc pas résider dans une autre distribution ou un autre
+> conteneur. Pour partager la mémoire entre environnements, donnez à chaque
+> installation sa propre base SQLite et pointez-les toutes vers le même cluster Qdrant
+> (voir « Mémoire multi-appareils »).
 
 ---
 

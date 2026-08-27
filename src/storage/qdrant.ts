@@ -167,13 +167,13 @@ export class QdrantStore {
     }
 
     const perCollection = await Promise.all(targets.map(name =>
-      this.executeWithBreaker(() => this.client.search(name, {
-        vector,
+      this.executeWithBreaker(() => this.client.query(name, {
+        query: vector,
         limit,
         filter: must.length > 0 ? { must } : undefined,
         score_threshold: filters?.minScore,
         with_payload: true,
-      })).catch((err: unknown) => {
+      })).then(response => response.points).catch((err: unknown) => {
         // A target collection that no longer exists simply contributes no results.
         if (this.isNotFoundError(err)) return [];
         throw err;
@@ -201,17 +201,26 @@ export class QdrantStore {
   ): Promise<Array<{ id: string; score: number }>> {
     const name = this.collectionName(namespace, collection);
     try {
-      const results = await this.client.search(name, {
-        vector,
+      const response = await this.client.query(name, {
+        query: vector,
         limit: topK,
         filter: {
           must: [{ key: 'namespace', match: { value: namespace } }],
         },
         with_payload: false,
       });
-      return results.map(r => ({ id: r.id as string, score: r.score }));
-    } catch {
-      return [];
+      return response.points.map(r => ({ id: r.id as string, score: r.score }));
+    } catch (err) {
+      // A collection that has never been written to (namespace/collection pair
+      // with no prior memories) simply has no similar vectors. Any other
+      // failure (transport, auth, a removed client method) must not be
+      // presented to the write pipeline as "no near duplicates" - it is
+      // propagated so the caller can distinguish an empty result from a
+      // failed similarity check.
+      if (this.isNotFoundError(err)) {
+        return [];
+      }
+      throw err;
     }
   }
 

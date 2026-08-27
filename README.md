@@ -2,7 +2,7 @@
 
 Persistent, vector-backed memory for MCP clients (Claude, Codex, OpenClaw, etc.).
 
-BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (semantic vectors), exposing them over the Model Context Protocol (MCP) via stdio or HTTP. It is designed to give AI agents a durable, searchable second brain that persists across sessions - with full lifecycle management, automatic deduplication, tiered retention, and hybrid search.
+BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (semantic vectors), exposing them over the Model Context Protocol (MCP) via stdio, plus a REST API over HTTP. It is designed to give AI agents a durable, searchable second brain that persists across sessions - with full lifecycle management, automatic deduplication, tiered retention, and hybrid search.
 
 ---
 
@@ -65,7 +65,7 @@ graph TD
     subgraph Client["MCP Client<br/><i>Claude Desktop / OpenClaw / Codex</i>"]
     end
 
-    Client -->|"MCP (stdio or HTTP)"| Server
+    Client -->|"MCP (stdio) or REST (HTTP)"| Server
 
     subgraph Server["BHGBrain Server"]
         WP["Write Pipeline"]
@@ -122,7 +122,7 @@ graph TD
 | Requirement | Version | Notes |
 |---|---|---|
 | Node.js | ≥ 20.0.0 | LTS recommended |
-| Qdrant | ≥ 1.9 | Must be running before starting BHGBrain |
+| Qdrant | ≥ 1.10 | Must be running before starting BHGBrain. The bundled client (`@qdrant/js-client-rest` `~1.19.0`) calls the `query` API introduced in Qdrant 1.10; older servers will fail semantic search. |
 | OpenAI API key | - | For embeddings (`text-embedding-3-small` by default). Server starts in degraded mode if missing. |
 
 ---
@@ -493,6 +493,10 @@ node dist/index.js --stdio --config=/path/to/config.json
 
 ### HTTP mode
 
+> This transport is a plain REST API for scripts, health probes, and the CLI. It does
+> **not** implement MCP Streamable HTTP, so MCP clients must use stdio instead — see
+> [MCP Client Configuration](#mcp-client-configuration).
+
 HTTP is enabled by default on `127.0.0.1:3721`. Set `BHGBRAIN_TOKEN` before starting if you want authenticated access:
 
 ```bash
@@ -561,31 +565,20 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter (HTTP transport)
+### OpenClaw / mcporter (stdio transport)
 
-```json
-{
-  "mcpServers": {
-    "bhgbrain": {
-      "transport": "http",
-      "url": "http://127.0.0.1:3721",
-      "headers": {
-        "Authorization": "Bearer <your-token>"
-      }
-    }
-  }
-}
-```
-
-Or using environment variable lookup if your mcporter supports it:
+BHGBrain speaks MCP over **stdio only**. The HTTP server described in
+[HTTP mode](#http-mode) is a plain REST API (`POST /tool/:name`, `GET /resource`) — it
+is *not* an MCP Streamable HTTP endpoint, so MCP clients cannot connect to it. Point
+them at the `bhgbrain-server` binary instead:
 
 ```json
 {
   "mcpServers": {
     "bhgbrain": {
       "transport": "stdio",
-      "command": "node",
-      "args": ["C:/Temp/GitHub/BHGBrain/dist/index.js"],
+      "command": "bhgbrain-server",
+      "args": ["--stdio"],
       "env": {
         "OPENAI_API_KEY": "sk-...",
         "QDRANT_API_KEY": "..."
@@ -594,6 +587,30 @@ Or using environment variable lookup if your mcporter supports it:
   }
 }
 ```
+
+Or against a source checkout rather than the globally installed binary:
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["/path/to/BHGBrain/dist/index.js", "--stdio"],
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "QDRANT_API_KEY": "..."
+      }
+    }
+  }
+}
+```
+
+> **Running OpenClaw inside WSL or a container?** BHGBrain must be installed in that
+> same environment. stdio means the client spawns the server as a child process, so
+> the server cannot live in a separate distro or container. To share memory across
+> environments, give each install its own SQLite and point them all at the same Qdrant
+> cluster — see [Multi-Device Memory](#multi-device-memory).
 
 ---
 

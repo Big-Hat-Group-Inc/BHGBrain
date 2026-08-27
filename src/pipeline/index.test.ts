@@ -10,17 +10,20 @@ describe('WritePipeline NOOP handling', () => {
     pipeline: { extraction_enabled: true, fallback_to_threshold_dedup: true },
   } as unknown as BrainConfig;
 
-  const embedding: EmbeddingProvider = {
-    model: 'test-model',
-    dimensions: 2,
-    embed: vi.fn(async () => [0.1, 0.2]),
-    embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
-    healthCheck: vi.fn(async () => true),
-  };
-
+  let embedding: EmbeddingProvider;
   let storage: StorageManager;
 
   beforeEach(() => {
+    // Fresh per test: several tests reassign `embedding.embed` /
+    // `storage.qdrant.searchSimilar` to simulate failures, and those
+    // overrides must not leak into later tests.
+    embedding = {
+      model: 'test-model',
+      dimensions: 2,
+      embed: vi.fn(async () => [0.1, 0.2]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
+      healthCheck: vi.fn(async () => true),
+    };
     storage = {
       sqlite: {
         getMemoryByChecksum: vi.fn(() => null),
@@ -97,5 +100,29 @@ describe('WritePipeline NOOP handling', () => {
     expect(result[0]!.operation).toBe('ADD');
     expect(storage.writeMemoryWithoutVector).toHaveBeenCalledTimes(1);
     expect(storage.writeMemory).not.toHaveBeenCalled();
+  });
+
+  it('does not silently record a novel write when the similarity check is unavailable', async () => {
+    // searchSimilar failing (transport/auth/removed-method) must not be
+    // treated the same as "no near duplicates" - the write should fail
+    // rather than proceeding as an ADD.
+    storage.qdrant.searchSimilar = vi.fn(async () => {
+      throw new Error('vector store unavailable');
+    });
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await expect(
+      pipeline.process({
+        content: 'some content',
+        namespace: 'global',
+        collection: 'general',
+        tags: [],
+        source: 'cli',
+      }),
+    ).rejects.toThrow('vector store unavailable');
+
+    expect(storage.writeMemory).not.toHaveBeenCalled();
+    expect(storage.writeMemoryWithoutVector).not.toHaveBeenCalled();
+    expect(storage.updateMemory).not.toHaveBeenCalled();
   });
 });
