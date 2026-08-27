@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { Mock } from 'vitest';
 import { QdrantStore } from './qdrant.js';
+import { CircuitBreaker } from '../resilience/index.js';
 import type { BrainConfig } from '../config/index.js';
 import type { QdrantClient } from '@qdrant/js-client-rest';
 
@@ -16,13 +17,16 @@ type MockClient = {
   createPayloadIndex?: Mock<QdrantClient['createPayloadIndex']>;
 };
 
-function createStore(client: MockClient): QdrantStore {
+function createStore(
+  client: MockClient,
+  options?: { breaker?: CircuitBreaker; logger?: { warn: Mock } },
+): QdrantStore {
   const config = {
     embedding: { dimensions: 3 },
     qdrant: { mode: 'embedded' },
     defaults: { namespace: 'global', collection: 'general' },
   } as unknown as BrainConfig;
-  const store = new QdrantStore(config);
+  const store = new QdrantStore(config, options?.breaker, options?.logger);
   // Inject the mock transport (no breaker -> executeWithBreaker calls through).
   (store as unknown as { client: MockClient }).client = client;
   return store;
@@ -154,6 +158,60 @@ describe('QdrantStore.searchSimilar', () => {
     await expect(store.searchSimilar('global', 'work', [1, 2, 3], 10)).rejects.toThrow(
       'this.client.query is not a function',
     );
+  });
+
+  it('logs a warning when a genuine similarity-search failure occurs', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => {
+        throw new Error('transport failure');
+      }),
+    };
+    const warn = vi.fn();
+    const store = createStore(client, { logger: { warn } });
+    await expect(store.searchSimilar('global', 'work', [1, 2, 3], 10)).rejects.toThrow('transport failure');
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'similarity_search_failed',
+      namespace: 'global',
+      collection: 'work',
+      error: 'transport failure',
+    }));
+  });
+
+  it('does not log when a missing collection is treated as no similar vectors', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => {
+        const err = new Error('Collection `bhgbrain_global_work` doesn\'t exist!') as Error & { status?: number };
+        err.status = 404;
+        throw err;
+      }),
+    };
+    const warn = vi.fn();
+    const store = createStore(client, { logger: { warn } });
+    await store.searchSimilar('global', 'work', [1, 2, 3], 10);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('routes calls through the circuit breaker and reports an open circuit as a failure', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => {
+        throw new Error('transport failure');
+      }),
+    };
+    const breaker = new CircuitBreaker({ failureThreshold: 1, openWindowMs: 60_000, halfOpenProbeCount: 1 });
+    const store = createStore(client, { breaker });
+
+    // First call trips the breaker (failureThreshold: 1).
+    await expect(store.searchSimilar('global', 'work', [1, 2, 3], 10)).rejects.toThrow('transport failure');
+    expect(breaker.getState()).toBe('open');
+
+    // Second call must not reach the client at all - the open breaker short-circuits it.
+    await expect(store.searchSimilar('global', 'work', [1, 2, 3], 10)).rejects.toThrow(
+      'Qdrant circuit breaker is open',
+    );
+    expect(client.query).toHaveBeenCalledTimes(1);
   });
 });
 

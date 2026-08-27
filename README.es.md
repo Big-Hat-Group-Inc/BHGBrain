@@ -402,7 +402,7 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     "extraction_model": "gpt-4o-mini",
     // Nombre de la variable de entorno para la clave API del modelo de extracción
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
-    // Cuando es true, recurre a dedup solo por checksum si el embedding no está disponible
+    // Cuando es true, recurre a dedup por checksum + similitud de texto completo si el embedding no está disponible
     "fallback_to_threshold_dedup": true
   },
 
@@ -1061,13 +1061,16 @@ checksum = SHA-256(normalizeContent(content))
 
 #### Fase 2: Deduplicación Semántica (Similitud Vectorial)
 
-Si no se encuentra ninguna coincidencia exacta, el contenido se embede y se recuperan de Qdrant las 10 memorias existentes más similares en la colección. Basándose en las puntuaciones de similitud coseno y el nivel asignado a la memoria, se toma una de tres decisiones:
+Si no se encuentra ninguna coincidencia exacta, el contenido se embede y se recuperan de Qdrant las 10 memorias existentes más similares en la colección. Basándose en las puntuaciones de similitud coseno y el nivel asignado a la memoria, se toma una de cuatro decisiones:
 
 | Decisión | Condición | Efecto |
 |---|---|---|
 | `NOOP` | Puntuación ≥ umbral noop | El contenido se considera un duplicado; devuelve el ID de la memoria existente sin escribir |
+| `DELETE` | Puntuación ≥ umbral update **y** el contenido invalida explícitamente la coincidencia (p. ej. "ya no es cierto", "corrección:", "olvida eso") | La memoria existente se elimina y el candidato se guarda como una nueva memoria que la referencia mediante `merged_from` |
 | `UPDATE` | Puntuación ≥ umbral update | El contenido es una actualización del existente; fusiona etiquetas, actualiza contenido y checksum, preserva el ID |
 | `ADD` | Puntuación < umbral update | Memoria genuinamente nueva; crea con un nuevo UUID |
+
+El diagrama anterior muestra las rutas NOOP/UPDATE/ADD; DELETE es una variante de la ruta UPDATE que solo se toma cuando se activa la heurística de invalidación.
 
 **Umbrales de deduplicación específicos por nivel:**
 
@@ -1087,7 +1090,7 @@ El `similarity_threshold` base (por defecto 0.92) se ajusta por nivel porque las
 - El nivel de retención y la expiración se recalculan desde la clasificación del nuevo contenido
 
 **Comportamiento de reserva:**
-Si el proveedor de embeddings no está disponible y `pipeline.fallback_to_threshold_dedup: true`, el pipeline recurre a la deduplicación solo por checksum y escribe la memoria solo en SQLite (con `vector_synced: false`). La memoria estará disponible para búsqueda de texto completo pero no para búsqueda semántica hasta que se restaure la sincronización con Qdrant.
+Si el proveedor de embeddings no está disponible y `pipeline.fallback_to_threshold_dedup: true`, el pipeline pasa a una ruta de deduplicación sin vectores en lugar de fallar la escritura. Las coincidencias exactas de checksum siguen resolviéndose directamente como `NOOP`, igual que en la Fase 1. Para el resto, el pipeline usa la búsqueda de texto completo de SQLite sobre el mismo namespace/colección para encontrar la memoria existente más cercana y la puntúa con una similitud determinista de solapamiento de palabras (no la puntuación coseno vectorial); en o por encima del umbral `update` el contenido se fusiona en esa memoria (`UPDATE`, con `vector_synced: false`), de lo contrario se escribe como una nueva memoria solo en SQLite (`ADD`, `vector_synced: false`). En cualquier caso, la memoria estará disponible para búsqueda de texto completo pero no para búsqueda semántica hasta que se restaure la sincronización con Qdrant, y entrar en esta ruta registra una advertencia estructurada `degraded_write`.
 
 ---
 

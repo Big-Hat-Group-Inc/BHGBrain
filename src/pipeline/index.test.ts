@@ -31,12 +31,14 @@ describe('WritePipeline NOOP handling', () => {
           id: 'existing-id',
           summary: 'existing summary',
           type: 'semantic',
+          content: 'existing content',
           created_at: '2026-01-01T00:00:00.000Z',
           importance: 0.5,
           tags: [],
         })),
         insertMemory: vi.fn(),
         flushIfDirty: vi.fn(),
+        fullTextSearch: vi.fn(() => []),
       },
       qdrant: {
         searchSimilar: vi.fn(async () => [{ id: 'existing-id', score: 0.99 }]),
@@ -44,6 +46,7 @@ describe('WritePipeline NOOP handling', () => {
       updateMemory: vi.fn(),
       writeMemory: vi.fn(),
       writeMemoryWithoutVector: vi.fn(),
+      deleteMemory: vi.fn(async () => true),
       logAudit: vi.fn(),
     } as unknown as StorageManager;
   });
@@ -136,6 +139,138 @@ describe('WritePipeline NOOP handling', () => {
     });
 
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('classifies UPDATE and merges when similarity is below NOOP but at/above the update threshold', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'existing-id', score: 0.95 }]);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'a refinement of the existing memory',
+      namespace: 'global',
+      collection: 'general',
+      tags: ['new-tag'],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('UPDATE');
+    expect(result[0]!.merged_with_id).toBe('existing-id');
+    expect(storage.updateMemory).toHaveBeenCalledTimes(1);
+    expect(storage.writeMemory).not.toHaveBeenCalled();
+    expect(storage.logAudit).toHaveBeenCalledWith('UPDATE', 'existing-id', 'global', undefined);
+  });
+
+  it('fails when UPDATE target is missing instead of silently duplicating as ADD', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'missing-id', score: 0.95 }]);
+    storage.sqlite.getMemoryById = vi.fn(() => null);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await expect(
+      pipeline.process({
+        content: 'a refinement of a memory that has drifted out of sqlite',
+        namespace: 'global',
+        collection: 'general',
+        tags: [],
+        source: 'cli',
+      }),
+    ).rejects.toThrow('UPDATE target');
+
+    expect(storage.writeMemory).not.toHaveBeenCalled();
+    expect(storage.updateMemory).not.toHaveBeenCalled();
+  });
+
+  it('classifies DELETE and stores the correction when the candidate explicitly invalidates a similar memory', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'existing-id', score: 0.95 }]);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'That is no longer true, the deployment now uses containers.',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('DELETE');
+    expect(result[0]!.merged_with_id).toBe('existing-id');
+    expect(storage.deleteMemory).toHaveBeenCalledWith('existing-id');
+    expect(storage.writeMemory).toHaveBeenCalledTimes(1);
+    expect(storage.logAudit).toHaveBeenCalledWith('DELETE', 'existing-id', 'global', undefined);
+    expect(storage.logAudit).toHaveBeenCalledWith('ADD', result[0]!.id, 'global', undefined);
+  });
+
+  it('fails when DELETE target is missing instead of silently proceeding', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'missing-id', score: 0.95 }]);
+    storage.sqlite.getMemoryById = vi.fn(() => null);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await expect(
+      pipeline.process({
+        content: 'This is no longer true and needs correcting.',
+        namespace: 'global',
+        collection: 'general',
+        tags: [],
+        source: 'cli',
+      }),
+    ).rejects.toThrow('DELETE target');
+
+    expect(storage.deleteMemory).not.toHaveBeenCalled();
+    expect(storage.writeMemory).not.toHaveBeenCalled();
+  });
+
+  it('uses full-text similarity to choose UPDATE over ADD in fallback mode', async () => {
+    embedding.embed = vi.fn(async () => { throw new Error('embedding unavailable'); });
+    storage.sqlite.fullTextSearch = vi.fn(() => [{ id: 'existing-id', rank: 5 }]);
+    storage.sqlite.getMemoryById = vi.fn(() => ({
+      id: 'existing-id',
+      summary: 'existing summary',
+      type: 'semantic',
+      content: 'shared wording used for the fallback similarity test',
+      created_at: '2026-01-01T00:00:00.000Z',
+      importance: 0.5,
+      tags: [],
+    }));
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'shared wording used for the fallback similarity test',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('UPDATE');
+    expect(result[0]!.merged_with_id).toBe('existing-id');
+    expect(storage.updateMemory).toHaveBeenCalledTimes(1);
+    expect(storage.writeMemoryWithoutVector).not.toHaveBeenCalled();
+  });
+
+  it('falls back to ADD when full-text similarity is below the update threshold', async () => {
+    embedding.embed = vi.fn(async () => { throw new Error('embedding unavailable'); });
+    storage.sqlite.fullTextSearch = vi.fn(() => [{ id: 'existing-id', rank: 1 }]);
+    storage.sqlite.getMemoryById = vi.fn(() => ({
+      id: 'existing-id',
+      summary: 'existing summary',
+      type: 'semantic',
+      content: 'completely unrelated wording about something else entirely',
+      created_at: '2026-01-01T00:00:00.000Z',
+      importance: 0.5,
+      tags: [],
+    }));
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'brand new fallback content sharing nothing in common',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('ADD');
+    expect(storage.writeMemoryWithoutVector).toHaveBeenCalledTimes(1);
+    expect(storage.updateMemory).not.toHaveBeenCalled();
   });
 
   it('does not silently record a novel write when the similarity check is unavailable', async () => {

@@ -13,6 +13,7 @@ export class QdrantStore {
   constructor(
     private config: BrainConfig,
     private readonly breaker?: CircuitBreaker,
+    private readonly logger?: { warn: (obj: Record<string, unknown>) => void },
   ) {
     this.dimensions = config.embedding.dimensions;
 
@@ -218,25 +219,32 @@ export class QdrantStore {
   ): Promise<Array<{ id: string; score: number }>> {
     const name = this.collectionName(namespace, collection);
     try {
-      const response = await this.client.query(name, {
+      const response = await this.executeWithBreaker(() => this.client.query(name, {
         query: vector,
         limit: topK,
         filter: {
           must: [{ key: 'namespace', match: { value: namespace } }],
         },
         with_payload: false,
-      });
+      }));
       return response.points.map(r => ({ id: r.id as string, score: r.score }));
     } catch (err) {
       // A collection that has never been written to (namespace/collection pair
       // with no prior memories) simply has no similar vectors. Any other
-      // failure (transport, auth, a removed client method) must not be
-      // presented to the write pipeline as "no near duplicates" - it is
-      // propagated so the caller can distinguish an empty result from a
-      // failed similarity check.
+      // failure (transport, auth, a removed client method, an open circuit
+      // breaker) must not be presented to the write pipeline as "no near
+      // duplicates" - it is logged and propagated so the caller can
+      // distinguish an empty result from a failed similarity check instead
+      // of silently proceeding as a novel write.
       if (this.isNotFoundError(err)) {
         return [];
       }
+      this.logger?.warn({
+        event: 'similarity_search_failed',
+        namespace,
+        collection,
+        error: (err as Error).message,
+      });
       throw err;
     }
   }

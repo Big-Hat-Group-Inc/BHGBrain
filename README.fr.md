@@ -403,7 +403,7 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     "extraction_model": "gpt-4o-mini",
     // Nom de la variable d'env pour la clé API du modèle d'extraction
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
-    // Quand true, se rabat sur la déduplication par somme de contrôle uniquement si l'embedding est indisponible
+    // Quand true, se rabat sur la déduplication par somme de contrôle + similarité plein texte si l'embedding est indisponible
     "fallback_to_threshold_dedup": true
   },
 
@@ -1063,13 +1063,16 @@ checksum = SHA-256(normalizeContent(content))
 
 #### Phase 2 : Déduplication sémantique (similarité vectorielle)
 
-Si aucune correspondance exacte n'est trouvée, le contenu est intégré et les 10 souvenirs existants les plus similaires dans la collection sont récupérés depuis Qdrant. En fonction des scores de similarité cosinus et du niveau attribué au souvenir, l'une des trois décisions est prise :
+Si aucune correspondance exacte n'est trouvée, le contenu est intégré et les 10 souvenirs existants les plus similaires dans la collection sont récupérés depuis Qdrant. En fonction des scores de similarité cosinus et du niveau attribué au souvenir, l'une des quatre décisions est prise :
 
 | Décision | Condition | Effet |
 |---|---|---|
 | `NOOP` | Score ≥ seuil noop | Le contenu est considéré comme un doublon ; renvoyer l'ID du souvenir existant sans écriture |
+| `DELETE` | Score ≥ seuil update **et** le contenu invalide explicitement la correspondance (p. ex. « n'est plus vrai », « correction : », « oublie ça ») | Le souvenir existant est supprimé et le candidat est stocké comme nouveau souvenir y faisant référence via `merged_from` |
 | `UPDATE` | Score ≥ seuil update | Le contenu est une mise à jour de l'existant ; fusionner les tags, mettre à jour le contenu et la somme de contrôle, conserver l'ID |
 | `ADD` | Score < seuil update | Souvenir véritablement nouveau ; créer avec un nouvel UUID |
+
+Le diagramme ci-dessus montre les chemins NOOP/UPDATE/ADD ; DELETE est une variante du chemin UPDATE déclenchée uniquement lorsque l'heuristique d'invalidation se déclenche.
 
 **Seuils de déduplication spécifiques au niveau :**
 
@@ -1089,7 +1092,7 @@ Le `similarity_threshold` de base (par défaut 0,92) est ajusté par niveau car 
 - Le niveau de rétention et l'expiration sont recalculés à partir de la classification du nouveau contenu
 
 **Comportement de repli :**
-Si le fournisseur d'embedding est indisponible et que `pipeline.fallback_to_threshold_dedup: true`, le pipeline se rabat sur la déduplication par somme de contrôle uniquement et écrit le souvenir dans SQLite uniquement (avec `vector_synced: false`). Le souvenir sera disponible pour la recherche plein texte mais pas pour la recherche sémantique jusqu'à ce que la synchronisation Qdrant soit rétablie.
+Si le fournisseur d'embedding est indisponible et que `pipeline.fallback_to_threshold_dedup: true`, le pipeline passe sur un chemin de déduplication sans vecteur au lieu de faire échouer l'écriture. Les correspondances exactes de somme de contrôle continuent de court-circuiter vers `NOOP` comme en phase 1. Pour le reste, le pipeline utilise la recherche plein texte SQLite sur le même namespace/collection pour trouver le souvenir existant le plus proche et le note avec une similarité déterministe de chevauchement de mots (et non le score cosinus vectoriel) ; au seuil `update` ou au-delà, le contenu est fusionné dans ce souvenir (`UPDATE`, avec `vector_synced: false`), sinon il est écrit comme nouveau souvenir dans SQLite uniquement (`ADD`, `vector_synced: false`). Dans tous les cas, le souvenir est disponible pour la recherche plein texte mais pas pour la recherche sémantique jusqu'à ce que la synchronisation Qdrant soit rétablie, et l'entrée dans ce chemin journalise un avertissement structuré `degraded_write`.
 
 ---
 

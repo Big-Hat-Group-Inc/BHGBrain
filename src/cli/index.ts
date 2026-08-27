@@ -34,7 +34,7 @@ async function createContext(): Promise<ToolContext> {
   const embeddingBreaker = new CircuitBreaker(breakerOptions);
   const qdrantBreaker = new CircuitBreaker(breakerOptions);
   const metrics = new MetricsCollector(config);
-  const qdrant = new QdrantStore(config, qdrantBreaker);
+  const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
   const storage = new StorageManager(sqlite, qdrant, embedding);
 

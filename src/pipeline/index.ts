@@ -3,7 +3,7 @@ import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MemoryType, MemorySource, WriteOperation, MemoryRecord, WriteResult, RetentionTier } from '../domain/types.js';
-import { normalizeContent, computeChecksum, generateSummary, containsSecret } from '../domain/normalize.js';
+import { normalizeContent, computeChecksum, generateSummary, containsSecret, detectsInvalidation } from '../domain/normalize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { invalidInput, internal } from '../errors/index.js';
 
@@ -62,19 +62,15 @@ export class WritePipeline {
     normalized: string,
     input: { type?: MemoryType; tags: string[]; importance?: number },
   ): MemoryCandidate[] {
-    // In v1, extraction is simplified - produce single candidate
-    // LLM-based extraction would split multi-fact content into atomic candidates
-    if (!this.config.pipeline.extraction_enabled) {
-      return [{
-        content: normalized,
-        type: input.type,
-        tags: input.tags,
-        importance: input.importance,
-      }];
-    }
-
-    // For now, deterministic single-candidate extraction
-    // Full LLM extraction would use the extraction model to split content
+    // v1 extraction is deterministic and single-candidate only, regardless of
+    // `pipeline.extraction_enabled` — the config knob is reserved for a future
+    // model-backed extraction stage but has no effect on candidate count today.
+    // TODO(bootstrap-memory-core): implement LLM-backed multi-candidate
+    // extraction using `config.pipeline.extraction_model` to split multi-fact
+    // content into atomic candidates, or retire `extraction_enabled` /
+    // `extraction_model` if multi-candidate extraction stays out of scope.
+    // The multi-candidate scenario is de-scoped for v1 in
+    // `write-decision-pipeline/spec.md` until this lands.
     return [{
       content: normalized,
       type: input.type,
@@ -131,7 +127,7 @@ export class WritePipeline {
           collection: input.collection,
           error: (err as Error).message,
         });
-        return this.deterministicFallback(candidate, input, checksum, now);
+        return await this.deterministicFallback(candidate, input, checksum, now);
       }
       throw err;
     }
@@ -144,7 +140,7 @@ export class WritePipeline {
       10,
     );
 
-    const operation = this.classifyOperation(similar, tier);
+    const operation = this.classifyOperation(candidate.content, similar, tier);
     const resolvedType = candidate.type ?? 'semantic';
     const summary = generateSummary(candidate.content);
     const importance = candidate.importance ?? 0.5;
@@ -165,33 +161,90 @@ export class WritePipeline {
 
     if (operation.op === 'UPDATE' && operation.targetId) {
       const existing = this.storage.sqlite.getMemoryById(operation.targetId);
-      if (existing) {
-        const mergedTags = [...new Set([...existing.tags, ...candidate.tags])];
-        await this.storage.updateMemory(operation.targetId, {
-          content: candidate.content,
-          summary,
-          tags: mergedTags,
-          checksum,
-          importance: Math.max(existing.importance, importance),
-          retention_tier: tier,
-          expires_at: lifecycleMetadata.expires_at,
-          decay_eligible: lifecycleMetadata.decay_eligible,
-          review_due: lifecycleMetadata.review_due,
-          last_operation: 'UPDATE',
-          updated_at: now,
-        }, vector);
-
-        this.storage.logAudit('UPDATE', operation.targetId, input.namespace, input.clientId);
-
-        return {
-          id: operation.targetId,
-          summary,
-          type: existing.type,
-          operation: 'UPDATE',
-          merged_with_id: operation.targetId,
-          created_at: existing.created_at,
-        };
+      if (!existing) {
+        // A drifted store (Qdrant returned a target SQLite no longer has) must
+        // surface as an error, never silently degrade into a duplicate ADD.
+        throw internal(`UPDATE target ${operation.targetId} not found`);
       }
+
+      const mergedTags = [...new Set([...existing.tags, ...candidate.tags])];
+      await this.storage.updateMemory(operation.targetId, {
+        content: candidate.content,
+        summary,
+        tags: mergedTags,
+        checksum,
+        importance: Math.max(existing.importance, importance),
+        retention_tier: tier,
+        expires_at: lifecycleMetadata.expires_at,
+        decay_eligible: lifecycleMetadata.decay_eligible,
+        review_due: lifecycleMetadata.review_due,
+        last_operation: 'UPDATE',
+        updated_at: now,
+      }, vector);
+
+      this.storage.logAudit('UPDATE', operation.targetId, input.namespace, input.clientId);
+
+      return {
+        id: operation.targetId,
+        summary,
+        type: existing.type,
+        operation: 'UPDATE',
+        merged_with_id: operation.targetId,
+        created_at: existing.created_at,
+      };
+    }
+
+    if (operation.op === 'DELETE' && operation.targetId) {
+      const existing = this.storage.sqlite.getMemoryById(operation.targetId);
+      if (!existing) {
+        throw internal(`DELETE target ${operation.targetId} not found`);
+      }
+
+      // Candidate explicitly invalidates the prior memory: remove the stale
+      // record and persist the correction as a new memory, linked back via
+      // `merged_from`/`merged_with_id` so the replacement lineage is visible.
+      await this.storage.deleteMemory(operation.targetId);
+      this.storage.logAudit('DELETE', operation.targetId, input.namespace, input.clientId);
+
+      const id = uuidv4();
+      const mem: Omit<MemoryRecord, 'embedding'> = {
+        id,
+        namespace: input.namespace,
+        collection: input.collection,
+        type: resolvedType,
+        category: input.category ?? null,
+        content: candidate.content,
+        summary,
+        tags: candidate.tags,
+        source: input.source,
+        checksum,
+        importance,
+        retention_tier: tier,
+        expires_at: lifecycleMetadata.expires_at,
+        decay_eligible: lifecycleMetadata.decay_eligible,
+        review_due: lifecycleMetadata.review_due,
+        access_count: 0,
+        last_operation: 'DELETE',
+        merged_from: operation.targetId,
+        archived: false,
+        vector_synced: true,
+        device_id: input.device_id ?? null,
+        created_at: now,
+        updated_at: now,
+        last_accessed: now,
+      };
+
+      await this.storage.writeMemory(mem, vector);
+      this.storage.logAudit('ADD', id, input.namespace, input.clientId);
+
+      return {
+        id,
+        summary,
+        type: resolvedType,
+        operation: 'DELETE',
+        merged_with_id: operation.targetId,
+        created_at: now,
+      };
     }
 
     // ADD: new memory
@@ -236,6 +289,7 @@ export class WritePipeline {
   }
 
   private classifyOperation(
+    candidateContent: string,
     similar: Array<{ id: string; score: number }>,
     tier: RetentionTier,
   ): { op: WriteOperation; targetId?: string } {
@@ -244,6 +298,12 @@ export class WritePipeline {
     const top = similar[0]!;
     const thresholds = this.lifecycle.dedupThresholdFor(tier, this.config.deduplication.similarity_threshold);
 
+    // An explicit invalidation ("no longer true", "correction:", ...) tied to
+    // a sufficiently similar prior memory takes DELETE over NOOP/UPDATE — see
+    // "Candidate invalidation results in DELETE" in write-decision-pipeline/spec.md.
+    if (top.score >= thresholds.update && detectsInvalidation(candidateContent)) {
+      return { op: 'DELETE', targetId: top.id };
+    }
     if (top.score >= thresholds.noop) {
       return { op: 'NOOP', targetId: top.id };
     }
@@ -253,7 +313,28 @@ export class WritePipeline {
     return { op: 'ADD' };
   }
 
-  private deterministicFallback(
+  /**
+   * Deterministic, embedding-free similarity proxy used by
+   * `deterministicFallback` when no vector is available. Token-set Jaccard
+   * similarity over lowercased word sets — cheap, dependency-free, and
+   * comparable (0..1) to the cosine-similarity thresholds configured for the
+   * normal embedding path, even though the two are not the same metric.
+   */
+  private textSimilarity(a: string, b: string): number {
+    const tokenize = (s: string): Set<string> => new Set(s.toLowerCase().split(/\W+/).filter(Boolean));
+    const setA = tokenize(a);
+    const setB = tokenize(b);
+    if (setA.size === 0 || setB.size === 0) return 0;
+
+    let intersection = 0;
+    for (const token of setA) {
+      if (setB.has(token)) intersection++;
+    }
+    const union = setA.size + setB.size - intersection;
+    return union === 0 ? 0 : intersection / union;
+  }
+
+  private async deterministicFallback(
     candidate: MemoryCandidate,
     input: {
       namespace: string;
@@ -266,11 +347,17 @@ export class WritePipeline {
     },
     checksum: string,
     now: string,
-  ): WriteResult {
-    // No embedding available: just ADD with zero vector
-    const id = uuidv4();
+  ): Promise<WriteResult> {
+    // No embedding available: fall back to a vectorless similarity proxy
+    // (namespace/collection-scoped full-text search + token-set Jaccard
+    // similarity) so a degraded window still threshold-branches between
+    // UPDATE and ADD instead of unconditionally ADDing every candidate —
+    // see "High-similarity candidate yields UPDATE in fallback mode" /
+    // "Below-threshold candidate yields ADD in fallback mode" in
+    // write-decision-pipeline/spec.md.
     const resolvedType = candidate.type ?? 'semantic';
     const summary = generateSummary(candidate.content);
+    const importance = candidate.importance ?? 0.5;
     const tier = this.lifecycle.assignTier({
       category: input.category,
       source: input.source,
@@ -280,7 +367,57 @@ export class WritePipeline {
       explicitTier: input.retention_tier,
     });
     const lifecycleMetadata = this.lifecycle.buildMetadata(tier, new Date(now));
+    const thresholds = this.lifecycle.dedupThresholdFor(tier, this.config.deduplication.similarity_threshold);
 
+    let updateTargetId: string | undefined;
+    const ftsMatches = this.storage.sqlite.fullTextSearch(input.namespace, candidate.content, 5, input.collection);
+    if (ftsMatches.length > 0) {
+      const top = ftsMatches[0]!;
+      const existing = this.storage.sqlite.getMemoryById(top.id);
+      if (existing && this.textSimilarity(candidate.content, existing.content) >= thresholds.update) {
+        updateTargetId = top.id;
+      }
+    }
+
+    if (updateTargetId) {
+      const existing = this.storage.sqlite.getMemoryById(updateTargetId);
+      if (!existing) {
+        throw internal(`Fallback UPDATE target ${updateTargetId} not found`);
+      }
+
+      const mergedTags = [...new Set([...existing.tags, ...candidate.tags])];
+      // No vector to upsert: the merged content now diverges from whatever
+      // vector (if any) Qdrant holds for this id, so the row is explicitly
+      // marked unsynced rather than left falsely reporting a clean sync.
+      await this.storage.updateMemory(updateTargetId, {
+        content: candidate.content,
+        summary,
+        tags: mergedTags,
+        checksum,
+        importance: Math.max(existing.importance, importance),
+        retention_tier: tier,
+        expires_at: lifecycleMetadata.expires_at,
+        decay_eligible: lifecycleMetadata.decay_eligible,
+        review_due: lifecycleMetadata.review_due,
+        last_operation: 'UPDATE',
+        vector_synced: false,
+        updated_at: now,
+      });
+
+      this.storage.logAudit('UPDATE', updateTargetId, input.namespace, input.clientId);
+
+      return {
+        id: updateTargetId,
+        summary,
+        type: existing.type,
+        operation: 'UPDATE',
+        merged_with_id: updateTargetId,
+        created_at: existing.created_at,
+      };
+    }
+
+    // Below threshold (or no candidates at all): ADD with no vector.
+    const id = uuidv4();
     const mem: Omit<MemoryRecord, 'embedding'> = {
       id,
       namespace: input.namespace,
@@ -292,7 +429,7 @@ export class WritePipeline {
       tags: candidate.tags,
       source: input.source,
       checksum,
-      importance: candidate.importance ?? 0.5,
+      importance,
       retention_tier: tier,
       expires_at: lifecycleMetadata.expires_at,
       decay_eligible: lifecycleMetadata.decay_eligible,

@@ -29,3 +29,26 @@ const SECRET_PATTERNS = [
 export function containsSecret(content: string): boolean {
   return SECRET_PATTERNS.some(p => p.test(content));
 }
+
+// Deterministic phrase heuristics that flag a candidate as explicitly
+// invalidating a prior memory (vs. simply refining/extending it). Used by
+// the write-decision pipeline to reach the DELETE operation — see
+// `write-decision-pipeline/spec.md`, "Candidate invalidation results in
+// DELETE". Deliberately conservative: these are v1 deterministic triggers,
+// not semantic understanding, so they only fire on explicit correction
+// language rather than trying to infer intent from arbitrary rewrites.
+const INVALIDATION_PATTERNS = [
+  /\bno longer\b/i,
+  /\bnot true anymore\b/i,
+  /\bis outdated\b/i,
+  /\b(that|this)('|’)s (wrong|incorrect|false)\b/i,
+  /\b(correction|retraction|retract)\s*[:\-]/i,
+  /\bforget (that|this|what i said)\b/i,
+  /\bdelete (that|this)( memory| fact)?\b/i,
+  /\bwas incorrect\b/i,
+  /\bactually,? (that|this) (is|was) (wrong|false|incorrect)\b/i,
+];
+
+export function detectsInvalidation(content: string): boolean {
+  return INVALIDATION_PATTERNS.some(p => p.test(content));
+}

@@ -402,7 +402,7 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "extraction_model": "gpt-4o-mini",
     // Name der Umgebungsvariable für den API-Schlüssel des Extraktionsmodells
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
-    // Wenn true, Fallback auf nur-Prüfsummen-Deduplizierung, falls Einbettung nicht verfügbar
+    // Wenn true, Fallback auf Prüfsummen- + Volltext-Ähnlichkeits-Deduplizierung, falls Einbettung nicht verfügbar
     "fallback_to_threshold_dedup": true
   },
 
@@ -1063,13 +1063,16 @@ checksum = SHA-256(normalizeContent(content))
 
 #### Phase 2: Semantische Deduplizierung (Vektorähnlichkeit)
 
-Wenn keine exakte Übereinstimmung gefunden wird, wird der Inhalt eingebettet und die 10 ähnlichsten vorhandenen Erinnerungen in der Sammlung werden aus Qdrant abgerufen. Basierend auf Kosinus-Ähnlichkeitsscores und der zugewiesenen Stufe der Erinnerung wird eine von drei Entscheidungen getroffen:
+Wenn keine exakte Übereinstimmung gefunden wird, wird der Inhalt eingebettet und die 10 ähnlichsten vorhandenen Erinnerungen in der Sammlung werden aus Qdrant abgerufen. Basierend auf Kosinus-Ähnlichkeitsscores und der zugewiesenen Stufe der Erinnerung wird eine von vier Entscheidungen getroffen:
 
 | Entscheidung | Bedingung | Auswirkung |
 |---|---|---|
 | `NOOP` | Score ≥ NOOP-Schwellenwert | Inhalt gilt als Duplikat; ID der vorhandenen Erinnerung wird ohne Schreibvorgang zurückgegeben |
+| `DELETE` | Score ≥ UPDATE-Schwellenwert **und** der Inhalt macht die Übereinstimmung explizit ungültig (z. B. "nicht mehr wahr", "Korrektur:", "vergiss das") | Die vorhandene Erinnerung wird gelöscht und der Kandidat wird als neue Erinnerung gespeichert, die über `merged_from` darauf verweist |
 | `UPDATE` | Score ≥ UPDATE-Schwellenwert | Inhalt ist eine Aktualisierung einer vorhandenen; Tags zusammenführen, Inhalt und Prüfsumme aktualisieren, ID beibehalten |
 | `ADD` | Score < UPDATE-Schwellenwert | Wirklich neue Erinnerung; mit neuer UUID erstellen |
+
+Das obige Diagramm zeigt die Pfade NOOP/UPDATE/ADD; DELETE ist eine Variante des UPDATE-Pfads, die nur ausgelöst wird, wenn die Ungültigkeits-Heuristik anschlägt.
 
 **Stufenspezifische Deduplizierungsschwellenwerte:**
 
@@ -1089,7 +1092,7 @@ Der Basis-`similarity_threshold` (Standard 0.92) wird pro Stufe angepasst, da T0
 - Aufbewahrungsstufe und Ablaufzeit werden aus der Klassifizierung des neuen Inhalts neu berechnet
 
 **Fallback-Verhalten:**
-Wenn der Einbettungsanbieter nicht verfügbar ist und `pipeline.fallback_to_threshold_dedup: true`, fällt die Pipeline auf nur-Prüfsummen-Deduplizierung zurück und schreibt die Erinnerung nur in SQLite (mit `vector_synced: false`). Die Erinnerung ist für die Volltextsuche verfügbar, aber nicht für die semantische Suche, bis die Qdrant-Synchronisation wiederhergestellt ist.
+Wenn der Einbettungsanbieter nicht verfügbar ist und `pipeline.fallback_to_threshold_dedup: true`, wechselt die Pipeline auf einen vektorlosen Dedup-Pfad, statt den Schreibvorgang fehlschlagen zu lassen. Exakte Prüfsummen-Treffer führen weiterhin sofort zu `NOOP` wie in Phase 1. Für alles andere nutzt die Pipeline die SQLite-Volltextsuche über denselben Namensraum/dieselbe Sammlung, um die ähnlichste vorhandene Erinnerung zu finden, und bewertet sie mit einer deterministischen Wortüberlappungs-Ähnlichkeit (nicht dem Vektor-Kosinuswert); bei Erreichen oder Überschreiten des `UPDATE`-Schwellenwerts wird der Inhalt in diese Erinnerung zusammengeführt (`UPDATE`, mit `vector_synced: false`), andernfalls wird er als neue Erinnerung nur in SQLite geschrieben (`ADD`, `vector_synced: false`). In beiden Fällen ist die Erinnerung für die Volltextsuche verfügbar, aber nicht für die semantische Suche, bis die Qdrant-Synchronisation wiederhergestellt ist, und das Erreichen dieses Pfads protokolliert eine strukturierte `degraded_write`-Warnung.
 
 ---
 

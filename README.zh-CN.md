@@ -401,7 +401,7 @@ BHGBrain 从以下位置加载配置文件：
     "extraction_model": "gpt-4o-mini",
     // 提取模型 API key 的环境变量名称
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
-    // 为 true 时，若嵌入不可用则回退到仅校验和去重
+    // 为 true 时，若嵌入不可用则回退到校验和 + 全文相似度去重
     "fallback_to_threshold_dedup": true
   },
 
@@ -1056,13 +1056,16 @@ checksum = SHA-256(normalizeContent(content))
 
 #### 第二阶段：语义去重（向量相似度）
 
-如果没有找到精确匹配，则对内容进行嵌入，并从 Qdrant 中检索集合内最相似的前 10 条现有记忆。基于余弦相似度得分和记忆分配的层级，做出以下三种决策之一：
+如果没有找到精确匹配，则对内容进行嵌入，并从 Qdrant 中检索集合内最相似的前 10 条现有记忆。基于余弦相似度得分和记忆分配的层级，做出以下四种决策之一：
 
 | 决策 | 条件 | 效果 |
 |---|---|---|
 | `NOOP` | 得分 ≥ noop 阈值 | 内容被视为重复；返回现有记忆的 ID 而不写入 |
+| `DELETE` | 得分 ≥ update 阈值**且**内容明确使匹配项失效（例如"不再正确"、"更正："、"忘记那个"） | 删除现有记忆，候选内容作为新记忆存储，并通过 `merged_from` 引用被删除的记忆 |
 | `UPDATE` | 得分 ≥ update 阈值 | 内容是对现有内容的更新；合并标签、更新内容和校验和，保留 ID |
 | `ADD` | 得分 < update 阈值 | 全新记忆；使用新 UUID 创建 |
+
+上图展示的是 NOOP/UPDATE/ADD 路径；DELETE 是 UPDATE 路径的一个变体，仅在失效启发式规则触发时才会走这条路径。
 
 **各层级的去重阈值：**
 
@@ -1082,7 +1085,7 @@ checksum = SHA-256(normalizeContent(content))
 - 保留层级和过期时间根据新内容的分类结果重新计算
 
 **回退行为：**
-如果嵌入提供商不可用且 `pipeline.fallback_to_threshold_dedup: true`，管道回退到仅校验和去重，并仅将记忆写入 SQLite（`vector_synced: false`）。该记忆在 Qdrant 同步恢复之前可用于全文搜索，但不可用于语义搜索。
+如果嵌入提供商不可用且 `pipeline.fallback_to_threshold_dedup: true`，管道会降级到无向量的去重路径，而不是让写入失败。精确校验和匹配仍会像第一阶段一样直接短路为 `NOOP`。对于其他情况，管道使用 SQLite 全文搜索在同一命名空间/集合内查找最接近的现有记忆，并用确定性的词汇重叠相似度（而非向量余弦得分）为其打分；达到或超过 `update` 阈值时，内容会合并到该记忆中（`UPDATE`，`vector_synced: false`），否则会作为新记忆仅写入 SQLite（`ADD`，`vector_synced: false`）。无论哪种情况，该记忆在 Qdrant 同步恢复之前都可用于全文搜索，但不可用于语义搜索，并且进入此路径会记录一条结构化的 `degraded_write` 警告。
 
 ---
 

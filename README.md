@@ -449,7 +449,7 @@ The file is created automatically on first run with all defaults applied. Edit i
     "extraction_model": "gpt-4o-mini",
     // Env var name for the extraction model API key
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
-    // When true, fall back to checksum-only dedup if embedding is unavailable
+    // When true, fall back to checksum + full-text-similarity dedup if embedding is unavailable
     "fallback_to_threshold_dedup": true
   },
 
@@ -1111,13 +1111,16 @@ checksum = SHA-256(normalizeContent(content))
 
 #### Phase 2: Semantic Deduplication (Vector Similarity)
 
-If no exact match is found, the content is embedded and the top 10 most similar existing memories in the collection are retrieved from Qdrant. Based on cosine similarity scores and the memory's assigned tier, one of three decisions is made:
+If no exact match is found, the content is embedded and the top 10 most similar existing memories in the collection are retrieved from Qdrant. Based on cosine similarity scores and the memory's assigned tier, one of four decisions is made:
 
 | Decision | Condition | Effect |
 |---|---|---|
 | `NOOP` | Score ≥ noop threshold | Content is considered a duplicate; return the existing memory's ID without writing |
+| `DELETE` | Score ≥ update threshold **and** the content explicitly invalidates the match (e.g. "no longer true", "correction:", "forget that") | The existing memory is deleted and the candidate is stored as a new memory referencing it via `merged_from` |
 | `UPDATE` | Score ≥ update threshold | Content is an update of existing; merge tags, update content and checksum, preserve ID |
 | `ADD` | Score < update threshold | Genuinely new memory; create with a new UUID |
+
+The diagram above shows the NOOP/UPDATE/ADD paths; DELETE is a variant of the UPDATE path taken only when the invalidation heuristic fires.
 
 **Tier-specific deduplication thresholds:**
 
@@ -1137,7 +1140,7 @@ The base `similarity_threshold` (default 0.92) is adjusted per tier because T0/T
 - Retention tier and expiry are recalculated from the new content's classification
 
 **Fallback behavior:**
-If the embedding provider is unavailable and `pipeline.fallback_to_threshold_dedup: true`, the pipeline falls back to checksum-only deduplication and writes the memory to SQLite only (with `vector_synced: false`). The memory will be available for fulltext search but not semantic search until Qdrant sync is restored.
+If the embedding provider is unavailable and `pipeline.fallback_to_threshold_dedup: true`, the pipeline degrades to a vectorless dedup path instead of failing the write. Exact-checksum matches still short-circuit to `NOOP` as in Phase 1. For everything else, the pipeline uses SQLite full-text search over the same namespace/collection to find the closest existing memory and scores it with a deterministic word-overlap similarity (not the vector cosine score); at or above the `update` threshold the content is merged into that memory (`UPDATE`, with `vector_synced: false`), otherwise it is written as a new memory in SQLite only (`ADD`, `vector_synced: false`). Either way the memory is available for fulltext search but not semantic search until Qdrant sync is restored, and entering this path logs a structured `degraded_write` warning.
 
 ---
 
