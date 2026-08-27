@@ -1,3 +1,4 @@
+import type pino from 'pino';
 import type { BrainConfig } from '../config/index.js';
 import type { HealthSnapshot, HealthStatus, ComponentHealth, VectorReconciliationStatus } from '../domain/types.js';
 import type { StorageManager } from '../storage/index.js';
@@ -17,6 +18,7 @@ export class HealthService {
     private embedding: EmbeddingProvider,
     private config: BrainConfig,
     private breakers: Record<string, CircuitBreaker> = {},
+    private logger?: pino.Logger,
   ) {}
 
   async check(): Promise<HealthSnapshot> {
@@ -75,7 +77,13 @@ export class HealthService {
         ? { status: 'healthy' }
         : { status: 'unhealthy', message: 'Qdrant unreachable' };
     } catch (err) {
-      return { status: 'unhealthy', message: (err as Error).message };
+      const message = (err as Error).message;
+      // Log the raw failure reason so an operator reading structured logs can
+      // tell a retrieval-path failure (e.g. "this.client.query is not a
+      // function") from a plain connectivity failure (e.g. ECONNREFUSED),
+      // not just an operator polling /health and reading the message field.
+      this.logger?.warn({ event: 'qdrant_health_check_failed', message });
+      return { status: 'unhealthy', message };
     }
   }
 

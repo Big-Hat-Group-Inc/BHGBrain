@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import type pino from 'pino';
 import { HealthService } from './index.js';
 import { DegradedEmbeddingProvider } from '../embedding/index.js';
 import { CircuitBreaker } from '../resilience/index.js';
@@ -261,6 +262,23 @@ describe('HealthService', () => {
     expect(result.status).toBe('degraded');
     expect(result.components.qdrant.status).toBe('unhealthy');
     expect(result.components.qdrant.message).toBe('this.client.query is not a function');
+  });
+
+  it('logs the qdrant retrieval failure reason to structured logs (task 2.2)', async () => {
+    const storage = createStorage();
+    storage.qdrant.healthCheck = vi.fn(async () => {
+      throw new TypeError('this.client.query is not a function');
+    });
+    const warn = vi.fn();
+    const logger = { warn } as unknown as pino.Logger;
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig(), {}, logger);
+    await health.check();
+
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'qdrant_health_check_failed',
+      message: 'this.client.query is not a function',
+    }));
   });
 
   it('reports unhealthy when sqlite is unavailable', async () => {

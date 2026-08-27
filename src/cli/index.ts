@@ -44,7 +44,7 @@ async function createContext(): Promise<ToolContext> {
   const healthService = new HealthService(storage, embedding, config, {
     [getEmbeddingBreakerKey(config.embedding.provider)]: embeddingBreaker,
     qdrant: qdrantBreaker,
-  });
+  }, logger);
 
   return { config, storage, embedding, pipeline, search: searchService, backup: backupService, health: healthService, metrics, logger };
 }

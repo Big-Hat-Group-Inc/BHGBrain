@@ -81,7 +81,7 @@ async function main() {
   const healthService = new HealthService(storage, embedding, config, {
     [embeddingBreakerKey]: embeddingBreaker,
     qdrant: qdrantBreaker,
-  });
+  }, logger);
 
   // Scheduled cleanup: same execution path as `bhgbrain gc`, run on
   // `retention.cleanup_schedule` for the lifetime of this long-running

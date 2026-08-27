@@ -8,7 +8,7 @@
 ## 2. Health service wiring
 
 - [x] 2.1 Confirm the probe call site at `src/health/index.ts:72` still maps a `false` result to a non-healthy `qdrant` component and that `computeOverall` (`src/health/index.ts:144-153`) degrades overall status accordingly.
-- [x] 2.2 Confirm the failure reason reaches structured logs so an operator can tell a retrieval failure from a connectivity failure.
+- [x] 2.2 Confirm the failure reason reaches structured logs so an operator can tell a retrieval failure from a connectivity failure. (Correction: this box was previously checked but the premise did not hold — `HealthService` had no logger wired in at all, so the qdrant failure `message` only ever reached the `/health` JSON body, never Pino. Fixed: added an optional `logger` param to `HealthService`, wired from `src/index.ts` and `src/cli/index.ts`; `checkQdrant()` now emits `logger.warn({ event: 'qdrant_health_check_failed', message })` on failure, carrying the raw error text that already distinguishes a retrieval-path failure like "this.client.query is not a function" from a connectivity failure like ECONNREFUSED. Covered by a new test in `src/health/index.test.ts`.)
 
 ## 3. Regression coverage
 
