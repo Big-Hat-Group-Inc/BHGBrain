@@ -1520,7 +1520,7 @@ sequenceDiagram
             S->>DB: Hot-reload in-memory SQLite
             S->>DB: Run schema migrations
             DB-->>S: Ready
-            S-->>C: memory_count, activated: true
+            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
         end
     end
 ```
@@ -1599,11 +1599,13 @@ JSON 头部包含：
 2. 将嵌入的 SQLite 数据库原子性写入数据目录（先写临时文件再重命名）。
 3. 从恢复的文件热重载内存中的 SQLite 数据库，无需重启进程。
 4. 对重新加载的数据库运行 schema 迁移以确保向前兼容。
-5. 返回 `{ memory_count: <count>, activated: true }`。
+5. 根据实际漂移（drift）对向量进行协调（见下文），并返回 `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`。
 
-**恢复是实时的：** 恢复的数据库立即生效。无需重启服务器。响应包含 `activated: true` 以确认这一点。
+**恢复是实时的：** 恢复的数据库立即生效。无需重启服务器。响应包含 `metadata_activated: true` 以确认这一点。
 
-**并发恢复保护：** 如果恢复操作已在进行中，后续恢复请求返回 `INVALID_INPUT: Backup restore already in progress`。
+**向量协调仅针对实际漂移，且有边界限制。** 恢复不会无条件清空并重新嵌入整个语料库：它会将每条恢复记忆的内容校验和与 Qdrant 中已存储的向量进行比较，只将新增或内容发生变化的记忆标记为需要重新嵌入。如果自备份创建以来嵌入模型/维度发生了变化，或无法读取 Qdrant 的现有状态，恢复会转而执行完整重建。一旦漂移检查完成，恢复生命周期锁即被释放——如果没有任何漂移，`vector_reconciliation.state` 会立即变为 `"reconciled"`；如果漂移子集的重新嵌入需要在调用已经返回之后，在一个有边界的后台任务（每轮有超时和批次上限，并带有自动重试）中继续进行，则为 `"reconciling"`。可轮询 `health://status`（`components.vector_reconciliation`）以观察其完成情况。
+
+**并发恢复保护：** 如果恢复操作已在进行中，后续恢复请求返回 `INVALID_INPUT: Backup restore already in progress`。该锁仅覆盖元数据激活和漂移检查阶段，不包括后台重新嵌入，因此即使是大规模恢复也会很快释放。
 
 ---
 
@@ -2240,8 +2242,18 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 
 **`restore` 输出：**
 ```json
-{ "memory_count": 1234, "activated": true }
+{
+  "memory_count": 1234,
+  "metadata_activated": true,
+  "vector_reconciliation": {
+    "status": "degraded",
+    "state": "reconciling",
+    "unsynced_vectors": 42,
+    "message": "Restore activated SQLite metadata; vector reconciliation for the drifted subset is continuing in the background."
+  }
+}
 ```
+当没有向量真正发生漂移（无需重新嵌入）时，`vector_reconciliation.state` 为 `"reconciled"`；当一个有边界的后台任务正在重新嵌入漂移或缺失的子集时，为 `"reconciling"`。参见[从备份恢复](#从备份恢复)。
 
 ---
 
@@ -2343,7 +2355,11 @@ bhgbrain backup create
 
 ### 备份恢复激活
 
-`backup.restore` 在返回成功之前重新加载运行时 SQLite 状态。当恢复的数据立即生效时，恢复响应包含 `activated: true`。服务器无需重启。
+`backup.restore` 在返回成功之前重新加载运行时 SQLite 状态。当恢复的数据立即生效时，恢复响应包含 `metadata_activated: true`。服务器无需重启。
+
+恢复操作会获取一个故障保护锁（`beginRestoreOperation()`），该锁仅在 SQLite 被激活以及恢复的向量针对 Qdrant 进行漂移检查期间阻止并发写入。向量**不会**被无条件清空并重新嵌入：只有内容校验和与 Qdrant 中不一致（或在其中缺失）的记忆才会被标记为需要重新嵌入，因此无漂移的恢复完成时甚至不会调用嵌入提供方。如果自备份创建以来嵌入模型/维度发生了变化，或无法读取 Qdrant 的现有状态，恢复会转而执行完整重建。
+
+漂移检查完成后，该锁即被释放——对漂移子集（如果有）的重新嵌入会在一个有边界的后台任务（每轮有超时和批次上限）中运行，而不会拖住恢复调用或在此期间阻塞其他写入。遇到暂时性故障时会自动带退避重试；如果始终未能完全追上进度，`health://status` 会持续报告 `vector_reconciliation.state: "pending"`（或在某轮任务进行中时报告 `"reconciling"`），而不是悄无声息地让语义搜索为空。进度会按批次粒度落盘，因此进程在协调过程中被强制终止最多只会丢失一个批次的工作——重启后会通过幂等的重新 upsert，安全地从剩余未同步集合继续。
 
 ### HTTP 安全加固
 

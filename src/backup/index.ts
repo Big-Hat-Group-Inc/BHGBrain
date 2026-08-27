@@ -8,9 +8,39 @@ import type { BackupInfo, RestoreResult, VectorReconciliationStatus } from '../d
 import { BrainError, invalidInput, internal } from '../errors/index.js';
 import type pino from 'pino';
 
+// Backups are intentionally SQLite-only: the `.bhgb` file is a JSON header
+// plus a raw export of the SQLite database, and deliberately contains no
+// vector data. Qdrant vectors are always rebuilt from the restored SQLite
+// content (reconciled against drift, see restoreVectorStateAfterActivation
+// below) rather than bundled into the backup artifact. This keeps backups
+// small and portable and avoids coupling the backup format to a specific
+// vector store's snapshot format; see openspec/changes/
+// bound-restore-reconciliation/design.md for the reasoning.
+const BACKUP_FORMAT_VERSION = 1;
+
+interface BackupHeader {
+  version: number;
+  memory_count: number;
+  checksum: string;
+  embedding_model?: string;
+  embedding_dimensions?: number;
+}
+
 export class BackupService {
   private backupDir: string;
   private restoreInProgress = false;
+  // Set once restoreVectorStateAfterActivation has already released the
+  // restore lifecycle lock (or decided reconciliation needs no lock at all),
+  // so the outer restore()'s finally block does not try to release it again.
+  private restoreLockReleased = false;
+
+  // Bounds for the reconciliation pass that runs *after* the lifecycle lock
+  // has been released, so a slow/hanging embedding provider blocks neither
+  // the restore call nor other writers.
+  private static readonly BACKGROUND_RECONCILE_TIMEOUT_MS = 60_000;
+  private static readonly BACKGROUND_RECONCILE_MAX_BATCHES = 500;
+  private static readonly BACKGROUND_RECONCILE_MAX_RETRIES = 3;
+  private static readonly BACKGROUND_RECONCILE_RETRY_DELAY_MS = 5_000;
 
   constructor(
     private config: BrainConfig,
@@ -30,9 +60,11 @@ export class BackupService {
       const memoryCount = this.storage.sqlite.countMemories();
       const checksum = createHash('sha256').update(dbData).digest('hex');
 
-      // Write backup as a simple format: JSON header + db data
+      // Write backup as a simple format: JSON header + db data. This format
+      // is intentionally SQLite-only (see the BACKUP_FORMAT_VERSION comment
+      // above) — no vectors are included.
       const header = JSON.stringify({
-        version: 1,
+        version: BACKUP_FORMAT_VERSION,
         memory_count: memoryCount,
         checksum,
         created_at: new Date().toISOString(),
@@ -86,11 +118,7 @@ export class BackupService {
       const data = readFileSync(backupPath);
       const headerLen = data.readUInt32LE(0);
       const headerJson = data.subarray(4, 4 + headerLen).toString('utf-8');
-      const header = JSON.parse(headerJson) as {
-        version: number;
-        memory_count: number;
-        checksum: string;
-      };
+      const header = JSON.parse(headerJson) as BackupHeader;
 
       const dbData = data.subarray(4 + headerLen);
       const checksum = createHash('sha256').update(dbData).digest('hex');
@@ -117,7 +145,7 @@ export class BackupService {
       }
 
       const activeCount = this.storage.sqlite.countMemories();
-      const vectorReconciliation = await this.restoreVectorStateAfterActivation(activeCount);
+      const vectorReconciliation = await this.restoreVectorStateAfterActivation(activeCount, header);
       this.logger?.info({
         event: 'backup_restore_complete',
         path: backupPath,
@@ -137,11 +165,7 @@ export class BackupService {
       throw internal(`Backup restore failed: ${(err as Error).message}`);
     } finally {
       if (restoreGuardAcquired) {
-        try {
-          this.storage.sqlite.endLifecycleOperation('restore');
-        } finally {
-          this.restoreInProgress = false;
-        }
+        this.endRestoreLifecycleLock();
       }
     }
   }
@@ -158,25 +182,27 @@ export class BackupService {
     }
 
     this.restoreInProgress = true;
+    this.restoreLockReleased = false;
   }
 
-  private async restoreVectorStateAfterActivation(memoryCount: number): Promise<VectorReconciliationStatus> {
+  // Idempotent: safe to call once after drift detection completes (to free
+  // the lock before the potentially slow re-embed) and again from the outer
+  // restore() `finally` (covers every path that returns before reaching that
+  // point, e.g. activation failure or drift-detection failure).
+  private endRestoreLifecycleLock(): void {
+    if (this.restoreLockReleased) return;
+    this.restoreLockReleased = true;
     try {
-      this.storage.markAllMemoriesVectorSync(false, { allowDuringLifecycle: true });
-    } catch (err) {
-      return this.toPendingVectorReconciliation(err, 'backup_restore_vector_invalidation_pending');
+      this.storage.sqlite.endLifecycleOperation('restore');
+    } finally {
+      this.restoreInProgress = false;
     }
-
-    try {
-      await this.storage.clearManagedVectors();
-    } catch (err) {
-      return this.toPendingVectorReconciliation(err, 'backup_restore_vector_clear_pending');
-    }
-
-    return this.reconcileVectorsAfterRestore(memoryCount);
   }
 
-  private async reconcileVectorsAfterRestore(memoryCount: number): Promise<VectorReconciliationStatus> {
+  private async restoreVectorStateAfterActivation(
+    memoryCount: number,
+    header: BackupHeader,
+  ): Promise<VectorReconciliationStatus> {
     if (memoryCount === 0) {
       return {
         status: 'healthy',
@@ -185,24 +211,118 @@ export class BackupService {
       };
     }
 
+    let outcome: Awaited<ReturnType<StorageManager['detectAndMarkVectorDrift']>>;
     try {
-      const result = await this.storage.reconcileVectorsFromSqlite({ batchSize: 100, allowDuringLifecycle: true });
-      if (result.remaining > 0) {
-        return {
-          status: 'degraded',
-          state: 'pending',
-          unsynced_vectors: result.remaining,
-          message: 'Restore activated SQLite metadata, but vector reconciliation is still pending.',
-        };
-      }
+      outcome = await this.storage.detectAndMarkVectorDrift({
+        // Legacy backups written before this field existed have no recorded
+        // embedding model/dimensions; treat that as "unchanged" rather than
+        // forcing every such restore into a full rebuild — checksum-based
+        // drift detection still runs and self-heals any real mismatch.
+        expectedEmbeddingModel: header.embedding_model ?? this.config.embedding.model,
+        expectedEmbeddingDimensions: header.embedding_dimensions ?? this.config.embedding.dimensions,
+        allowDuringLifecycle: true,
+      });
+    } catch (err) {
+      this.endRestoreLifecycleLock();
+      return this.toPendingVectorReconciliation(err, 'backup_restore_vector_drift_detection_pending');
+    }
+
+    // The only lock-scoped work is the drift check above (a few bounded
+    // SQLite/Qdrant reads). The potentially slow, unbounded part —
+    // re-embedding drifted memories — has not started yet, so the restore
+    // lifecycle lock is released here instead of being held for it.
+    this.endRestoreLifecycleLock();
+
+    if (outcome.driftedCount === 0) {
+      this.logger?.info({ event: 'backup_restore_vector_no_drift', mode: outcome.mode });
       return {
         status: 'healthy',
         state: 'reconciled',
         unsynced_vectors: 0,
       };
-    } catch (err) {
-      return this.toPendingVectorReconciliation(err, 'backup_restore_vector_reconciliation_pending');
     }
+
+    this.logger?.info({
+      event: 'backup_restore_vector_drift_detected',
+      mode: outcome.mode,
+      drifted_count: outcome.driftedCount,
+    });
+
+    this.scheduleBackgroundReconciliation();
+
+    return {
+      status: 'degraded',
+      state: 'reconciling',
+      unsynced_vectors: outcome.driftedCount,
+      message: outcome.mode === 'full-rebuild'
+        ? 'Restore activated SQLite metadata; the embedding model or dimensions changed since this backup, so vectors are being fully rebuilt in the background.'
+        : 'Restore activated SQLite metadata; vector reconciliation for the drifted subset is continuing in the background.',
+    };
+  }
+
+  // Bounded background reconciliation: released from the restore lifecycle
+  // lock, this runs `reconcileVectorsFromSqlite` under its own timeout/batch
+  // cap and, if unsynced memories remain (bound reached, or a transient
+  // Qdrant/embedding failure), automatically retries with a short backoff up
+  // to BACKGROUND_RECONCILE_MAX_RETRIES. It never holds the restore lock,
+  // is safe to interleave with other writers, and always resumes from
+  // whatever `listMemoriesNeedingVectorSync` currently reports — so it is
+  // resumable even across a process restart (the next reconcile trigger,
+  // whether another restore or an explicit repair, simply picks up the
+  // remaining unsynced set).
+  private scheduleBackgroundReconciliation(attempt = 1): void {
+    this.storage.setBackgroundReconciliationActive(true);
+    void this.runBackgroundReconciliation(attempt);
+  }
+
+  private async runBackgroundReconciliation(attempt: number): Promise<void> {
+    try {
+      const result = await this.storage.reconcileVectorsFromSqlite({
+        batchSize: 100,
+        timeoutMs: BackupService.BACKGROUND_RECONCILE_TIMEOUT_MS,
+        maxBatches: BackupService.BACKGROUND_RECONCILE_MAX_BATCHES,
+      });
+      this.logger?.info({
+        event: 'backup_restore_background_reconcile',
+        reconciled: result.reconciled,
+        remaining: result.remaining,
+        bound_reached: result.boundReached,
+        attempt,
+      });
+      if (result.remaining > 0) {
+        this.retryOrGiveUp(attempt);
+      } else {
+        this.storage.setBackgroundReconciliationActive(false);
+      }
+    } catch (err) {
+      this.logger?.warn?.({
+        event: 'backup_restore_background_reconcile_failed',
+        error: (err as Error).message,
+        attempt,
+      });
+      this.retryOrGiveUp(attempt);
+    }
+  }
+
+  private retryOrGiveUp(attempt: number): void {
+    if (attempt >= BackupService.BACKGROUND_RECONCILE_MAX_RETRIES) {
+      this.logger?.warn?.({
+        event: 'backup_restore_background_reconcile_retries_exhausted',
+        attempts: attempt,
+        unsynced_vectors: this.storage.sqlite.countUnsyncedVectors(),
+      });
+      // Auto-retry is exhausted, but search is not left blank with no
+      // recovery path: health reports a degraded "pending" vector
+      // reconciliation state (see HealthService.checkVectorReconciliation)
+      // for as long as unsynced vectors remain, and any later restore or
+      // reconciliation trigger resumes from the same unsynced set.
+      this.storage.setBackgroundReconciliationActive(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.scheduleBackgroundReconciliation(attempt + 1);
+    }, BackupService.BACKGROUND_RECONCILE_RETRY_DELAY_MS);
+    timer.unref?.();
   }
 
   private toPendingVectorReconciliation(

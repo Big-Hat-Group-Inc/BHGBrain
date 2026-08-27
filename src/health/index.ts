@@ -123,6 +123,18 @@ export class HealthService {
       };
     }
 
+    // Restore releases the lifecycle lock before the (bounded) re-embed
+    // runs, so `lifecycleOperation` alone no longer covers the in-flight
+    // window; the background reconciliation flag picks up where it left off.
+    if (this.storage.isBackgroundReconciliationActive()) {
+      return {
+        status: 'degraded',
+        state: 'reconciling',
+        unsynced_vectors: unsyncedVectors,
+        message: 'Bounded background vector reconciliation is in progress.',
+      };
+    }
+
     if (unsyncedVectors > 0) {
       return {
         status: 'degraded',

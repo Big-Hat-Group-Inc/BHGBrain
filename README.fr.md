@@ -1526,7 +1526,7 @@ sequenceDiagram
             S->>DB: Hot-reload in-memory SQLite
             S->>DB: Run schema migrations
             DB-->>S: Ready
-            S-->>C: memory_count, activated: true
+            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
         end
     end
 ```
@@ -1605,11 +1605,13 @@ Renvoie :
 2. Écrire atomiquement la base de données SQLite intégrée dans le répertoire de données (écriture-vers-temp-puis-renommage).
 3. Recharger à chaud la base de données SQLite en mémoire depuis le fichier restauré sans redémarrer le processus.
 4. Exécuter les migrations de schéma sur la base de données rechargée pour assurer la compatibilité ascendante.
-5. Renvoyer `{ memory_count: <count>, activated: true }`.
+5. Réconcilier les vecteurs par rapport à la dérive (drift) réelle (voir ci-dessous) et renvoyer `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
 
-**La restauration est en direct :** La base de données restaurée est immédiatement active. Il n'est pas nécessaire de redémarrer le serveur. La réponse inclut `activated: true` pour le confirmer.
+**La restauration est en direct :** La base de données restaurée est immédiatement active. Il n'est pas nécessaire de redémarrer le serveur. La réponse inclut `metadata_activated: true` pour le confirmer.
 
-**Protection contre les restaurations simultanées :** Si une restauration est déjà en cours, les demandes de restauration ultérieures renvoient `INVALID_INPUT: Backup restore already in progress`.
+**La réconciliation des vecteurs ne porte que sur la dérive réelle et est bornée.** La restauration ne vide pas et ne réintègre pas inconditionnellement l'intégralité du corpus : elle compare la somme de contrôle du contenu de chaque mémoire restaurée au vecteur déjà stocké dans Qdrant et ne marque pour un nouvel embedding que les mémoires nouvelles ou dont le contenu a changé. Si le modèle/les dimensions d'embedding ont changé depuis la création de la sauvegarde, ou si l'état de Qdrant ne peut pas être lu, la restauration bascule à la place sur une reconstruction complète. Une fois cette vérification de dérive terminée, le verrou de cycle de vie de la restauration est libéré — `vector_reconciliation.state` vaut `"reconciled"` immédiatement si rien n'a dérivé, ou `"reconciling"` si le réembedding du sous-ensemble en dérive se poursuit dans une tâche d'arrière-plan bornée (un délai d'expiration et un plafond de lots par passage, avec des relances automatiques) après que l'appel a déjà renvoyé sa réponse. Interrogez `health://status` (`components.vector_reconciliation`) pour suivre son achèvement.
+
+**Protection contre les restaurations simultanées :** Si une restauration est déjà en cours, les demandes de restauration ultérieures renvoient `INVALID_INPUT: Backup restore already in progress`. Ce verrou ne couvre que l'activation des métadonnées et la vérification de dérive, pas le réembedding en arrière-plan, il est donc libéré rapidement même pour une restauration volumineuse.
 
 ---
 
@@ -2246,8 +2248,18 @@ Créer, lister ou restaurer des sauvegardes de mémoire.
 
 **Sortie `restore` :**
 ```json
-{ "memory_count": 1234, "activated": true }
+{
+  "memory_count": 1234,
+  "metadata_activated": true,
+  "vector_reconciliation": {
+    "status": "degraded",
+    "state": "reconciling",
+    "unsynced_vectors": 42,
+    "message": "Restore activated SQLite metadata; vector reconciliation for the drifted subset is continuing in the background."
+  }
+}
 ```
+`vector_reconciliation.state` vaut `"reconciled"` quand aucun vecteur n'a réellement dérivé (rien à réintégrer), ou `"reconciling"` tant qu'une tâche d'arrière-plan bornée réintègre le sous-ensemble en dérive ou manquant. Voir [Restauration depuis une sauvegarde](#restauration-depuis-une-sauvegarde).
 
 ---
 
@@ -2349,7 +2361,11 @@ La sauvegarde est stockée dans le répertoire de données (`%LOCALAPPDATA%\BHGB
 
 ### Activation de la restauration de sauvegarde
 
-`backup.restore` recharge l'état SQLite en cours d'exécution avant de renvoyer le succès. Les réponses de restauration incluent `activated: true` lorsque les données restaurées sont immédiatement actives. Il n'est pas nécessaire de redémarrer le serveur.
+`backup.restore` recharge l'état SQLite en cours d'exécution avant de renvoyer le succès. Les réponses de restauration incluent `metadata_activated: true` lorsque les données restaurées sont immédiatement actives. Il n'est pas nécessaire de redémarrer le serveur.
+
+La restauration acquiert un verrou de sécurité (`beginRestoreOperation()`) qui ne bloque les écritures concurrentes que le temps que SQLite soit activé et que les vecteurs restaurés soient vérifiés pour dérive par rapport à Qdrant. Les vecteurs ne sont **pas** vidés et réintégrés inconditionnellement : seules les mémoires dont la somme de contrôle du contenu diffère de Qdrant (ou en est absente) sont marquées pour un nouvel embedding, de sorte qu'une restauration sans dérive s'achève sans même appeler le fournisseur d'embeddings. Si le modèle/les dimensions d'embedding ont changé depuis la prise de la sauvegarde, ou si l'état de Qdrant ne peut pas être lu, la restauration bascule à la place sur une reconstruction complète.
+
+Une fois la vérification de dérive terminée, le verrou est libéré — le réembedding du sous-ensemble en dérive (le cas échéant) s'exécute dans une tâche d'arrière-plan bornée (un délai d'expiration et un plafond de lots par passage) au lieu de retenir l'appel de restauration ou de bloquer les autres écritures pendant sa durée. Il relance automatiquement avec un backoff en cas d'échec transitoire ; s'il ne rattrape jamais complètement son retard, `health://status` continue de signaler `vector_reconciliation.state: "pending"` (ou `"reconciling"` pendant qu'un passage est en cours) plutôt que de laisser silencieusement la recherche sémantique vide. La progression est vidée sur disque par lot, de sorte qu'un plantage brutal pendant la réconciliation ne perd au plus qu'un lot de travail — au redémarrage, on reprend en toute sécurité à partir de l'ensemble non synchronisé restant grâce à un ré-upsert idempotent.
 
 ### Renforcement HTTP
 

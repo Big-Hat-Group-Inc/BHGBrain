@@ -1524,7 +1524,7 @@ sequenceDiagram
             S->>DB: Hot-reload in-memory SQLite
             S->>DB: Run schema migrations
             DB-->>S: Ready
-            S-->>C: memory_count, activated: true
+            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
         end
     end
 ```
@@ -1603,11 +1603,13 @@ Devuelve:
 2. Escribir atómicamente la base de datos SQLite embebida en el directorio de datos (escritura-en-temporal-luego-renombrar).
 3. Recargar en caliente la base de datos SQLite en memoria desde el archivo restaurado sin reiniciar el proceso.
 4. Ejecutar migraciones de esquema en la base de datos recargada para garantizar compatibilidad futura.
-5. Devolver `{ memory_count: <count>, activated: true }`.
+5. Reconciliar los vectores contra el drift real (ver abajo) y devolver `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
 
-**La restauración es en vivo:** La base de datos restaurada está inmediatamente activa. No es necesario reiniciar el servidor. La respuesta incluye `activated: true` para confirmar esto.
+**La restauración es en vivo:** La base de datos restaurada está inmediatamente activa. No es necesario reiniciar el servidor. La respuesta incluye `metadata_activated: true` para confirmar esto.
 
-**Protección contra restauración concurrente:** Si ya hay una restauración en progreso, las solicitudes de restauración posteriores devuelven `INVALID_INPUT: Backup restore already in progress`.
+**La reconciliación de vectores es solo por drift y está acotada.** La restauración no vacía y reincrusta incondicionalmente todo el corpus: compara el checksum de contenido de cada memoria restaurada con el vector ya almacenado en Qdrant y marca para reincrustación solo las memorias nuevas o cuyo contenido cambió. Si el modelo/dimensiones de embedding cambiaron desde que se creó la copia de seguridad, o el estado de Qdrant no se puede leer, la restauración recurre a una reconstrucción completa. Una vez que termina esta comprobación de drift, se libera el bloqueo del ciclo de vida de restauración — `vector_reconciliation.state` es `"reconciled"` de inmediato si nada cambió, o `"reconciling"` si la reincrustación del subconjunto con drift continúa en una tarea de fondo acotada (un timeout y un límite de lotes por pasada, con reintentos automáticos) después de que la llamada ya haya devuelto la respuesta. Consulta `health://status` (`components.vector_reconciliation`) para ver cuándo termina.
+
+**Protección contra restauración concurrente:** Si ya hay una restauración en progreso, las solicitudes de restauración posteriores devuelven `INVALID_INPUT: Backup restore already in progress`. Ese bloqueo solo cubre la activación de metadatos y la comprobación de drift, no la reincrustación en segundo plano, así que se libera rápidamente incluso en una restauración grande.
 
 ---
 
@@ -2244,8 +2246,18 @@ Crea, lista o restaura copias de seguridad de memorias.
 
 **Salida de `restore`:**
 ```json
-{ "memory_count": 1234, "activated": true }
+{
+  "memory_count": 1234,
+  "metadata_activated": true,
+  "vector_reconciliation": {
+    "status": "degraded",
+    "state": "reconciling",
+    "unsynced_vectors": 42,
+    "message": "Restore activated SQLite metadata; vector reconciliation for the drifted subset is continuing in the background."
+  }
+}
 ```
+`vector_reconciliation.state` es `"reconciled"` cuando ningún vector tuvo drift real (nada que reincrustar), o `"reconciling"` mientras una tarea de fondo acotada reincrusta el subconjunto con drift o faltante. Ver [Restauración desde una Copia de Seguridad](#restauración-desde-una-copia-de-seguridad).
 
 ---
 
@@ -2347,7 +2359,11 @@ La copia de seguridad se almacena en el directorio de datos (`%LOCALAPPDATA%\BHG
 
 ### Activación de Restauración de Copia de Seguridad
 
-`backup.restore` recarga el estado SQLite en tiempo de ejecución antes de devolver el éxito. Las respuestas de restauración incluyen `activated: true` cuando los datos restaurados están inmediatamente activos. No es necesario reiniciar el servidor.
+`backup.restore` recarga el estado SQLite en tiempo de ejecución antes de devolver el éxito. Las respuestas de restauración incluyen `metadata_activated: true` cuando los datos restaurados están inmediatamente activos. No es necesario reiniciar el servidor.
+
+La restauración adquiere un bloqueo de seguridad (`beginRestoreOperation()`) que solo bloquea las escrituras concurrentes mientras SQLite se activa y los vectores restaurados se comprueban contra Qdrant en busca de drift. Los vectores **no** se vacían y reincrustan incondicionalmente: solo se marcan para reincrustación las memorias cuyo checksum de contenido difiere de (o falta en) Qdrant, de modo que una restauración sin drift se completa sin llamar en absoluto al proveedor de embeddings. Si el modelo/dimensiones de embedding cambiaron desde que se tomó la copia de seguridad, o el estado de Qdrant no se puede leer, la restauración recurre en su lugar a una reconstrucción completa.
+
+Una vez que termina la comprobación de drift, se libera el bloqueo — la reincrustación del subconjunto con drift (si lo hay) se ejecuta en una tarea de fondo acotada (un timeout y un límite de lotes por pasada) en lugar de retener la llamada de restauración o bloquear otras escrituras durante ese tiempo. Reintenta automáticamente con backoff ante fallos transitorios; si nunca llega a ponerse al día del todo, `health://status` sigue reportando `vector_reconciliation.state: "pending"` (o `"reconciling"` mientras una pasada está en curso) en lugar de dejar la búsqueda semántica en blanco silenciosamente. El progreso se vuelca a disco por lotes, así que un fallo brusco durante la reconciliación pierde como máximo un lote de trabajo — al reiniciar se reanuda de forma segura desde el conjunto no sincronizado restante mediante un re-upsert idempotente.
 
 ### Fortalecimiento HTTP
 

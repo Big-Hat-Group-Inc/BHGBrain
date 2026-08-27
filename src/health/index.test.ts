@@ -92,6 +92,7 @@ describe('HealthService', () => {
       qdrant: {
         healthCheck: vi.fn(async () => true),
       },
+      isBackgroundReconciliationActive: vi.fn(() => false),
     } as unknown as StorageManager;
   }
 
@@ -257,6 +258,24 @@ describe('HealthService', () => {
       state: 'reconciling',
       unsynced_vectors: 2,
       message: 'Restore is active and vector reconciliation is in progress.',
+    });
+  });
+
+  it('reports reconciling while bounded background reconciliation runs after the restore lock is released', async () => {
+    const storage = createStorage();
+    storage.sqlite.getLifecycleOperation = vi.fn(() => null);
+    storage.sqlite.countUnsyncedVectors = vi.fn(() => 5);
+    storage.isBackgroundReconciliationActive = vi.fn(() => true);
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.status).toBe('degraded');
+    expect(result.components.vector_reconciliation).toEqual({
+      status: 'degraded',
+      state: 'reconciling',
+      unsynced_vectors: 5,
+      message: 'Bounded background vector reconciliation is in progress.',
     });
   });
 });

@@ -7,12 +7,42 @@ import { internal, conflict } from '../errors/index.js';
 
 type MemoryRecordWithoutEmbedding = Omit<MemoryRecord, 'embedding'>;
 
+export interface VectorDriftReconciliationOutcome {
+  // 'no-drift': every restored memory's vector already matches Qdrant; nothing
+  //   was cleared or marked unsynced.
+  // 'partial-drift': only the memories whose content checksum differs from (or
+  //   is missing in) Qdrant were marked unsynced for re-embedding.
+  // 'full-rebuild': drift could not be reliably determined (embedding model or
+  //   dimensions changed, or Qdrant state was unreadable), so every memory was
+  //   marked unsynced and managed collections were cleared.
+  mode: 'no-drift' | 'partial-drift' | 'full-rebuild';
+  driftedCount: number;
+}
+
+export interface ReconcileVectorsResult {
+  reconciled: number;
+  remaining: number;
+  // true when the timeout or batch cap stopped the run before every unsynced
+  // memory was processed; callers should treat `remaining > 0` as "resume me".
+  boundReached: boolean;
+}
+
 export class StorageManager {
+  private backgroundReconciliationActive = false;
+
   constructor(
     public readonly sqlite: SqliteStore,
     public readonly qdrant: QdrantStore,
     public readonly embedding: EmbeddingProvider,
   ) {}
+
+  isBackgroundReconciliationActive(): boolean {
+    return this.backgroundReconciliationActive;
+  }
+
+  setBackgroundReconciliationActive(active: boolean): void {
+    this.backgroundReconciliationActive = active;
+  }
 
   async init(): Promise<void> {
     await this.sqlite.init();
@@ -235,14 +265,126 @@ export class StorageManager {
     return this.qdrant.clearManagedCollections();
   }
 
+  /**
+   * Reads back the checksum payload field for every point in every managed
+   * Qdrant collection. Used to detect drift without paying any embedding
+   * cost: a point whose stored checksum matches the restored SQLite row's
+   * checksum did not change and does not need to be re-embedded. Points
+   * written before this field existed simply have no entry here, which the
+   * caller treats as "needs re-embedding" (self-healing on first reconcile).
+   */
+  async collectExistingVectorChecksums(): Promise<Map<string, string>> {
+    const collections = await this.qdrant.listAllCollections();
+    const checksums = new Map<string, string>();
+    for (const name of collections) {
+      const points = await this.qdrant.scrollAll(name);
+      for (const point of points) {
+        const checksum = point.payload.checksum;
+        if (typeof checksum === 'string') {
+          checksums.set(point.id, checksum);
+        }
+      }
+    }
+    return checksums;
+  }
+
+  /**
+   * Reconciles restored vector state against actual drift instead of
+   * unconditionally re-embedding the whole corpus. Falls back to marking the
+   * whole corpus unsynced (a full rebuild) only when drift cannot be
+   * reliably determined:
+   *  - the embedding model or dimensions changed since the backup was
+   *    created, in which case the existing vectors are the wrong
+   *    dimensionality for the current provider regardless of content, so
+   *    managed collections are also cleared (there is no usable vector to
+   *    preserve — a query against them would fail dimension checks anyway);
+   *  - Qdrant's existing state could not be read, in which case the
+   *    embedding space is unchanged and the existing vectors are left in
+   *    place (not cleared) so search keeps using them until reconciliation
+   *    individually replaces each one.
+   */
+  async detectAndMarkVectorDrift(options: {
+    expectedEmbeddingModel: string;
+    expectedEmbeddingDimensions: number;
+    allowDuringLifecycle?: boolean;
+  }): Promise<VectorDriftReconciliationOutcome> {
+    const modelChanged = options.expectedEmbeddingModel !== this.embedding.model
+      || options.expectedEmbeddingDimensions !== this.embedding.dimensions;
+
+    if (modelChanged) {
+      await this.clearManagedVectors();
+      const driftedCount = this.markAllMemoriesVectorSync(false, {
+        allowDuringLifecycle: options.allowDuringLifecycle,
+      });
+      return { mode: 'full-rebuild', driftedCount };
+    }
+
+    let existingChecksums: Map<string, string>;
+    try {
+      existingChecksums = await this.collectExistingVectorChecksums();
+    } catch {
+      // Qdrant state could not be read reliably, so per-memory drift can't be
+      // trusted; every memory is marked unsynced so reconciliation re-embeds
+      // and upserts (idempotently overwriting) the whole corpus. Unlike the
+      // model-change branch above, the embedding space itself hasn't
+      // changed, so the existing vectors are still dimensionally valid and
+      // are deliberately left in place — search keeps using them until each
+      // is individually replaced by the (bounded, resumable) reconciliation
+      // pass, instead of being destroyed up front on what may be a
+      // transient read failure.
+      const driftedCount = this.markAllMemoriesVectorSync(false, {
+        allowDuringLifecycle: options.allowDuringLifecycle,
+      });
+      return { mode: 'full-rebuild', driftedCount };
+    }
+
+    const rows = this.sqlite.listMemoryChecksums();
+    const driftedIds = rows
+      .filter(row => existingChecksums.get(row.id) !== row.checksum)
+      .map(row => row.id);
+
+    if (driftedIds.length > 0) {
+      this.sqlite.markVectorsSyncBatch(driftedIds, false, {
+        allowDuringLifecycle: options.allowDuringLifecycle,
+      });
+      this.sqlite.flushIfDirty();
+    }
+
+    return {
+      mode: driftedIds.length === 0 ? 'no-drift' : 'partial-drift',
+      driftedCount: driftedIds.length,
+    };
+  }
+
   async reconcileVectorsFromSqlite(
-    options?: { batchSize?: number; allowDuringLifecycle?: boolean },
-  ): Promise<{ reconciled: number; remaining: number }> {
+    options?: {
+      batchSize?: number;
+      allowDuringLifecycle?: boolean;
+      // Bounds so a slow/hanging embedding provider cannot hold this loop
+      // open indefinitely. When either bound is hit, the method returns with
+      // `boundReached: true` and `remaining > 0`; a later call resumes from
+      // the same unsynced set (it is re-queried from scratch each call).
+      timeoutMs?: number;
+      maxBatches?: number;
+    },
+  ): Promise<ReconcileVectorsResult> {
     const batchSize = options?.batchSize ?? 100;
+    const startedAt = Date.now();
     let cursor: string | undefined;
     let reconciled = 0;
+    let batches = 0;
+    let boundReached = false;
 
     while (true) {
+      if (options?.timeoutMs !== undefined && Date.now() - startedAt >= options.timeoutMs) {
+        boundReached = true;
+        break;
+      }
+      if (options?.maxBatches !== undefined && batches >= options.maxBatches) {
+        boundReached = true;
+        break;
+      }
+
       const memories = this.sqlite.listMemoriesNeedingVectorSync(batchSize, cursor);
       if (memories.length === 0) {
         break;
@@ -274,12 +416,19 @@ export class StorageManager {
           });
           reconciled++;
         } catch (err) {
+          // Durability is bounded at batch granularity, not per item: this
+          // flush persists every mark completed so far in *this* batch (plus
+          // any prior batches) so a hard crash right after this point loses
+          // at most the remainder of the in-flight batch. Restart resumes
+          // from `listMemoriesNeedingVectorSync`, and `upsert`/`markVectorSync`
+          // are both idempotent, so replaying the lost slice is always safe.
           this.sqlite.flushIfDirty();
           throw err;
         }
       }
 
       this.sqlite.flushIfDirty();
+      batches++;
 
       if (memories.length < batchSize) {
         break;
@@ -288,7 +437,7 @@ export class StorageManager {
       cursor = `${last.created_at}|${last.id}`;
     }
 
-    return { reconciled, remaining: this.sqlite.countUnsyncedVectors() };
+    return { reconciled, remaining: this.sqlite.countUnsyncedVectors(), boundReached };
   }
 
   logAudit(
@@ -347,7 +496,7 @@ function toQdrantPayload(
   mem: Pick<
     MemoryRecordWithoutEmbedding,
     'type' | 'tags' | 'collection' | 'content' | 'summary' | 'category' | 'source' |
-    'importance' | 'retention_tier' | 'decay_eligible' | 'expires_at' | 'created_at'
+    'importance' | 'retention_tier' | 'decay_eligible' | 'expires_at' | 'created_at' | 'checksum'
   > & { device_id?: string | null },
 ): Record<string, unknown> {
   return {
@@ -364,5 +513,8 @@ function toQdrantPayload(
     expires_at: mem.expires_at ? Math.floor(Date.parse(mem.expires_at) / 1000) : null,
     device_id: mem.device_id ?? null,
     created_at: mem.created_at,
+    // Content checksum, used on restore to detect drift without re-embedding
+    // (see StorageManager.detectAndMarkVectorDrift).
+    checksum: mem.checksum,
   };
 }

@@ -11,10 +11,14 @@ type MockSqliteStore = SqliteStore & {
   updateMemory: ReturnType<typeof vi.fn>;
   getCollection: ReturnType<typeof vi.fn>;
   listMemoriesNeedingVectorSync: ReturnType<typeof vi.fn>;
+  listMemoryChecksums: ReturnType<typeof vi.fn>;
+  markVectorsSyncBatch: ReturnType<typeof vi.fn>;
 };
 type MockQdrantStore = QdrantStore & {
   upsert: ReturnType<typeof vi.fn>;
   clearManagedCollections: ReturnType<typeof vi.fn>;
+  listAllCollections: ReturnType<typeof vi.fn>;
+  scrollAll: ReturnType<typeof vi.fn>;
 };
 
 function createMockSqlite(): MockSqliteStore {
@@ -39,12 +43,21 @@ function createMockSqlite(): MockSqliteStore {
         existing.vector_synced = synced;
       }
     }),
+    markVectorsSyncBatch: vi.fn((ids: string[], synced: boolean) => {
+      for (const id of ids) {
+        const existing = memoryStore.get(id);
+        if (existing) {
+          existing.vector_synced = synced;
+        }
+      }
+    }),
     listRevisions: vi.fn(() => []),
     insertRevision: vi.fn(),
     getCollection: vi.fn(() => ({ name: 'general', namespace: 'global', embedding_model: 'test', embedding_dimensions: 3 })),
     createCollection: vi.fn(),
     listMemoryIdsInCollection: vi.fn(() => ['mem-1']),
     listMemoriesNeedingVectorSync: vi.fn(() => []),
+    listMemoryChecksums: vi.fn(() => Array.from(memoryStore.values()).map(mem => ({ id: mem.id, checksum: mem.checksum }))),
     flushIfDirty: vi.fn(),
     countMemories: vi.fn(() => memoryStore.size),
     countUnsyncedVectors: vi.fn(() => Array.from(memoryStore.values()).filter(mem => !mem.vector_synced).length),
@@ -66,6 +79,8 @@ function createMockQdrant(shouldFail = false): MockQdrantStore {
     deleteMany: vi.fn(async () => {}),
     deleteCollection: vi.fn(async () => {}),
     clearManagedCollections: vi.fn(async () => 0),
+    listAllCollections: vi.fn(async () => []),
+    scrollAll: vi.fn(async () => []),
   } as unknown as MockQdrantStore;
 }
 
@@ -201,7 +216,7 @@ describe('StorageManager cross-store consistency', () => {
       expect(sqlite.markVectorSync).toHaveBeenNthCalledWith(2, 'mem-b', true, {
         allowDuringLifecycle: undefined,
       });
-      expect(result).toEqual({ reconciled: 2, remaining: 0 });
+      expect(result).toEqual({ reconciled: 2, remaining: 0, boundReached: false });
     });
 
     it('flushes completed reconciliation progress before returning a later failure', async () => {
@@ -235,8 +250,144 @@ describe('StorageManager cross-store consistency', () => {
 
       const retryResult = await storage.reconcileVectorsFromSqlite({ batchSize: 2 });
 
-      expect(retryResult).toEqual({ reconciled: 1, remaining: 0 });
+      expect(retryResult).toEqual({ reconciled: 1, remaining: 0, boundReached: false });
       expect(sqlite.getMemoryById('mem-b')?.vector_synced).toBe(true);
+    });
+
+    it('stops at the batch cap and reports boundReached so a caller can resume later', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a', vector_synced: false });
+      sqlite.insertMemory({ ...baseMem, id: 'mem-b', vector_synced: false, checksum: 'chk2' });
+      sqlite.listMemoriesNeedingVectorSync
+        .mockReturnValueOnce([sqlite.getMemoryById('mem-a')!])
+        .mockReturnValueOnce([sqlite.getMemoryById('mem-b')!]);
+
+      const result = await storage.reconcileVectorsFromSqlite({ batchSize: 1, maxBatches: 1 });
+
+      expect(result.reconciled).toBe(1);
+      expect(result.boundReached).toBe(true);
+      expect(qdrant.upsert).toHaveBeenCalledTimes(1);
+      // Only the first batch's cursor lookup happened; the cap stopped the loop
+      // before a second `listMemoriesNeedingVectorSync` call.
+      expect(sqlite.listMemoriesNeedingVectorSync).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops once the timeout elapses even if unsynced memories remain', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a', vector_synced: false });
+      sqlite.listMemoriesNeedingVectorSync.mockReturnValue([sqlite.getMemoryById('mem-a')!]);
+
+      const result = await storage.reconcileVectorsFromSqlite({ batchSize: 1, timeoutMs: 0 });
+
+      expect(result.reconciled).toBe(0);
+      expect(result.boundReached).toBe(true);
+      expect(qdrant.upsert).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('vector drift reconciliation', () => {
+    it('marks no memories unsynced and clears nothing when every checksum already matches', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a', checksum: 'chk-a', vector_synced: true });
+      qdrant.listAllCollections.mockResolvedValue(['bhgbrain_global_general']);
+      qdrant.scrollAll.mockResolvedValue([{ id: 'mem-a', payload: { checksum: 'chk-a' } }]);
+
+      const outcome = await storage.detectAndMarkVectorDrift({
+        expectedEmbeddingModel: 'test',
+        expectedEmbeddingDimensions: 3,
+      });
+
+      expect(outcome).toEqual({ mode: 'no-drift', driftedCount: 0 });
+      expect(sqlite.markVectorsSyncBatch).not.toHaveBeenCalled();
+      expect(qdrant.clearManagedCollections).not.toHaveBeenCalled();
+    });
+
+    it('marks only the drifted subset unsynced without clearing managed collections', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a', checksum: 'chk-a', vector_synced: true });
+      sqlite.insertMemory({ ...baseMem, id: 'mem-b', checksum: 'chk-b-new', vector_synced: true });
+      sqlite.insertMemory({ ...baseMem, id: 'mem-c', checksum: 'chk-c', vector_synced: true });
+      qdrant.listAllCollections.mockResolvedValue(['bhgbrain_global_general']);
+      qdrant.scrollAll.mockResolvedValue([
+        { id: 'mem-a', payload: { checksum: 'chk-a' } },
+        { id: 'mem-b', payload: { checksum: 'chk-b-old' } },
+        // mem-c has no point in Qdrant at all -> treated as drifted/missing.
+      ]);
+
+      const outcome = await storage.detectAndMarkVectorDrift({
+        expectedEmbeddingModel: 'test',
+        expectedEmbeddingDimensions: 3,
+      });
+
+      expect(outcome).toEqual({ mode: 'partial-drift', driftedCount: 2 });
+      expect(sqlite.markVectorsSyncBatch).toHaveBeenCalledWith(
+        expect.arrayContaining(['mem-b', 'mem-c']),
+        false,
+        { allowDuringLifecycle: undefined },
+      );
+      expect(qdrant.clearManagedCollections).not.toHaveBeenCalled();
+      expect(sqlite.getMemoryById('mem-a')?.vector_synced).toBe(true);
+      expect(sqlite.getMemoryById('mem-b')?.vector_synced).toBe(false);
+      expect(sqlite.getMemoryById('mem-c')?.vector_synced).toBe(false);
+    });
+
+    it('falls back to a full rebuild when the embedding model changed since the backup', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a', vector_synced: true });
+
+      const outcome = await storage.detectAndMarkVectorDrift({
+        expectedEmbeddingModel: 'old-model',
+        expectedEmbeddingDimensions: 3,
+        allowDuringLifecycle: true,
+      });
+
+      expect(outcome).toEqual({ mode: 'full-rebuild', driftedCount: 1 });
+      expect(qdrant.clearManagedCollections).toHaveBeenCalledTimes(1);
+      expect(qdrant.listAllCollections).not.toHaveBeenCalled();
+      expect(sqlite.getMemoryById('mem-a')?.vector_synced).toBe(false);
+    });
+
+    it('falls back to a full rebuild when existing Qdrant state cannot be read', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a', vector_synced: true });
+      qdrant.listAllCollections.mockRejectedValue(new Error('qdrant unreachable'));
+
+      const outcome = await storage.detectAndMarkVectorDrift({
+        expectedEmbeddingModel: 'test',
+        expectedEmbeddingDimensions: 3,
+      });
+
+      expect(outcome).toEqual({ mode: 'full-rebuild', driftedCount: 1 });
+      // Unlike the model-change fallback, an unreadable Qdrant state does
+      // not imply the existing vectors are unusable (the embedding space is
+      // unchanged), so they are deliberately left in place rather than
+      // destroyed on what may be a transient read failure.
+      expect(qdrant.clearManagedCollections).not.toHaveBeenCalled();
+      expect(sqlite.getMemoryById('mem-a')?.vector_synced).toBe(false);
     });
   });
 

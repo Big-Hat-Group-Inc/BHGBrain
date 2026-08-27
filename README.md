@@ -1574,7 +1574,7 @@ sequenceDiagram
             S->>DB: Hot-reload in-memory SQLite
             S->>DB: Run schema migrations
             DB-->>S: Ready
-            S-->>C: memory_count, activated: true
+            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
         end
     end
 ```
@@ -1652,11 +1652,13 @@ Returns:
 2. Write the embedded SQLite database atomically to the data directory (write-to-temp-then-rename).
 3. Hot-reload the in-memory SQLite database from the restored file without restarting the process.
 4. Run schema migrations on the reloaded database to ensure forward compatibility.
-5. Return `{ memory_count: <count>, activated: true }`.
+5. Reconcile vectors against actual drift (see below) and return `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
 
-**Restore is live:** The restored database is immediately active. There is no need to restart the server. The response includes `activated: true` to confirm this.
+**Restore is live:** The restored database is immediately active. There is no need to restart the server. The response includes `metadata_activated: true` to confirm this.
 
-**Concurrent restore protection:** If a restore is already in progress, subsequent restore requests return `INVALID_INPUT: Backup restore already in progress`.
+**Vector reconciliation is drift-only and bounded.** Restore does not unconditionally clear and re-embed the whole corpus: it compares each restored memory's content checksum against the vector already stored in Qdrant and marks only memories that are new or whose content changed for re-embedding. When the embedding model/dimensions changed since the backup was created, or Qdrant's existing state can't be read, restore falls back to a full rebuild instead. Once this drift check completes, the restore lifecycle lock is released — `vector_reconciliation.state` is `"reconciled"` immediately if nothing drifted, or `"reconciling"` if re-embedding the drifted subset continues in a bounded background task (a timeout and batch cap per pass, with automatic retries on transient failures) after the call has already returned. Poll `health://status` (`components.vector_reconciliation`) to watch it finish.
+
+**Concurrent restore protection:** If a restore is already in progress, subsequent restore requests return `INVALID_INPUT: Backup restore already in progress`. That guard only covers metadata activation and the drift check, not the background re-embed, so it releases quickly even for a large restore.
 
 ---
 
@@ -2334,8 +2336,18 @@ Create, list, or restore memory backups.
 
 **`restore` output:**
 ```json
-{ "memory_count": 1234, "activated": true }
+{
+  "memory_count": 1234,
+  "metadata_activated": true,
+  "vector_reconciliation": {
+    "status": "degraded",
+    "state": "reconciling",
+    "unsynced_vectors": 42,
+    "message": "Restore activated SQLite metadata; vector reconciliation for the drifted subset is continuing in the background."
+  }
+}
 ```
+`vector_reconciliation.state` is `"reconciled"` when no memory's vector actually drifted (nothing to re-embed), or `"reconciling"` while a bounded background task re-embeds the drifted/missing subset. See [Restoring from Backup](#restoring-from-backup).
 
 ---
 
@@ -2653,9 +2665,11 @@ The backup is stored in the data directory (`%LOCALAPPDATA%\BHGBrain\` on Window
 
 ### Backup Restore Activation
 
-`backup.restore` reloads runtime SQLite state before returning success. Restore responses include `activated: true` when restored data is immediately active. The server does not need to be restarted.
+`backup.restore` reloads runtime SQLite state before returning success. Restore responses include `metadata_activated: true` when restored data is immediately active. The server does not need to be restarted.
 
-As of v1.4, restore acquires a fail-safe guard (`beginRestoreOperation()`) so concurrent writes are blocked during recovery. Vector reconciliation runs per-step with isolated error handling - if Qdrant is unavailable during restore, SQLite is still activated and the response returns `readiness: "degraded"` instead of failing entirely. Progress is flushed incrementally, so a crash mid-reconciliation does not lose already-recovered records.
+Restore acquires a fail-safe guard (`beginRestoreOperation()`) that blocks concurrent writes only while SQLite is being activated and restored vectors are checked for drift against Qdrant. Vectors are **not** unconditionally cleared and re-embedded: only memories whose content checksum differs from (or is missing in) Qdrant are marked for re-embedding, so a no-drift restore completes without calling the embedding provider at all. If the embedding model/dimensions changed since the backup was taken, or Qdrant's existing state can't be read, restore falls back to a full rebuild instead.
+
+Once the drift check finishes, the guard is released — re-embedding the drifted subset (if any) runs in a bounded background task (a timeout and batch cap per pass) instead of holding up the restore call or blocking other writers for its duration. It retries automatically with backoff on transient failures; if it never fully catches up, `health://status` keeps reporting `vector_reconciliation.state: "pending"` (or `"reconciling"` while a pass is in flight) rather than silently leaving semantic search blank. Progress is flushed to disk at batch granularity, so a hard crash mid-reconciliation loses at most one batch of work — restart safely resumes from the remaining unsynced set via idempotent re-upsert.
 
 ### HTTP Hardening
 

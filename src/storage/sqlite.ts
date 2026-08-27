@@ -96,6 +96,7 @@ export interface SqliteStorage {
     reviewDue?: string | null,
   ): void;
   markVectorSync(id: string, synced: boolean, options?: { allowDuringLifecycle?: boolean }): void;
+  markVectorsSyncBatch(ids: string[], synced: boolean, options?: { allowDuringLifecycle?: boolean }): void;
   markAllVectorsSyncState(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number;
   recordAccessBatch(updates: AccessUpdate[]): void;
   listExpiredMemories(nowIso: string, tier?: RetentionTier): MemoryRecordWithoutEmbedding[];
@@ -106,6 +107,7 @@ export interface SqliteStorage {
   countArchivedMemories(): number;
   countUnsyncedVectors(): number;
   listMemoriesNeedingVectorSync(limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
+  listMemoryChecksums(): Array<{ id: string; checksum: string }>;
   archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void;
   listArchive(limit: number): ArchiveRecord[];
   searchArchive(query: string, limit: number): ArchiveRecord[];
@@ -748,6 +750,19 @@ export class SqliteStore implements SqliteStorage {
     this.markDirty();
   }
 
+  markVectorsSyncBatch(ids: string[], synced: boolean, options?: { allowDuringLifecycle?: boolean }): void {
+    if (!options?.allowDuringLifecycle) {
+      this.assertMutableAllowed();
+    }
+    if (ids.length === 0) return;
+    const placeholders = ids.map(() => '?').join(', ');
+    this.db.run(
+      `UPDATE memories SET vector_synced = ? WHERE id IN (${placeholders})`,
+      [synced ? 1 : 0, ...ids],
+    );
+    this.markDirty();
+  }
+
   markAllVectorsSyncState(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number {
     if (!options?.allowDuringLifecycle) {
       this.assertMutableAllowed();
@@ -884,6 +899,17 @@ export class SqliteStore implements SqliteStorage {
     sql += ` ORDER BY created_at ASC, id ASC LIMIT ?`;
     params.push(limit);
     return this.queryMemories(sql, params);
+  }
+
+  listMemoryChecksums(): Array<{ id: string; checksum: string }> {
+    const stmt = this.db.prepare(`SELECT id, checksum FROM memories WHERE archived = 0`);
+    const rows: Array<{ id: string; checksum: string }> = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject() as { id: string; checksum: string };
+      rows.push({ id: row.id, checksum: row.checksum });
+    }
+    stmt.free();
+    return rows;
   }
 
   archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void {

@@ -1527,7 +1527,7 @@ sequenceDiagram
             S->>DB: Hot-reload in-memory SQLite
             S->>DB: Run schema migrations
             DB-->>S: Ready
-            S-->>C: memory_count, activated: true
+            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
         end
     end
 ```
@@ -1606,11 +1606,13 @@ Gibt zurück:
 2. Die eingebettete SQLite-Datenbank atomar in das Datenverzeichnis schreiben (Schreiben-in-Temp-dann-Umbenennen).
 3. Die im-Arbeitsspeicher-SQLite-Datenbank aus der wiederhergestellten Datei ohne Neustart des Prozesses neu laden.
 4. Schema-Migrationen auf der neu geladenen Datenbank ausführen, um Vorwärtskompatibilität sicherzustellen.
-5. `{ memory_count: <Anzahl>, activated: true }` zurückgeben.
+5. Vektoren gegen tatsächliche Abweichungen (Drift) abgleichen (siehe unten) und `{ memory_count: <Anzahl>, metadata_activated: true, vector_reconciliation: {...} }` zurückgeben.
 
-**Wiederherstellung ist live:** Die wiederhergestellte Datenbank ist sofort aktiv. Ein Neustart des Servers ist nicht erforderlich. Die Antwort enthält `activated: true` zur Bestätigung.
+**Wiederherstellung ist live:** Die wiederhergestellte Datenbank ist sofort aktiv. Ein Neustart des Servers ist nicht erforderlich. Die Antwort enthält `metadata_activated: true` zur Bestätigung.
 
-**Schutz vor gleichzeitiger Wiederherstellung:** Wenn bereits eine Wiederherstellung läuft, geben nachfolgende Wiederherstellungsanfragen `INVALID_INPUT: Backup restore already in progress` zurück.
+**Die Vektor-Abgleichung ist drift-basiert und begrenzt.** Die Wiederherstellung leert und re-embedded nicht bedingungslos den gesamten Bestand: Sie vergleicht die Inhalts-Prüfsumme jeder wiederhergestellten Erinnerung mit dem bereits in Qdrant gespeicherten Vektor und markiert nur neue oder inhaltlich geänderte Erinnerungen für ein erneutes Embedding. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben oder der Qdrant-Zustand nicht gelesen werden kann, greift stattdessen ein vollständiger Neuaufbau. Sobald diese Drift-Prüfung abgeschlossen ist, wird die Restore-Lifecycle-Sperre freigegeben — `vector_reconciliation.state` ist sofort `"reconciled"`, wenn nichts abgewichen ist, oder `"reconciling"`, wenn das erneute Embedding der abweichenden Teilmenge in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf, mit automatischen Wiederholungsversuchen) fortgesetzt wird, nachdem der Aufruf bereits zurückgekehrt ist. Fragen Sie `health://status` (`components.vector_reconciliation`) ab, um den Fortschritt zu beobachten.
+
+**Schutz vor gleichzeitiger Wiederherstellung:** Wenn bereits eine Wiederherstellung läuft, geben nachfolgende Wiederherstellungsanfragen `INVALID_INPUT: Backup restore already in progress` zurück. Diese Sperre deckt nur die Metadaten-Aktivierung und die Drift-Prüfung ab, nicht das Hintergrund-Re-Embedding, und wird daher auch bei einer großen Wiederherstellung schnell wieder freigegeben.
 
 ---
 
@@ -2247,8 +2249,18 @@ Speichersicherungen erstellen, auflisten oder wiederherstellen.
 
 **`restore`-Ausgabe:**
 ```json
-{ "memory_count": 1234, "activated": true }
+{
+  "memory_count": 1234,
+  "metadata_activated": true,
+  "vector_reconciliation": {
+    "status": "degraded",
+    "state": "reconciling",
+    "unsynced_vectors": 42,
+    "message": "Restore activated SQLite metadata; vector reconciliation for the drifted subset is continuing in the background."
+  }
+}
 ```
+`vector_reconciliation.state` ist `"reconciled"`, wenn kein Vektor tatsächlich abgewichen ist (nichts erneut einzubetten), oder `"reconciling"`, während eine begrenzte Hintergrundaufgabe die abweichende/fehlende Teilmenge erneut einbettet. Siehe [Aus Sicherung wiederherstellen](#aus-sicherung-wiederherstellen).
 
 ---
 
@@ -2350,7 +2362,11 @@ Die Sicherung wird im Datenverzeichnis gespeichert (`%LOCALAPPDATA%\BHGBrain\` u
 
 ### Aktivierung der Sicherungswiederherstellung
 
-`backup.restore` lädt den Laufzeit-SQLite-Zustand vor der Rückgabe des Erfolgs neu. Wiederherstellungsantworten enthalten `activated: true`, wenn die wiederhergestellten Daten sofort aktiv sind. Der Server muss nicht neu gestartet werden.
+`backup.restore` lädt den Laufzeit-SQLite-Zustand vor der Rückgabe des Erfolgs neu. Wiederherstellungsantworten enthalten `metadata_activated: true`, wenn die wiederhergestellten Daten sofort aktiv sind. Der Server muss nicht neu gestartet werden.
+
+Die Wiederherstellung erwirbt eine Fail-Safe-Sperre (`beginRestoreOperation()`), die gleichzeitige Schreibvorgänge nur so lange blockiert, wie SQLite aktiviert und die wiederhergestellten Vektoren auf Abweichungen (Drift) gegenüber Qdrant geprüft werden. Vektoren werden **nicht** bedingungslos geleert und neu eingebettet: Nur Erinnerungen, deren Inhalts-Prüfsumme von Qdrant abweicht (oder dort fehlt), werden für ein erneutes Embedding markiert, sodass eine Wiederherstellung ohne Abweichungen abgeschlossen wird, ohne den Embedding-Anbieter überhaupt aufzurufen. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben oder der Qdrant-Zustand nicht gelesen werden kann, greift stattdessen ein vollständiger Neuaufbau.
+
+Sobald die Drift-Prüfung abgeschlossen ist, wird die Sperre freigegeben — das erneute Embedding der abweichenden Teilmenge (falls vorhanden) läuft in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf), anstatt den Wiederherstellungsaufruf zu blockieren oder andere Schreibvorgänge währenddessen aufzuhalten. Bei vorübergehenden Fehlern wird automatisch mit Backoff wiederholt; falls die Abgleichung nie vollständig aufholt, meldet `health://status` weiterhin `vector_reconciliation.state: "pending"` (oder `"reconciling"`, während ein Durchlauf läuft), anstatt die semantische Suche stillschweigend leer zu lassen. Der Fortschritt wird in Batch-Granularität auf die Festplatte geschrieben, sodass ein harter Absturz während der Abgleichung höchstens einen Batch an Arbeit verliert — ein Neustart setzt über idempotentes Re-Upsert sicher bei der verbleibenden nicht synchronisierten Menge fort.
 
 ### HTTP-Absicherung
 
