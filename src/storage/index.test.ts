@@ -4,6 +4,7 @@ import type { SqliteStore } from './sqlite.js';
 import type { QdrantStore } from './qdrant.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MemoryRecord } from '../domain/types.js';
+import type { MetricsCollector } from '../health/metrics.js';
 
 type StoredMemory = Omit<MemoryRecord, 'embedding'>;
 type MockSqliteStore = SqliteStore & {
@@ -218,6 +219,33 @@ describe('StorageManager cross-store consistency', () => {
 
       expect(sqlite.createCollection).toHaveBeenCalledWith('global', 'general', 'test', 3);
       expect(sqlite.insertMemory).toHaveBeenCalledWith(expect.objectContaining({ vector_synced: false }));
+    });
+
+    it('increments the degraded-write metric when a metadata-only row is persisted', () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const metrics = { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector;
+      const storage = new StorageManager(sqlite, qdrant, embedding, metrics);
+
+      sqlite.getCollection = vi.fn(() => null);
+      storage.writeMemoryWithoutVector(baseMem);
+
+      expect(metrics.incCounter).toHaveBeenCalledWith('degraded_writes_total');
+    });
+
+    it('does not increment the degraded-write metric when the SQLite write fails', () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const metrics = { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector;
+      const storage = new StorageManager(sqlite, qdrant, embedding, metrics);
+
+      sqlite.getCollection = vi.fn(() => null);
+      sqlite.insertMemory = vi.fn(() => { throw new Error('disk full'); });
+
+      expect(() => storage.writeMemoryWithoutVector(baseMem)).toThrow();
+      expect(metrics.incCounter).not.toHaveBeenCalled();
     });
   });
 

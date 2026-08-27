@@ -3,6 +3,7 @@ import { SqliteStore } from './sqlite.js';
 import { QdrantStore } from './qdrant.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MemoryRecord, WriteOperation, AuditEntry } from '../domain/types.js';
+import type { MetricsCollector } from '../health/metrics.js';
 import { internal, conflict } from '../errors/index.js';
 
 type MemoryRecordWithoutEmbedding = Omit<MemoryRecord, 'embedding'>;
@@ -47,6 +48,7 @@ export class StorageManager {
     public readonly sqlite: SqliteStore,
     public readonly qdrant: QdrantStore,
     public readonly embedding: EmbeddingProvider,
+    private readonly metrics?: MetricsCollector,
   ) {}
 
   isBackgroundReconciliationActive(): boolean {
@@ -93,6 +95,7 @@ export class StorageManager {
         vector_synced: false,
       });
       this.sqlite.flushIfDirty();
+      this.metrics?.incCounter('degraded_writes_total');
     } catch (err) {
       throw internal(`SQLite degraded write failed: ${(err as Error).message}`);
     }

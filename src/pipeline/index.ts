@@ -21,6 +21,7 @@ export class WritePipeline {
     private config: BrainConfig,
     private storage: StorageManager,
     private embedding: EmbeddingProvider,
+    private logger?: { warn: (obj: Record<string, unknown>) => void },
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
   }
@@ -124,6 +125,12 @@ export class WritePipeline {
       vector = await this.embedding.embed(candidate.content);
     } catch (err) {
       if (this.config.pipeline.fallback_to_threshold_dedup) {
+        this.logger?.warn({
+          event: 'degraded_write',
+          namespace: input.namespace,
+          collection: input.collection,
+          error: (err as Error).message,
+        });
         return this.deterministicFallback(candidate, input, checksum, now);
       }
       throw err;

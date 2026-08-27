@@ -27,6 +27,7 @@ export class RetentionService {
   constructor(
     private config: BrainConfig,
     private storage: StorageManager,
+    private logger?: { info: (obj: Record<string, unknown>) => void },
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
   }
@@ -45,6 +46,14 @@ export class RetentionService {
     }));
 
     if (options?.dryRun) {
+      this.logger?.info({
+        event: 'retention_gc',
+        outcome: 'dry_run',
+        scanned: expired.length,
+        archived: 0,
+        deleted: 0,
+        degraded: false,
+      });
       return {
         scanned: expired.length,
         archived: 0,
@@ -76,6 +85,16 @@ export class RetentionService {
 
     this.storage.sqlite.flushIfDirty();
 
+    this.logger?.info({
+      event: 'retention_gc',
+      outcome: deleteResult.degraded ? 'degraded' : 'ok',
+      scanned: expired.length,
+      archived,
+      deleted: deleteResult.deleted,
+      degraded: deleteResult.degraded,
+      unreconciled: deleteResult.unreconciled.length,
+    });
+
     return {
       scanned: expired.length,
       archived,
@@ -95,12 +114,23 @@ export class RetentionService {
       this.storage.sqlite.markStale(id);
     }
     this.storage.sqlite.flushIfDirty();
+    this.logger?.info({
+      event: 'retention_stale_marked',
+      outcome: 'ok',
+      stale_marked: staleIds.length,
+    });
     return staleIds.length;
   }
 
   runConsolidation(): { staleMarked: number; lowImportanceCandidates: number } {
     const staleMarked = this.markStaleMemories();
     const lowImportanceCandidates = this.storage.sqlite.getStaleMemories(0.5, 100).length;
+    this.logger?.info({
+      event: 'retention_consolidation',
+      outcome: 'ok',
+      stale_marked: staleMarked,
+      low_importance_candidates: lowImportanceCandidates,
+    });
     return { staleMarked, lowImportanceCandidates };
   }
 

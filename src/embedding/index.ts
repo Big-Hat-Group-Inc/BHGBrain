@@ -132,6 +132,26 @@ export function getEmbeddingBreakerKey(provider: BrainConfig['embedding']['provi
     : 'openai_embedding';
 }
 
+/**
+ * Emits a structured startup warning when the resolved embedding provider is
+ * the degraded provider (e.g. missing credentials), honoring the project's
+ * "no silent degradation" rule instead of leaving the condition to surface
+ * only at a later request or health check.
+ */
+export function warnIfEmbeddingDegraded(
+  embedding: EmbeddingProvider,
+  config: BrainConfig,
+  logger: { warn: (obj: Record<string, unknown>) => void },
+): void {
+  if (embedding instanceof DegradedEmbeddingProvider) {
+    logger.warn({
+      event: 'degraded_startup',
+      provider: config.embedding.provider,
+      reason: 'missing embedding provider credentials',
+    });
+  }
+}
+
 export function createEmbeddingProvider(
   config: BrainConfig,
   options?: { breaker?: CircuitBreaker; metrics?: MetricsCollector },

@@ -102,6 +102,42 @@ describe('WritePipeline NOOP handling', () => {
     expect(storage.writeMemory).not.toHaveBeenCalled();
   });
 
+  it('emits a structured warning log when the degraded-write fallback is taken', async () => {
+    embedding.embed = vi.fn(async () => { throw new Error('embedding unavailable'); });
+    const logger = { warn: vi.fn() };
+    const pipeline = new WritePipeline(config, storage, embedding, logger);
+
+    await pipeline.process({
+      content: 'fallback content',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'degraded_write',
+      namespace: 'global',
+      collection: 'general',
+      error: 'embedding unavailable',
+    }));
+  });
+
+  it('does not warn when the write succeeds without a degraded fallback', async () => {
+    const logger = { warn: vi.fn() };
+    const pipeline = new WritePipeline(config, storage, embedding, logger);
+
+    await pipeline.process({
+      content: 'brand new content',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
   it('does not silently record a novel write when the similarity check is unavailable', async () => {
     // searchSimilar failing (transport/auth/removed-method) must not be
     // treated the same as "no near duplicates" - the write should fail

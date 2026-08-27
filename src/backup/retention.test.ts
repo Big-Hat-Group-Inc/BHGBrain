@@ -53,13 +53,18 @@ describe('RetentionService', () => {
 
     const config = { retention: { decay_after_days: 30 } } as unknown as BrainConfig;
     const storage = { sqlite } as unknown as StorageManager;
-    const retention = new RetentionService(config, storage);
+    const logger = { info: vi.fn() };
+    const retention = new RetentionService(config, storage, logger);
     const staleMarked = retention.markStaleMemories();
 
     expect(staleMarked).toBe(1);
     const stale = sqlite.getStaleMemories(1, 10);
     expect(stale.map(s => s.id)).toContain('old-1');
     expect(stale.map(s => s.id)).not.toContain('cat-1');
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'retention_stale_marked',
+      stale_marked: 1,
+    }));
   });
 
   it('batches GC persistence work and audits after batched delete', async () => {
@@ -85,7 +90,8 @@ describe('RetentionService', () => {
     const config = {
       retention: { archive_before_delete: true, pre_expiry_warning_days: 7 },
     } as unknown as BrainConfig;
-    const retention = new RetentionService(config, storage);
+    const logger = { info: vi.fn() };
+    const retention = new RetentionService(config, storage, logger);
 
     const result = await retention.runGc();
 
@@ -95,6 +101,14 @@ describe('RetentionService', () => {
     expect(storage.deleteMemories).toHaveBeenCalledTimes(1);
     expect(storage.logAudit).toHaveBeenCalledWith('FORGET', expired[0]!.id, 'global', 'system', { flush: false });
     expect(storage.sqlite.flushIfDirty).toHaveBeenCalledTimes(1);
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'retention_gc',
+      outcome: 'ok',
+      scanned: 1,
+      archived: 1,
+      deleted: 1,
+      degraded: false,
+    }));
   });
 
   it('reports a degraded result and skips the FORGET audit when deleteMemories cannot reconcile all vectors', async () => {
@@ -132,7 +146,8 @@ describe('RetentionService', () => {
     const config = {
       retention: { archive_before_delete: true, pre_expiry_warning_days: 7 },
     } as unknown as BrainConfig;
-    const retention = new RetentionService(config, storage);
+    const logger = { info: vi.fn() };
+    const retention = new RetentionService(config, storage, logger);
 
     const result = await retention.runGc();
 
@@ -146,5 +161,62 @@ describe('RetentionService', () => {
     expect(storage.logAudit).toHaveBeenCalledTimes(1);
     expect(storage.logAudit).toHaveBeenCalledWith('FORGET', 'old-3', 'global', 'system', { flush: false });
     expect(storage.sqlite.flushIfDirty).toHaveBeenCalledTimes(1);
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'retention_gc',
+      outcome: 'degraded',
+      deleted: 1,
+      degraded: true,
+      unreconciled: 1,
+    }));
+  });
+
+  it('logs a structured summary for runConsolidation combining stale and low-importance counts', () => {
+    sqlite.insertMemory(memory('old-5', '2025-01-01T00:00:00.000Z'));
+    sqlite.flushIfDirty();
+
+    const config = { retention: { decay_after_days: 30 } } as unknown as BrainConfig;
+    const storage = { sqlite } as unknown as StorageManager;
+    const logger = { info: vi.fn() };
+    const retention = new RetentionService(config, storage, logger);
+
+    const result = retention.runConsolidation();
+
+    expect(result.staleMarked).toBe(1);
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'retention_consolidation',
+      outcome: 'ok',
+      stale_marked: 1,
+      low_importance_candidates: result.lowImportanceCandidates,
+    }));
+  });
+
+  it('logs a dry-run outcome without mutating state', async () => {
+    const expired = [{
+      ...memory('old-6', '2025-01-01T00:00:00.000Z'),
+      retention_tier: 'T2' as const,
+      expires_at: '2025-02-01T00:00:00.000Z',
+      decay_eligible: true,
+      namespace: 'global',
+      collection: 'general',
+    }];
+    const storage = {
+      sqlite: {
+        listExpiredMemories: vi.fn(() => expired),
+      },
+    } as unknown as StorageManager;
+    const config = {
+      retention: { archive_before_delete: true, pre_expiry_warning_days: 7 },
+    } as unknown as BrainConfig;
+    const logger = { info: vi.fn() };
+    const retention = new RetentionService(config, storage, logger);
+
+    const result = await retention.runGc({ dryRun: true });
+
+    expect(result.scanned).toBe(1);
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'retention_gc',
+      outcome: 'dry_run',
+      scanned: 1,
+    }));
   });
 });

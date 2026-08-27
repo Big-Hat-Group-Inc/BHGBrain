@@ -232,7 +232,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .option('--tier <tier>', 'Limit cleanup to a single tier (T1|T2|T3)')
     .action(async (opts) => {
       const ctx = await createContextImpl();
-      const retention = new RetentionService(ctx.config, ctx.storage);
+      const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger);
       const result = await retention.runGc({ dryRun: Boolean(opts.dryRun), tier: opts.tier });
       console.log(JSON.stringify(result, null, 2));
       ctx.storage.sqlite.close();
@@ -245,7 +245,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .option('--expiring', 'Show memories expiring soon')
     .action(async (opts) => {
       const ctx = await createContextImpl();
-      const retention = new RetentionService(ctx.config, ctx.storage);
+      const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger);
       const total = ctx.storage.sqlite.countMemories();
       const collections = ctx.storage.sqlite.listCollections();
       const categories = ctx.storage.sqlite.listCategories();
@@ -311,7 +311,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
         console.error(`Memory ${id} not found.`);
         process.exitCode = 1;
       } else {
-        const retention = new RetentionService(ctx.config, ctx.storage);
+        const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger);
         const metadata = retention.buildMetadataForTier(tier);
         ctx.storage.sqlite.updateMemory(id, {
           retention_tier: tier,
@@ -349,7 +349,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .description('List archived memory summaries')
     .action(async () => {
       const ctx = await createContextImpl();
-      const retention = new RetentionService(ctx.config, ctx.storage);
+      const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger);
       console.log(JSON.stringify(retention.listArchive(), null, 2));
       ctx.storage.sqlite.close();
     });
@@ -359,7 +359,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .description('Search archived memory summaries')
     .action(async (query) => {
       const ctx = await createContextImpl();
-      const retention = new RetentionService(ctx.config, ctx.storage);
+      const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger);
       console.log(JSON.stringify(retention.searchArchive(query), null, 2));
       ctx.storage.sqlite.close();
     });
@@ -369,7 +369,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .description('Restore an archived summary into active memory')
     .action(async (id) => {
       const ctx = await createContextImpl();
-      const retention = new RetentionService(ctx.config, ctx.storage);
+      const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger);
       console.log(JSON.stringify(await retention.restoreArchive(id), null, 2));
       ctx.storage.sqlite.close();
     });

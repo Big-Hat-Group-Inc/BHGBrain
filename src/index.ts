@@ -14,7 +14,7 @@ import { loadConfig, ensureDataDir } from './config/index.js';
 import { SqliteStore } from './storage/sqlite.js';
 import { QdrantStore } from './storage/qdrant.js';
 import { StorageManager } from './storage/index.js';
-import { createEmbeddingProvider, getEmbeddingBreakerKey } from './embedding/index.js';
+import { createEmbeddingProvider, getEmbeddingBreakerKey, warnIfEmbeddingDegraded } from './embedding/index.js';
 import { WritePipeline } from './pipeline/index.js';
 import { SearchService } from './search/index.js';
 import { BackupService } from './backup/index.js';
@@ -54,7 +54,8 @@ async function main() {
   const metrics = new MetricsCollector(config);
   const qdrant = new QdrantStore(config, qdrantBreaker);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
-  const storage = new StorageManager(sqlite, qdrant, embedding);
+  warnIfEmbeddingDegraded(embedding, config, logger);
+  const storage = new StorageManager(sqlite, qdrant, embedding, metrics);
 
   // Bootstrap: hydrate SQLite from Qdrant if this is a new device
   try {
@@ -71,7 +72,7 @@ async function main() {
   }
 
   // Initialize services
-  const pipeline = new WritePipeline(config, storage, embedding);
+  const pipeline = new WritePipeline(config, storage, embedding, logger);
   const searchService = new SearchService(config, storage, embedding, metrics, logger);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {
