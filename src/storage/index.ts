@@ -27,6 +27,19 @@ export interface ReconcileVectorsResult {
   boundReached: boolean;
 }
 
+export interface DeleteMemoriesResult {
+  // Count of memories whose SQLite row was actually removed (vector delete
+  // confirmed).
+  deleted: number;
+  // Ids whose vector delete failed mid-batch; their SQLite rows were
+  // preserved (not deleted) and their `vector_synced` flag was cleared so
+  // they remain detectable as cross-store drift.
+  unreconciled: string[];
+  // true when `unreconciled` is non-empty, i.e. this was not a fully clean
+  // pass even though it did not throw.
+  degraded: boolean;
+}
+
 export class StorageManager {
   private backgroundReconciliationActive = false;
 
@@ -149,8 +162,8 @@ export class StorageManager {
   async deleteMemories(
     memories: Array<Pick<MemoryRecord, 'id' | 'namespace' | 'collection'>>,
     options?: { flush?: boolean },
-  ): Promise<number> {
-    if (memories.length === 0) return 0;
+  ): Promise<DeleteMemoriesResult> {
+    if (memories.length === 0) return { deleted: 0, unreconciled: [], degraded: false };
 
     const grouped = new Map<string, string[]>();
     for (const memory of memories) {
@@ -160,13 +173,30 @@ export class StorageManager {
       grouped.set(key, ids);
     }
 
+    // Confirmed groups have their vectors removed and are eligible for SQLite
+    // deletion below. A transient Qdrant error on any one group must not
+    // throw a generic internal error after archive rows were already written
+    // by the caller (the exact silent-divergence mode this batching replaced)
+    // — instead the group's ids are marked unreconciled: their vectors were
+    // never confirmed removed, so their SQLite rows are preserved and their
+    // `vector_synced` flag is explicitly cleared so they remain visible as
+    // cross-store drift rather than silently reporting a clean pass.
+    const confirmed = new Set<string>();
+    const unreconciled: string[] = [];
     for (const [key, ids] of grouped.entries()) {
       const [namespace, collection] = key.split('|');
-      await this.qdrant.deleteMany(namespace!, collection!, ids);
+      try {
+        await this.qdrant.deleteMany(namespace!, collection!, ids);
+        for (const id of ids) confirmed.add(id);
+      } catch {
+        unreconciled.push(...ids);
+        this.sqlite.markVectorsSyncBatch(ids, false);
+      }
     }
 
     let deleted = 0;
     for (const memory of memories) {
+      if (!confirmed.has(memory.id)) continue;
       if (this.sqlite.deleteMemory(memory.id)) {
         deleted++;
       }
@@ -175,16 +205,42 @@ export class StorageManager {
     if (options?.flush !== false) {
       this.sqlite.flushIfDirty();
     }
-    return deleted;
+    return { deleted, unreconciled, degraded: unreconciled.length > 0 };
   }
 
   countMemoriesInCollection(namespace: string, collection: string): number {
     return this.sqlite.countMemoriesInCollection(namespace, collection);
   }
 
-  async deleteCollectionData(namespace: string, collection: string): Promise<{ deleted: number; ids: string[] }> {
+  async deleteCollectionData(
+    namespace: string,
+    collection: string,
+    options?: { logger?: { warn: (obj: Record<string, unknown>) => void } },
+  ): Promise<{ deleted: number; ids: string[] }> {
     const ids = this.sqlite.listMemoryIdsInCollection(namespace, collection);
-    await this.qdrant.deleteCollection(namespace, collection);
+    try {
+      await this.qdrant.deleteCollection(namespace, collection);
+    } catch (err) {
+      // Non-not-found Qdrant failure: the collection's vectors may now be
+      // partially deleted or orphaned. SQLite rows are preserved (never
+      // reached the delete below), but leaving them `vector_synced=true`
+      // would report zero drift even though cleanup did not complete. Mark
+      // them explicitly unsynced — a narrow, retryable tombstone — and emit
+      // a warn signal so `unsynced_vectors` / `checkVectorReconciliation`
+      // surface the residual cleanup instead of it going silent.
+      if (ids.length > 0) {
+        this.sqlite.markVectorsSyncBatch(ids, false);
+        this.sqlite.flushIfDirty();
+      }
+      options?.logger?.warn({
+        event: 'collection_vector_cleanup_failed',
+        namespace,
+        collection,
+        memory_ids: ids,
+        error: (err as Error).message,
+      });
+      throw internal(`Qdrant collection delete failed, vector cleanup incomplete: ${(err as Error).message}`);
+    }
     const removed = this.sqlite.deleteMemoriesInCollection(namespace, collection);
     if (removed.deleted > 0) {
       this.sqlite.flushIfDirty();

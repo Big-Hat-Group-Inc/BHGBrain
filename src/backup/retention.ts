@@ -8,6 +8,11 @@ export interface GarbageCollectionResult {
   scanned: number;
   archived: number;
   deleted: number;
+  // true when one or more expired memories' vector deletion failed mid-batch;
+  // `deleted` reflects only confirmed removals and `unreconciled` names the
+  // rest, which remain in SQLite with `vector_synced=false` for retry.
+  degraded: boolean;
+  unreconciled: string[];
   candidates: Array<{
     id: string;
     tier: RetentionTier;
@@ -44,12 +49,13 @@ export class RetentionService {
         scanned: expired.length,
         archived: 0,
         deleted: 0,
+        degraded: false,
+        unreconciled: [],
         candidates,
       };
     }
 
     let archived = 0;
-    let deleted = 0;
 
     for (const memory of expired) {
       if (this.config.retention.archive_before_delete) {
@@ -58,8 +64,13 @@ export class RetentionService {
       }
     }
 
-    deleted = await this.storage.deleteMemories(expired, { flush: false });
+    const deleteResult = await this.storage.deleteMemories(expired, { flush: false });
+    const unreconciledIds = new Set(deleteResult.unreconciled);
     for (const memory of expired) {
+      // Only memories whose vector delete was confirmed (and SQLite row
+      // actually removed) get a FORGET audit entry; unreconciled memories
+      // are still present and should not be logged as deleted.
+      if (unreconciledIds.has(memory.id)) continue;
       this.storage.logAudit('FORGET', memory.id, memory.namespace, 'system', { flush: false });
     }
 
@@ -68,7 +79,9 @@ export class RetentionService {
     return {
       scanned: expired.length,
       archived,
-      deleted,
+      deleted: deleteResult.deleted,
+      degraded: deleteResult.degraded,
+      unreconciled: deleteResult.unreconciled,
       candidates,
     };
   }

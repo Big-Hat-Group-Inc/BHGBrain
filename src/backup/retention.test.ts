@@ -78,7 +78,7 @@ describe('RetentionService', () => {
         archiveMemory: vi.fn(),
         flushIfDirty: vi.fn(),
       },
-      deleteMemories: vi.fn(async () => 1),
+      deleteMemories: vi.fn(async () => ({ deleted: 1, unreconciled: [], degraded: false })),
       logAudit: vi.fn(),
     } as unknown as StorageManager;
 
@@ -90,8 +90,61 @@ describe('RetentionService', () => {
     const result = await retention.runGc();
 
     expect(result.deleted).toBe(1);
+    expect(result.degraded).toBe(false);
+    expect(result.unreconciled).toEqual([]);
     expect(storage.deleteMemories).toHaveBeenCalledTimes(1);
     expect(storage.logAudit).toHaveBeenCalledWith('FORGET', expired[0]!.id, 'global', 'system', { flush: false });
+    expect(storage.sqlite.flushIfDirty).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a degraded result and skips the FORGET audit when deleteMemories cannot reconcile all vectors', async () => {
+    const expired = [
+      {
+        ...memory('old-3', '2025-01-01T00:00:00.000Z'),
+        retention_tier: 'T2' as const,
+        expires_at: '2025-02-01T00:00:00.000Z',
+        decay_eligible: true,
+        namespace: 'global',
+        collection: 'general',
+      },
+      {
+        ...memory('old-4', '2025-01-01T00:00:00.000Z'),
+        retention_tier: 'T2' as const,
+        expires_at: '2025-02-01T00:00:00.000Z',
+        decay_eligible: true,
+        namespace: 'global',
+        collection: 'general',
+      },
+    ];
+
+    const storage = {
+      sqlite: {
+        listExpiredMemories: vi.fn(() => expired),
+        archiveMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+      },
+      // Simulates a transient Qdrant error mid-batch: 'old-3' was confirmed
+      // deleted, 'old-4' was not and remains unreconciled.
+      deleteMemories: vi.fn(async () => ({ deleted: 1, unreconciled: ['old-4'], degraded: true })),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+
+    const config = {
+      retention: { archive_before_delete: true, pre_expiry_warning_days: 7 },
+    } as unknown as BrainConfig;
+    const retention = new RetentionService(config, storage);
+
+    const result = await retention.runGc();
+
+    expect(result.deleted).toBe(1);
+    expect(result.degraded).toBe(true);
+    expect(result.unreconciled).toEqual(['old-4']);
+    // Archive rows are still written for every expired candidate (unchanged
+    // from before), but the FORGET audit — which asserts the memory is gone
+    // — is only logged for the confirmed deletion.
+    expect(storage.sqlite.archiveMemory).toHaveBeenCalledTimes(2);
+    expect(storage.logAudit).toHaveBeenCalledTimes(1);
+    expect(storage.logAudit).toHaveBeenCalledWith('FORGET', 'old-3', 'global', 'system', { flush: false });
     expect(storage.sqlite.flushIfDirty).toHaveBeenCalledTimes(1);
   });
 });

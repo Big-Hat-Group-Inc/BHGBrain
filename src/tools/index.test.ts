@@ -67,7 +67,7 @@ describe('collections delete semantics', () => {
 
     expect(result.ok).toBe(true);
     expect(result.deleted_memory_count).toBe(3);
-    expect(storage.deleteCollectionData).toHaveBeenCalledWith('global', 'general');
+    expect(storage.deleteCollectionData).toHaveBeenCalledWith('global', 'general', { logger: ctx.logger });
     expect(storage.sqlite.deleteCollection).toHaveBeenCalledWith('global', 'general');
     expect(storage.logAudit).toHaveBeenCalledTimes(3);
     expect(ctx.metrics.setGauge).toHaveBeenCalled();

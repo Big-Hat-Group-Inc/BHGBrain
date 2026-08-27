@@ -566,4 +566,100 @@ describe('StorageManager cross-store consistency', () => {
       expect(upsertMock).toHaveBeenCalledTimes(2);
     });
   });
+
+  describe('deleteMemories partial failure', () => {
+    it('returns a degraded result with unreconciled ids when a group delete throws, leaving that group\'s rows in place and unsynced', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a', collection: 'general', vector_synced: true });
+      sqlite.insertMemory({ ...baseMem, id: 'mem-b', collection: 'notes', vector_synced: true });
+
+      qdrant.deleteMany = vi.fn(async (_namespace: string, collection: string) => {
+        if (collection === 'notes') {
+          throw new Error('transient Qdrant error');
+        }
+      });
+
+      const result = await storage.deleteMemories([
+        { id: 'mem-a', namespace: 'global', collection: 'general' },
+        { id: 'mem-b', namespace: 'global', collection: 'notes' },
+      ]);
+
+      expect(result.deleted).toBe(1);
+      expect(result.degraded).toBe(true);
+      expect(result.unreconciled).toEqual(['mem-b']);
+      // Confirmed group's row is gone; the failed group's row is preserved
+      // but explicitly marked unsynced (detectable cross-store drift).
+      expect(sqlite.getMemoryById('mem-a')).toBeNull();
+      expect(sqlite.getMemoryById('mem-b')).not.toBeNull();
+      expect(sqlite.getMemoryById('mem-b')?.vector_synced).toBe(false);
+      expect(sqlite.countUnsyncedVectors()).toBe(1);
+    });
+
+    it('reports a fully clean pass (not degraded) when every group succeeds', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a', vector_synced: true });
+
+      const result = await storage.deleteMemories([
+        { id: 'mem-a', namespace: 'global', collection: 'general' },
+      ]);
+
+      expect(result).toEqual({ deleted: 1, unreconciled: [], degraded: false });
+      expect(sqlite.getMemoryById('mem-a')).toBeNull();
+    });
+  });
+
+  describe('deleteCollectionData vector cleanup failure', () => {
+    it('leaves a detectable tombstone and emits a warn signal when Qdrant collection delete fails for a non-not-found reason', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.insertMemory({ ...baseMem, id: 'mem-1', vector_synced: true });
+      sqlite.listMemoryIdsInCollection = vi.fn(() => ['mem-1']);
+      sqlite.deleteMemoriesInCollection = vi.fn(() => ({ deleted: 0, ids: [] }));
+      qdrant.deleteCollection = vi.fn(async () => { throw new Error('qdrant unavailable'); });
+      const logger = { warn: vi.fn() };
+
+      await expect(
+        storage.deleteCollectionData('global', 'general', { logger }),
+      ).rejects.toThrow('vector cleanup incomplete');
+
+      // SQLite row is preserved, not deleted, but no longer reports as synced
+      // -> visible to unsynced_vectors / checkVectorReconciliation.
+      expect(sqlite.deleteMemoriesInCollection).not.toHaveBeenCalled();
+      expect(sqlite.getMemoryById('mem-1')).not.toBeNull();
+      expect(sqlite.getMemoryById('mem-1')?.vector_synced).toBe(false);
+      expect(sqlite.countUnsyncedVectors()).toBe(1);
+      expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'collection_vector_cleanup_failed',
+        namespace: 'global',
+        collection: 'general',
+        memory_ids: ['mem-1'],
+      }));
+    });
+
+    it('deletes SQLite rows normally when Qdrant collection delete succeeds', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.listMemoryIdsInCollection = vi.fn(() => ['mem-1']);
+      sqlite.deleteMemoriesInCollection = vi.fn(() => ({ deleted: 1, ids: ['mem-1'] }));
+
+      const result = await storage.deleteCollectionData('global', 'general');
+
+      expect(result).toEqual({ deleted: 1, ids: ['mem-1'] });
+      expect(sqlite.markVectorsSyncBatch).not.toHaveBeenCalled();
+    });
+  });
 });

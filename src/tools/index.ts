@@ -210,7 +210,7 @@ async function handleCollections(ctx: ToolContext, args: unknown): Promise<unkno
 
       let deletedMemoryCount = 0;
       if (input.force) {
-        const removed = await ctx.storage.deleteCollectionData(namespace, input.name);
+        const removed = await ctx.storage.deleteCollectionData(namespace, input.name, { logger: ctx.logger });
         deletedMemoryCount = removed.deleted;
         for (const memoryId of removed.ids) {
           ctx.storage.logAudit('FORGET', memoryId, namespace);
