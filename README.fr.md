@@ -374,6 +374,23 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     "hybrid_weights": {
       "semantic": 0.7,
       "fulltext": 0.3
+    },
+    // Classement composite : ordonne les résultats par pertinence x un prior
+    // dérivé de l'importance, de la fréquence d'accès et de la décroissance
+    // liée à l'ancienneté selon le niveau (voir "Classement Composite"
+    // ci-dessous). enabled: false rétablit le tri par pertinence pure.
+    "ranking": {
+      "enabled": true,
+      "w_importance": 0.3,
+      "w_access": 0.2,
+      "access_norm": 50,
+      // Taux de décroissance exponentielle quotidien par niveau de rétention. T0 vaut 0 (ne décroît jamais).
+      "decay_per_day": {
+        "T0": 0,
+        "T1": 0.002,
+        "T2": 0.008,
+        "T3": 0.02
+      }
     }
   },
 
@@ -944,7 +961,7 @@ Chaque souvenir se voit attribuer un **niveau de rétention** lors de l'ingestio
 
 **Propriétés clés par niveau :**
 
-- **T0** : `expires_at` est toujours `null`. `decay_eligible` est toujours `false`. Les souvenirs T0 ne peuvent pas être nettoyés automatiquement. Les mises à jour des souvenirs T0 déclenchent un instantané de révision dans la table `memory_revisions` (historique en ajout seul). Les souvenirs T0 reçoivent un boost de score de +0,1 dans les résultats de recherche hybride.
+- **T0** : `expires_at` est toujours `null`. `decay_eligible` est toujours `false`. Les souvenirs T0 ne peuvent pas être nettoyés automatiquement. Les mises à jour des souvenirs T0 déclenchent un instantané de révision dans la table `memory_revisions` (historique en ajout seul). Les souvenirs T0 ne décroissent jamais dans le classement composite (`decay_per_day.T0` vaut `0` par défaut), ce qui leur donne un avantage de classement durable dans tous les modes de recherche.
 
 - **T1** : `review_due` est défini à `created_at + 365 jours` et réinitialisé à chaque accès. Les souvenirs approchant leur `expires_at` sont signalés avec `expiring_soon: true` dans les résultats de recherche.
 
@@ -1484,8 +1501,8 @@ flowchart TD
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
     FR --> RRF
-    RRF --> BOOST["T0 Score Boost<br/><i>+0.1 for foundational</i>"]
-    BOOST --> TOP["Return Top N Results"]
+    RRF --> RANK["Composite Ranking<br/><i>relevance x importance/access/decay prior</i>"]
+    RANK --> TOP["Return Top N Results"]
     TOP --> TRACK["Update Access Tracking<br/><i>count++, sliding window reset</i>"]
 
     classDef search fill:#4a90d9,stroke:#2c5f8a,color:#fff
@@ -1493,7 +1510,7 @@ flowchart TD
     classDef result fill:#5ba85b,stroke:#3d7a3d,color:#fff
 
     class P1,QD,SR,P2,FTS,FR search
-    class RRF,BOOST fusion
+    class RRF,RANK fusion
     class TOP,TRACK result
 ```
 
@@ -1513,7 +1530,7 @@ La recherche hybride combine les résultats sémantiques et plein texte en utili
 
 4. Les éléments n'apparaissant que dans une liste reçoivent une contribution `0` de l'autre.
 5. La liste fusionnée est triée par score RRF (décroissant).
-6. Les souvenirs T0 reçoivent un **boost de score de +0,1** appliqué après la fusion RRF, garantissant que les connaissances fondamentales émergent de manière proéminente.
+6. Le **classement composite** (voir ci-dessous) est appliqué aux résultats de chaque mode, y compris ce score RRF, et la liste est retriée selon le score composite.
 7. Les `limit` premiers résultats sont renvoyés.
 
 **Dégradation gracieuse :** Si le fournisseur d'embedding est indisponible, la recherche hybride se rabat silencieusement sur des résultats plein texte uniquement plutôt que de générer une erreur.
@@ -1529,6 +1546,34 @@ La recherche hybride combine les résultats sémantiques et plein texte en utili
   "limit": 10
 }
 ```
+
+---
+
+### Classement Composite
+
+Chaque mode de recherche (`semantic`, `fulltext`, `hybrid`) trie ses résultats selon un score composite plutôt que par pertinence seule. La pertinence (similarité cosinus, rang FTS, ou score RRF selon le mode) est multipliée par un **prior** dérivé de signaux que chaque souvenir porte déjà — `importance`, `access_count`, et son ancienneté depuis la dernière mise à jour — de sorte qu'un souvenir confirmé utile à de nombreuses reprises, marqué comme important, ou récemment modifié dépasse un doublon obsolète tout aussi pertinent.
+
+```
+final_score = relevance x (w_base + w_importance x importance + w_access x log1p(access_count) / log1p(access_norm))
+                        x exp(-decay_per_day[tier] x age_days)
+```
+
+- `w_base` est fixé à `1.0` et n'est pas configurable.
+- `age_days` est mesuré à partir de `updated_at`, de sorte qu'une `UPDATE` réinitialise l'ancienneté effective d'un souvenir — un souvenir tout juste modifié redevient « jeune ».
+- Les souvenirs `T0` ont par défaut un `decay_per_day` de `0` et ne décroissent donc jamais, donnant aux connaissances fondamentales un avantage durable (ceci remplace l'ancien boost fixe de `+0,1` pour T0).
+- La fréquence d'accès est amortie logarithmiquement (`log1p`) afin qu'une poignée d'accès supplémentaires ne puisse pas dominer le classement, et normalisée par `access_norm` (par défaut `50`) pour que le terme d'accès reste d'une échelle comparable au terme d'importance.
+
+**Configuration** (`search.ranking` dans `config.json`, voir [Configuration](#configuration)) :
+
+| Champ | Par défaut | Signification |
+|---|---|---|
+| `enabled` | `true` | Passer à `false` pour désactiver entièrement le classement composite et rétablir le tri par pertinence pure. |
+| `w_importance` | `0.3` | Poids appliqué à l'`importance` (0–1) d'un souvenir. |
+| `w_access` | `0.2` | Poids appliqué au nombre d'accès amorti logarithmiquement. |
+| `access_norm` | `50` | Normalise le terme du nombre d'accès ; des valeurs plus élevées nécessitent plus d'accès pour atteindre le même boost. |
+| `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Taux de décroissance exponentielle par niveau appliqué à `age_days`. La valeur par défaut de `T2` donne une demi-vie d'environ 87 jours, alignée sur son TTL de 90 jours. |
+
+**Ce que le classement composite n'affecte *pas* :** les champs bruts `semantic_score` et `fulltext_score` de chaque résultat, ainsi que le champ auquel s'applique le seuil `min_score` de `recall` (`semantic_score`) — voir [Recall vs Search](#recall-vs-search--différences). Le classement composite change l'*ordre* des résultats, jamais les souvenirs qui franchissent le seuil `min_score`.
 
 ---
 
@@ -1550,7 +1595,7 @@ BHGBrain expose deux outils de récupération de mémoire avec des sémantiques 
 | **Appelant prévu** | Agents IA lors de l'exécution de tâches | Humains ou agents administrateurs faisant une investigation |
 
 **Filtrage par score dans recall :**
-Le paramètre `min_score` (par défaut 0,6) agit comme un filtre de qualité — il est appliqué au champ `semantic_score` (similarité cosinus), et non au `score` fusionné/majoré par palier, puisque `recall` s'exécute en mode sémantique — seuls les souvenirs avec une similarité cosinus ≥ 0,6 sont renvoyés. Cela évite les résultats non pertinents. Vous pouvez abaisser `min_score` pour récupérer plus de résultats au détriment de la précision.
+Le paramètre `min_score` (par défaut 0,6) agit comme un filtre de qualité — il est appliqué au champ `semantic_score` (similarité cosinus), et non au `score` de classement composite, puisque `recall` s'exécute en mode sémantique — seuls les souvenirs avec une similarité cosinus ≥ 0,6 sont renvoyés. Cela évite les résultats non pertinents. Vous pouvez abaisser `min_score` pour récupérer plus de résultats au détriment de la précision.
 
 ```json
 // Exemple de recall — sémantique, filtré par type et tags
@@ -1582,13 +1627,13 @@ Le paramètre `min_score` (par défaut 0,6) agit comme un filtre de qualité —
 
 ---
 
-### Seuils de score et boosts par niveau
+### Seuils de score et classement composite
 
-**`min_score` (recall uniquement) :** Un score de similarité cosinus minimal entre 0 et 1, appliqué spécifiquement au champ `semantic_score` — et non au `score` fusionné/majoré par palier — car `recall` impose le mode sémantique et la valeur par défaut de `min_score` est calibrée pour une plage de similarité cosinus, pas pour des scores RRF hybrides. Les souvenirs en dessous de ce seuil sont exclus des résultats de `recall`. Par défaut : 0,6.
+**`min_score` (recall uniquement) :** Un score de similarité cosinus minimal entre 0 et 1, appliqué spécifiquement au champ `semantic_score` — et non au `score` de classement composite — car `recall` impose le mode sémantique et la valeur par défaut de `min_score` est calibrée pour une plage de similarité cosinus, pas pour des scores RRF hybrides ni pour le prior composite. Les souvenirs en dessous de ce seuil sont exclus des résultats de `recall`. Par défaut : 0,6.
 
 **Exclusion des souvenirs expirés :** Le filtre de recherche vectorielle de Qdrant exclut les souvenirs où `decay_eligible = true ET expires_at < maintenant()`. Les souvenirs T0/T1 (decay_eligible = false) ne sont jamais exclus par le filtre côté vecteur. Côté SQLite, le service de cycle de vie revérifie l'expiration sur tout souvenir renvoyé par le magasin vectoriel.
 
-**Boost de score T0 (recherche hybride) :** Après la fusion RRF, les souvenirs T0 (fondamentaux) reçoivent un +0,1 supplémentaire ajouté à leur score. Cela garantit que le contenu architecturalement significatif émerge dans les résultats hybrides même si sa terminologie exacte ne correspond pas bien à la requête.
+**Classement composite (tous modes) :** `score` est la pertinence multipliée par un prior d'importance, d'accès et d'ancienneté — voir [Classement Composite](#classement-composite) ci-dessus. Les souvenirs T0 (fondamentaux) ne décroissent jamais par défaut, garantissant que le contenu architecturalement significatif reste durablement bien classé à mesure qu'il vieillit.
 
 ---
 

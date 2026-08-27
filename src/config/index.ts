@@ -159,6 +159,22 @@ const ConfigSchema = z.object({
       semantic: z.number().min(0).max(1).default(0.7),
       fulltext: z.number().min(0).max(1).default(0.3),
     }).default({}),
+    // Composite ranking prior applied at result-assembly time:
+    // final = relevance × (w_base + w_importance·importance +
+    //   w_access·log1p(access_count)/log1p(access_norm)) × exp(-decay_per_day[tier]·age_days)
+    // `enabled: false` restores pure-relevance ordering. See add-composite-recall-ranking.
+    ranking: z.object({
+      enabled: z.boolean().default(true),
+      w_importance: z.number().nonnegative().default(0.3),
+      w_access: z.number().nonnegative().default(0.2),
+      access_norm: z.number().positive().default(50),
+      decay_per_day: z.object({
+        T0: z.number().nonnegative().default(0),
+        T1: z.number().nonnegative().default(0.002),
+        T2: z.number().nonnegative().default(0.008),
+        T3: z.number().nonnegative().default(0.02),
+      }).default({}),
+    }).default({}),
   }).default({}),
   security: z.object({
     require_loopback_http: z.boolean().default(true),

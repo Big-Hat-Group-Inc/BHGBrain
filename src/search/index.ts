@@ -218,14 +218,41 @@ export class SearchService {
         semantic_score: item.semanticScore,
         fulltext_score: item.fulltextScore,
       })),
-      { boostT0: true },
     );
   }
 
+  // Composite ranking prior: final = relevance × (w_base + w_imp·importance +
+  // w_acc·log1p(access_count)/log1p(access_norm)) × exp(-λ_tier·age_days).
+  // `w_base` is a fixed constant (not configurable) so the prior for a
+  // never-accessed, default-importance memory stays close to 1 by design; only
+  // the auxiliary weights and decay rates are operator-tunable. Age is measured
+  // from `updated_at` so an UPDATE resets a memory's effective age, consistent
+  // with the merge semantics elsewhere in the pipeline.
+  private static readonly RANKING_W_BASE = 1.0;
+  private static readonly MS_PER_DAY = 86400000;
+
+  private compositeScore(
+    relevance: number,
+    mem: Pick<MemoryRecord, 'importance' | 'access_count' | 'retention_tier' | 'updated_at'>,
+    now: Date,
+  ): number {
+    const ranking = this.config.search.ranking;
+    if (!ranking.enabled) return relevance;
+
+    const prior =
+      SearchService.RANKING_W_BASE +
+      ranking.w_importance * mem.importance +
+      ranking.w_access * (Math.log1p(mem.access_count) / Math.log1p(ranking.access_norm));
+
+    const ageDays = Math.max(0, now.getTime() - new Date(mem.updated_at).getTime()) / SearchService.MS_PER_DAY;
+    const lambda = ranking.decay_per_day[mem.retention_tier];
+    const decay = Math.exp(-lambda * ageDays);
+
+    return relevance * prior * decay;
+  }
 
   private buildSearchResults(
     ranked: Array<{ id: string; score: number; semantic_score?: number; fulltext_score?: number; qdrantPayload?: Record<string, unknown> }>,
-    options?: { boostT0?: boolean },
   ): SearchResult[] {
     const now = new Date();
     const nowIso = now.toISOString();
@@ -248,10 +275,7 @@ export class SearchService {
 
       if (this.lifecycle.isExpired(mem.expires_at, now)) continue;
 
-      let adjustedScore = item.score;
-      if (options?.boostT0 && mem.retention_tier === 'T0') {
-        adjustedScore += 0.1;
-      }
+      const adjustedScore = this.compositeScore(item.score, mem, now);
 
       accessUpdates.push(this.buildAccessUpdate(mem, now, nowIso));
       searchResults.push({
@@ -271,6 +295,12 @@ export class SearchService {
         last_accessed: nowIso,
       });
     }
+
+    // Composite scoring can reorder relative to the incoming relevance order
+    // (a lower-relevance, high-importance/high-access/fresh memory can now
+    // outrank a higher-relevance stale one), so results must be re-sorted here
+    // rather than trusting the order the mode implementations produced.
+    searchResults.sort((a, b) => b.score - a.score);
 
     if (accessUpdates.length > 0) {
       this.storage.sqlite.recordAccessBatch(accessUpdates);

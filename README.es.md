@@ -373,6 +373,23 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     "hybrid_weights": {
       "semantic": 0.7,
       "fulltext": 0.3
+    },
+    // Ranking compuesto: ordena los resultados por relevancia x un prior
+    // derivado de la importancia, la frecuencia de acceso y la decadencia por
+    // antigüedad según el nivel (ver "Ranking Compuesto" más abajo).
+    // enabled: false restaura el orden por relevancia pura.
+    "ranking": {
+      "enabled": true,
+      "w_importance": 0.3,
+      "w_access": 0.2,
+      "access_norm": 50,
+      // Tasa de decadencia exponencial diaria por nivel de retención. T0 es 0 (nunca decae).
+      "decay_per_day": {
+        "T0": 0,
+        "T1": 0.002,
+        "T2": 0.008,
+        "T3": 0.02
+      }
     }
   },
 
@@ -940,7 +957,7 @@ A cada memoria se le asigna un **nivel de retención** en el momento de la inges
 
 **Propiedades clave por nivel:**
 
-- **T0**: `expires_at` es siempre `null`. `decay_eligible` es siempre `false`. Las memorias T0 no pueden ser limpiadas automáticamente. Las actualizaciones a memorias T0 desencadenan una instantánea de revisión en la tabla `memory_revisions` (historial de solo adición). Las memorias T0 reciben un impulso de puntuación de +0.1 en los resultados de búsqueda híbrida.
+- **T0**: `expires_at` es siempre `null`. `decay_eligible` es siempre `false`. Las memorias T0 no pueden ser limpiadas automáticamente. Las actualizaciones a memorias T0 desencadenan una instantánea de revisión en la tabla `memory_revisions` (historial de solo adición). Las memorias T0 nunca decaen en el ranking compuesto (`decay_per_day.T0` es `0` por defecto), lo que les da una ventaja de ranking duradera en todos los modos de búsqueda.
 
 - **T1**: `review_due` se establece en `created_at + 365 días` y se restablece en cada acceso. Las memorias que se acercan a su `expires_at` se marcan con `expiring_soon: true` en los resultados de búsqueda.
 
@@ -1480,8 +1497,8 @@ flowchart TD
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
     FR --> RRF
-    RRF --> BOOST["T0 Score Boost<br/><i>+0.1 for foundational</i>"]
-    BOOST --> TOP["Return Top N Results"]
+    RRF --> RANK["Composite Ranking<br/><i>relevance x importance/access/decay prior</i>"]
+    RANK --> TOP["Return Top N Results"]
     TOP --> TRACK["Update Access Tracking<br/><i>count++, sliding window reset</i>"]
 
     classDef search fill:#4a90d9,stroke:#2c5f8a,color:#fff
@@ -1489,7 +1506,7 @@ flowchart TD
     classDef result fill:#5ba85b,stroke:#3d7a3d,color:#fff
 
     class P1,QD,SR,P2,FTS,FR search
-    class RRF,BOOST fusion
+    class RRF,RANK fusion
     class TOP,TRACK result
 ```
 
@@ -1509,7 +1526,7 @@ La búsqueda híbrida combina resultados semánticos y de texto completo usando 
 
 4. Los elementos que aparecen en solo una lista reciben `0` de contribución de la otra.
 5. La lista fusionada se ordena por puntuación RRF (descendente).
-6. Las memorias T0 reciben un **impulso de puntuación de +0.1** aplicado después de la fusión RRF, asegurando que el conocimiento fundacional aparezca de forma prominente.
+6. El **ranking compuesto** (ver más abajo) se aplica a los resultados de cada modo, incluida esta puntuación RRF, y la lista se reordena por la puntuación compuesta.
 7. Se devuelven los `limit` resultados superiores.
 
 **Degradación elegante:** Si el proveedor de embeddings no está disponible, la búsqueda híbrida silenciosamente recurre a resultados solo de texto completo en lugar de devolver un error.
@@ -1525,6 +1542,34 @@ La búsqueda híbrida combina resultados semánticos y de texto completo usando 
   "limit": 10
 }
 ```
+
+---
+
+### Ranking Compuesto
+
+Cada modo de búsqueda (`semantic`, `fulltext`, `hybrid`) ordena sus resultados por una puntuación compuesta en lugar de solo por relevancia. La relevancia (similitud coseno, rango FTS o puntuación RRF, según el modo) se multiplica por un **prior** derivado de señales que cada memoria ya posee — `importance`, `access_count` y qué tan recientemente se actualizó — de modo que una memoria confirmada como útil muchas veces, marcada como importante, o editada recientemente supera a un duplicado obsoleto igualmente relevante.
+
+```
+final_score = relevance x (w_base + w_importance x importance + w_access x log1p(access_count) / log1p(access_norm))
+                        x exp(-decay_per_day[tier] x age_days)
+```
+
+- `w_base` es fijo en `1.0` y no es configurable.
+- `age_days` se mide desde `updated_at`, así que un `UPDATE` reinicia la antigüedad efectiva de una memoria — una memoria recién editada vuelve a ser "joven".
+- Las memorias `T0` tienen un `decay_per_day` de `0` por defecto y por lo tanto nunca decaen, dando al conocimiento fundacional una ventaja duradera (esto reemplaza el antiguo impulso plano de `+0.1` para T0).
+- La frecuencia de acceso se amortigua logarítmicamente (`log1p`) para que un puñado de accesos adicionales no pueda dominar el orden, y se normaliza mediante `access_norm` (predeterminado `50`) para que el término de acceso permanezca en una escala comparable al término de importancia.
+
+**Configuración** (`search.ranking` en `config.json`, ver [Configuración](#configuración)):
+
+| Campo | Predeterminado | Significado |
+|---|---|---|
+| `enabled` | `true` | Establecer en `false` para desactivar el ranking compuesto por completo y restaurar el orden por relevancia pura. |
+| `w_importance` | `0.3` | Peso aplicado a la `importance` (0–1) de una memoria. |
+| `w_access` | `0.2` | Peso aplicado al conteo de accesos amortiguado logarítmicamente. |
+| `access_norm` | `50` | Normaliza el término de conteo de accesos; valores más altos requieren más accesos para alcanzar el mismo impulso. |
+| `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Tasa de decadencia exponencial por nivel aplicada a `age_days`. El predeterminado de `T2` da una vida media de aproximadamente 87 días, alineada con su TTL de 90 días. |
+
+**Lo que el ranking compuesto *no* afecta:** los campos crudos `semantic_score` y `fulltext_score` de cada resultado, y el campo al que se aplica el umbral `min_score` de `recall` (`semantic_score`) — ver [Recall vs Search](#recall-vs-search--diferencias). El ranking compuesto cambia el *orden* de los resultados, nunca qué memorias superan el filtro `min_score`.
 
 ---
 
@@ -1546,7 +1591,7 @@ BHGBrain expone dos herramientas para la recuperación de memorias con diferente
 | **Llamador previsto** | Agentes de IA durante la ejecución de tareas | Humanos o agentes administrativos haciendo investigación |
 
 **Filtrado por puntuación en recall:**
-El parámetro `min_score` (predeterminado 0.6) actúa como una compuerta de calidad — se aplica al campo `semantic_score` (similitud coseno), no al `score` fusionado/potenciado por nivel, ya que `recall` se ejecuta en modo semántico — solo se devuelven memorias con similitud coseno ≥ 0.6. Esto previene resultados irrelevantes. Puedes reducir `min_score` para recuperar más resultados a expensas de la precisión.
+El parámetro `min_score` (predeterminado 0.6) actúa como una compuerta de calidad — se aplica al campo `semantic_score` (similitud coseno), no al `score` de ranking compuesto, ya que `recall` se ejecuta en modo semántico — solo se devuelven memorias con similitud coseno ≥ 0.6. Esto previene resultados irrelevantes. Puedes reducir `min_score` para recuperar más resultados a expensas de la precisión.
 
 ```json
 // Ejemplo de recall — semántico, filtrado por tipo y etiquetas
@@ -1578,13 +1623,13 @@ Tanto `recall` como `search` admiten alcance por namespace y colección. `recall
 
 ---
 
-### Umbrales de Puntuación y Bonificaciones por Nivel
+### Umbrales de Puntuación y Ranking Compuesto
 
-**`min_score` (solo recall):** Una puntuación mínima de similitud coseno entre 0 y 1, aplicada específicamente al campo `semantic_score` — no al `score` fusionado/potenciado por nivel — ya que `recall` fija el modo semántico y el valor predeterminado de `min_score` está calibrado para un rango de similitud coseno, no para puntuaciones RRF híbridas. Las memorias por debajo de este umbral se excluyen de los resultados de `recall`. Predeterminado: 0.6.
+**`min_score` (solo recall):** Una puntuación mínima de similitud coseno entre 0 y 1, aplicada específicamente al campo `semantic_score` — no al `score` de ranking compuesto — ya que `recall` fija el modo semántico y el valor predeterminado de `min_score` está calibrado para un rango de similitud coseno, no para puntuaciones RRF híbridas ni para el prior compuesto. Las memorias por debajo de este umbral se excluyen de los resultados de `recall`. Predeterminado: 0.6.
 
 **Exclusión de memorias expiradas:** El filtro de búsqueda vectorial de Qdrant excluye memorias donde `decay_eligible = true AND expires_at < now()`. Las memorias T0/T1 (decay_eligible = false) nunca son excluidas por el filtro del lado vectorial. En el lado de SQLite, el servicio de ciclo de vida re-verifica la expiración en cualquier memoria devuelta desde el almacén de vectores.
 
-**Impulso de puntuación T0 (búsqueda híbrida):** Después de la fusión RRF, las memorias T0 (fundacionales) reciben un +0.1 adicional añadido a su puntuación. Esto asegura que el contenido arquitectónicamente significativo aparezca en los resultados híbridos incluso si su terminología exacta no coincide bien con la consulta.
+**Ranking compuesto (todos los modos):** `score` es la relevancia multiplicada por un prior de importancia, acceso y antigüedad — ver [Ranking Compuesto](#ranking-compuesto) más arriba. Las memorias T0 (fundacionales) nunca decaen por defecto, asegurando que el contenido arquitectónicamente significativo permanezca bien clasificado de forma duradera a medida que envejece.
 
 ---
 

@@ -13,6 +13,7 @@ describe('SearchService', () => {
     fulltextResults?: Array<{ id: string; rank: number }>;
     memories?: Map<string, StoredMemory>;
     slidingWindowEnabled?: boolean;
+    ranking?: BrainConfig['search']['ranking'];
   } = {}) {
     const memories = opts.memories ?? new Map([
       ['mem-1', {
@@ -53,7 +54,16 @@ describe('SearchService', () => {
     } as unknown as StorageManager;
 
     const config = {
-      search: { hybrid_weights: { semantic: 0.7, fulltext: 0.3 } },
+      search: {
+        hybrid_weights: { semantic: 0.7, fulltext: 0.3 },
+        ranking: opts.ranking ?? {
+          enabled: true,
+          w_importance: 0.3,
+          w_access: 0.2,
+          access_norm: 50,
+          decay_per_day: { T0: 0, T1: 0.002, T2: 0.008, T3: 0.02 },
+        },
+      },
       ...(opts.slidingWindowEnabled === undefined ? {} : {
         retention: {
           tier_ttl: { T0: null, T1: 365, T2: 90, T3: 30 },
@@ -360,6 +370,195 @@ describe('SearchService', () => {
       await service.search('hello', 'global', 'my-col', 'hybrid', 5);
       expect(storage.sqlite.fullTextSearch).toHaveBeenCalledWith('global', 'hello', 10, 'my-col');
       expect(storage.qdrant.search).toHaveBeenCalledWith('global', 'my-col', [1, 2, 3], 10);
+    });
+  });
+
+  describe('composite ranking (add-composite-recall-ranking)', () => {
+    const makeMem = (id: string, overrides: Partial<StoredMemory> = {}): StoredMemory => ({
+      id, namespace: 'global', collection: 'general', type: 'semantic',
+      content: `content-${id}`, summary: `summary-${id}`, tags: [], source: 'cli',
+      checksum: id,
+      importance: 0.5,
+      retention_tier: 'T1',
+      expires_at: '2026-12-31T00:00:00Z',
+      decay_eligible: true,
+      review_due: null,
+      access_count: 0,
+      last_operation: 'ADD',
+      merged_from: null,
+      archived: false,
+      vector_synced: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+      ...overrides,
+    });
+
+    it('orders equal-relevance semantic (cosine-range) results by importance', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['low-importance', makeMem('low-importance', { importance: 0.1 })],
+        ['high-importance', makeMem('high-importance', { importance: 0.9 })],
+      ]);
+      const { service, storage } = createSearchService({ memories });
+      storage.qdrant.search.mockResolvedValue([
+        { id: 'low-importance', score: 0.8, payload: {} },
+        { id: 'high-importance', score: 0.8, payload: {} },
+      ]);
+
+      const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+      expect(results.map(r => r.id)).toEqual(['high-importance', 'low-importance']);
+    });
+
+    it('orders equal-relevance semantic (cosine-range) results by access frequency', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['low-access', makeMem('low-access', { access_count: 0 })],
+        ['high-access', makeMem('high-access', { access_count: 100 })],
+      ]);
+      const { service, storage } = createSearchService({ memories });
+      storage.qdrant.search.mockResolvedValue([
+        { id: 'low-access', score: 0.8, payload: {} },
+        { id: 'high-access', score: 0.8, payload: {} },
+      ]);
+
+      const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+      expect(results.map(r => r.id)).toEqual(['high-access', 'low-access']);
+    });
+
+    it('orders equal-relevance hybrid (RRF-range) results by importance', async () => {
+      // Both memories rank identically in fulltext AND semantic, so their RRF
+      // scores are equal; only the composite prior can break the tie.
+      const memories = new Map<string, StoredMemory>([
+        ['low-importance', makeMem('low-importance', { importance: 0.1 })],
+        ['high-importance', makeMem('high-importance', { importance: 0.9 })],
+      ]);
+      const { service, storage } = createSearchService({
+        memories,
+        fulltextResults: [
+          { id: 'low-importance', rank: -1 },
+          { id: 'high-importance', rank: -1 },
+        ],
+      });
+      storage.qdrant.search.mockResolvedValue([
+        { id: 'low-importance', score: 0.5, payload: {} },
+        { id: 'high-importance', score: 0.5, payload: {} },
+      ]);
+
+      const results = await service.search('hello', 'global', undefined, 'hybrid', 10);
+      expect(results.map(r => r.id)).toEqual(['high-importance', 'low-importance']);
+    });
+
+    it('does not decay T0 memories regardless of age', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['t0-old', makeMem('t0-old', { retention_tier: 'T0', updated_at: '2020-01-01T00:00:00Z' })],
+        ['t0-fresh', makeMem('t0-fresh', { retention_tier: 'T0', updated_at: '2026-01-01T00:00:00Z' })],
+      ]);
+      const { service, storage } = createSearchService({ memories });
+      storage.qdrant.search.mockResolvedValue([
+        { id: 't0-old', score: 0.8, payload: {} },
+        { id: 't0-fresh', score: 0.8, payload: {} },
+      ]);
+
+      const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+      const [old, fresh] = ['t0-old', 't0-fresh'].map(id => results.find(r => r.id === id)!.score);
+      expect(old).toBeCloseTo(fresh, 10);
+    });
+
+    it('decays lower tiers, with T3 decaying faster than T1 over the same age', async () => {
+      const staleUpdatedAt = new Date(Date.now() - 200 * 86400000).toISOString();
+      const memories = new Map<string, StoredMemory>([
+        ['t1-stale', makeMem('t1-stale', { retention_tier: 'T1', updated_at: staleUpdatedAt })],
+        ['t1-fresh', makeMem('t1-fresh', { retention_tier: 'T1', updated_at: new Date().toISOString() })],
+        ['t3-stale', makeMem('t3-stale', { retention_tier: 'T3', updated_at: staleUpdatedAt })],
+      ]);
+      const { service, storage } = createSearchService({ memories });
+      storage.qdrant.search.mockResolvedValue([
+        { id: 't1-stale', score: 0.8, payload: {} },
+        { id: 't1-fresh', score: 0.8, payload: {} },
+        { id: 't3-stale', score: 0.8, payload: {} },
+      ]);
+
+      const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+      const scoreOf = (id: string) => results.find(r => r.id === id)!.score;
+      // Aged T1 decays relative to fresh T1 at the same relevance...
+      expect(scoreOf('t1-stale')).toBeLessThan(scoreOf('t1-fresh'));
+      // ...and T3 decays faster than T1 at the same age.
+      expect(scoreOf('t3-stale')).toBeLessThan(scoreOf('t1-stale'));
+    });
+
+    it('resets effective age on UPDATE (fresh updated_at outranks an older created_at)', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['recently-updated', makeMem('recently-updated', {
+          retention_tier: 'T2',
+          created_at: '2020-01-01T00:00:00Z',
+          updated_at: new Date().toISOString(),
+        })],
+        ['never-updated', makeMem('never-updated', {
+          retention_tier: 'T2',
+          created_at: '2020-01-01T00:00:00Z',
+          updated_at: '2020-01-01T00:00:00Z',
+        })],
+      ]);
+      const { service, storage } = createSearchService({ memories });
+      storage.qdrant.search.mockResolvedValue([
+        { id: 'recently-updated', score: 0.8, payload: {} },
+        { id: 'never-updated', score: 0.8, payload: {} },
+      ]);
+
+      const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+      expect(results.map(r => r.id)).toEqual(['recently-updated', 'never-updated']);
+    });
+
+    it('kill switch: enabled=false restores pure-relevance ordering', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['low-everything', makeMem('low-everything', { importance: 0.1, access_count: 0 })],
+        ['high-everything', makeMem('high-everything', { importance: 0.9, access_count: 100 })],
+      ]);
+      const ranking: BrainConfig['search']['ranking'] = {
+        enabled: false,
+        w_importance: 0.3,
+        w_access: 0.2,
+        access_norm: 50,
+        decay_per_day: { T0: 0, T1: 0.002, T2: 0.008, T3: 0.02 },
+      };
+      const { service, storage } = createSearchService({ memories, ranking });
+      // Higher relevance score belongs to the low-signal memory: with ranking
+      // disabled it must still win, proving the composite prior is bypassed.
+      storage.qdrant.search.mockResolvedValue([
+        { id: 'low-everything', score: 0.9, payload: {} },
+        { id: 'high-everything', score: 0.1, payload: {} },
+      ]);
+
+      const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+      expect(results.map(r => r.id)).toEqual(['low-everything', 'high-everything']);
+      expect(results.find(r => r.id === 'low-everything')!.score).toBe(0.9);
+      expect(results.find(r => r.id === 'high-everything')!.score).toBe(0.1);
+    });
+
+    it('leaves semantic_score/fulltext_score raw fields unaffected by composite ranking (min_score regression)', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['mem-a', makeMem('mem-a', { importance: 0.9, access_count: 100 })],
+      ]);
+      const { service: enabledService, storage: enabledStorage } = createSearchService({ memories });
+      enabledStorage.qdrant.search.mockResolvedValue([{ id: 'mem-a', score: 0.7, payload: {} }]);
+      const enabledResults = await enabledService.search('hello', 'global', undefined, 'semantic', 10);
+
+      const ranking: BrainConfig['search']['ranking'] = {
+        enabled: false,
+        w_importance: 0.3,
+        w_access: 0.2,
+        access_norm: 50,
+        decay_per_day: { T0: 0, T1: 0.002, T2: 0.008, T3: 0.02 },
+      };
+      const { service: disabledService, storage: disabledStorage } = createSearchService({ memories, ranking });
+      disabledStorage.qdrant.search.mockResolvedValue([{ id: 'mem-a', score: 0.7, payload: {} }]);
+      const disabledResults = await disabledService.search('hello', 'global', undefined, 'semantic', 10);
+
+      // The composite prior clearly changed `score` (importance/access boost it)...
+      expect(enabledResults[0].score).not.toBe(disabledResults[0].score);
+      // ...but semantic_score, the field min_score filters on, is identical
+      // either way.
+      expect(enabledResults[0].semantic_score).toBe(0.7);
+      expect(disabledResults[0].semantic_score).toBe(0.7);
     });
   });
 });

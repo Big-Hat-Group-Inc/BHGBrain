@@ -372,6 +372,23 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "hybrid_weights": {
       "semantic": 0.7,
       "fulltext": 0.3
+    },
+    // Composite-Ranking: ordnet Ergebnisse nach Relevanz x einem Prior aus
+    // Wichtigkeit, Zugriffshäufigkeit und stufenabhängigem Recency-Decay
+    // (siehe "Composite Ranking" unten). enabled: false stellt die reine
+    // Relevanz-Reihenfolge wieder her (Verhalten vor dem Ranking).
+    "ranking": {
+      "enabled": true,
+      "w_importance": 0.3,
+      "w_access": 0.2,
+      "access_norm": 50,
+      // Täglicher exponentieller Decay-Satz pro Retention-Stufe. T0 ist 0 (verfällt nie).
+      "decay_per_day": {
+        "T0": 0,
+        "T1": 0.002,
+        "T2": 0.008,
+        "T3": 0.02
+      }
     }
   },
 
@@ -940,7 +957,7 @@ Jeder Erinnerung wird bei der Aufnahme eine **Aufbewahrungsstufe** zugewiesen, d
 
 **Wesentliche Eigenschaften nach Stufe:**
 
-- **T0**: `expires_at` ist immer `null`. `decay_eligible` ist immer `false`. T0-Erinnerungen können nicht automatisch bereinigt werden. Aktualisierungen von T0-Erinnerungen lösen einen Revisions-Snapshot in der Tabelle `memory_revisions` aus (append-only-Verlauf). T0-Erinnerungen erhalten in Hybrid-Suchergebnissen einen Score-Bonus von +0.1.
+- **T0**: `expires_at` ist immer `null`. `decay_eligible` ist immer `false`. T0-Erinnerungen können nicht automatisch bereinigt werden. Aktualisierungen von T0-Erinnerungen lösen einen Revisions-Snapshot in der Tabelle `memory_revisions` aus (append-only-Verlauf). T0-Erinnerungen verfallen im Composite Ranking nie (`decay_per_day.T0` ist standardmäßig `0`) und behalten so über alle Suchmodi hinweg einen dauerhaften Ranking-Vorteil.
 
 - **T1**: `review_due` wird auf `created_at + 365 Tage` gesetzt und bei jedem Zugriff zurückgesetzt. Erinnerungen, die ihrem `expires_at` nahekommen, werden in den Suchergebnissen mit `expiring_soon: true` markiert.
 
@@ -1480,8 +1497,8 @@ flowchart TD
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
     FR --> RRF
-    RRF --> BOOST["T0 Score Boost<br/><i>+0.1 for foundational</i>"]
-    BOOST --> TOP["Return Top N Results"]
+    RRF --> RANK["Composite Ranking<br/><i>relevance x importance/access/decay prior</i>"]
+    RANK --> TOP["Return Top N Results"]
     TOP --> TRACK["Update Access Tracking<br/><i>count++, sliding window reset</i>"]
 
     classDef search fill:#4a90d9,stroke:#2c5f8a,color:#fff
@@ -1489,7 +1506,7 @@ flowchart TD
     classDef result fill:#5ba85b,stroke:#3d7a3d,color:#fff
 
     class P1,QD,SR,P2,FTS,FR search
-    class RRF,BOOST fusion
+    class RRF,RANK fusion
     class TOP,TRACK result
 ```
 
@@ -1509,7 +1526,7 @@ Die Hybridsuche kombiniert semantische und Volltextergebnisse mit **Reciprocal R
 
 4. Elemente, die nur in einer Liste erscheinen, erhalten `0` Beitrag von der anderen.
 5. Die zusammengeführte Liste wird nach RRF-Score (absteigend) sortiert.
-6. T0-Erinnerungen erhalten nach der RRF-Fusion einen **+0.1 Score-Bonus**, um sicherzustellen, dass grundlegendes Wissen prominent angezeigt wird.
+6. **Composite Ranking** (siehe unten) wird auf die Ergebnisse jedes Modus angewendet, einschließlich dieses RRF-Scores, und die Liste wird nach dem Composite-Score neu sortiert.
 7. Die Top-`limit`-Ergebnisse werden zurückgegeben.
 
 **Graceful Degradation:** Wenn der Einbettungsanbieter nicht verfügbar ist, fällt die Hybridsuche stillschweigend auf nur-Volltext-Ergebnisse zurück, anstatt einen Fehler zu melden.
@@ -1525,6 +1542,34 @@ Die Hybridsuche kombiniert semantische und Volltextergebnisse mit **Reciprocal R
   "limit": 10
 }
 ```
+
+---
+
+### Composite Ranking
+
+Jeder Suchmodus (`semantic`, `fulltext`, `hybrid`) sortiert seine Ergebnisse nach einem Composite-Score statt nach reiner Relevanz. Die Relevanz (Kosinus-Ähnlichkeit, FTS-Rang oder RRF-Score, je nach Modus) wird mit einem **Prior** multipliziert, der aus Signalen abgeleitet wird, die jede Erinnerung bereits trägt – `importance`, `access_count` und wie kürzlich sie aktualisiert wurde –, sodass eine oft bestätigte, als wichtig markierte oder kürzlich bearbeitete Erinnerung ein gleich relevantes, aber veraltetes Duplikat übertrifft.
+
+```
+final_score = relevance x (w_base + w_importance x importance + w_access x log1p(access_count) / log1p(access_norm))
+                        x exp(-decay_per_day[tier] x age_days)
+```
+
+- `w_base` ist fest auf `1.0` gesetzt und nicht konfigurierbar.
+- `age_days` wird ab `updated_at` gemessen, sodass ein `UPDATE` das effektive Alter einer Erinnerung zurücksetzt – eine gerade bearbeitete Erinnerung ist wieder "jung".
+- `T0`-Erinnerungen haben standardmäßig einen `decay_per_day` von `0` und verfallen daher nie, was grundlegendem Wissen einen dauerhaften Vorteil verschafft (dies ersetzt den alten pauschalen `+0.1` T0-Bonus).
+- Die Zugriffshäufigkeit wird log-gedämpft (`log1p`), sodass wenige zusätzliche Abrufe die Reihenfolge nicht dominieren können, und durch `access_norm` (Standard `50`) normalisiert, damit der Zugriffsterm größenordnungsmäßig mit dem Wichtigkeitsterm vergleichbar bleibt.
+
+**Konfiguration** (`search.ranking` in `config.json`, siehe [Konfiguration](#konfiguration)):
+
+| Feld | Standard | Bedeutung |
+|---|---|---|
+| `enabled` | `true` | Auf `false` setzen, um Composite Ranking vollständig zu deaktivieren und die reine Relevanz-Reihenfolge wiederherzustellen. |
+| `w_importance` | `0.3` | Gewichtung der `importance` (0–1) einer Erinnerung. |
+| `w_access` | `0.2` | Gewichtung der log-gedämpften Zugriffsanzahl. |
+| `access_norm` | `50` | Normalisiert den Zugriffsanzahl-Term; größere Werte erfordern mehr Zugriffe für denselben Bonus. |
+| `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Pro-Stufe exponentieller Decay-Satz auf `age_days`. Der Standard für `T2` ergibt eine Halbwertszeit von etwa 87 Tagen, passend zur 90-Tage-TTL. |
+
+**Was Composite Ranking *nicht* beeinflusst:** die rohen Felder `semantic_score` und `fulltext_score` jedes Ergebnisses sowie das Feld, auf das der `min_score`-Schwellenwert von `recall` angewendet wird (`semantic_score`) – siehe [Recall vs. Search](#recall-vs-search--unterschiede). Composite Ranking ändert die *Reihenfolge* der Ergebnisse, niemals, welche Erinnerungen die `min_score`-Schwelle passieren.
 
 ---
 
@@ -1546,7 +1591,7 @@ BHGBrain bietet zwei Tools für den Speicherabruf mit unterschiedlicher Semantik
 | **Beabsichtigter Aufrufer** | KI-Agenten während der Aufgabenausführung | Menschen oder Admin-Agenten bei Untersuchungen |
 
 **Score-Filterung bei Recall:**
-Der Parameter `min_score` (Standard 0.6) fungiert als Qualitätssicherung – er wird auf das Feld `semantic_score` (Kosinus-Ähnlichkeit) angewendet, nicht auf den fusionierten/stufenverstärkten `score`, da `recall` im semantischen Modus läuft – nur Erinnerungen mit einer Kosinus-Ähnlichkeit ≥ 0.6 werden zurückgegeben. Dies verhindert irrelevante Ergebnisse. Sie können `min_score` senken, um mehr Ergebnisse auf Kosten der Präzision abzurufen.
+Der Parameter `min_score` (Standard 0.6) fungiert als Qualitätssicherung – er wird auf das Feld `semantic_score` (Kosinus-Ähnlichkeit) angewendet, nicht auf den Composite-Rank-`score`, da `recall` im semantischen Modus läuft – nur Erinnerungen mit einer Kosinus-Ähnlichkeit ≥ 0.6 werden zurückgegeben. Dies verhindert irrelevante Ergebnisse. Sie können `min_score` senken, um mehr Ergebnisse auf Kosten der Präzision abzurufen.
 
 ```json
 // Recall-Beispiel – semantisch, gefiltert nach Typ und Tags
@@ -1578,13 +1623,13 @@ Sowohl `recall` als auch `search` unterstützen Namensraum- und Sammlungs-Scopin
 
 ---
 
-### Score-Schwellenwerte und Stufenverstärkungen
+### Score-Schwellenwerte und Composite Ranking
 
-**`min_score` (nur recall):** Ein Mindestkosinus-Ähnlichkeitsscore zwischen 0 und 1, angewendet speziell auf das Feld `semantic_score` – nicht auf den fusionierten/stufenverstärkten `score` – da `recall` fest im semantischen Modus arbeitet und der Standardwert von `min_score` auf einen Kosinus-Ähnlichkeitsbereich kalibriert ist, nicht auf hybride RRF-Scores. Erinnerungen unter diesem Schwellenwert werden aus `recall`-Ergebnissen ausgeschlossen. Standard: 0.6.
+**`min_score` (nur recall):** Ein Mindestkosinus-Ähnlichkeitsscore zwischen 0 und 1, angewendet speziell auf das Feld `semantic_score` – nicht auf den Composite-Rank-`score` – da `recall` fest im semantischen Modus arbeitet und der Standardwert von `min_score` auf einen Kosinus-Ähnlichkeitsbereich kalibriert ist, nicht auf hybride RRF-Scores oder den Composite-Prior. Erinnerungen unter diesem Schwellenwert werden aus `recall`-Ergebnissen ausgeschlossen. Standard: 0.6.
 
 **Ausschluss abgelaufener Erinnerungen:** Qdrants Vektorsuchfilter schließt Erinnerungen aus, bei denen `decay_eligible = true UND expires_at < now()`. T0/T1-Erinnerungen (decay_eligible = false) werden nie durch den vektorseitigen Filter ausgeschlossen. Auf der SQLite-Seite überprüft der Lifecycle-Service den Ablauf jeder aus dem Vektorspeicher zurückgegebenen Erinnerung erneut.
 
-**T0 Score-Bonus (Hybridsuche):** Nach der RRF-Fusion erhalten T0 (grundlegende) Erinnerungen zusätzliche +0.1 zu ihrem Score. Dies stellt sicher, dass architektonisch bedeutsame Inhalte in Hybrid-Ergebnissen auch dann angezeigt werden, wenn ihre genaue Terminologie nicht gut zur Abfrage passt.
+**Composite Ranking (alle Modi):** `score` ist die Relevanz multipliziert mit einem Prior aus Wichtigkeit, Zugriff und Aktualität – siehe [Composite Ranking](#composite-ranking) oben. T0-Erinnerungen (grundlegend) verfallen standardmäßig nie, sodass architektonisch bedeutsame Inhalte auch mit zunehmendem Alter dauerhaft gut platziert bleiben.
 
 ---
 

@@ -369,6 +369,22 @@ BHGBrain 从以下位置加载配置文件：
     "hybrid_weights": {
       "semantic": 0.7,
       "fulltext": 0.3
+    },
+    // 复合排名：按相关性 x 一个由重要性、访问频率和分层感知的时效衰减
+    // 共同决定的先验值对结果排序（详见下方"复合排名"）。
+    // enabled 设为 false 可恢复纯相关性排序。
+    "ranking": {
+      "enabled": true,
+      "w_importance": 0.3,
+      "w_access": 0.2,
+      "access_norm": 50,
+      // 每个保留层级的每日指数衰减率。T0 为 0（永不衰减）。
+      "decay_per_day": {
+        "T0": 0,
+        "T1": 0.002,
+        "T2": 0.008,
+        "T3": 0.02
+      }
     }
   },
 
@@ -918,7 +934,7 @@ CREATE INDEX idx_memories_vector_sync ON memories(vector_synced);
 
 **各层级的关键属性：**
 
-- **T0**：`expires_at` 始终为 `null`。`decay_eligible` 始终为 `false`。T0 记忆无法被自动清理。T0 记忆的更新会在应用更新之前在 `memory_revisions` 表中创建版本快照（只追加历史）。T0 记忆在混合搜索结果中获得 +0.1 的得分加权。
+- **T0**：`expires_at` 始终为 `null`。`decay_eligible` 始终为 `false`。T0 记忆无法被自动清理。T0 记忆的更新会在应用更新之前在 `memory_revisions` 表中创建版本快照（只追加历史）。T0 记忆在复合排名中永不衰减（`decay_per_day.T0` 默认为 `0`），使其在所有搜索模式下都保持持久的排名优势。
 
 - **T1**：`review_due` 设置为 `created_at + 365 天`，每次访问时重置。接近 `expires_at` 的记忆在搜索结果中标记 `expiring_soon: true`。
 
@@ -1458,8 +1474,8 @@ flowchart TD
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
     FR --> RRF
-    RRF --> BOOST["T0 Score Boost<br/><i>+0.1 for foundational</i>"]
-    BOOST --> TOP["Return Top N Results"]
+    RRF --> RANK["Composite Ranking<br/><i>relevance x importance/access/decay prior</i>"]
+    RANK --> TOP["Return Top N Results"]
     TOP --> TRACK["Update Access Tracking<br/><i>count++, sliding window reset</i>"]
 
     classDef search fill:#4a90d9,stroke:#2c5f8a,color:#fff
@@ -1467,7 +1483,7 @@ flowchart TD
     classDef result fill:#5ba85b,stroke:#3d7a3d,color:#fff
 
     class P1,QD,SR,P2,FTS,FR search
-    class RRF,BOOST fusion
+    class RRF,RANK fusion
     class TOP,TRACK result
 ```
 
@@ -1487,7 +1503,7 @@ flowchart TD
 
 4. 仅出现在一个列表中的条目从另一个列表获得 `0` 贡献。
 5. 合并后的列表按 RRF 得分降序排序。
-6. T0 记忆在 RRF 融合后获得 **+0.1 得分加权**，确保基础知识在结果中突出呈现。
+6. **复合排名**（详见下文）应用于每种模式的结果，包括这个 RRF 得分，并按复合得分重新排序。
 7. 返回前 `limit` 条结果。
 
 **优雅降级：** 如果嵌入提供商不可用，混合搜索会静默回退到仅全文搜索结果，而不是报错。
@@ -1503,6 +1519,34 @@ flowchart TD
   "limit": 10
 }
 ```
+
+---
+
+### 复合排名
+
+每种搜索模式（`semantic`、`fulltext`、`hybrid`）都按复合得分而不仅仅是相关性对结果排序。相关性（余弦相似度、FTS 排名或 RRF 得分，取决于模式）乘以一个**先验值**，该先验值由每条记忆已经携带的信号——`importance`、`access_count` 以及最近更新的时间——共同决定，因此被多次确认有用、标记为重要或最近编辑过的记忆会超过同等相关但已过时的相似记忆。
+
+```
+final_score = relevance x (w_base + w_importance x importance + w_access x log1p(access_count) / log1p(access_norm))
+                        x exp(-decay_per_day[tier] x age_days)
+```
+
+- `w_base` 固定为 `1.0`，不可配置。
+- `age_days` 从 `updated_at` 开始计算，因此 `UPDATE` 会重置记忆的有效年龄——刚编辑过的记忆会重新变"新"。
+- `T0` 记忆默认 `decay_per_day` 为 `0`，因此永不衰减，使基础知识获得持久优势（这取代了旧的固定 `+0.1` T0 加权）。
+- 访问频率通过对数阻尼（`log1p`）处理，使得少量额外访问无法主导排序结果，并通过 `access_norm`（默认 `50`）归一化，使访问项与重要性项保持相当的量级。
+
+**配置**（`config.json` 中的 `search.ranking`，参见[配置](#配置)）：
+
+| 字段 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `true` | 设为 `false` 可完全禁用复合排名，恢复纯相关性排序。 |
+| `w_importance` | `0.3` | 应用于记忆 `importance`（0–1）的权重。 |
+| `w_access` | `0.2` | 应用于对数阻尼后访问次数的权重。 |
+| `access_norm` | `50` | 归一化访问次数项；值越大，达到同等加权所需的访问次数越多。 |
+| `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | 应用于 `age_days` 的各层级指数衰减率。`T2` 的默认值给出约 87 天的半衰期，与其 90 天 TTL 相吻合。 |
+
+**复合排名*不*影响的内容：** 每条结果上原始的 `semantic_score` 和 `fulltext_score` 字段，以及 `recall` 的 `min_score` 阈值所作用的字段（`semantic_score`）——参见 [Recall 与 Search 的区别](#recall-与-search-的区别)。复合排名改变的是结果的*排序*，绝不会改变哪些记忆能通过 `min_score` 关卡。
 
 ---
 
@@ -1524,7 +1568,7 @@ BHGBrain 提供两种具有不同语义的记忆检索工具：
 | **预期调用方** | 执行任务时的 AI 智能体 | 进行调查的人类或管理智能体 |
 
 **recall 中的得分过滤：**
-`min_score` 参数（默认 0.6）作为质量关卡——它作用于 `semantic_score` 字段（余弦相似度），而不是融合/分层加成后的 `score`，因为 `recall` 运行在语义模式下——只有余弦相似度 ≥ 0.6 的记忆才会被返回。这防止了不相关的结果。你可以降低 `min_score` 以获取更多结果，但会牺牲精确性。
+`min_score` 参数（默认 0.6）作为质量关卡——它作用于 `semantic_score` 字段（余弦相似度），而不是复合排名后的 `score`，因为 `recall` 运行在语义模式下——只有余弦相似度 ≥ 0.6 的记忆才会被返回。这防止了不相关的结果。你可以降低 `min_score` 以获取更多结果，但会牺牲精确性。
 
 ```json
 // Recall 示例——语义搜索，按类型和标签过滤
@@ -1556,13 +1600,13 @@ BHGBrain 提供两种具有不同语义的记忆检索工具：
 
 ---
 
-### 得分阈值与层级加权
+### 得分阈值与复合排名
 
-**`min_score`（仅 recall）：** 0 到 1 之间的最低余弦相似度得分，专门作用于 `semantic_score` 字段——而非融合/分层加成后的 `score`——因为 `recall` 固定使用语义模式，且 `min_score` 的默认值是针对余弦相似度范围校准的，而非混合 RRF 得分。低于此阈值的记忆从 `recall` 结果中排除。默认：0.6。
+**`min_score`（仅 recall）：** 0 到 1 之间的最低余弦相似度得分，专门作用于 `semantic_score` 字段——而非复合排名后的 `score`——因为 `recall` 固定使用语义模式，且 `min_score` 的默认值是针对余弦相似度范围校准的，而非混合 RRF 得分或复合先验值。低于此阈值的记忆从 `recall` 结果中排除。默认：0.6。
 
 **过期记忆排除：** Qdrant 的向量搜索过滤器排除满足 `decay_eligible = true AND expires_at < now()` 的记忆。T0/T1 记忆（decay_eligible = false）永远不会被向量侧过滤器排除。在 SQLite 侧，生命周期服务对从向量库返回的任何记忆重新检查过期状态。
 
-**T0 得分加权（混合搜索）：** 在 RRF 融合后，T0（基础层）记忆额外获得 +0.1 的得分加成。这确保架构上重要的内容即使其确切术语与查询匹配不佳，也能在混合结果中浮现。
+**复合排名（所有模式）：** `score` 是相关性乘以由重要性、访问和时效性构成的先验值——参见上方[复合排名](#复合排名)。T0（基础层）记忆默认永不衰减，确保架构上重要的内容随着时间推移仍能持久保持良好排名。
 
 ---
 

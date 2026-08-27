@@ -418,6 +418,23 @@ The file is created automatically on first run with all defaults applied. Edit i
     "hybrid_weights": {
       "semantic": 0.7,
       "fulltext": 0.3
+    },
+    // Composite ranking: orders results by relevance x a prior derived from
+    // importance, access frequency, and tier-aware recency decay (see
+    // "Composite Ranking" below). Set enabled: false to restore pure-relevance
+    // ordering (the pre-ranking behavior).
+    "ranking": {
+      "enabled": true,
+      "w_importance": 0.3,
+      "w_access": 0.2,
+      "access_norm": 50,
+      // Per-day exponential decay rate by retention tier. T0 is 0 (never decays).
+      "decay_per_day": {
+        "T0": 0,
+        "T1": 0.002,
+        "T2": 0.008,
+        "T3": 0.02
+      }
     }
   },
 
@@ -980,7 +997,7 @@ Every memory is assigned a **retention tier** at ingestion time that governs its
 
 **Key properties by tier:**
 
-- **T0**: `expires_at` is always `null`. `decay_eligible` is always `false`. T0 memories cannot be automatically cleaned up. Updates to T0 memories trigger a revision snapshot in the `memory_revisions` table (append-only history). T0 memories receive a +0.1 score boost in hybrid search results.
+- **T0**: `expires_at` is always `null`. `decay_eligible` is always `false`. T0 memories cannot be automatically cleaned up. Updates to T0 memories trigger a revision snapshot in the `memory_revisions` table (append-only history). T0 memories never decay in composite ranking (`decay_per_day.T0` defaults to `0`), giving them a durable ranking edge across all search modes.
 
 - **T1**: `review_due` is set to `created_at + 365 days` and reset on each access. Memories approaching their `expires_at` are flagged with `expiring_soon: true` in search results.
 
@@ -1520,8 +1537,8 @@ flowchart TD
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
     FR --> RRF
-    RRF --> BOOST["T0 Score Boost<br/><i>+0.1 for foundational</i>"]
-    BOOST --> TOP["Return Top N Results"]
+    RRF --> RANK["Composite Ranking<br/><i>relevance x importance/access/decay prior</i>"]
+    RANK --> TOP["Return Top N Results"]
     TOP --> TRACK["Update Access Tracking<br/><i>count++, sliding window reset</i>"]
 
     classDef search fill:#4a90d9,stroke:#2c5f8a,color:#fff
@@ -1529,7 +1546,7 @@ flowchart TD
     classDef result fill:#5ba85b,stroke:#3d7a3d,color:#fff
 
     class P1,QD,SR,P2,FTS,FR search
-    class RRF,BOOST fusion
+    class RRF,RANK fusion
     class TOP,TRACK result
 ```
 
@@ -1549,7 +1566,7 @@ Hybrid search combines semantic and fulltext results using **Reciprocal Rank Fus
 
 4. Items appearing in only one list receive `0` contribution from the other.
 5. The merged list is sorted by RRF score (descending).
-6. T0 memories receive a **+0.1 score boost** applied after RRF fusion, ensuring foundational knowledge surfaces prominently.
+6. **Composite ranking** (see below) is applied to every mode's results, including this RRF score, and the list is re-sorted by the composite score.
 7. The top `limit` results are returned.
 
 **Graceful degradation:** If the embedding provider is unavailable, hybrid search silently falls back to fulltext-only results rather than erroring.
@@ -1565,6 +1582,34 @@ Hybrid search combines semantic and fulltext results using **Reciprocal Rank Fus
   "limit": 10
 }
 ```
+
+---
+
+### Composite Ranking
+
+Every search mode (`semantic`, `fulltext`, `hybrid`) orders its results by a composite score rather than relevance alone. Relevance (cosine similarity, FTS rank, or RRF score, depending on mode) is multiplied by a **prior** derived from signals every memory already carries - `importance`, `access_count`, and how recently it was updated - so that a memory confirmed useful many times, marked important, or edited recently outranks an equally-relevant stale look-alike.
+
+```
+final_score = relevance x (w_base + w_importance x importance + w_access x log1p(access_count) / log1p(access_norm))
+                        x exp(-decay_per_day[tier] x age_days)
+```
+
+- `w_base` is a fixed `1.0` and is not configurable.
+- `age_days` is measured from `updated_at`, so an `UPDATE` resets a memory's effective age - a freshly edited memory is "young" again.
+- `T0` memories have a `decay_per_day` of `0` by default and therefore never decay, giving foundational knowledge a durable edge (this replaces the old flat `+0.1` T0 boost).
+- Access frequency is log-damped (`log1p`) so a handful of extra recalls cannot dominate the ordering, and normalized by `access_norm` (default `50`) so the access term stays roughly comparable in scale to the importance term.
+
+**Configuration** (`search.ranking` in `config.json`, see [Configuration](#configuration)):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Set `false` to disable composite ranking entirely and restore pure-relevance ordering. |
+| `w_importance` | `0.3` | Weight applied to a memory's `importance` (0-1). |
+| `w_access` | `0.2` | Weight applied to the log-damped access count. |
+| `access_norm` | `50` | Normalizes the access-count term; larger values require more accesses to reach the same boost. |
+| `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Per-tier exponential decay rate applied to `age_days`. `T2`'s default gives a half-life of roughly 87 days, aligned with its 90-day TTL. |
+
+**What composite ranking does *not* affect:** the raw `semantic_score` and `fulltext_score` fields on each result, and the field `recall`'s `min_score` threshold applies to (`semantic_score`) - see [Recall vs Search](#recall-vs-search---differences). Composite ranking changes result *ordering*, never which memories clear the `min_score` gate.
 
 ---
 
@@ -1586,7 +1631,7 @@ BHGBrain exposes two tools for memory retrieval with different semantics:
 | **Intended caller** | AI agents during task execution | Humans or admin agents doing investigation |
 
 **Score filtering in recall:**
-The `min_score` parameter (default 0.6) acts as a quality gate - it is applied to the `semantic_score` field (cosine similarity), not the fused/tier-boosted `score`, since `recall` runs in semantic mode - only memories with cosine similarity ≥ 0.6 are returned. This prevents irrelevant results. You can lower `min_score` to retrieve more results at the cost of precision.
+The `min_score` parameter (default 0.6) acts as a quality gate - it is applied to the `semantic_score` field (cosine similarity), not the composite-ranked `score`, since `recall` runs in semantic mode - only memories with cosine similarity ≥ 0.6 are returned. This prevents irrelevant results. You can lower `min_score` to retrieve more results at the cost of precision.
 
 ```json
 // Recall example - semantic, filtered by type and tags
@@ -1618,13 +1663,13 @@ Both `recall` and `search` support namespace and collection scoping. `recall` ad
 
 ---
 
-### Score Thresholds and Tier Boosts
+### Score Thresholds and Composite Ranking
 
-**`min_score` (recall only):** A minimum cosine-similarity score between 0 and 1, applied to the `semantic_score` field specifically - not the fused/tier-boosted `score` - since `recall` hardcodes semantic mode and `min_score`'s default is calibrated for a cosine-similarity range, not hybrid RRF scores. Memories below this threshold are excluded from `recall` results. Default: 0.6.
+**`min_score` (recall only):** A minimum cosine-similarity score between 0 and 1, applied to the `semantic_score` field specifically - not the composite-ranked `score` - since `recall` hardcodes semantic mode and `min_score`'s default is calibrated for a cosine-similarity range, not hybrid RRF scores or the composite prior. Memories below this threshold are excluded from `recall` results. Default: 0.6.
 
 **Expired memory exclusion:** Qdrant's vector search filter excludes memories where `decay_eligible = true AND expires_at < now()`. T0/T1 memories (decay_eligible = false) are never excluded by the vector-side filter. SQLite-side, the lifecycle service re-checks expiry on any memory returned from the vector store.
 
-**T0 score boost (hybrid search):** After RRF fusion, T0 (foundational) memories receive an additional +0.1 added to their score. This ensures that architecturally significant content surfaces in hybrid results even if its exact terminology doesn't match the query well.
+**Composite ranking (all modes):** `score` is relevance multiplied by an importance/access/recency prior - see [Composite Ranking](#composite-ranking) above. T0 (foundational) memories never decay by default, ensuring architecturally significant content stays durably ranked even as it ages.
 
 ---
 
