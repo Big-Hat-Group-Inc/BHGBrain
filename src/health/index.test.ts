@@ -197,6 +197,30 @@ describe('HealthService', () => {
     expect(embedding.healthCheck).toHaveBeenCalledTimes(1);
   });
 
+  it('re-invokes the embedding health check once the 30s cache window has elapsed (task 5.4 / 8.7)', async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = createStorage();
+      const embedding = createEmbedding(true);
+      const health = new HealthService(storage, embedding, createConfig());
+
+      await health.check();
+      expect(embedding.healthCheck).toHaveBeenCalledTimes(1);
+
+      // Still within the 30s window: cache hit, no re-invocation.
+      await vi.advanceTimersByTimeAsync(29_000);
+      await health.check();
+      expect(embedding.healthCheck).toHaveBeenCalledTimes(1);
+
+      // Past the 30s window: cache expires and the sub-check re-runs.
+      await vi.advanceTimersByTimeAsync(2_000);
+      await health.check();
+      expect(embedding.healthCheck).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('returns memory count and db size', async () => {
     const storage = createStorage();
     const embedding = createEmbedding(true);

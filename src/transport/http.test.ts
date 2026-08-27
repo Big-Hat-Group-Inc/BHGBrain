@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { AddressInfo } from 'node:net';
+import request from 'supertest';
 import type { BrainConfig } from '../config/index.js';
 
 const handleToolMock = vi.fn();
@@ -73,7 +73,12 @@ describe('createHttpServer', () => {
     };
   }
 
-  async function startServer(config: BrainConfig, overrides?: {
+  // Builds the Express app in-process. Requests are dispatched via
+  // supertest(app), which never calls `.listen()` on the app under test and
+  // requires no port bookkeeping or connection-teardown plumbing (see
+  // design decision "Use supertest ... never call .listen() in tests" and
+  // audit follow-up 8.9).
+  async function buildApp(config: BrainConfig, overrides?: {
     health?: { check: () => Promise<unknown> };
     metrics?: Partial<{
       getMetrics: () => Array<{ name: string; value: number }>;
@@ -111,89 +116,74 @@ describe('createHttpServer', () => {
       resources as never,
       logger as never,
     );
-    const server = await new Promise<import('node:http').Server>((resolve) => {
-      const instance = app.listen(0, '127.0.0.1', () => resolve(instance));
-    });
-    const address = server.address() as AddressInfo;
-    const baseUrl = `http://127.0.0.1:${address.port}`;
 
-    return { baseUrl, server, resources };
+    return { app, resources };
   }
 
-  async function closeServer(server: import('node:http').Server) {
-    server.closeIdleConnections?.();
-    server.closeAllConnections?.();
-    await new Promise<void>((resolve, reject) =>
-      server.close((error) => error ? reject(error) : resolve()),
-    );
-  }
-
-  afterEach(async () => {
+  afterEach(() => {
     vi.clearAllMocks();
     delete process.env.BHGBRAIN_TOKEN;
   });
 
   it('returns health without auth and uses 200/503 based on status', async () => {
-    const healthy = await startServer(createConfig(false, true), {
+    const healthy = await buildApp(createConfig(false, true), {
       health: { check: vi.fn(async () => ({ status: 'healthy' })) },
     });
-    const healthyResponse = await fetch(`${healthy.baseUrl}/health`);
+    const healthyResponse = await request(healthy.app).get('/health');
     expect(healthyResponse.status).toBe(200);
-    await healthyResponse.json();
-    await closeServer(healthy.server);
 
-    const unhealthy = await startServer(createConfig(false, true), {
+    const unhealthy = await buildApp(createConfig(false, true), {
       health: { check: vi.fn(async () => ({ status: 'unhealthy' })) },
     });
-    const unhealthyResponse = await fetch(`${unhealthy.baseUrl}/health`);
+    const unhealthyResponse = await request(unhealthy.app).get('/health');
     expect(unhealthyResponse.status).toBe(503);
-    await unhealthyResponse.json();
-    await closeServer(unhealthy.server);
-  }, 15000);
+  });
+
+  it('returns 200 (not 503) when health reports degraded', async () => {
+    // Covers http.ts:31 — the `degraded` branch, distinct from the
+    // `unhealthy`->503 path above (audit follow-up 8.8 / task 2.3).
+    const degraded = await buildApp(createConfig(false, true), {
+      health: { check: vi.fn(async () => ({ status: 'degraded' })) },
+    });
+    const degradedResponse = await request(degraded.app).get('/health');
+    expect(degradedResponse.status).toBe(200);
+    expect(degradedResponse.body.status).toBe('degraded');
+  });
 
   it('rejects tool calls without or with invalid auth', async () => {
-    const { baseUrl, server } = await startServer(createConfig(false, true));
+    const { app } = await buildApp(createConfig(false, true));
 
-    const missingAuth = await fetch(`${baseUrl}/tool/remember`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: 'hello' }),
-    });
+    const missingAuth = await request(app)
+      .post('/tool/remember')
+      .set('Content-Type', 'application/json')
+      .send({ content: 'hello' });
     expect(missingAuth.status).toBe(401);
 
-    const invalidAuth = await fetch(`${baseUrl}/tool/remember`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer wrong-token',
-      },
-      body: JSON.stringify({ content: 'hello' }),
-    });
+    const invalidAuth = await request(app)
+      .post('/tool/remember')
+      .set('Content-Type', 'application/json')
+      .set('Authorization', 'Bearer wrong-token')
+      .send({ content: 'hello' });
     expect(invalidAuth.status).toBe(401);
-
-    await closeServer(server);
   });
 
   it('calls handleTool and resources when authorized', async () => {
     handleToolMock.mockResolvedValue({ ok: true });
     const resourcesHandle = vi.fn(async () => ({ resource: true }));
-    const { baseUrl, server } = await startServer(createConfig(false, true), {
+    const { app } = await buildApp(createConfig(false, true), {
       resources: { handle: resourcesHandle },
     });
 
-    const toolResponse = await fetch(`${baseUrl}/tool/remember`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer secret-token',
-        // A caller-supplied x-client-id is an untrusted hint only — it must
-        // never become the recorded audit/client identity (task 4.4).
-        'x-client-id': 'client-1',
-      },
-      body: JSON.stringify({ content: 'hello' }),
-    });
+    const toolResponse = await request(app)
+      .post('/tool/remember')
+      .set('Content-Type', 'application/json')
+      .set('Authorization', 'Bearer secret-token')
+      // A caller-supplied x-client-id is an untrusted hint only — it must
+      // never become the recorded audit/client identity (task 4.4).
+      .set('x-client-id', 'client-1')
+      .send({ content: 'hello' });
     expect(toolResponse.status).toBe(200);
-    expect(await toolResponse.json()).toEqual({ ok: true });
+    expect(toolResponse.body).toEqual({ ok: true });
     // The recorded client id is derived from the authenticated principal
     // (req.ip, a loopback address here), not from the spoofable
     // `x-client-id` header value 'client-1'.
@@ -201,31 +191,28 @@ describe('createHttpServer', () => {
     expect(recordedClientId).not.toBe('client-1');
     expect(recordedClientId).toMatch(/127\.0\.0\.1|::1|::ffff:127\.0\.0\.1/);
 
-    const missingUri = await fetch(`${baseUrl}/resource`, {
-      headers: { 'Authorization': 'Bearer secret-token' },
-    });
+    const missingUri = await request(app)
+      .get('/resource')
+      .set('Authorization', 'Bearer secret-token');
     expect(missingUri.status).toBe(400);
 
-    const resourceResponse = await fetch(`${baseUrl}/resource?uri=memory://list`, {
-      headers: { 'Authorization': 'Bearer secret-token' },
-    });
+    const resourceResponse = await request(app)
+      .get('/resource')
+      .query({ uri: 'memory://list' })
+      .set('Authorization', 'Bearer secret-token');
     expect(resourceResponse.status).toBe(200);
-    expect(await resourceResponse.json()).toEqual({ resource: true });
+    expect(resourceResponse.body).toEqual({ resource: true });
     expect(resourcesHandle).toHaveBeenCalledWith('memory://list');
-
-    await closeServer(server);
   });
 
   it('serves metrics only when enabled', async () => {
-    const disabled = await startServer(createConfig(false, true));
-    const disabledResponse = await fetch(`${disabled.baseUrl}/metrics`, {
-      headers: { 'Authorization': 'Bearer secret-token' },
-    });
+    const disabled = await buildApp(createConfig(false, true));
+    const disabledResponse = await request(disabled.app)
+      .get('/metrics')
+      .set('Authorization', 'Bearer secret-token');
     expect(disabledResponse.status).toBe(404);
-    await disabledResponse.text();
-    await closeServer(disabled.server);
 
-    const enabled = await startServer(createConfig(true, true), {
+    const enabled = await buildApp(createConfig(true, true), {
       metrics: {
         getMetrics: vi.fn(() => [
           { name: 'bhgbrain_tool_handler_ms_p95', value: 12 },
@@ -233,80 +220,59 @@ describe('createHttpServer', () => {
         ]),
       },
     });
-    const enabledResponse = await fetch(`${enabled.baseUrl}/metrics`, {
-      headers: { 'Authorization': 'Bearer secret-token' },
-    });
+    const enabledResponse = await request(enabled.app)
+      .get('/metrics')
+      .set('Authorization', 'Bearer secret-token');
     expect(enabledResponse.status).toBe(200);
-    expect(await enabledResponse.text()).toContain('bhgbrain_tool_handler_ms_p95 12');
-    await closeServer(enabled.server);
+    expect(enabledResponse.text).toContain('bhgbrain_tool_handler_ms_p95 12');
   });
 
   it('ignores X-Forwarded-For for rate-limit identity when trust_proxy is disabled', async () => {
-    const { baseUrl, server } = await startServer(
+    const { app } = await buildApp(
       createConfig(false, true, { trustProxy: false, rateLimitRpm: 1 }),
     );
 
-    const first = await fetch(`${baseUrl}/tool/remember`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer secret-token',
-        'X-Forwarded-For': '203.0.113.1',
-      },
-      body: JSON.stringify({ content: 'hello' }),
-    });
+    const first = await request(app)
+      .post('/tool/remember')
+      .set('Content-Type', 'application/json')
+      .set('Authorization', 'Bearer secret-token')
+      .set('X-Forwarded-For', '203.0.113.1')
+      .send({ content: 'hello' });
     expect(first.status).toBe(200);
-    await first.json();
 
     // Different spoofed forwarding header, but with trust proxy disabled the
     // limiter must key on the real loopback socket peer for both requests,
     // so this second request from the "same" real client is rate-limited.
-    const second = await fetch(`${baseUrl}/tool/remember`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer secret-token',
-        'X-Forwarded-For': '203.0.113.2',
-      },
-      body: JSON.stringify({ content: 'hello' }),
-    });
+    const second = await request(app)
+      .post('/tool/remember')
+      .set('Content-Type', 'application/json')
+      .set('Authorization', 'Bearer secret-token')
+      .set('X-Forwarded-For', '203.0.113.2')
+      .send({ content: 'hello' });
     expect(second.status).toBe(429);
-    await second.json();
-
-    await closeServer(server);
   });
 
   it('derives rate-limit identity from X-Forwarded-For when trust_proxy is enabled', async () => {
-    const { baseUrl, server } = await startServer(
+    const { app } = await buildApp(
       createConfig(false, true, { trustProxy: true, rateLimitRpm: 1 }),
     );
 
-    const clientA = await fetch(`${baseUrl}/tool/remember`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer secret-token',
-        'X-Forwarded-For': '203.0.113.10',
-      },
-      body: JSON.stringify({ content: 'hello' }),
-    });
+    const clientA = await request(app)
+      .post('/tool/remember')
+      .set('Content-Type', 'application/json')
+      .set('Authorization', 'Bearer secret-token')
+      .set('X-Forwarded-For', '203.0.113.10')
+      .send({ content: 'hello' });
     expect(clientA.status).toBe(200);
-    await clientA.json();
 
     // Distinct forwarded client identity is tracked in a distinct bucket, so
     // it is not rate-limited by client A's request.
-    const clientB = await fetch(`${baseUrl}/tool/remember`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer secret-token',
-        'X-Forwarded-For': '203.0.113.20',
-      },
-      body: JSON.stringify({ content: 'hello' }),
-    });
+    const clientB = await request(app)
+      .post('/tool/remember')
+      .set('Content-Type', 'application/json')
+      .set('Authorization', 'Bearer secret-token')
+      .set('X-Forwarded-For', '203.0.113.20')
+      .send({ content: 'hello' });
     expect(clientB.status).toBe(200);
-    await clientB.json();
-
-    await closeServer(server);
   });
 });

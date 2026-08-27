@@ -26,12 +26,12 @@
 
 ## 3. MetricsCollector Tests (`src/health/metrics.test.ts`)
 
-- [ ] 3.1 Assert `incCounter` accumulates correctly across multiple calls (audit 2026-06-05: not implemented — `incCounter` never called in `src/health/metrics.test.ts`; `metrics.ts:85-86` uncovered)
-- [ ] 3.2 Assert `incCounter` with custom `amount` adds the correct increment (audit 2026-06-05: not implemented)
+- [x] 3.1 Assert `incCounter` accumulates correctly across multiple calls (audit 2026-06-05: not implemented — `incCounter` never called in `src/health/metrics.test.ts`; `metrics.ts:85-86` uncovered)
+- [x] 3.2 Assert `incCounter` with custom `amount` adds the correct increment (audit 2026-06-05: not implemented)
 - [x] 3.3 Assert `recordHistogram` stores values and `getMetrics` returns correct `_avg` and `_count`
 - [x] 3.4 Assert `BoundedBuffer` wraps correctly at capacity: after `capacity + N` pushes, `values()` returns exactly `capacity` items and `_avg` reflects the most recent window (audit 2026-06-05: partial — wrap verified indirectly via percentile count cap; `values()`/`_avg` window not asserted directly)
-- [ ] 3.5 Assert `setGauge` overwrites previous value; `getMetrics` returns the latest value (audit 2026-06-05: not implemented — `setGauge` never called; `metrics.ts:100-101` uncovered)
-- [ ] 3.6 Assert a disabled `MetricsCollector` (`metrics_enabled: false`) silently ignores all record calls and returns `[]` from `getMetrics` (audit 2026-06-05: not implemented — disabled-collector path/`metrics.ts:107-108` uncovered)
+- [x] 3.5 Assert `setGauge` overwrites previous value; `getMetrics` returns the latest value (audit 2026-06-05: not implemented — `setGauge` never called; `metrics.ts:100-101` uncovered)
+- [x] 3.6 Assert a disabled `MetricsCollector` (`metrics_enabled: false`) silently ignores all record calls and returns `[]` from `getMetrics` (audit 2026-06-05: not implemented — disabled-collector path/`metrics.ts:107-108` uncovered)
 - [x] 3.7 Assert `getMetrics` returns entries with correct `name`, `type`, and `value` shape (audit 2026-06-05: partial — `name`/`value` asserted; `type` field never asserted)
 
 ## 4. Logger / Redaction Tests (`src/health/logger.test.ts`)
@@ -70,13 +70,13 @@ Source: `codeaudit/expand-test-coverage-2026-06-05-02-19.md`. These items close 
 and design deviations the audit found. No production code under `src/` changes — test
 files only.
 
-- [ ] 8.1 Implement task 3.1 — `incCounter('c'); incCounter('c')` then assert `getMetrics()` contains `{ name: 'c', type: 'counter', value: 2 }` (covers `metrics.ts:85-86`)
-- [ ] 8.2 Implement task 3.2 — `incCounter('c', 3)` adds the custom amount; assert accumulated value reflects the increment
-- [ ] 8.3 Implement task 3.5 — `setGauge('g', 1); setGauge('g', 2)` then assert `getMetrics()` reports the latest value `2` (covers `metrics.ts:100-101`)
-- [ ] 8.4 Implement task 3.6 — construct `new MetricsCollector(createConfig(false))`, issue record/counter/gauge calls, then assert `getMetrics()` deep-equals `[]` (covers the disabled branch / `metrics.ts:107-108`)
-- [ ] 8.5 Finish Partial 3.4 — assert `BoundedBuffer` wrap directly: after `capacity + N` pushes, `values()` returns exactly `capacity` items and `_avg` reflects the most-recent window (not only via percentile count cap)
-- [ ] 8.6 Finish Partial 3.7 — assert the `type` field on `getMetrics()` entries (e.g. `_count`→`'counter'`, `_avg`/`_p95`→`'histogram'`, gauge→`'gauge'`)
-- [ ] 8.7 Finish Partial 5.4 — add a `vi.useFakeTimers()` variant that advances past the 30s cache window and asserts sub-checks (`embedding.healthCheck`) are re-invoked after expiry, confirming both cache hit and TTL boundary
-- [ ] 8.8 Finish Partial 2.3 — assert `GET /health` returns 200 when the health stub reports `status: 'degraded'` (covers `http.ts:31`)
-- [ ] 8.9 FIX HTTP suite drift from design — rewrite `src/transport/http.test.ts` to drive the Express app in-process via `supertest(app)` with no real socket bind; remove `app.listen(0)` + `fetch`, the `closeIdleConnections`/`closeAllConnections`/`close` teardown plumbing, and the bumped 15s timeout, per design Decision "Use `supertest` ... never call `.listen()` in tests". (If real-port binding is instead chosen deliberately, the design must be amended to record that decision rather than leaving code and design contradictory.)
-- [ ] 8.10 Re-run `npm test` and coverage; confirm `metrics.ts` branch coverage rises (counter/gauge/disabled branches covered) and all suites stay green
+- [x] 8.1 Implement task 3.1 — `incCounter('c'); incCounter('c')` then assert `getMetrics()` contains `{ name: 'c', type: 'counter', value: 2 }` (covers `metrics.ts:85-86`)
+- [x] 8.2 Implement task 3.2 — `incCounter('c', 3)` adds the custom amount; assert accumulated value reflects the increment
+- [x] 8.3 Implement task 3.5 — `setGauge('g', 1); setGauge('g', 2)` then assert `getMetrics()` reports the latest value `2` (covers `metrics.ts:100-101`)
+- [x] 8.4 Implement task 3.6 — construct `new MetricsCollector(createConfig(false))`, issue record/counter/gauge calls, then assert `getMetrics()` deep-equals `[]` (covers the disabled branch / `metrics.ts:107-108`)
+- [x] 8.5 Finish Partial 3.4 — assert `BoundedBuffer` wrap directly: after `capacity + N` pushes, `values()` returns exactly `capacity` items and `_avg` reflects the most-recent window (not only via percentile count cap)
+- [x] 8.6 Finish Partial 3.7 — assert the `type` field on `getMetrics()` entries (e.g. `_count`→`'counter'`, `_avg`/`_p95`→`'histogram'`, gauge→`'gauge'`)
+- [x] 8.7 Finish Partial 5.4 — add a `vi.useFakeTimers()` variant that advances past the 30s cache window and asserts sub-checks (`embedding.healthCheck`) are re-invoked after expiry, confirming both cache hit and TTL boundary
+- [x] 8.8 Finish Partial 2.3 — assert `GET /health` returns 200 when the health stub reports `status: 'degraded'` (covers `http.ts:31`)
+- [x] 8.9 FIX HTTP suite drift from design — rewrite `src/transport/http.test.ts` to drive the Express app in-process via `supertest(app)` with no real socket bind; remove `app.listen(0)` + `fetch`, the `closeIdleConnections`/`closeAllConnections`/`close` teardown plumbing, and the bumped 15s timeout, per design Decision "Use `supertest` ... never call `.listen()` in tests". (If real-port binding is instead chosen deliberately, the design must be amended to record that decision rather than leaving code and design contradictory.)
+- [x] 8.10 Re-run `npm test` and coverage; confirm `metrics.ts` branch coverage rises (counter/gauge/disabled branches covered) and all suites stay green

@@ -78,6 +78,60 @@ describe('MetricsCollector', () => {
     expect(entries.latency_ms_count).toBe(4);
   });
 
+  it('accumulates incCounter across multiple calls (task 3.1 / 8.1)', () => {
+    const metrics = new MetricsCollector(createConfig());
+    metrics.incCounter('requests_total');
+    metrics.incCounter('requests_total');
+
+    const entry = metrics.getMetrics().find(e => e.name === 'requests_total');
+    expect(entry).toEqual({ name: 'requests_total', type: 'counter', value: 2 });
+  });
+
+  it('accumulates incCounter with a custom amount (task 3.2 / 8.2)', () => {
+    const metrics = new MetricsCollector(createConfig());
+    metrics.incCounter('bytes_total', 3);
+    metrics.incCounter('bytes_total', 5);
+
+    const entry = metrics.getMetrics().find(e => e.name === 'bytes_total');
+    expect(entry).toEqual({ name: 'bytes_total', type: 'counter', value: 8 });
+  });
+
+  it('overwrites the previous value with setGauge (task 3.5 / 8.3)', () => {
+    const metrics = new MetricsCollector(createConfig());
+    metrics.setGauge('active_connections', 1);
+    metrics.setGauge('active_connections', 2);
+
+    const entry = metrics.getMetrics().find(e => e.name === 'active_connections');
+    expect(entry).toEqual({ name: 'active_connections', type: 'gauge', value: 2 });
+  });
+
+  it('ignores all record calls and returns [] when disabled (task 3.6 / 8.4)', () => {
+    const metrics = new MetricsCollector(createConfig(false));
+    metrics.incCounter('requests_total');
+    metrics.setGauge('active_connections', 1);
+    metrics.recordHistogram('latency_ms', 10);
+
+    expect(metrics.getMetrics()).toEqual([]);
+  });
+
+  it('tags getMetrics entries with the correct type (task 3.7 / 8.6)', () => {
+    const metrics = new MetricsCollector(createConfig());
+    metrics.incCounter('requests_total');
+    metrics.setGauge('active_connections', 1);
+    metrics.recordHistogram('latency_ms', 10);
+
+    const entries = Object.fromEntries(metrics.getMetrics().map(entry => [entry.name, entry.type]));
+
+    expect(entries.requests_total).toBe('counter');
+    expect(entries.active_connections).toBe('gauge');
+    expect(entries.latency_ms_avg).toBe('histogram');
+    expect(entries.latency_ms_p50).toBe('histogram');
+    expect(entries.latency_ms_p95).toBe('histogram');
+    expect(entries.latency_ms_p99).toBe('histogram');
+    // The rolling sample count is itself tagged 'counter', not 'histogram'.
+    expect(entries.latency_ms_count).toBe('counter');
+  });
+
   it('computes percentiles for empty, single-value, and known distributions', () => {
     expect(computePercentile([], 50)).toBe(0);
     expect(computePercentile([7], 95)).toBe(7);
@@ -88,14 +142,22 @@ describe('MetricsCollector', () => {
     expect(computePercentile(values, 99)).toBe(99);
   });
 
-  it('computes percentiles from the most recent 1000 histogram samples', () => {
+  it('wraps the bounded histogram buffer at capacity: count, avg, and percentiles reflect only the most recent window (task 3.4 / 8.5)', () => {
+    // Pushes capacity (1000) + 5 samples. The oldest 5 (values 1..5) must be
+    // evicted by the circular buffer, leaving exactly `capacity` items — the
+    // window 6..1005 — which is asserted directly via count and avg, not
+    // only indirectly via the percentile cap.
     const metrics = new MetricsCollector(createConfig());
     for (let value = 1; value <= 1005; value += 1) {
       metrics.recordHistogram('rolling_ms', value);
     }
 
     const entries = Object.fromEntries(metrics.getMetrics().map(entry => [entry.name, entry.value]));
+    // Exactly `capacity` items remain in the window (not 1005).
     expect(entries.rolling_ms_count).toBe(1000);
+    // Average of the most-recent window [6..1005], not the full [1..1005]
+    // sequence (which would average to 503).
+    expect(entries.rolling_ms_avg).toBe(505.5);
     expect(entries.rolling_ms_p50).toBe(505);
     expect(entries.rolling_ms_p95).toBe(955);
     expect(entries.rolling_ms_p99).toBe(995);
