@@ -102,6 +102,55 @@ describe('SqliteStore', () => {
     expect(updated.access_count).toBe(1);
   });
 
+  it('recordAccessBatch applies per-row updates via a reused prepared statement', () => {
+    const mem1 = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440020' };
+    const mem2 = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440021', checksum: 'def456' };
+    store.insertMemory(mem1);
+    store.insertMemory(mem2);
+
+    store.recordAccessBatch([
+      {
+        id: mem1.id,
+        access_count: 5,
+        last_accessed: '2026-02-01T00:00:00Z',
+        expires_at: '2026-03-01T00:00:00Z',
+        retention_tier: 'T1',
+        review_due: '2026-02-15T00:00:00Z',
+      },
+      // mem2: only the always-present fields are supplied — the tri-state
+      // optional fields (expires_at/retention_tier/review_due) are omitted and
+      // must be left untouched by the shared prepared statement.
+      { id: mem2.id, access_count: 3, last_accessed: '2026-02-02T00:00:00Z' },
+    ]);
+
+    const r1 = store.getMemoryById(mem1.id)!;
+    expect(r1.access_count).toBe(5);
+    expect(r1.last_accessed).toBe('2026-02-01T00:00:00Z');
+    expect(r1.expires_at).toBe('2026-03-01T00:00:00Z');
+    expect(r1.retention_tier).toBe('T1');
+    expect(r1.review_due).toBe('2026-02-15T00:00:00Z');
+
+    const r2 = store.getMemoryById(mem2.id)!;
+    expect(r2.access_count).toBe(3);
+    expect(r2.last_accessed).toBe('2026-02-02T00:00:00Z');
+    expect(r2.expires_at).toBeNull();
+    expect(r2.retention_tier).toBe('T2');
+    expect(r2.review_due).toBeNull();
+  });
+
+  it('recordAccessBatch clears expires_at when explicitly passed null', () => {
+    const mem = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440022' };
+    store.insertMemory(mem);
+    store.updateMemory(mem.id, { expires_at: '2026-05-01T00:00:00Z' });
+
+    store.recordAccessBatch([
+      { id: mem.id, access_count: 1, last_accessed: '2026-02-01T00:00:00Z', expires_at: null },
+    ]);
+
+    const updated = store.getMemoryById(mem.id)!;
+    expect(updated.expires_at).toBeNull();
+  });
+
   it('lists stale candidate ids before cutoff and excludes categorized memories', () => {
     const stale = {
       ...sampleMemory(),

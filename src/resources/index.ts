@@ -157,8 +157,12 @@ export class ResourceHandler {
         break;
       }
 
-      const content = this.storage.sqlite.getCategoryContentSlice(cat.name, remainingForContent) ?? '';
-      const fullyIncluded = content.length >= cat.content_length;
+      const slice = this.storage.sqlite.getCategoryContentSlice(cat.name, remainingForContent);
+      const content = slice?.content ?? '';
+      // Compare SQLite-counted character lengths on both sides (slice.length vs.
+      // cat.content_length) rather than JS UTF-16 `.length`, so multibyte/astral
+      // content near the budget boundary is not mis-classified as fully included.
+      const fullyIncluded = (slice?.length ?? 0) >= cat.content_length;
       if (!appendBlock(`${content}\n\n`)) break;
       if (!fullyIncluded) {
         truncated = true;

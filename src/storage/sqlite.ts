@@ -42,6 +42,15 @@ export interface CategoryHeader {
   content_length: number;
 }
 
+export interface CategoryContentSlice {
+  content: string;
+  // Character length of `content` as counted by SQLite's LENGTH(), i.e. the same
+  // unit as CategoryHeader.content_length. Deliberately NOT the JS UTF-16
+  // `content.length` — those disagree for astral-plane characters, which is the
+  // mismatch this type exists to avoid at the call site.
+  length: number;
+}
+
 export interface CollectionRecord {
   name: string;
   namespace: string;
@@ -130,7 +139,7 @@ export interface SqliteStorage {
   listMemoryIdsInCollection(namespace: string, collection: string): string[];
   upsertMemoryFromPayload(id: string, payload: Record<string, unknown>): boolean;
   listCategoryHeaders(): CategoryHeader[];
-  getCategoryContentSlice(name: string, maxChars: number): string | null;
+  getCategoryContentSlice(name: string, maxChars: number): CategoryContentSlice | null;
 
   // Bootstrap session methods
   createBootstrapSession(namespace: string, totalSections: number): void;
@@ -756,23 +765,43 @@ export class SqliteStore implements SqliteStorage {
     updates: AccessUpdate[],
   ): void {
     if (this.lifecycleOperation || updates.length === 0) return;
-    for (const update of updates) {
-      const sets = ['access_count = ?', 'last_accessed = ?'];
-      const params: SqlParams = [update.access_count, update.last_accessed];
-      if (update.expires_at !== undefined) {
-        sets.push('expires_at = ?');
-        params.push(update.expires_at);
+    // A single prepared statement is reused across every row: the tri-state
+    // optional fields (expires_at/retention_tier/review_due) are expressed with a
+    // `CASE WHEN <changed> THEN <value> ELSE <column>` guard so an "unchanged"
+    // field (update.<field> === undefined) is a no-op write in SQL, without
+    // needing to know the row's current value in JS and without rebuilding/
+    // re-parsing the SQL string per row (matching prior per-row SET-shape
+    // behavior exactly).
+    const stmt = this.db.prepare(
+      `UPDATE memories SET
+        access_count = ?,
+        last_accessed = ?,
+        expires_at = CASE WHEN ? THEN ? ELSE expires_at END,
+        retention_tier = CASE WHEN ? THEN ? ELSE retention_tier END,
+        review_due = CASE WHEN ? THEN ? ELSE review_due END
+      WHERE id = ?`,
+    );
+    try {
+      for (const update of updates) {
+        const expiresChanged = update.expires_at !== undefined;
+        const tierChanged = !!update.retention_tier;
+        const reviewChanged = update.review_due !== undefined;
+        const params: SqlParams = [
+          update.access_count,
+          update.last_accessed,
+          expiresChanged ? 1 : 0,
+          expiresChanged ? (update.expires_at as string | null) : null,
+          tierChanged ? 1 : 0,
+          tierChanged ? (update.retention_tier as string) : null,
+          reviewChanged ? 1 : 0,
+          reviewChanged ? (update.review_due as string | null) : null,
+          update.id,
+        ];
+        stmt.bind(params);
+        stmt.step();
       }
-      if (update.retention_tier) {
-        sets.push('retention_tier = ?');
-        params.push(update.retention_tier);
-      }
-      if (update.review_due !== undefined) {
-        sets.push('review_due = ?');
-        params.push(update.review_due);
-      }
-      params.push(update.id);
-      this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, params);
+    } finally {
+      stmt.free();
     }
     this.markDirty();
   }
@@ -1238,16 +1267,25 @@ export class SqliteStore implements SqliteStorage {
     return results;
   }
 
-  getCategoryContentSlice(name: string, maxChars: number): string | null {
-    const stmt = this.db.prepare(`SELECT substr(content, 1, ?) as content FROM categories WHERE name = ?`);
-    stmt.bind([maxChars, name]);
+  getCategoryContentSlice(name: string, maxChars: number): CategoryContentSlice | null {
+    // Both `content` and `content_length` are computed by SQLite in the same
+    // character-counting unit, so callers can compare `length` against a
+    // SQLite-derived total (e.g. CategoryHeader.content_length) without ever
+    // going through JS's UTF-16 `.length` on either side.
+    const stmt = this.db.prepare(
+      `SELECT substr(content, 1, ?) as content, LENGTH(substr(content, 1, ?)) as content_length FROM categories WHERE name = ?`,
+    );
+    stmt.bind([maxChars, maxChars, name]);
     if (!stmt.step()) {
       stmt.free();
       return null;
     }
     const row = this.getRow(stmt.getAsObject());
     stmt.free();
-    return this.getNullableString(row, 'content') ?? '';
+    return {
+      content: this.getNullableString(row, 'content') ?? '',
+      length: this.getNumber(row, 'content_length'),
+    };
   }
 
   private queryMemories(sql: string, params: SqlParams): MemoryRecordWithoutEmbedding[] {

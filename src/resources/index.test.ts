@@ -85,7 +85,7 @@ describe('resource pagination bounds', () => {
     const storage = {
       sqlite: {
         listCategoryHeaders: () => [{ name: 'Policy', slot: 'custom', revision: 1, updated_at: '2026-01-01T00:00:00Z', content_length: 200 }],
-        getCategoryContentSlice: (_name: string, maxChars: number) => 'x'.repeat(maxChars),
+        getCategoryContentSlice: (_name: string, maxChars: number) => ({ content: 'x'.repeat(maxChars), length: maxChars }),
         listMemories: () => [],
         countMemories: () => 0,
         getMemoryById: () => null,
@@ -106,6 +106,44 @@ describe('resource pagination bounds', () => {
     const result = await handler.handle('memory://inject') as ResourceResult;
     expect(result.content.length).toBeLessThanOrEqual(24);
     expect(result.truncated).toBe(true);
+  });
+
+  it('flags truncation for multibyte/astral category content near the budget boundary', async () => {
+    // Regression for the JS UTF-16 vs. SQLite character-count mismatch: an astral
+    // character (e.g. an emoji outside the BMP) is 1 SQLite character but 2 JS
+    // UTF-16 code units. The full category content is 5 astral characters
+    // (content_length: 5), but only 3 of them were sliced due to the budget. The
+    // sliced JS string's `.length` is 6 (3 * 2 surrogate units) which is >= 5 —
+    // comparing that against content_length would wrongly report "fully
+    // included". Comparing SQLite-counted lengths on both sides must not.
+    const config = {
+      defaults: { namespace: 'global', auto_inject_limit: 5 },
+      auto_inject: { max_chars: 500 },
+    } as unknown as BrainConfig;
+    const storage = {
+      sqlite: {
+        listCategoryHeaders: () => [{ name: 'Policy', slot: 'custom', revision: 1, updated_at: '2026-01-01T00:00:00Z', content_length: 5 }],
+        getCategoryContentSlice: () => ({ content: '\u{1F600}'.repeat(3), length: 3 }),
+        listMemories: () => [],
+        countMemories: () => 0,
+        getMemoryById: () => null,
+        touchMemory: () => undefined,
+        scheduleDeferredFlush: () => undefined,
+        listCategories: () => [],
+        listCollections: () => [],
+        getCategory: () => null,
+      },
+    } as unknown as StorageManager;
+    const handler = new ResourceHandler(
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+
+    const result = await handler.handle('memory://inject') as ResourceResult;
+    expect(result.truncated).toBe(true);
+    expect([...result.content.matchAll(/\u{1F600}/gu)]).toHaveLength(3);
   });
 });
 

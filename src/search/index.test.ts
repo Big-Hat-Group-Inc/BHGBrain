@@ -108,6 +108,126 @@ describe('SearchService', () => {
     expect(storage.sqlite.getMemoriesByIds).toHaveBeenCalledWith(['mem-1']);
   });
 
+  it('preserves ranked order even when the store returns rows in a different order', async () => {
+    // Regression: an `IN (...)` bulk lookup does not guarantee row order matches
+    // the ranked input. The service-layer memoryMap must re-order results to the
+    // ranking, not trust whatever order the store hands back.
+    const makeMem = (id: string): StoredMemory => ({
+      id, namespace: 'global', collection: 'general', type: 'semantic',
+      content: `content-${id}`, summary: `summary-${id}`, tags: [], source: 'cli',
+      checksum: id,
+      importance: 0.9,
+      retention_tier: 'T2',
+      expires_at: '2026-12-31T00:00:00Z',
+      decay_eligible: true,
+      review_due: null,
+      access_count: 0,
+      last_operation: 'ADD',
+      merged_from: null,
+      archived: false,
+      vector_synced: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+    });
+    const memories = new Map<string, StoredMemory>([
+      ['mem-1', makeMem('mem-1')],
+      ['mem-2', makeMem('mem-2')],
+      ['mem-3', makeMem('mem-3')],
+    ]);
+    const { service, storage } = createSearchService({
+      memories,
+      fulltextResults: [
+        { id: 'mem-3', rank: -3 },
+        { id: 'mem-1', rank: -2 },
+        { id: 'mem-2', rank: -1 },
+      ],
+    });
+    // Deliberately return rows in ascending-id order — the opposite of the
+    // ranked input — so a regression that trusted SQL row order would fail.
+    (storage.sqlite.getMemoriesByIds as ReturnType<typeof vi.fn>).mockImplementation(
+      (ids: string[]) => [...ids].sort().map(id => memories.get(id)).filter((m): m is StoredMemory => !!m),
+    );
+
+    const results = await service.search('hello', 'global', undefined, 'fulltext', 10);
+    expect(results.map(r => r.id)).toEqual(['mem-3', 'mem-1', 'mem-2']);
+  });
+
+  it('reconstructs a search result from the Qdrant payload when the ranked id misses local storage', async () => {
+    const { service, storage } = createSearchService({ memories: new Map() });
+    storage.qdrant.search.mockResolvedValue([
+      {
+        id: 'mem-cross-device',
+        score: 0.87,
+        payload: {
+          content: 'cross-device content',
+          summary: 'cross-device summary',
+          type: 'episodic',
+          tags: ['a', 'b'],
+          retention_tier: 'T1',
+          device_id: 'device-42',
+          created_at: '2026-01-05T00:00:00Z',
+        },
+      },
+    ]);
+
+    const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      id: 'mem-cross-device',
+      content: 'cross-device content',
+      summary: 'cross-device summary',
+      type: 'episodic',
+      tags: ['a', 'b'],
+      retention_tier: 'T1',
+      device_id: 'device-42',
+      created_at: '2026-01-05T00:00:00Z',
+      expires_at: null,
+      expiring_soon: false,
+    });
+  });
+
+  it('falls back to established defaults for malformed Qdrant payload fields', async () => {
+    const { service, storage } = createSearchService({ memories: new Map() });
+    storage.qdrant.search.mockResolvedValue([
+      {
+        id: 'mem-cross-device',
+        score: 0.5,
+        payload: {
+          content: 'partial content',
+          summary: 42,
+          type: 'not-a-real-type',
+          tags: 'not-an-array',
+          retention_tier: 'BOGUS',
+          device_id: 123,
+          created_at: 999,
+        },
+      },
+    ]);
+
+    const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+    expect(results).toHaveLength(1);
+    const [result] = results;
+    expect(result.content).toBe('partial content');
+    expect(result.summary).toBe('');
+    expect(result.type).toBe('semantic');
+    expect(result.tags).toEqual([]);
+    expect(result.retention_tier).toBe('T2');
+    expect(result.device_id).toBeNull();
+    expect(typeof result.created_at).toBe('string');
+    expect(result.created_at).not.toBe(999);
+  });
+
+  it('drops the fallback result when the Qdrant payload has no usable content', async () => {
+    const { service, storage } = createSearchService({ memories: new Map() });
+    storage.qdrant.search.mockResolvedValue([
+      { id: 'mem-cross-device', score: 0.5, payload: { summary: 'no content field' } },
+    ]);
+
+    const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+    expect(results).toHaveLength(0);
+  });
+
   it('preserves existing expiry on read when sliding window is disabled', async () => {
     // Regression: non-sliding access updates must not clear T2/T3 TTLs.
     const { service, storage } = createSearchService({ slidingWindowEnabled: false });
