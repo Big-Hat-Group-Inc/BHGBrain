@@ -67,13 +67,19 @@ export type RateLimitMiddleware = ((req: Request, res: Response, next: NextFunct
 };
 
 /**
- * Derive the client identity used for rate limiting. `req.ip` reflects
- * Express's `trust proxy` setting (see `createHttpServer`): with proxy trust
- * disabled it is the direct socket peer, and with it enabled it honors
- * `X-Forwarded-For` from the trusted proxy. When no IP can be derived at all,
- * the caller fails closed rather than collapsing into a shared bucket.
+ * Derive the trusted client identity for rate limiting *and* audit logging.
+ * `req.ip` reflects Express's `trust proxy` setting (see `createHttpServer`):
+ * with proxy trust disabled it is the direct socket peer, and with it
+ * enabled it honors `X-Forwarded-For` from the trusted proxy. This is the
+ * only source of client identity that is not attacker-controllable over
+ * plain HTTP headers, so both the rate limiter and the audit trail
+ * (`src/transport/http.ts`) key on it rather than the caller-supplied
+ * `x-client-id` header, which is retained only as a non-authoritative debug
+ * hint (see `add-operations-security-reliability` audit follow-up
+ * 2026-06-05, task 4.4). When no IP can be derived at all, callers should
+ * fail closed rather than collapsing into a shared/spoofable bucket.
  */
-function deriveRateLimitClientId(req: Request): string | undefined {
+export function deriveTrustedClientId(req: Request): string | undefined {
   return req.ip || undefined;
 }
 
@@ -101,7 +107,7 @@ export function createRateLimitMiddleware(
     }
 
     const clientHint = req.headers['x-client-id'] as string | undefined;
-    const trustedClientId = deriveRateLimitClientId(req);
+    const trustedClientId = deriveTrustedClientId(req);
 
     if (!trustedClientId) {
       logger?.warn({ event: 'rate_limit_identity_missing', client_hint: clientHint });

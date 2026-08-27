@@ -145,6 +145,27 @@ export class BackupService {
       }
 
       const activeCount = this.storage.sqlite.countMemories();
+
+      // Memory-count cross-check (audit follow-up 2026-06-05, task 4.6): the
+      // backup archive is a raw byte-for-byte export of the SQLite database
+      // captured at `create()` time, so after activation the restored count
+      // must exactly equal what was recorded in the header. A mismatch here
+      // means the checksum check above passed but the activated data still
+      // does not match what was backed up — treat that as a failed restore
+      // rather than a successful one with silently wrong data.
+      if (activeCount !== header.memory_count) {
+        this.logger?.error({
+          event: 'backup_restore_count_mismatch',
+          path: backupPath,
+          expected_memory_count: header.memory_count,
+          actual_memory_count: activeCount,
+        });
+        throw internal(
+          `Backup restore integrity check failed: expected ${header.memory_count} memories after ` +
+          `activation but found ${activeCount}`,
+        );
+      }
+
       const vectorReconciliation = await this.restoreVectorStateAfterActivation(activeCount, header);
       this.logger?.info({
         event: 'backup_restore_complete',

@@ -50,7 +50,7 @@ describe('BackupService restore activation', () => {
   it('reloads sqlite and reports reconciled when there is no vector drift', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
     const payload = Buffer.from('db-bytes-1');
-    const backupPath = makeBackupFile(tempDir, payload);
+    const backupPath = makeBackupFile(tempDir, payload, { memory_count: 7 });
 
     const storage = {
       sqlite: {
@@ -98,7 +98,7 @@ describe('BackupService restore activation', () => {
   it('releases the restore lock before background reconciliation runs and reports reconciling', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
     const payload = Buffer.from('db-bytes-drift');
-    const backupPath = makeBackupFile(tempDir, payload);
+    const backupPath = makeBackupFile(tempDir, payload, { memory_count: 5 });
 
     const callOrder: string[] = [];
     const storage = {
@@ -152,7 +152,9 @@ describe('BackupService restore activation', () => {
   it('falls back to a full rebuild and clears managed vectors when the embedding model changed', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
     const payload = Buffer.from('db-bytes-model-change');
-    const backupPath = makeBackupFile(tempDir, payload, { embedding_model: 'old-model', embedding_dimensions: 1536 });
+    const backupPath = makeBackupFile(tempDir, payload, {
+      embedding_model: 'old-model', embedding_dimensions: 1536, memory_count: 3,
+    });
 
     const storage = {
       sqlite: {
@@ -196,7 +198,7 @@ describe('BackupService restore activation', () => {
     try {
       const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
       const payload = Buffer.from('db-bytes-retry');
-      const backupPath = makeBackupFile(tempDir, payload);
+      const backupPath = makeBackupFile(tempDir, payload, { memory_count: 4 });
 
       const storage = {
         sqlite: {
@@ -240,7 +242,7 @@ describe('BackupService restore activation', () => {
   it('reports pending vector reconciliation when drift detection fails after activation', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
     const payload = Buffer.from('db-bytes-pending');
-    const backupPath = makeBackupFile(tempDir, payload);
+    const backupPath = makeBackupFile(tempDir, payload, { memory_count: 4 });
 
     const storage = {
       sqlite: {
@@ -396,10 +398,48 @@ describe('BackupService restore activation', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it('fails restore when the post-activation memory count does not match the backup header', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
+    const payload = Buffer.from('db-bytes-count-mismatch');
+    // Header claims 5 memories, but activation reports only 2.
+    const backupPath = makeBackupFile(tempDir, payload, { memory_count: 5 });
+
+    const storage = {
+      sqlite: {
+        beginLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(),
+        getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
+        countMemories: vi.fn(() => 2),
+        countUnsyncedVectors: vi.fn(() => 0),
+      },
+      reloadSqliteFromDisk: vi.fn(async () => {}),
+      detectAndMarkVectorDrift: vi.fn(async () => ({ mode: 'no-drift', driftedCount: 0 })),
+      reconcileVectorsFromSqlite: vi.fn(),
+      setBackgroundReconciliationActive: vi.fn(),
+    } as unknown as StorageManager;
+
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger;
+    const config = createConfig(tempDir);
+    const service = new BackupService(config, storage, logger);
+
+    await expect(service.restore(backupPath)).rejects.toThrow(/expected 5 memories/);
+    expect(logger.error).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'backup_restore_count_mismatch',
+      expected_memory_count: 5,
+      actual_memory_count: 2,
+    }));
+    // The vector reconciliation pass never starts, and the lifecycle lock is
+    // still released so a later restore attempt is not blocked forever.
+    expect(storage.detectAndMarkVectorDrift).not.toHaveBeenCalled();
+    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith('restore');
+
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
   it('serializes concurrent restore requests', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
     const payload = Buffer.from('db-bytes-3');
-    const backupPath = makeBackupFile(tempDir, payload);
+    const backupPath = makeBackupFile(tempDir, payload, { memory_count: 1 });
 
     let resolveReload: (() => void) | null = null;
     const storage = {

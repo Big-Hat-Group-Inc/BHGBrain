@@ -1571,7 +1571,7 @@ Der JSON-Header enthält:
 **Was NICHT in der Sicherung enthalten ist:**
 - Qdrant-Vektordaten sind **nicht** enthalten. Nach der Wiederherstellung aus einer Sicherung müssen Qdrant-Sammlungen durch erneutes Einbetten der Inhalte neu aufgebaut werden. Bis dahin funktioniert die Volltextsuche, aber nicht die semantische Suche.
 
-**Sicherungsintegrität:** Ein SHA-256-Prüfsumme der Datenbankdaten wird im Header gespeichert und bei der Wiederherstellung überprüft. Wenn die Datei beschädigt ist, schlägt die Wiederherstellung mit `INVALID_INPUT: Backup integrity check failed` fehl.
+**Sicherungsintegrität:** Ein SHA-256-Prüfsumme der Datenbankdaten wird im Header gespeichert und bei der Wiederherstellung überprüft. Wenn die Datei beschädigt ist, schlägt die Wiederherstellung mit `INVALID_INPUT: Backup integrity check failed` fehl. Nachdem die wiederhergestellte Datenbank aktiviert wurde, wird ihre Erinnerungsanzahl außerdem gegen `memory_count` im Header abgeglichen — eine Abweichung lässt die Wiederherstellung mit `INTERNAL` fehlschlagen (protokolliert als `backup_restore_count_mismatch`), statt eine erfolgreiche Antwort über stillschweigend falsche Daten zurückzugeben.
 
 **Sicherungsmetadaten** werden in der SQLite-Tabelle `backup_metadata` verfolgt, damit `backup list` Informationen über historische Sicherungen zurückgeben kann.
 
@@ -1613,6 +1613,8 @@ Gibt zurück:
 5. Vektoren gegen tatsächliche Abweichungen (Drift) abgleichen (siehe unten) und `{ memory_count: <Anzahl>, metadata_activated: true, vector_reconciliation: {...} }` zurückgeben.
 
 **Wiederherstellung ist live:** Die wiederhergestellte Datenbank ist sofort aktiv. Ein Neustart des Servers ist nicht erforderlich. Die Antwort enthält `metadata_activated: true` zur Bestätigung.
+
+**Prüfung der Erinnerungsanzahl nach der Aktivierung:** Da ein Backup ein Byte-für-Byte-Export der SQLite-Datenbank ist, muss die Erinnerungsanzahl nach der Aktivierung exakt `memory_count` aus dem Header entsprechen. Andernfalls wirft die Wiederherstellung `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` und protokolliert ein `backup_restore_count_mismatch`-Ereignis — der Aufruf gibt keine erfolgreiche Antwort zurück.
 
 **Die Vektor-Abgleichung ist drift-basiert und begrenzt.** Die Wiederherstellung leert und re-embedded nicht bedingungslos den gesamten Bestand: Sie vergleicht die Inhalts-Prüfsumme jeder wiederhergestellten Erinnerung mit dem bereits in Qdrant gespeicherten Vektor und markiert nur neue oder inhaltlich geänderte Erinnerungen für ein erneutes Embedding. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben oder der Qdrant-Zustand nicht gelesen werden kann, greift stattdessen ein vollständiger Neuaufbau. Sobald diese Drift-Prüfung abgeschlossen ist, wird die Restore-Lifecycle-Sperre freigegeben — `vector_reconciliation.state` ist sofort `"reconciled"`, wenn nichts abgewichen ist, oder `"reconciling"`, wenn das erneute Embedding der abweichenden Teilmenge in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf, mit automatischen Wiederholungsversuchen) fortgesetzt wird, nachdem der Aufruf bereits zurückgekehrt ist. Fragen Sie `health://status` (`components.vector_reconciliation`) ab, um den Fortschritt zu beobachten.
 
@@ -1776,7 +1778,7 @@ HTTP-Anfrage-Bodies sind auf `security.max_request_size_bytes` begrenzt (Standar
 
 ### Log-Redigierung
 
-Wenn `security.log_redaction: true` (Standard), werden in der Log-Ausgabe erscheinende Bearer-Tokens redigiert. Logs über Authentifizierungsfehler zeigen nur eine verkürzte Vorschau ungültiger Tokens.
+Wenn `security.log_redaction: true` (Standard), werden in der Log-Ausgabe erscheinende Bearer-Tokens redigiert. Logs über Authentifizierungsfehler zeigen nur eine verkürzte Vorschau ungültiger Tokens. Erinnerungsinhaltsfelder (`content`, `preview`, `summary` sowie jedes verschachtelte `*.content`) werden auf dieselbe Weise aus der strukturierten Log-Ausgabe redigiert — durchgesetzt über die konfigurierten Redact-Pfade des Loggers, nicht durch Auslassung an einzelnen Log-Aufrufstellen.
 
 ### Geheimnis-Erkennung im Inhalt
 
@@ -2403,6 +2405,7 @@ Sobald die Drift-Prüfung abgeschlossen ist, wird die Sperre freigegeben — das
 
 - `/health` ist absichtlich unauthentifiziert für Probe-Kompatibilität.
 - Rate Limiting verwendet die vertrauenswürdige Anfragen-Identität (IP) und ignoriert `x-client-id` für die Durchsetzung.
+- Die `client_id` in Audit-/Anfrageprotokollen wird ebenso von der vertrauenswürdigen Anfragen-Identität (`req.ip`) abgeleitet, niemals vom vom Aufrufer angegebenen `x-client-id`-Header — dieser Header wird nur als nicht-maßgeblicher Debug-Hinweis akzeptiert und nie für die Audit-Spur vertraut.
 - `memory://list` erzwingt `limit`-Grenzen von `1..100`; ungültige Werte geben `INVALID_INPUT` zurück.
 
 ### Fail-Closed-Authentifizierung

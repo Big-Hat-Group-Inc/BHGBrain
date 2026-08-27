@@ -1618,7 +1618,7 @@ The JSON header contains:
 **What is NOT in the backup:**
 - Qdrant vector data is **not** included. After restoring from a backup, Qdrant collections must be rebuilt by re-embedding content. Until then, fulltext search works but semantic search does not.
 
-**Backup integrity:** A SHA-256 checksum of the database data is stored in the header and verified on restore. If the file is corrupted, restore fails with `INVALID_INPUT: Backup integrity check failed`.
+**Backup integrity:** A SHA-256 checksum of the database data is stored in the header and verified on restore. If the file is corrupted, restore fails with `INVALID_INPUT: Backup integrity check failed`. After the restored database is activated, its memory count is also cross-checked against `memory_count` in the header — a mismatch fails the restore with `INTERNAL` (logged as `backup_restore_count_mismatch`) rather than returning a successful response over silently wrong data.
 
 **Backup metadata** is tracked in the SQLite `backup_metadata` table so `backup list` can return information about historical backups.
 
@@ -1659,6 +1659,8 @@ Returns:
 5. Reconcile vectors against actual drift (see below) and return `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
 
 **Restore is live:** The restored database is immediately active. There is no need to restart the server. The response includes `metadata_activated: true` to confirm this.
+
+**Post-activation memory-count check:** Because a backup is a byte-for-byte export of the SQLite database, the memory count after activation must exactly equal `memory_count` from the header. If it doesn't, restore throws `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` and logs a `backup_restore_count_mismatch` event — the call does not return a successful response.
 
 **Vector reconciliation is drift-only and bounded.** Restore does not unconditionally clear and re-embed the whole corpus: it compares each restored memory's content checksum against the vector already stored in Qdrant and marks only memories that are new or whose content changed for re-embedding. When the embedding model/dimensions changed since the backup was created, or Qdrant's existing state can't be read, restore falls back to a full rebuild instead. Once this drift check completes, the restore lifecycle lock is released — `vector_reconciliation.state` is `"reconciled"` immediately if nothing drifted, or `"reconciling"` if re-embedding the drifted subset continues in a bounded background task (a timeout and batch cap per pass, with automatic retries on transient failures) after the call has already returned. Poll `health://status` (`components.vector_reconciliation`) to watch it finish.
 
@@ -1833,7 +1835,7 @@ HTTP request bodies are limited to `security.max_request_size_bytes` (default 1 
 
 ### Log Redaction
 
-When `security.log_redaction: true` (default), bearer tokens appearing in log output are redacted. Authentication failure logs show only a truncated preview of invalid tokens.
+When `security.log_redaction: true` (default), bearer tokens appearing in log output are redacted. Authentication failure logs show only a truncated preview of invalid tokens. Memory content fields (`content`, `preview`, `summary`, and any nested `*.content`) are redacted from structured log output the same way — enforced by the logger's configured redact paths, not by omission at individual log call sites.
 
 ### Secret Detection in Content
 
@@ -2706,6 +2708,7 @@ Once the drift check finishes, the guard is released — re-embedding the drifte
 
 - `/health` is intentionally unauthenticated for probe compatibility.
 - Rate limiting keys on trusted request identity (IP) and ignores `x-client-id` for enforcement.
+- Audit/request-log `client_id` is likewise derived from the trusted request identity (`req.ip`), never from the caller-supplied `x-client-id` header — that header is accepted only as a non-authoritative debug hint and is never trusted for the audit trail.
 - `memory://list` enforces `limit` bounds of `1..100`; invalid values return `INVALID_INPUT`.
 
 ### Fail-Closed Authentication

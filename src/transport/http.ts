@@ -9,6 +9,7 @@ import {
   createSizeLimitMiddleware,
   validateLoopbackBinding,
   validateExternalAuthBinding,
+  deriveTrustedClientId,
 } from './middleware.js';
 import type pino from 'pino';
 
@@ -44,7 +45,14 @@ export function createHttpServer(
 
   // Tool endpoint
   app.post('/tool/:name', async (req, res) => {
-    const clientId = req.headers['x-client-id'] as string ?? 'http-client';
+    // Audit/log client identity is derived from the authenticated principal
+    // (`req.ip`, subject to the `trust proxy` setting above) — the same
+    // trusted source the rate limiter keys on — never from the
+    // caller-supplied `x-client-id` header, which is fully spoofable and is
+    // not used to identify the caller for audit purposes. See
+    // `add-operations-security-reliability` audit follow-up 2026-06-05,
+    // task 4.4.
+    const clientId = deriveTrustedClientId(req) ?? 'http-client';
     const result = await handleTool(ctx, req.params.name, req.body, clientId);
     res.json(result);
   });

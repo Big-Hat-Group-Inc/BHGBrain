@@ -186,13 +186,20 @@ describe('createHttpServer', () => {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer secret-token',
+        // A caller-supplied x-client-id is an untrusted hint only — it must
+        // never become the recorded audit/client identity (task 4.4).
         'x-client-id': 'client-1',
       },
       body: JSON.stringify({ content: 'hello' }),
     });
     expect(toolResponse.status).toBe(200);
     expect(await toolResponse.json()).toEqual({ ok: true });
-    expect(handleToolMock).toHaveBeenCalledWith(expect.anything(), 'remember', { content: 'hello' }, 'client-1');
+    // The recorded client id is derived from the authenticated principal
+    // (req.ip, a loopback address here), not from the spoofable
+    // `x-client-id` header value 'client-1'.
+    const [, , , recordedClientId] = handleToolMock.mock.calls[0] as [unknown, unknown, unknown, string];
+    expect(recordedClientId).not.toBe('client-1');
+    expect(recordedClientId).toMatch(/127\.0\.0\.1|::1|::ffff:127\.0\.0\.1/);
 
     const missingUri = await fetch(`${baseUrl}/resource`, {
       headers: { 'Authorization': 'Bearer secret-token' },

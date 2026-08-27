@@ -274,6 +274,20 @@ CREATE TABLE IF NOT EXISTS bootstrap_sessions (
 );
 `;
 
+// SQLite-lock retry/backoff (audit follow-up 2026-06-05, task 4.2): this
+// store runs on sql.js, an in-process, single-threaded WASM SQLite build
+// with no separate database server and no OS-level file lock contended by
+// concurrent connections — every read/write goes through this one `Database`
+// instance in this one Node.js process. There is therefore no "SQLite is
+// locked by another writer" condition for a retry-with-backoff wrapper to
+// recover from; the closest real failure (a WASM/JS exception from a
+// malformed statement or constraint violation) is not a transient
+// lock-contention error and should not be retried. Per the
+// `retention-and-degradation` spec's "In-process store documents retry as
+// no-op" scenario, this is intentionally not implemented rather than
+// asserting an unimplemented contract — see
+// `openspec/changes/add-operations-security-reliability/specs/
+// retention-and-degradation/spec.md`.
 export class SqliteStore implements SqliteStorage {
   private db!: Database;
   private dbPath: string;

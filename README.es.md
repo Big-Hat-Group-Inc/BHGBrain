@@ -1568,7 +1568,7 @@ La cabecera JSON contiene:
 **Lo que NO está en la copia de seguridad:**
 - Los datos vectoriales de Qdrant **no** están incluidos. Después de restaurar desde una copia de seguridad, las colecciones de Qdrant deben reconstruirse re-embediendo el contenido. Hasta entonces, la búsqueda de texto completo funciona pero la búsqueda semántica no.
 
-**Integridad de la copia de seguridad:** Un checksum SHA-256 de los datos de la base de datos se almacena en la cabecera y se verifica en la restauración. Si el archivo está corrompido, la restauración falla con `INVALID_INPUT: Backup integrity check failed`.
+**Integridad de la copia de seguridad:** Un checksum SHA-256 de los datos de la base de datos se almacena en la cabecera y se verifica en la restauración. Si el archivo está corrompido, la restauración falla con `INVALID_INPUT: Backup integrity check failed`. Tras activar la base de datos restaurada, su recuento de memorias también se contrasta con `memory_count` de la cabecera; si no coinciden, la restauración falla con `INTERNAL` (registrado como `backup_restore_count_mismatch`) en lugar de devolver una respuesta exitosa sobre datos silenciosamente incorrectos.
 
 Los **metadatos de copia de seguridad** se rastrean en la tabla SQLite `backup_metadata` para que `backup list` pueda devolver información sobre copias de seguridad históricas.
 
@@ -1610,6 +1610,8 @@ Devuelve:
 5. Reconciliar los vectores contra el drift real (ver abajo) y devolver `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
 
 **La restauración es en vivo:** La base de datos restaurada está inmediatamente activa. No es necesario reiniciar el servidor. La respuesta incluye `metadata_activated: true` para confirmar esto.
+
+**Comprobación del recuento de memorias tras la activación:** Dado que una copia de seguridad es una exportación byte a byte de la base de datos SQLite, el recuento de memorias tras la activación debe coincidir exactamente con `memory_count` de la cabecera. Si no coincide, la restauración lanza `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` y registra un evento `backup_restore_count_mismatch`; la llamada no devuelve una respuesta exitosa.
 
 **La reconciliación de vectores es solo por drift y está acotada.** La restauración no vacía y reincrusta incondicionalmente todo el corpus: compara el checksum de contenido de cada memoria restaurada con el vector ya almacenado en Qdrant y marca para reincrustación solo las memorias nuevas o cuyo contenido cambió. Si el modelo/dimensiones de embedding cambiaron desde que se creó la copia de seguridad, o el estado de Qdrant no se puede leer, la restauración recurre a una reconstrucción completa. Una vez que termina esta comprobación de drift, se libera el bloqueo del ciclo de vida de restauración — `vector_reconciliation.state` es `"reconciled"` de inmediato si nada cambió, o `"reconciling"` si la reincrustación del subconjunto con drift continúa en una tarea de fondo acotada (un timeout y un límite de lotes por pasada, con reintentos automáticos) después de que la llamada ya haya devuelto la respuesta. Consulta `health://status` (`components.vector_reconciliation`) para ver cuándo termina.
 
@@ -1773,7 +1775,7 @@ Los cuerpos de solicitudes HTTP están limitados a `security.max_request_size_by
 
 ### Redacción de Logs
 
-Cuando `security.log_redaction: true` (predeterminado), los bearer tokens que aparecen en la salida de logs se redactan. Los logs de fallo de autenticación muestran solo una vista previa truncada de los tokens inválidos.
+Cuando `security.log_redaction: true` (predeterminado), los bearer tokens que aparecen en la salida de logs se redactan. Los logs de fallo de autenticación muestran solo una vista previa truncada de los tokens inválidos. Los campos de contenido de memoria (`content`, `preview`, `summary` y cualquier `*.content` anidado) se redactan de la misma forma en la salida de logs estructurados, aplicado mediante las rutas de redacción configuradas del logger, no por omisión en cada punto de registro.
 
 ### Detección de Secretos en el Contenido
 
@@ -2400,6 +2402,7 @@ Una vez que termina la comprobación de drift, se libera el bloqueo — la reinc
 
 - `/health` es intencionalmente sin autenticación para compatibilidad con sondas.
 - El límite de tasa se basa en la identidad de solicitud confiable (IP) e ignora `x-client-id` para su aplicación.
+- El `client_id` de los logs de auditoría/solicitud también se deriva de la identidad de solicitud confiable (`req.ip`), nunca del encabezado `x-client-id` proporcionado por el llamante; ese encabezado solo se acepta como una pista de depuración no autoritativa y nunca se confía en él para el registro de auditoría.
 - `memory://list` aplica límites de `limit` de `1..100`; los valores inválidos devuelven `INVALID_INPUT`.
 
 ### Autenticación Fail-Closed

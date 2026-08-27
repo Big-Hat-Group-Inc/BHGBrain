@@ -31,6 +31,7 @@ describe('collections delete semantics', () => {
         getCollection: vi.fn(() => ({ name: 'general' })),
         deleteCollection: vi.fn(() => true),
         countMemories: vi.fn(() => 0),
+        listCategories: vi.fn(() => []),
       },
       countMemoriesInCollection: vi.fn(() => 3),
       deleteCollectionData: vi.fn(async () => ({ deleted: 3, ids: ['a', 'b', 'c'] })),
@@ -71,6 +72,22 @@ describe('collections delete semantics', () => {
     expect(storage.sqlite.deleteCollection).toHaveBeenCalledWith('global', 'general');
     expect(storage.logAudit).toHaveBeenCalledTimes(3);
     expect(ctx.metrics.setGauge).toHaveBeenCalled();
+  });
+
+  it('includes the resolved namespace in the tool_call log', async () => {
+    await handleTool(ctx, 'collections', { action: 'list', namespace: 'team-a' }, 'c1');
+
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'tool_call', tool: 'collections', namespace: 'team-a' }),
+    );
+  });
+
+  it('includes a null namespace in the tool_call log for namespace-agnostic tools', async () => {
+    await handleTool(ctx, 'category', { action: 'list' }, 'c1');
+
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'tool_call', tool: 'category', namespace: null }),
+    );
   });
 
   it('deletes empty collection without force', async () => {

@@ -1563,7 +1563,7 @@ JSON 头部包含：
 **备份中不包含的内容：**
 - Qdrant 向量数据**不**包含在内。从备份恢复后，必须通过重新嵌入内容来重建 Qdrant 集合。在此之前，全文搜索可用，但语义搜索不可用。
 
-**备份完整性：** 数据库数据的 SHA-256 校验和存储在头部并在恢复时验证。如果文件损坏，恢复失败并返回 `INVALID_INPUT: Backup integrity check failed`。
+**备份完整性：** 数据库数据的 SHA-256 校验和存储在头部并在恢复时验证。如果文件损坏，恢复失败并返回 `INVALID_INPUT: Backup integrity check failed`。恢复的数据库激活后，其记忆数量还会与头部中的 `memory_count` 进行交叉核对；如果不一致，恢复将以 `INTERNAL` 失败（记录为 `backup_restore_count_mismatch` 事件），而不是在数据静默错误的情况下返回成功响应。
 
 **备份元数据**追踪在 SQLite 的 `backup_metadata` 表中，以便 `backup list` 可以返回历史备份信息。
 
@@ -1605,6 +1605,8 @@ JSON 头部包含：
 5. 根据实际漂移（drift）对向量进行协调（见下文），并返回 `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`。
 
 **恢复是实时的：** 恢复的数据库立即生效。无需重启服务器。响应包含 `metadata_activated: true` 以确认这一点。
+
+**激活后的记忆数量核对：** 由于备份是 SQLite 数据库的逐字节导出，激活后的记忆数量必须与头部中的 `memory_count` 完全一致。如果不一致，恢复将抛出 `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` 并记录 `backup_restore_count_mismatch` 事件——该调用不会返回成功响应。
 
 **向量协调仅针对实际漂移，且有边界限制。** 恢复不会无条件清空并重新嵌入整个语料库：它会将每条恢复记忆的内容校验和与 Qdrant 中已存储的向量进行比较，只将新增或内容发生变化的记忆标记为需要重新嵌入。如果自备份创建以来嵌入模型/维度发生了变化，或无法读取 Qdrant 的现有状态，恢复会转而执行完整重建。一旦漂移检查完成，恢复生命周期锁即被释放——如果没有任何漂移，`vector_reconciliation.state` 会立即变为 `"reconciled"`；如果漂移子集的重新嵌入需要在调用已经返回之后，在一个有边界的后台任务（每轮有超时和批次上限，并带有自动重试）中继续进行，则为 `"reconciling"`。可轮询 `health://status`（`components.vector_reconciliation`）以观察其完成情况。
 
@@ -1768,7 +1770,7 @@ HTTP 请求体限制为 `security.max_request_size_bytes`（默认 1 MB = 1,048,
 
 ### 日志脱敏
 
-当 `security.log_redaction: true`（默认值）时，出现在日志输出中的 Bearer token 会被脱敏。认证失败日志仅显示无效 token 的截断预览。
+当 `security.log_redaction: true`（默认值）时，出现在日志输出中的 Bearer token 会被脱敏。认证失败日志仅显示无效 token 的截断预览。记忆内容字段（`content`、`preview`、`summary`，以及任何嵌套的 `*.content`）在结构化日志输出中也会以同样方式脱敏——由日志记录器配置的脱敏路径强制执行，而非依赖各记录点的遗漏式省略。
 
 ### 内容中的密钥检测
 
@@ -2395,6 +2397,7 @@ bhgbrain backup create
 
 - `/health` 有意设计为无需认证，以兼容探针。
 - 速率限制以受信任的请求身份（IP）为键，忽略 `x-client-id` 用于强制执行。
+- 审计/请求日志中的 `client_id` 同样源自受信任的请求身份（`req.ip`），而非调用方提供的 `x-client-id` 头部——该头部仅作为非权威的调试提示接受，绝不用于审计追踪的信任来源。
 - `memory://list` 强制 `limit` 范围为 `1..100`；无效值返回 `INVALID_INPUT`。
 
 ### 安全失败关闭认证

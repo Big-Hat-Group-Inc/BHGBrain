@@ -11,17 +11,6 @@ The system SHALL mark memories as stale after configured inactivity windows and 
 - **WHEN** retention processing evaluates category entries
 - **THEN** category entries are not flagged stale by age-based decay rules
 
-### Requirement: Consolidation SHALL detect merge clusters and contradictions
-Consolidation runs SHALL detect low-importance stale clusters and contradiction candidates while preserving traceability of decisions.
-
-#### Scenario: Similar stale cluster is surfaced for merge handling
-- **WHEN** three or more stale memories exceed cluster similarity thresholds
-- **THEN** the run reports the cluster as a consolidation candidate
-
-#### Scenario: Prior delete decisions generate contradiction candidates
-- **WHEN** consolidation analyzes historical delete/correction events
-- **THEN** potential contradictions are surfaced for review
-
 ### Requirement: Runtime failures SHALL map to explicit degraded behaviors
 The system SHALL provide deterministic degraded behavior for embedding, Qdrant, extraction-model, and SQLite-lock failures.
 
@@ -38,22 +27,6 @@ The system SHALL provide deterministic degraded behavior for embedding, Qdrant, 
 - **THEN** the system retries with exponential backoff before returning `INTERNAL` on exhaustion
 
 ## MODIFIED Requirements
-
-### Requirement: Consolidation SHALL detect merge clusters and contradictions
-Consolidation runs SHALL detect low-importance stale clusters and contradiction candidates while preserving traceability of decisions. This requirement SHALL be considered satisfied only when both scenarios below are implemented and tested; if the capability is not implemented it SHALL be explicitly removed from the proposal and this spec rather than left asserted-but-absent.
-
-#### Scenario: Similar stale cluster is surfaced for merge handling
-- **WHEN** three or more stale memories exceed cluster similarity thresholds
-- **THEN** the run reports the cluster as a consolidation candidate
-
-#### Scenario: Prior delete decisions generate contradiction candidates
-- **WHEN** consolidation analyzes historical delete/correction events
-- **THEN** potential contradictions are surfaced for review
-
-#### Scenario: Unimplemented consolidation is de-scoped rather than silently asserted
-- **WHEN** cluster and contradiction detection are not implemented
-- **THEN** this requirement and its corresponding tasks are removed or marked out-of-scope in the change artifacts
-- **AND** no scenario claims coverage that the implementation does not provide
 
 ### Requirement: Runtime failures SHALL map to explicit degraded behaviors
 The system SHALL provide deterministic degraded behavior for embedding, Qdrant, extraction-model, and SQLite-lock failures. The SQLite-lock retry behavior SHALL be backed by an actual retry-with-backoff wrapper around write transactions keyed on busy/locked errors; if the underlying store is in-process sql.js with no OS-level lock, the spec SHALL document the retry scenario as an intentional no-op rather than asserting an unimplemented contract.

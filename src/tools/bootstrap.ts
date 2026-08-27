@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ToolContext } from './index.js';
+import type { ToolContext, ToolLogContext } from './index.js';
 import type { WriteResult } from '../domain/types.js';
 import { BootstrapSessionManager } from '../bootstrap/session.js';
 import { BOOTSTRAP_SECTIONS, TOTAL_SECTIONS, getSectionByNumber } from '../bootstrap/sections.js';
@@ -14,8 +14,11 @@ export const BootstrapInputSchema = z.object({
 
 export type BootstrapInput = z.infer<typeof BootstrapInputSchema>;
 
-export async function handleBootstrap(ctx: ToolContext, args: unknown): Promise<unknown> {
+export async function handleBootstrap(
+  ctx: ToolContext, args: unknown, logCtx?: ToolLogContext,
+): Promise<unknown> {
   const input = parseBootstrapInput(args);
+  if (logCtx) logCtx.namespace = input.namespace;
   const sessionMgr = new BootstrapSessionManager(ctx.storage.sqlite);
 
   switch (input.action) {
