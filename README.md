@@ -364,8 +364,13 @@ The file is created automatically on first run with all defaults applied. Edit i
     // When true, expired memories are written to the archive table before deletion
     "archive_before_delete": true,
 
-    // Cron schedule for the background cleanup job (default: 2am daily)
+    // Cron schedule for the background cleanup job (default: 2am daily), evaluated in UTC
     "cleanup_schedule": "0 2 * * *",
+
+    // When true, the server process runs `cleanup_schedule` automatically via an
+    // internal scheduler (same execution path as `bhgbrain gc`). Set false to
+    // rely solely on manual `bhgbrain gc` runs or an external cron trigger.
+    "scheduled_cleanup_enabled": true,
 
     // Days before expiry at which memories are flagged as expiring_soon
     "pre_expiry_warning_days": 7,
@@ -1251,13 +1256,15 @@ Each category is assigned to one of four named slots:
 
 #### Background Cleanup
 
-The retention system runs a scheduled cleanup job (default: daily at 2:00 AM, configurable via `retention.cleanup_schedule` as a cron expression). You can also trigger cleanup manually via `bhgbrain gc`.
+The server runs a scheduled cleanup job (default: daily at 2:00 AM UTC, configurable via `retention.cleanup_schedule` as a cron expression; disable with `retention.scheduled_cleanup_enabled: false`). It runs on the same code path as the manual `bhgbrain gc` command, so scheduled and manual runs behave identically.
 
 **Cleanup phases:**
 
-1. **Identify expired memories:** Query SQLite for all memories where `decay_eligible = true` AND `expires_at < now()`. T0 memories are always excluded (T0 is never decay eligible).
+1. **Identify expired memories:** Query SQLite for all memories where `decay_eligible = true` AND `expires_at < now()`. Only `T2`/`T3` are eligible for direct archive-and-delete:
+   - `T0` is always excluded (T0 is never decay eligible).
+   - `T1` is never directly deleted. Expired or `review_due`-past `T1` memories are surfaced as **review candidates** in the GC result instead, so an operator can decide whether to promote, re-save, or manually delete them.
 
-2. **Archive before delete (if enabled):** For each expired memory, write a summary record to the `memory_archive` table:
+2. **Archive before delete (if enabled):** For each `T2`/`T3` candidate, write a summary record to the `memory_archive` table and log a distinct `ARCHIVE` audit event:
 
    ```sql
    memory_archive {
@@ -1273,13 +1280,21 @@ The retention system runs a scheduled cleanup job (default: daily at 2:00 AM, co
    }
    ```
 
+   If archiving a given memory fails, that memory is skipped for deletion (never deleted without a durable archive row when archival is enabled) and the run is reported degraded rather than aborting or throwing.
+
 3. **Delete from Qdrant:** Batch delete all expired point IDs from their respective Qdrant collections.
 
 4. **Delete from SQLite:** Remove expired rows from the `memories` and `memories_fts` tables.
 
-5. **Audit log:** Each deletion is recorded in the `audit_log` table with `operation: FORGET` and `client_id: "system"`.
+5. **Audit log:** Each confirmed deletion is recorded in the `audit_log` table with `operation: FORGET` and `client_id: "system"`. Archival, promotion, T0 revision, and archive restore each get their own distinct operation code (`ARCHIVE`, `PROMOTE`, `REVISE`, `RESTORE`) rather than collapsing into generic `ADD`/`UPDATE`/`FORGET` entries — every lifecycle-transition event's `details` column carries a JSON payload of `{memory_id, prior_tier, new_tier, actor, timestamp, action}`.
 
-6. **Flush:** SQLite is flushed atomically to disk after all deletions.
+6. **Compaction (threshold-driven, not per-delete):** For each namespace/collection this run deleted from, once the deleted-vector ratio crosses `retention.compaction_deleted_threshold`, the run nudges Qdrant's segment optimizer to reclaim space via `optimizers_config.deleted_threshold`.
+
+7. **Flush:** SQLite is flushed atomically to disk after all deletions.
+
+8. **Health signal:** If any archive or delete step failed partway through, the run's outcome is persisted and surfaces as a degraded `retention` component in `health://status` until the next clean GC run.
+
+A GC run — manual or scheduled — never throws out to its caller: unexpected failures are caught, the in-progress lifecycle lock is always released, and the result is reported as `degraded: true` with whatever work completed intact.
 
 #### T0 Revision History
 
@@ -1705,7 +1720,8 @@ Returns a `HealthSnapshot`:
     "expiring_soon": 5,
     "archived_count": 128,
     "unsynced_vectors": 0,
-    "over_capacity": false
+    "over_capacity": false,
+    "cleanup_lag_seconds": 120
   },
   "circuitBreakers": {
     "openai_embedding": "closed",
@@ -1713,6 +1729,8 @@ Returns a `HealthSnapshot`:
   }
 }
 ```
+
+`components.retention` also goes `"degraded"` (with a message) when the most recent GC run — scheduled or manual — reported a partial failure (an archive or delete step failed), independent of tier-capacity pressure. It clears back to `"healthy"` on the next clean GC run.
 
 **Overall status logic:**
 - `unhealthy` - if SQLite or Qdrant is unhealthy
@@ -1901,6 +1919,8 @@ Response:
 
 Pagination uses composite cursors (`created_at|id`) for stable ordering. Ties at the same timestamp are broken by ID, ensuring no row is skipped or duplicated across pages.
 
+`memory://list` and `memory://{id}` apply the same lifecycle-visibility rule as `search`/`recall`: an expired, decay-eligible `T2`/`T3` memory is excluded (reads on `memory://{id}` return `NOT_FOUND`). `T0` and `T1` memories remain visible regardless of transient expiry.
+
 ### `memory://inject` - Session Context Injection
 
 The inject resource builds a budgeted text payload for injecting into an LLM context window:
@@ -2018,12 +2038,13 @@ bhgbrain stats --by-tier              # Memory count breakdown by retention tier
 bhgbrain stats --expiring             # Show memories expiring in next 7 days
 bhgbrain health                       # Full system health check
 
-# Garbage collection
-bhgbrain gc                           # Run cleanup (delete expired non-T0 memories)
-bhgbrain gc --dry-run                 # Show what would be cleaned without deleting
+# Garbage collection (archives + deletes expired T2/T3; T1 is surfaced as
+# reviewCandidates instead of deleted; Qdrant compaction runs automatically
+# once a touched collection's deleted-vector ratio crosses the configured
+# threshold — see retention.compaction_deleted_threshold)
+bhgbrain gc                           # Run cleanup
+bhgbrain gc --dry-run                 # Show candidates and review items without deleting
 bhgbrain gc --tier T3                 # Clean up only T3 memories
-bhgbrain gc --consolidate             # GC + stale marking consolidation pass
-bhgbrain gc --force-compact           # Force Qdrant segment compaction after GC
 
 # Audit log
 bhgbrain audit                        # Show recent audit entries

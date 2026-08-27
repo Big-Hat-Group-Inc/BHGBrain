@@ -285,6 +285,30 @@ export class QdrantStore {
     }
   }
 
+  /**
+   * Nudges Qdrant's segment optimizer to reclaim space in a collection whose
+   * deleted-vector ratio has crossed the configured threshold. Qdrant has no
+   * "compact now" endpoint; re-applying `optimizers_config.deleted_threshold`
+   * via `updateCollection` is the documented way to make the optimizer
+   * re-evaluate deleted segments on its next pass. A missing collection is a
+   * tolerated no-op (nothing to compact).
+   */
+  async compact(namespace: string, collection: string, deletedThreshold: number): Promise<void> {
+    await this.executeWithBreaker(async () => {
+      const name = this.collectionName(namespace, collection);
+      try {
+        await this.client.updateCollection(name, {
+          optimizers_config: { deleted_threshold: deletedThreshold },
+        });
+      } catch (err) {
+        if (this.isNotFoundError(err)) {
+          return;
+        }
+        throw err;
+      }
+    });
+  }
+
   async deleteCollection(namespace: string, collection: string): Promise<void> {
     const name = this.collectionName(namespace, collection);
     try {

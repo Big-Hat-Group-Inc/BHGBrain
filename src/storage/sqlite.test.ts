@@ -554,4 +554,40 @@ describe('SqliteStore', () => {
   it('passes health check', () => {
     expect(store.healthCheck()).toBe(true);
   });
+
+  // -- Retention state (GC degraded signal + cleanup lag) --
+
+  it('reports no degraded retention state and null last_success_at before any GC run', () => {
+    expect(store.getRetentionDegraded()).toEqual({ degraded: false, message: null, last_success_at: null });
+  });
+
+  it('records last_success_at on a clean run and clears it back to healthy', () => {
+    store.setRetentionDegraded(false, null, '2026-03-10T02:00:00.000Z');
+    expect(store.getRetentionDegraded()).toEqual({
+      degraded: false,
+      message: null,
+      last_success_at: '2026-03-10T02:00:00.000Z',
+    });
+  });
+
+  it('preserves last_success_at across a subsequent degraded run (cleanup lag keeps growing)', () => {
+    store.setRetentionDegraded(false, null, '2026-03-10T02:00:00.000Z');
+    store.setRetentionDegraded(true, 'archive failed', '2026-03-11T02:00:00.000Z');
+    expect(store.getRetentionDegraded()).toEqual({
+      degraded: true,
+      message: 'archive failed',
+      last_success_at: '2026-03-10T02:00:00.000Z', // unchanged: the failed run didn't complete cleanly
+    });
+  });
+
+  it('advances last_success_at again once a later run completes cleanly', () => {
+    store.setRetentionDegraded(false, null, '2026-03-10T02:00:00.000Z');
+    store.setRetentionDegraded(true, 'archive failed', '2026-03-11T02:00:00.000Z');
+    store.setRetentionDegraded(false, null, '2026-03-12T02:00:00.000Z');
+    expect(store.getRetentionDegraded()).toEqual({
+      degraded: false,
+      message: null,
+      last_success_at: '2026-03-12T02:00:00.000Z',
+    });
+  });
 });

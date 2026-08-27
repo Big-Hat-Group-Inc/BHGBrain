@@ -329,8 +329,14 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Wenn true, werden abgelaufene Erinnerungen vor dem Löschen in die Archivtabelle geschrieben
     "archive_before_delete": true,
 
-    // Cron-Zeitplan für den Hintergrund-Bereinigungsauftrag (Standard: täglich 2 Uhr)
+    // Cron-Zeitplan für den Hintergrund-Bereinigungsauftrag (Standard: täglich 2 Uhr UTC)
     "cleanup_schedule": "0 2 * * *",
+
+    // Wenn true, führt der Serverprozess `cleanup_schedule` automatisch über einen
+    // internen Scheduler aus (derselbe Ausführungspfad wie `bhgbrain gc`). Auf false
+    // setzen, um sich nur auf manuelle `bhgbrain gc`-Läufe oder einen externen
+    // Cron-Trigger zu verlassen.
+    "scheduled_cleanup_enabled": true,
 
     // Tage vor Ablauf, ab denen Erinnerungen als expiring_soon markiert werden
     "pre_expiry_warning_days": 7,
@@ -1203,13 +1209,15 @@ Jede Kategorie wird einem von vier benannten Slots zugewiesen:
 
 #### Hintergrund-Bereinigung
 
-Das Aufbewahrungssystem führt einen geplanten Bereinigungsauftrag aus (Standard: täglich um 2:00 Uhr, konfigurierbar über `retention.cleanup_schedule` als Cron-Ausdruck). Sie können die Bereinigung auch manuell über `bhgbrain gc` auslösen.
+Der Server führt einen geplanten Bereinigungsauftrag aus (Standard: täglich um 2:00 Uhr UTC, konfigurierbar über `retention.cleanup_schedule` als Cron-Ausdruck; deaktivierbar mit `retention.scheduled_cleanup_enabled: false`). Er läuft über denselben Codepfad wie der manuelle Befehl `bhgbrain gc`, sodass geplante und manuelle Läufe sich identisch verhalten.
 
 **Bereinigungsphasen:**
 
-1. **Abgelaufene Erinnerungen identifizieren:** SQLite nach allen Erinnerungen abfragen, bei denen `decay_eligible = true` UND `expires_at < now()`. T0-Erinnerungen sind immer ausgeschlossen (T0 ist nie verfallsberechtigt).
+1. **Abgelaufene Erinnerungen identifizieren:** SQLite nach allen Erinnerungen abfragen, bei denen `decay_eligible = true` UND `expires_at < now()`. Nur `T2`/`T3` sind für direktes Archivieren-und-Löschen berechtigt:
+   - `T0` ist immer ausgeschlossen (T0 ist nie verfallsberechtigt).
+   - `T1` wird nie direkt gelöscht. Abgelaufene oder `review_due`-überfällige `T1`-Erinnerungen werden stattdessen im GC-Ergebnis als **Review-Kandidaten** ausgewiesen, damit ein Operator entscheiden kann, ob sie befördert, neu gespeichert oder manuell gelöscht werden.
 
-2. **Vor dem Löschen archivieren (wenn aktiviert):** Für jede abgelaufene Erinnerung wird ein Zusammenfassungsdatensatz in die Tabelle `memory_archive` geschrieben:
+2. **Vor dem Löschen archivieren (wenn aktiviert):** Für jeden `T2`/`T3`-Kandidaten wird ein Zusammenfassungsdatensatz in die Tabelle `memory_archive` geschrieben und ein eigenständiges `ARCHIVE`-Audit-Ereignis protokolliert:
 
    ```sql
    memory_archive {
@@ -1225,13 +1233,21 @@ Das Aufbewahrungssystem führt einen geplanten Bereinigungsauftrag aus (Standard
    }
    ```
 
+   Schlägt die Archivierung einer Erinnerung fehl, wird diese Erinnerung von der Löschung ausgenommen (bei aktivierter Archivierung wird nie ohne dauerhaften Archivdatensatz gelöscht) und der Lauf als degradiert gemeldet, statt abzubrechen oder eine Ausnahme zu werfen.
+
 3. **Aus Qdrant löschen:** Alle abgelaufenen Punkt-IDs stapelweise aus den jeweiligen Qdrant-Sammlungen löschen.
 
 4. **Aus SQLite löschen:** Abgelaufene Zeilen aus den Tabellen `memories` und `memories_fts` entfernen.
 
-5. **Audit-Protokoll:** Jede Löschung wird in der Tabelle `audit_log` mit `operation: FORGET` und `client_id: "system"` aufgezeichnet.
+5. **Audit-Protokoll:** Jede bestätigte Löschung wird in der Tabelle `audit_log` mit `operation: FORGET` und `client_id: "system"` aufgezeichnet. Archivierung, Beförderung, T0-Revision und Archiv-Wiederherstellung erhalten jeweils einen eigenen Operationscode (`ARCHIVE`, `PROMOTE`, `REVISE`, `RESTORE`) statt in generischen `ADD`/`UPDATE`/`FORGET`-Einträgen zu verschwinden — jedes Lifecycle-Übergangsereignis trägt in der Spalte `details` eine JSON-Nutzlast `{memory_id, prior_tier, new_tier, actor, timestamp, action}`.
 
-6. **Flush:** SQLite wird nach allen Löschungen atomar auf die Festplatte geschrieben.
+6. **Kompaktierung (schwellenwertgesteuert, nicht pro Löschung):** Für jeden Namespace/Collection-Bereich, in dem dieser Lauf gelöscht hat, wird der Qdrant-Segmentoptimierer über `optimizers_config.deleted_threshold` zur Freigabe von Speicherplatz angestoßen, sobald der Anteil gelöschter Vektoren `retention.compaction_deleted_threshold` überschreitet.
+
+7. **Flush:** SQLite wird nach allen Löschungen atomar auf die Festplatte geschrieben.
+
+8. **Gesundheitssignal:** Ist während eines Laufs ein Archivierungs- oder Löschschritt fehlgeschlagen, wird das Ergebnis gespeichert und erscheint bis zum nächsten sauberen GC-Lauf als degradierte `retention`-Komponente in `health://status`.
+
+Ein GC-Lauf — manuell oder geplant — wirft nie eine Ausnahme an seinen Aufrufer: Unerwartete Fehler werden abgefangen, die laufende Lifecycle-Sperre wird immer freigegeben, und das Ergebnis wird als `degraded: true` mit dem bereits abgeschlossenen Arbeitsstand gemeldet.
 
 #### T0-Revisionsverlauf
 
@@ -1659,10 +1675,13 @@ Gibt einen `HealthSnapshot` zurück:
     "expiring_soon": 5,
     "archived_count": 128,
     "unsynced_vectors": 0,
-    "over_capacity": false
+    "over_capacity": false,
+    "cleanup_lag_seconds": 120
   }
 }
 ```
+
+`components.retention` wird ebenfalls `"degraded"` (mit Nachricht), wenn der letzte GC-Lauf — geplant oder manuell — einen teilweisen Fehler gemeldet hat (ein Archivierungs- oder Löschschritt ist fehlgeschlagen), unabhängig vom Kapazitätsdruck der Stufen. Der Status wird beim nächsten sauberen GC-Lauf wieder auf `"healthy"` zurückgesetzt.
 
 **Gesamtstatus-Logik:**
 - `unhealthy` — wenn SQLite oder Qdrant fehlerhaft ist
@@ -1849,6 +1868,8 @@ Antwort:
 
 Die Paginierung verwendet zusammengesetzte Cursor (`created_at|id`) für stabile Sortierung. Gleichstände mit demselben Zeitstempel werden durch die ID aufgelöst, sodass keine Zeile über Seiten hinweg übersprungen oder dupliziert wird.
 
+`memory://list` und `memory://{id}` wenden dieselbe Lifecycle-Sichtbarkeitsregel wie `search`/`recall` an: Eine abgelaufene, verfallsberechtigte `T2`/`T3`-Erinnerung wird ausgeschlossen (Abfragen über `memory://{id}` liefern `NOT_FOUND`). `T0`- und `T1`-Erinnerungen bleiben unabhängig von einem vorübergehenden Ablauf sichtbar.
+
 ### `memory://inject` — Sitzungskontext-Injektion
 
 Die Inject-Ressource erstellt einen budgetierten Text-Payload für die Einbettung in ein LLM-Kontextfenster:
@@ -1936,12 +1957,14 @@ bhgbrain stats --by-tier              # Erinnerungsanzahl aufgeteilt nach Aufbew
 bhgbrain stats --expiring             # Erinnerungen anzeigen, die in den nächsten 7 Tagen ablaufen
 bhgbrain health                       # Vollständige Systemgesundheitsprüfung
 
-# Garbage Collection
-bhgbrain gc                           # Bereinigung ausführen (abgelaufene Nicht-T0-Erinnerungen löschen)
-bhgbrain gc --dry-run                 # Zeigen, was bereinigt würde, ohne zu löschen
+# Garbage Collection (archiviert + löscht abgelaufene T2/T3; T1 wird als
+# reviewCandidates ausgewiesen statt gelöscht; Qdrant-Kompaktierung läuft
+# automatisch, sobald der Anteil gelöschter Vektoren einer betroffenen
+# Collection den konfigurierten Schwellenwert überschreitet — siehe
+# retention.compaction_deleted_threshold)
+bhgbrain gc                           # Bereinigung ausführen
+bhgbrain gc --dry-run                 # Kandidaten und Review-Elemente anzeigen, ohne zu löschen
 bhgbrain gc --tier T3                 # Nur T3-Erinnerungen bereinigen
-bhgbrain gc --consolidate             # GC + Stale-Markierungs-Konsolidierungsdurchgang
-bhgbrain gc --force-compact           # Qdrant-Segment-Kompaktierung nach GC erzwingen
 
 # Audit-Protokoll
 bhgbrain audit                        # Aktuelle Audit-Einträge anzeigen

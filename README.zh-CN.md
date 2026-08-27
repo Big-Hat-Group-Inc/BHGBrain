@@ -329,8 +329,13 @@ BHGBrain 从以下位置加载配置文件：
     // 为 true 时，过期记忆在删除前写入归档表
     "archive_before_delete": true,
 
-    // 后台清理任务的 cron 计划（默认：每天凌晨 2 点）
+    // 后台清理任务的 cron 计划（默认：每天 UTC 凌晨 2 点）
     "cleanup_schedule": "0 2 * * *",
+
+    // 为 true 时，服务器进程会通过内部调度器自动执行 `cleanup_schedule`
+    // （与 `bhgbrain gc` 相同的执行路径）。设为 false 则只依赖手动运行
+    // `bhgbrain gc` 或外部 cron 触发器。
+    "scheduled_cleanup_enabled": true,
 
     // 在到期前多少天将记忆标记为即将到期
     "pre_expiry_warning_days": 7,
@@ -1196,13 +1201,15 @@ checksum = SHA-256(normalizeContent(content))
 
 #### 后台清理
 
-保留系统运行定时清理任务（默认：每天凌晨 2:00，可通过 `retention.cleanup_schedule` 以 cron 表达式配置）。也可以通过 `bhgbrain gc` 手动触发清理。
+服务器运行定时清理任务（默认：每天 UTC 凌晨 2:00，可通过 `retention.cleanup_schedule` 以 cron 表达式配置；可通过 `retention.scheduled_cleanup_enabled: false` 关闭）。它与手动的 `bhgbrain gc` 命令走完全相同的执行路径，因此定时运行与手动运行行为一致。
 
 **清理阶段：**
 
-1. **识别过期记忆：** 查询 SQLite 中所有满足 `decay_eligible = true` 且 `expires_at < now()` 的记忆。T0 记忆始终被排除（T0 永远不具备衰减资格）。
+1. **识别过期记忆：** 查询 SQLite 中所有满足 `decay_eligible = true` 且 `expires_at < now()` 的记忆。只有 `T2`/`T3` 有资格被直接归档并删除：
+   - `T0` 始终被排除（T0 永远不具备衰减资格）。
+   - `T1` 永远不会被直接删除。已过期或 `review_due` 已超期的 `T1` 记忆会在 GC 结果中作为**待审核候选项**列出，由操作者决定是晋升、重新保存还是手动删除。
 
-2. **删除前归档（若已启用）：** 对每条过期记忆，将摘要记录写入 `memory_archive` 表：
+2. **删除前归档（若已启用）：** 对每条 `T2`/`T3` 候选记忆，将摘要记录写入 `memory_archive` 表，并记录一条独立的 `ARCHIVE` 审计事件：
 
    ```sql
    memory_archive {
@@ -1218,13 +1225,21 @@ checksum = SHA-256(normalizeContent(content))
    }
    ```
 
+   若某条记忆的归档失败，该记忆会被跳过、不予删除（启用归档时绝不在没有持久归档记录的情况下删除），本次运行会被报告为降级状态，而不是中止或抛出异常。
+
 3. **从 Qdrant 删除：** 从各自的 Qdrant 集合中批量删除所有过期的点 ID。
 
 4. **从 SQLite 删除：** 从 `memories` 和 `memories_fts` 表中移除过期行。
 
-5. **审计日志：** 每次删除都记录在 `audit_log` 表中，`operation: FORGET`，`client_id: "system"`。
+5. **审计日志：** 每次确认的删除都记录在 `audit_log` 表中，`operation: FORGET`，`client_id: "system"`。归档、晋升、T0 修订和归档恢复各自拥有独立的操作代码（`ARCHIVE`、`PROMOTE`、`REVISE`、`RESTORE`），不再混入通用的 `ADD`/`UPDATE`/`FORGET` 记录——每个生命周期转换事件的 `details` 列都携带一份 JSON 载荷 `{memory_id, prior_tier, new_tier, actor, timestamp, action}`。
 
-6. **刷写：** 所有删除完成后，SQLite 原子性刷写到磁盘。
+6. **压缩（由阈值驱动，而非逐条删除触发）：** 对本次运行涉及删除的每个命名空间/集合，一旦已删除向量占比超过 `retention.compaction_deleted_threshold`，本次运行会通过 `optimizers_config.deleted_threshold` 促使 Qdrant 的分段优化器回收空间。
+
+7. **刷写：** 所有删除完成后，SQLite 原子性刷写到磁盘。
+
+8. **健康信号：** 若归档或删除步骤中途失败，本次运行的结果会被持久化，并在 `health://status` 中显示为降级的 `retention` 组件，直到下一次干净的 GC 运行为止。
+
+无论是手动还是定时的 GC 运行，都不会向调用方抛出异常：意外故障会被捕获，进行中的生命周期锁始终会被释放，运行结果会以 `degraded: true` 的形式报告，并保留已完成的工作。
 
 #### T0 版本历史
 
@@ -1651,10 +1666,13 @@ bhgbrain health
     "expiring_soon": 5,
     "archived_count": 128,
     "unsynced_vectors": 0,
-    "over_capacity": false
+    "over_capacity": false,
+    "cleanup_lag_seconds": 120
   }
 }
 ```
+
+当最近一次 GC 运行（定时或手动）报告部分失败（某个归档或删除步骤失败）时，`components.retention` 也会变为 `"degraded"`（附带说明信息），与层级容量压力无关。下一次干净的 GC 运行会将其恢复为 `"healthy"`。
 
 **整体状态逻辑：**
 - `unhealthy`——如果 SQLite 或 Qdrant 不健康
@@ -1840,6 +1858,8 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 
 分页使用复合游标（`created_at|id`）以保证稳定排序。相同时间戳的记录按 ID 打破平局，确保跨页不跳过或重复任何行。
 
+`memory://list` 与 `memory://{id}` 应用与 `search`/`recall` 相同的生命周期可见性规则：已过期且具备衰减资格的 `T2`/`T3` 记忆会被排除（通过 `memory://{id}` 读取会返回 `NOT_FOUND`）。`T0` 与 `T1` 记忆不受临时过期影响，始终可见。
+
 ### `memory://inject`——会话上下文注入
 
 注入资源构建一个预算文本载荷，用于注入到 LLM 上下文窗口：
@@ -1927,12 +1947,12 @@ bhgbrain stats --by-tier              # 按保留层级统计记忆数量
 bhgbrain stats --expiring             # 显示未来 7 天内到期的记忆
 bhgbrain health                       # 完整系统健康检查
 
-# 垃圾回收
-bhgbrain gc                           # 运行清理（删除过期的非 T0 记忆）
-bhgbrain gc --dry-run                 # 不实际删除地显示将被清理的内容
+# 垃圾回收（归档并删除过期的 T2/T3；T1 会以 reviewCandidates 形式列出而非
+# 删除；一旦受影响集合的已删除向量占比超过配置阈值，Qdrant 压缩会自动执行——
+# 参见 retention.compaction_deleted_threshold）
+bhgbrain gc                           # 运行清理
+bhgbrain gc --dry-run                 # 显示候选项与待审核项，不实际删除
 bhgbrain gc --tier T3                 # 仅清理 T3 记忆
-bhgbrain gc --consolidate             # GC + 过期标记整合阶段
-bhgbrain gc --force-compact           # GC 后强制 Qdrant 分段压缩
 
 # 审计日志
 bhgbrain audit                        # 显示最近的审计条目

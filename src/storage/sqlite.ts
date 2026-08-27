@@ -100,10 +100,13 @@ export interface SqliteStorage {
   markAllVectorsSyncState(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number;
   recordAccessBatch(updates: AccessUpdate[]): void;
   listExpiredMemories(nowIso: string, tier?: RetentionTier): MemoryRecordWithoutEmbedding[];
+  listReviewCandidates(nowIso: string, limit?: number): MemoryRecordWithoutEmbedding[];
   listExpiringMemories(nowIso: string, untilIso: string, limit: number): MemoryRecordWithoutEmbedding[];
   countExpiringMemories(nowIso: string, untilIso: string): number;
   countByTier(): Record<RetentionTier, number>;
   getTierStats(): TierStats[];
+  setRetentionDegraded(degraded: boolean, message?: string | null, completedAt?: string): void;
+  getRetentionDegraded(): { degraded: boolean; message: string | null; last_success_at: string | null };
   countArchivedMemories(): number;
   countUnsyncedVectors(): number;
   listMemoriesNeedingVectorSync(limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
@@ -273,6 +276,19 @@ CREATE TABLE IF NOT EXISTS bootstrap_sessions (
   memory_ids TEXT NOT NULL DEFAULT '[]',
   updated_at TEXT NOT NULL,
   PRIMARY KEY (namespace, section_number)
+);
+
+-- Single-row state for the most recent cleanup (GC) run, so HealthService can
+-- surface a degraded retention signal and cleanup lag (time since the last
+-- clean run) without holding that state only in the in-memory
+-- RetentionService (which does not survive a restart or run inside a
+-- different process than the one polling health).
+CREATE TABLE IF NOT EXISTS retention_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  degraded INTEGER NOT NULL DEFAULT 0,
+  message TEXT,
+  last_success_at TEXT,
+  updated_at TEXT NOT NULL
 );
 `;
 
@@ -846,6 +862,23 @@ export class SqliteStore implements SqliteStorage {
     return this.queryMemories(sql, params);
   }
 
+  /**
+   * `T1` (institutional) memories whose `expires_at` or `review_due` has
+   * passed. These are surfaced as review candidates, never as direct-delete
+   * candidates: `listExpiredMemories` alone would miss rows whose expiry is
+   * still in the future but whose `review_due` has already lapsed, so this
+   * query is a separate OR condition rather than reusing that method with a
+   * `T1` filter.
+   */
+  listReviewCandidates(nowIso: string, limit = 200): MemoryRecordWithoutEmbedding[] {
+    return this.queryMemories(
+      `SELECT * FROM memories WHERE archived = 0 AND retention_tier = 'T1'
+       AND ((expires_at IS NOT NULL AND expires_at < ?) OR (review_due IS NOT NULL AND review_due < ?))
+       ORDER BY COALESCE(review_due, expires_at) ASC LIMIT ?`,
+      [nowIso, nowIso, limit],
+    );
+  }
+
   listExpiringMemories(nowIso: string, untilIso: string, limit: number): MemoryRecordWithoutEmbedding[] {
     return this.queryMemories(
       `SELECT * FROM memories WHERE archived = 0 AND expires_at IS NOT NULL AND expires_at >= ? AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?`,
@@ -880,6 +913,38 @@ export class SqliteStore implements SqliteStorage {
   getTierStats(): TierStats[] {
     const counts = this.countByTier();
     return (Object.keys(counts) as RetentionTier[]).map(tier => ({ tier, count: counts[tier] }));
+  }
+
+  // `last_success_at` only advances when this call reports a clean run
+  // (`degraded = false`); a degraded call leaves it untouched so it keeps
+  // reflecting the last time cleanup actually completed cleanly — the basis
+  // for the `cleanup_lag_seconds` health signal.
+  setRetentionDegraded(degraded: boolean, message: string | null = null, completedAt?: string): void {
+    this.assertMutableAllowed();
+    const degradedInt = degraded ? 1 : 0;
+    const now = completedAt ?? new Date().toISOString();
+    this.db.run(
+      `INSERT INTO retention_state (id, degraded, message, last_success_at, updated_at)
+       VALUES (1, ?1, ?2, CASE WHEN ?1 = 0 THEN ?3 ELSE NULL END, ?3)
+       ON CONFLICT(id) DO UPDATE SET
+         degraded = ?1,
+         message = ?2,
+         last_success_at = CASE WHEN ?1 = 0 THEN ?3 ELSE retention_state.last_success_at END,
+         updated_at = ?3`,
+      [degradedInt, message, now],
+    );
+    this.markDirty();
+  }
+
+  getRetentionDegraded(): { degraded: boolean; message: string | null; last_success_at: string | null } {
+    const stmt = this.db.prepare(`SELECT degraded, message, last_success_at FROM retention_state WHERE id = 1`);
+    if (!stmt.step()) {
+      stmt.free();
+      return { degraded: false, message: null, last_success_at: null };
+    }
+    const row = stmt.getAsObject() as { degraded: number; message: string | null; last_success_at: string | null };
+    stmt.free();
+    return { degraded: row.degraded === 1, message: row.message ?? null, last_success_at: row.last_success_at ?? null };
   }
 
   countArchivedMemories(): number {

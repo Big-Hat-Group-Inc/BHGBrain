@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { SqliteStore } from './sqlite.js';
 import { QdrantStore } from './qdrant.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
-import type { MemoryRecord, WriteOperation, AuditEntry } from '../domain/types.js';
+import type { MemoryRecord, WriteOperation, AuditEntry, LifecycleAuditDetails } from '../domain/types.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import { internal, conflict } from '../errors/index.js';
 
@@ -117,7 +117,19 @@ export class StorageManager {
     }
 
     if (existing.retention_tier === 'T0' && fields.content && fields.content !== existing.content) {
-      this.sqlite.insertRevision(id, this.sqlite.listRevisions(id).length + 1, existing.content, new Date().toISOString());
+      const revisedAt = new Date().toISOString();
+      this.sqlite.insertRevision(id, this.sqlite.listRevisions(id).length + 1, existing.content, revisedAt);
+      this.logAudit('REVISE', id, existing.namespace, 'system', {
+        flush: false,
+        details: {
+          memory_id: id,
+          prior_tier: existing.retention_tier,
+          new_tier: fields.retention_tier ?? existing.retention_tier,
+          actor: 'system',
+          timestamp: revisedAt,
+          action: 'revise',
+        },
+      });
     }
 
     this.sqlite.updateMemory(id, fields);
@@ -500,11 +512,11 @@ export class StorageManager {
   }
 
   logAudit(
-    operation: WriteOperation | 'FORGET',
+    operation: AuditEntry['operation'],
     memoryId: string,
     namespace: string,
     clientId = 'unknown',
-    options?: { flush?: boolean },
+    options?: { flush?: boolean; details?: LifecycleAuditDetails },
   ): void {
     const entry: AuditEntry = {
       id: uuidv4(),
@@ -513,6 +525,7 @@ export class StorageManager {
       operation,
       memory_id: memoryId,
       client_id: clientId,
+      details: options?.details ? JSON.stringify(options.details) : undefined,
     };
     this.sqlite.insertAudit(entry);
     if (options?.flush !== false) {

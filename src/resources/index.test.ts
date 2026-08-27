@@ -77,6 +77,109 @@ describe('resource pagination bounds', () => {
     expect(result.total_results).toBe(2);
   });
 
+  it('excludes an expired decay-eligible T2/T3 memory from memory://{id}', async () => {
+    const expiredMemory = {
+      id: '550e8400-e29b-41d4-a716-446655440002',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic',
+      content: 'stale content',
+      summary: 'stale summary',
+      tags: [],
+      retention_tier: 'T3',
+      expires_at: '2020-01-01T00:00:00.000Z',
+      decay_eligible: true,
+    };
+    const storage = {
+      sqlite: {
+        getMemoryById: () => expiredMemory,
+        touchMemory: () => undefined,
+        scheduleDeferredFlush: () => undefined,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global' } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+
+    const result = await handler.handle(`memory://${expiredMemory.id}`) as ResourceResult;
+    expect(result.error.code).toBe('NOT_FOUND');
+  });
+
+  it('keeps an expired T1 memory visible through memory://{id} (only T2/T3 are filtered)', async () => {
+    const expiredT1 = {
+      id: '550e8400-e29b-41d4-a716-446655440003',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic',
+      content: 'institutional content',
+      summary: 'institutional summary',
+      tags: [],
+      retention_tier: 'T1',
+      expires_at: '2020-01-01T00:00:00.000Z',
+      decay_eligible: true,
+    };
+    const storage = {
+      sqlite: {
+        getMemoryById: () => expiredT1,
+        touchMemory: () => undefined,
+        scheduleDeferredFlush: () => undefined,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global' } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+
+    const result = await handler.handle(`memory://${expiredT1.id}`) as { id?: string; error?: unknown };
+    expect(result.error).toBeUndefined();
+    expect(result.id).toBe(expiredT1.id);
+  });
+
+  it('excludes expired T2/T3 memories from a memory://list page', async () => {
+    const active = {
+      id: '550e8400-e29b-41d4-a716-446655440004',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic',
+      content: 'active content',
+      summary: 'active summary',
+      tags: [],
+      retention_tier: 'T2',
+      expires_at: null,
+      decay_eligible: true,
+      created_at: '2026-01-01T00:00:00.000Z',
+    };
+    const expired = {
+      ...active,
+      id: '550e8400-e29b-41d4-a716-446655440005',
+      retention_tier: 'T3',
+      expires_at: '2020-01-01T00:00:00.000Z',
+    };
+    const storage = {
+      sqlite: {
+        listMemories: (_ns: string, limit: number) => [active, expired].slice(0, limit),
+        countMemories: () => 2,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global' } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+
+    const result = await handler.handle('memory://list?limit=10') as ResourceResult;
+    expect(result.items).toEqual([active]);
+  });
+
   it('builds inject payload within budget without concatenating all category content', async () => {
     const config = {
       defaults: { namespace: 'global', auto_inject_limit: 5 },

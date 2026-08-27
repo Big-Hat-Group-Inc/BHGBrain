@@ -330,8 +330,14 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     // Quand true, les souvenirs expirés sont écrits dans la table d'archive avant suppression
     "archive_before_delete": true,
 
-    // Planification cron pour la tâche de nettoyage en arrière-plan (par défaut : 2h du matin quotidiennement)
+    // Planification cron pour la tâche de nettoyage en arrière-plan (par défaut : 2h du matin UTC quotidiennement)
     "cleanup_schedule": "0 2 * * *",
+
+    // Quand true, le processus serveur exécute `cleanup_schedule` automatiquement via
+    // un planificateur interne (même chemin d'exécution que `bhgbrain gc`). Mettre à
+    // false pour ne dépendre que d'exécutions manuelles de `bhgbrain gc` ou d'un
+    // déclencheur cron externe.
+    "scheduled_cleanup_enabled": true,
 
     // Jours avant expiration à partir desquels les souvenirs sont signalés comme expiring_soon
     "pre_expiry_warning_days": 7,
@@ -1203,13 +1209,15 @@ Chaque catégorie est assignée à l'un des quatre emplacements nommés :
 
 #### Nettoyage en arrière-plan
 
-Le système de rétention exécute une tâche de nettoyage planifiée (par défaut : quotidiennement à 2h00, configurable via `retention.cleanup_schedule` en expression cron). Vous pouvez également déclencher manuellement le nettoyage via `bhgbrain gc`.
+Le serveur exécute une tâche de nettoyage planifiée (par défaut : quotidiennement à 2h00 UTC, configurable via `retention.cleanup_schedule` en expression cron ; désactivable avec `retention.scheduled_cleanup_enabled: false`). Elle s'exécute sur le même chemin de code que la commande manuelle `bhgbrain gc`, donc les exécutions planifiées et manuelles se comportent de façon identique.
 
 **Phases de nettoyage :**
 
-1. **Identifier les souvenirs expirés :** Interroger SQLite pour tous les souvenirs où `decay_eligible = true` ET `expires_at < now()`. Les souvenirs T0 sont toujours exclus (T0 n'est jamais éligible au déclin).
+1. **Identifier les souvenirs expirés :** Interroger SQLite pour tous les souvenirs où `decay_eligible = true` ET `expires_at < now()`. Seuls `T2`/`T3` sont éligibles à l'archivage-et-suppression direct :
+   - `T0` est toujours exclu (T0 n'est jamais éligible au déclin).
+   - `T1` n'est jamais supprimé directement. Les souvenirs `T1` expirés ou dont `review_due` est dépassé sont présentés comme **candidats à révision** dans le résultat du GC, afin qu'un opérateur décide de les promouvoir, de les ré-enregistrer ou de les supprimer manuellement.
 
-2. **Archiver avant suppression (si activé) :** Pour chaque souvenir expiré, écrire un enregistrement de résumé dans la table `memory_archive` :
+2. **Archiver avant suppression (si activé) :** Pour chaque candidat `T2`/`T3`, un enregistrement de résumé est écrit dans la table `memory_archive` et un événement d'audit `ARCHIVE` distinct est consigné :
 
    ```sql
    memory_archive {
@@ -1225,13 +1233,21 @@ Le système de rétention exécute une tâche de nettoyage planifiée (par défa
    }
    ```
 
+   Si l'archivage d'un souvenir échoue, ce souvenir est exclu de la suppression (jamais supprimé sans enregistrement d'archive durable quand l'archivage est activé) et l'exécution est signalée comme dégradée plutôt que d'être abandonnée ou de lever une erreur.
+
 3. **Supprimer de Qdrant :** Supprimer en lot tous les IDs de points expirés de leurs collections Qdrant respectives.
 
 4. **Supprimer de SQLite :** Supprimer les lignes expirées des tables `memories` et `memories_fts`.
 
-5. **Journal d'audit :** Chaque suppression est enregistrée dans la table `audit_log` avec `operation: FORGET` et `client_id: "system"`.
+5. **Journal d'audit :** Chaque suppression confirmée est enregistrée dans la table `audit_log` avec `operation: FORGET` et `client_id: "system"`. L'archivage, la promotion, la révision T0 et la restauration d'archive obtiennent chacun leur propre code d'opération distinct (`ARCHIVE`, `PROMOTE`, `REVISE`, `RESTORE`) plutôt que de se fondre dans des entrées génériques `ADD`/`UPDATE`/`FORGET` — chaque événement de transition de cycle de vie porte dans la colonne `details` une charge JSON `{memory_id, prior_tier, new_tier, actor, timestamp, action}`.
 
-6. **Vidange :** SQLite est vidé atomiquement sur disque après toutes les suppressions.
+6. **Compaction (pilotée par seuil, pas par suppression) :** Pour chaque paire espace de noms/collection touchée par des suppressions durant cette exécution, une fois que le ratio de vecteurs supprimés dépasse `retention.compaction_deleted_threshold`, l'exécution incite l'optimiseur de segments Qdrant à récupérer de l'espace via `optimizers_config.deleted_threshold`.
+
+7. **Vidange :** SQLite est vidé atomiquement sur disque après toutes les suppressions.
+
+8. **Signal de santé :** Si une étape d'archivage ou de suppression échoue en cours de route, le résultat de l'exécution est persisté et apparaît comme un composant `retention` dégradé dans `health://status` jusqu'à la prochaine exécution de GC propre.
+
+Une exécution de GC — manuelle ou planifiée — ne lève jamais d'erreur vers son appelant : les échecs inattendus sont capturés, le verrou de cycle de vie en cours est toujours libéré, et le résultat est signalé comme `degraded: true` avec le travail déjà accompli intact.
 
 #### Historique des révisions T0
 
@@ -1658,10 +1674,13 @@ Renvoie un `HealthSnapshot` :
     "expiring_soon": 5,
     "archived_count": 128,
     "unsynced_vectors": 0,
-    "over_capacity": false
+    "over_capacity": false,
+    "cleanup_lag_seconds": 120
   }
 }
 ```
+
+`components.retention` passe également à `"degraded"` (avec un message) lorsque la dernière exécution de GC — planifiée ou manuelle — a signalé un échec partiel (une étape d'archivage ou de suppression a échoué), indépendamment de la pression de capacité par niveau. Il revient à `"healthy"` à la prochaine exécution de GC propre.
 
 **Logique de statut global :**
 - `unhealthy` — si SQLite ou Qdrant est défaillant
@@ -1850,6 +1869,8 @@ Réponse :
 
 La pagination utilise des curseurs composites (`created_at|id`) pour un ordre stable. Les liens à la même horodatage sont brisés par ID, garantissant qu'aucune ligne n'est sautée ou dupliquée entre les pages.
 
+`memory://list` et `memory://{id}` appliquent la même règle de visibilité de cycle de vie que `search`/`recall` : un souvenir `T2`/`T3` expiré et éligible au déclin est exclu (les lectures via `memory://{id}` renvoient `NOT_FOUND`). Les souvenirs `T0` et `T1` restent visibles indépendamment de l'expiration transitoire.
+
 ### `memory://inject` — Injection de contexte de session
 
 La ressource d'injection construit une charge utile textuelle budgétée pour l'injection dans une fenêtre de contexte LLM :
@@ -1937,12 +1958,13 @@ bhgbrain stats --by-tier              # Décomposition du nombre de souvenirs pa
 bhgbrain stats --expiring             # Afficher les souvenirs expirant dans les 7 prochains jours
 bhgbrain health                       # Vérification complète de la santé du système
 
-# Ramasse-miettes
-bhgbrain gc                           # Exécuter le nettoyage (supprimer les souvenirs non-T0 expirés)
-bhgbrain gc --dry-run                 # Afficher ce qui serait nettoyé sans supprimer
+# Ramasse-miettes (archive + supprime les T2/T3 expirés ; T1 est présenté
+# comme reviewCandidates plutôt que supprimé ; la compaction Qdrant s'exécute
+# automatiquement dès que le ratio de vecteurs supprimés d'une collection
+# concernée dépasse le seuil configuré — voir retention.compaction_deleted_threshold)
+bhgbrain gc                           # Exécuter le nettoyage
+bhgbrain gc --dry-run                 # Afficher les candidats et éléments à réviser sans supprimer
 bhgbrain gc --tier T3                 # Nettoyer uniquement les souvenirs T3
-bhgbrain gc --consolidate             # GC + passage de consolidation avec marquage de péremption
-bhgbrain gc --force-compact           # Forcer la compaction de segments Qdrant après le GC
 
 # Journal d'audit
 bhgbrain audit                        # Afficher les entrées d'audit récentes

@@ -132,6 +132,9 @@ export interface HealthSnapshot {
     archived_count: number;
     unsynced_vectors: number;
     over_capacity: boolean;
+    // Seconds since the last cleanup (GC) run that completed without a
+    // partial failure; null if cleanup has never completed successfully.
+    cleanup_lag_seconds: number | null;
   };
 }
 
@@ -143,14 +146,32 @@ export interface ErrorEnvelope {
   };
 }
 
+export type LifecycleAuditOperation = 'PROMOTE' | 'ARCHIVE' | 'REVISE' | 'RESTORE';
+
 export interface AuditEntry {
   id: string;
   timestamp: string;
   namespace: string;
-  operation: WriteOperation | 'FORGET';
+  operation: WriteOperation | 'FORGET' | LifecycleAuditOperation;
   memory_id: string;
   client_id: string;
   details?: string;
+}
+
+/**
+ * Structured payload for lifecycle-transition audit events (promotion,
+ * archival, revision, deletion, restore). Passed to `StorageManager.logAudit`
+ * via `options.details` and persisted as JSON in `AuditEntry.details`, so
+ * these transitions are distinguishable from generic content ADD/UPDATE
+ * events instead of collapsing into an undifferentiated write log.
+ */
+export interface LifecycleAuditDetails {
+  memory_id: string;
+  prior_tier: RetentionTier | null;
+  new_tier: RetentionTier | null;
+  actor: string;
+  timestamp: string;
+  action: 'promote' | 'archive' | 'revise' | 'delete' | 'restore';
 }
 
 export interface PaginatedResult<T> {

@@ -54,6 +54,7 @@ function createMockSqlite(): MockSqliteStore {
     }),
     listRevisions: vi.fn(() => []),
     insertRevision: vi.fn(),
+    insertAudit: vi.fn(),
     getCollection: vi.fn(() => ({ name: 'general', namespace: 'global', embedding_model: 'test', embedding_dimensions: 3 })),
     createCollection: vi.fn(),
     listMemoryIdsInCollection: vi.fn(() => ['mem-1']),
@@ -204,6 +205,42 @@ describe('StorageManager cross-store consistency', () => {
 
       await storage.updateMemory('mem-1', { importance: 0.8 });
       expect(qdrant.upsert).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('T0 revision history', () => {
+    it('persists a revision and emits a distinct REVISE audit event when T0 content changes', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory({ ...baseMem, retention_tier: 'T0' }, [1, 2, 3]);
+
+      await storage.updateMemory('mem-1', { content: 'revised content' });
+
+      expect(sqlite.insertRevision).toHaveBeenCalledWith('mem-1', 1, 'test content', expect.any(String));
+      expect(sqlite.insertAudit).toHaveBeenCalledWith(expect.objectContaining({
+        operation: 'REVISE',
+        memory_id: 'mem-1',
+        namespace: 'global',
+        client_id: 'system',
+        details: expect.stringContaining('"action":"revise"'),
+      }));
+    });
+
+    it('does not persist a revision or emit REVISE when a non-T0 memory content changes', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory(baseMem, [1, 2, 3]); // T2
+
+      await storage.updateMemory('mem-1', { content: 'revised content' });
+
+      expect(sqlite.insertRevision).not.toHaveBeenCalled();
+      expect(sqlite.insertAudit).not.toHaveBeenCalledWith(expect.objectContaining({ operation: 'REVISE' }));
     });
   });
 

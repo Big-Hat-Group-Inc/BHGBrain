@@ -18,6 +18,8 @@ import { createEmbeddingProvider, getEmbeddingBreakerKey, warnIfEmbeddingDegrade
 import { WritePipeline } from './pipeline/index.js';
 import { SearchService } from './search/index.js';
 import { BackupService } from './backup/index.js';
+import { RetentionService } from './backup/retention.js';
+import { CleanupScheduler } from './backup/scheduler.js';
 import { HealthService } from './health/index.js';
 import { MetricsCollector } from './health/metrics.js';
 import { createLogger } from './health/logger.js';
@@ -80,6 +82,13 @@ async function main() {
     [embeddingBreakerKey]: embeddingBreaker,
     qdrant: qdrantBreaker,
   });
+
+  // Scheduled cleanup: same execution path as `bhgbrain gc`, run on
+  // `retention.cleanup_schedule` for the lifetime of this long-running
+  // process (both stdio and HTTP transports keep the process alive).
+  const retentionService = new RetentionService(config, storage, logger, metrics);
+  const cleanupScheduler = new CleanupScheduler(config, retentionService, logger);
+  cleanupScheduler.start();
 
   const ctx: ToolContext = {
     config, storage, embedding, pipeline,

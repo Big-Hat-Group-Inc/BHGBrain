@@ -4,17 +4,31 @@ import type { SearchService } from '../search/index.js';
 import type { HealthService } from '../health/index.js';
 import type { InjectPayload, PaginatedResult, MemoryRecord } from '../domain/types.js';
 import type { CategoryHeader } from '../storage/sqlite.js';
+import { MemoryLifecycleService } from '../domain/lifecycle.js';
 
 export class ResourceHandler {
   private static readonly LIST_LIMIT_MIN = 1;
   private static readonly LIST_LIMIT_MAX = 100;
+  private lifecycle: MemoryLifecycleService;
 
   constructor(
     private config: BrainConfig,
     private storage: StorageManager,
     private search: SearchService,
     private health: HealthService,
-  ) {}
+  ) {
+    this.lifecycle = new MemoryLifecycleService(config);
+  }
+
+  // T0/T1 stay visible regardless of transient expiry (matches the search and
+  // recall retrieval paths); only expired, decay-eligible T2/T3 memories are
+  // excluded from resource reads. Closes the drift where `memory://list` and
+  // `memory://{id}` read SQLite directly with no expiry filtering, leaking
+  // memories that `search`/`recall` already exclude.
+  private isExpiredForResource(mem: Pick<MemoryRecord, 'retention_tier' | 'expires_at'>): boolean {
+    if (mem.retention_tier === 'T0' || mem.retention_tier === 'T1') return false;
+    return this.lifecycle.isExpired(mem.expires_at, new Date());
+  }
 
   async handle(uri: string): Promise<unknown> {
     const url = new URL(uri);
@@ -59,7 +73,7 @@ export class ResourceHandler {
     const id = path;
     if (id) {
       const mem = this.storage.sqlite.getMemoryById(id);
-      if (!mem) {
+      if (!mem || this.isExpiredForResource(mem)) {
         return { error: { code: 'NOT_FOUND', message: `Memory ${id} not found`, retryable: false } };
       }
       this.storage.sqlite.touchMemory(id);
@@ -78,13 +92,16 @@ export class ResourceHandler {
     const items = this.storage.sqlite.listMemories(namespace, limit + 1, cursor);
     const hasMore = items.length > limit;
     const page = hasMore ? items.slice(0, limit) : items;
+    // Cursor continuation is positional (based on the raw, unfiltered page),
+    // so it stays correct even though expired T2/T3 memories are dropped
+    // from what's actually returned below.
     const lastItem = page[page.length - 1];
-    // Composite cursor: "created_at|id" for stable tie-breaking
     const nextCursor = hasMore && lastItem ? `${lastItem.created_at}|${lastItem.id}` : null;
     const total = this.storage.sqlite.countMemories(namespace);
+    const visiblePage = page.filter(mem => !this.isExpiredForResource(mem));
 
     return {
-      items: page,
+      items: visiblePage,
       cursor: nextCursor,
       total_results: total,
       truncated: hasMore,

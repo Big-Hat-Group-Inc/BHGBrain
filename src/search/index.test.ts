@@ -49,6 +49,7 @@ describe('SearchService', () => {
       qdrant: {
         search: vi.fn(async () => []),
       },
+      logAudit: vi.fn(),
     } as unknown as StorageManager;
 
     const config = {
@@ -246,6 +247,44 @@ describe('SearchService', () => {
     const updates = (storage.sqlite.recordAccessBatch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     // sliding mode recomputes the deadline -> a concrete ISO timestamp string.
     expect(typeof updates[0].expires_at).toBe('string');
+  });
+
+  it('emits a distinct PROMOTE audit event when access-driven promotion crosses the threshold', async () => {
+    const memories = new Map<string, StoredMemory>([
+      ['mem-1', {
+        id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic',
+        content: 'hello world', summary: 'hello', tags: [], source: 'cli',
+        checksum: 'mem-1',
+        importance: 0.9,
+        retention_tier: 'T3',
+        expires_at: '2026-12-31T00:00:00Z',
+        decay_eligible: true,
+        review_due: null,
+        access_count: 4, // next access (5) hits the default threshold of 5
+        last_operation: 'ADD',
+        merged_from: null,
+        archived: false,
+        vector_synced: true,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        last_accessed: '2026-01-01T00:00:00Z',
+      }],
+    ]);
+    const { service, storage } = createSearchService({ memories, slidingWindowEnabled: true });
+
+    await service.search('hello', 'global', undefined, 'fulltext', 10);
+
+    expect(storage.logAudit).toHaveBeenCalledWith('PROMOTE', 'mem-1', 'global', 'system', {
+      flush: false,
+      details: {
+        memory_id: 'mem-1',
+        prior_tier: 'T3',
+        new_tier: 'T2',
+        actor: 'system',
+        timestamp: expect.any(String),
+        action: 'promote',
+      },
+    });
   });
 
   it('signals (metric + warn) instead of silently swallowing embedding outage in hybrid mode', async () => {

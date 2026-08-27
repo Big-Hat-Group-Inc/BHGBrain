@@ -329,8 +329,14 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     // Cuando es true, las memorias expiradas se escriben en la tabla de archivo antes de eliminarlas
     "archive_before_delete": true,
 
-    // Horario cron para el trabajo de limpieza en segundo plano (por defecto: 2am diariamente)
+    // Horario cron para el trabajo de limpieza en segundo plano (por defecto: 2am UTC diariamente)
     "cleanup_schedule": "0 2 * * *",
+
+    // Cuando es true, el proceso del servidor ejecuta `cleanup_schedule` automáticamente
+    // mediante un planificador interno (mismo camino de ejecución que `bhgbrain gc`).
+    // Ponlo en false para depender solo de ejecuciones manuales de `bhgbrain gc` o de
+    // un disparador cron externo.
+    "scheduled_cleanup_enabled": true,
 
     // Días antes de la expiración en los que las memorias se marcan como expiring_soon
     "pre_expiry_warning_days": 7,
@@ -1201,13 +1207,15 @@ Cada categoría se asigna a uno de cuatro slots con nombre:
 
 #### Limpieza en Segundo Plano
 
-El sistema de retención ejecuta un trabajo de limpieza programado (por defecto: diariamente a las 2:00 AM, configurable vía `retention.cleanup_schedule` como expresión cron). También puedes desencadenar la limpieza manualmente vía `bhgbrain gc`.
+El servidor ejecuta un trabajo de limpieza programado (por defecto: diariamente a las 2:00 AM UTC, configurable vía `retention.cleanup_schedule` como expresión cron; desactivable con `retention.scheduled_cleanup_enabled: false`). Se ejecuta por el mismo camino de código que el comando manual `bhgbrain gc`, por lo que las ejecuciones programadas y manuales se comportan de forma idéntica.
 
 **Fases de limpieza:**
 
-1. **Identificar memorias expiradas:** Consultar SQLite para todas las memorias donde `decay_eligible = true` Y `expires_at < now()`. Las memorias T0 siempre se excluyen (T0 nunca es elegible para decaimiento).
+1. **Identificar memorias expiradas:** Consultar SQLite para todas las memorias donde `decay_eligible = true` Y `expires_at < now()`. Solo `T2`/`T3` son elegibles para archivar-y-eliminar directamente:
+   - `T0` siempre se excluye (T0 nunca es elegible para decaimiento).
+   - `T1` nunca se elimina directamente. Las memorias `T1` expiradas o con `review_due` vencido se muestran como **candidatas de revisión** en el resultado de GC, para que un operador decida si promoverlas, volver a guardarlas o eliminarlas manualmente.
 
-2. **Archivar antes de eliminar (si está habilitado):** Para cada memoria expirada, escribir un registro de resumen en la tabla `memory_archive`:
+2. **Archivar antes de eliminar (si está habilitado):** Para cada candidata `T2`/`T3`, se escribe un registro de resumen en la tabla `memory_archive` y se registra un evento de auditoría `ARCHIVE` distinto:
 
    ```sql
    memory_archive {
@@ -1223,13 +1231,21 @@ El sistema de retención ejecuta un trabajo de limpieza programado (por defecto:
    }
    ```
 
+   Si el archivado de una memoria falla, esa memoria se omite de la eliminación (nunca se elimina sin un registro de archivo duradero cuando el archivado está habilitado) y la ejecución se reporta como degradada en lugar de abortar o lanzar un error.
+
 3. **Eliminar de Qdrant:** Eliminar en lote todos los IDs de puntos expirados de sus respectivas colecciones de Qdrant.
 
 4. **Eliminar de SQLite:** Eliminar filas expiradas de las tablas `memories` y `memories_fts`.
 
-5. **Log de auditoría:** Cada eliminación se registra en la tabla `audit_log` con `operation: FORGET` y `client_id: "system"`.
+5. **Log de auditoría:** Cada eliminación confirmada se registra en la tabla `audit_log` con `operation: FORGET` y `client_id: "system"`. El archivado, la promoción, la revisión T0 y la restauración de archivo obtienen cada uno su propio código de operación distinto (`ARCHIVE`, `PROMOTE`, `REVISE`, `RESTORE`) en lugar de mezclarse en entradas genéricas `ADD`/`UPDATE`/`FORGET` — cada evento de transición de ciclo de vida lleva en la columna `details` una carga JSON `{memory_id, prior_tier, new_tier, actor, timestamp, action}`.
 
-6. **Volcado:** SQLite se vuelca atómicamente a disco después de todas las eliminaciones.
+6. **Compactación (dirigida por umbral, no por eliminación):** Para cada par namespace/colección del que esta ejecución eliminó memorias, una vez que la proporción de vectores eliminados supera `retention.compaction_deleted_threshold`, la ejecución impulsa al optimizador de segmentos de Qdrant a recuperar espacio vía `optimizers_config.deleted_threshold`.
+
+7. **Volcado:** SQLite se vuelca atómicamente a disco después de todas las eliminaciones.
+
+8. **Señal de salud:** Si algún paso de archivado o eliminación falla a mitad de camino, el resultado de la ejecución se persiste y aparece como un componente `retention` degradado en `health://status` hasta la próxima ejecución de GC limpia.
+
+Una ejecución de GC — manual o programada — nunca lanza un error a quien la invoca: los fallos inesperados se capturan, el bloqueo de ciclo de vida en curso siempre se libera, y el resultado se reporta como `degraded: true` con el trabajo ya completado intacto.
 
 #### Historial de Revisiones T0
 
@@ -1656,10 +1672,13 @@ Devuelve un `HealthSnapshot`:
     "expiring_soon": 5,
     "archived_count": 128,
     "unsynced_vectors": 0,
-    "over_capacity": false
+    "over_capacity": false,
+    "cleanup_lag_seconds": 120
   }
 }
 ```
+
+`components.retention` también pasa a `"degraded"` (con un mensaje) cuando la última ejecución de GC — programada o manual — reportó un fallo parcial (falló un paso de archivado o eliminación), independientemente de la presión de capacidad por nivel. Vuelve a `"healthy"` en la siguiente ejecución de GC limpia.
 
 **Lógica del estado general:**
 - `unhealthy` — si SQLite o Qdrant no están en buen estado
@@ -1848,6 +1867,8 @@ Respuesta:
 
 La paginación usa cursores compuestos (`created_at|id`) para un orden estable. Los empates en la misma marca de tiempo se desempatan por ID, asegurando que ninguna fila se omita o duplique entre páginas.
 
+`memory://list` y `memory://{id}` aplican la misma regla de visibilidad de ciclo de vida que `search`/`recall`: una memoria `T2`/`T3` expirada y elegible para decaimiento se excluye (las lecturas en `memory://{id}` devuelven `NOT_FOUND`). Las memorias `T0` y `T1` permanecen visibles sin importar la expiración transitoria.
+
 ### `memory://inject` — Inyección de Contexto de Sesión
 
 El recurso inject construye un payload de texto con presupuesto para inyectar en una ventana de contexto LLM:
@@ -1935,12 +1956,14 @@ bhgbrain stats --by-tier              # Desglose del recuento de memorias por ni
 bhgbrain stats --expiring             # Mostrar memorias que expiran en los próximos 7 días
 bhgbrain health                       # Verificación completa del estado del sistema
 
-# Recolección de basura
-bhgbrain gc                           # Ejecutar limpieza (eliminar memorias no-T0 expiradas)
-bhgbrain gc --dry-run                 # Mostrar qué se limpiaría sin eliminar
+# Recolección de basura (archiva + elimina T2/T3 expiradas; T1 se muestra
+# como reviewCandidates en lugar de eliminarse; la compactación de Qdrant se
+# ejecuta automáticamente cuando la proporción de vectores eliminados de una
+# colección afectada supera el umbral configurado — ver
+# retention.compaction_deleted_threshold)
+bhgbrain gc                           # Ejecutar limpieza
+bhgbrain gc --dry-run                 # Mostrar candidatos y elementos de revisión sin eliminar
 bhgbrain gc --tier T3                 # Limpiar solo memorias T3
-bhgbrain gc --consolidate             # GC + paso de consolidación de marcado de obsolescencia
-bhgbrain gc --force-compact           # Forzar compactación de segmentos de Qdrant después de GC
 
 # Log de auditoría
 bhgbrain audit                        # Mostrar entradas de auditoría recientes

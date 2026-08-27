@@ -52,6 +52,7 @@ export class HealthService {
         archived_count: this.storage.sqlite.countArchivedMemories(),
         unsynced_vectors: this.storage.sqlite.countUnsyncedVectors(),
         over_capacity: this.isOverCapacity(countsByTier),
+        cleanup_lag_seconds: this.computeCleanupLagSeconds(now),
       },
     };
   }
@@ -102,7 +103,26 @@ export class HealthService {
     return this.cachedEmbeddingHealth;
   }
 
+  // `null` means cleanup has never completed successfully (a fresh install,
+  // or every run so far has failed) rather than "zero lag" — callers should
+  // treat null as "unknown", not "just ran".
+  private computeCleanupLagSeconds(now: Date): number | null {
+    const { last_success_at } = this.storage.sqlite.getRetentionDegraded();
+    if (!last_success_at) return null;
+    const lastSuccessMs = Date.parse(last_success_at);
+    if (Number.isNaN(lastSuccessMs)) return null;
+    return Math.max(0, Math.floor((now.getTime() - lastSuccessMs) / 1000));
+  }
+
   private checkRetention(): ComponentHealth {
+    const gcState = this.storage.sqlite.getRetentionDegraded();
+    if (gcState.degraded) {
+      return {
+        status: 'degraded',
+        message: gcState.message ?? 'Last cleanup (GC) run reported a partial failure',
+      };
+    }
+
     const counts = this.storage.sqlite.countByTier();
     if (this.isOverCapacity(counts)) {
       return { status: 'degraded', message: 'Retention tier or total capacity threshold exceeded' };

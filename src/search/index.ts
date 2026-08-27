@@ -298,7 +298,7 @@ export class SearchService {
   }
 
   private buildAccessUpdate(
-    mem: Pick<MemoryRecord, 'id' | 'access_count' | 'retention_tier' | 'expires_at'>,
+    mem: Pick<MemoryRecord, 'id' | 'namespace' | 'access_count' | 'retention_tier' | 'expires_at'>,
     now: Date,
     nowIso: string,
   ): AccessUpdate {
@@ -310,6 +310,24 @@ export class SearchService {
     const nextReviewDue = promotedTier === 'T1'
       ? this.lifecycle.computeExpiry('T1', now)
       : undefined;
+
+    if (promotedTier !== mem.retention_tier) {
+      // Promotion is a distinct lifecycle transition, not a generic content
+      // write, so it gets its own structured audit event rather than being
+      // folded into the ADD/UPDATE/FORGET log.
+      this.storage.logAudit('PROMOTE', mem.id, mem.namespace, 'system', {
+        flush: false,
+        details: {
+          memory_id: mem.id,
+          prior_tier: mem.retention_tier,
+          new_tier: promotedTier,
+          actor: 'system',
+          timestamp: nowIso,
+          action: 'promote',
+        },
+      });
+    }
+
     return {
       id: mem.id,
       access_count: nextAccessCount,

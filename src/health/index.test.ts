@@ -46,6 +46,7 @@ describe('HealthService', () => {
         sliding_window_enabled: true,
         archive_before_delete: true,
         cleanup_schedule: '0 2 * * *',
+        scheduled_cleanup_enabled: true,
         pre_expiry_warning_days: 7,
         compaction_deleted_threshold: 0.1,
       },
@@ -88,6 +89,7 @@ describe('HealthService', () => {
         countArchivedMemories: vi.fn(() => 0),
         countUnsyncedVectors: vi.fn(() => 0),
         getLifecycleOperation: vi.fn(() => null),
+        getRetentionDegraded: vi.fn(() => ({ degraded: false, message: null, last_success_at: null })),
       },
       qdrant: {
         healthCheck: vi.fn(async () => true),
@@ -303,6 +305,49 @@ describe('HealthService', () => {
       unsynced_vectors: 2,
       message: 'Restore is active and vector reconciliation is in progress.',
     });
+  });
+
+  it('reports degraded retention when the last GC run recorded a partial failure', async () => {
+    const storage = createStorage();
+    storage.sqlite.getRetentionDegraded = vi.fn(() => ({
+      degraded: true,
+      message: 'Archive step failed for 1 memory',
+      last_success_at: null,
+    }));
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.status).toBe('degraded');
+    expect(result.components.retention).toEqual({
+      status: 'degraded',
+      message: 'Archive step failed for 1 memory',
+    });
+  });
+
+  it('reports cleanup_lag_seconds as null when cleanup has never completed successfully', async () => {
+    const storage = createStorage();
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+    expect(result.retention?.cleanup_lag_seconds).toBeNull();
+  });
+
+  it('computes cleanup_lag_seconds from the last successful GC run', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-03-10T02:05:00.000Z'));
+      const storage = createStorage();
+      storage.sqlite.getRetentionDegraded = vi.fn(() => ({
+        degraded: false,
+        message: null,
+        last_success_at: '2026-03-10T02:00:00.000Z',
+      }));
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+      expect(result.retention?.cleanup_lag_seconds).toBe(300);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('reports reconciling while bounded background reconciliation runs after the restore lock is released', async () => {

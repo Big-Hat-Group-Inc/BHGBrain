@@ -31,6 +31,7 @@ describe('logger helpers', () => {
         sliding_window_enabled: true,
         archive_before_delete: true,
         cleanup_schedule: '0 2 * * *',
+        scheduled_cleanup_enabled: true,
         pre_expiry_warning_days: 7,
         compaction_deleted_threshold: 0.1,
       },

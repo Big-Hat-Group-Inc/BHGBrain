@@ -132,6 +132,7 @@ const ConfigSchema = z.object({
     sliding_window_enabled: z.boolean().default(true),
     archive_before_delete: z.boolean().default(true),
     cleanup_schedule: z.string().default('0 2 * * *'),
+    scheduled_cleanup_enabled: z.boolean().default(true),
     pre_expiry_warning_days: z.number().int().nonnegative().default(7),
     compaction_deleted_threshold: z.number().min(0).max(1).default(0.10),
   }).default({}),
