@@ -58,7 +58,7 @@ async function main() {
   const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
   warnIfEmbeddingDegraded(embedding, config, logger);
-  const storage = new StorageManager(sqlite, qdrant, embedding, metrics);
+  const storage = new StorageManager(sqlite, qdrant, embedding, metrics, config);
 
   // Bootstrap: hydrate SQLite from Qdrant if this is a new device
   try {
@@ -72,6 +72,22 @@ async function main() {
     }
   } catch (err) {
     logger.warn({ event: 'bootstrap_error', message: `[bootstrap] failed to hydrate from Qdrant: ${(err as Error).message}` });
+  }
+
+  // Embedding provenance: if the store already adopted an expected identity
+  // and it differs from the active configuration, log it loudly at startup
+  // (rather than only surfacing it lazily on the next health poll or write
+  // attempt) — see embedding-provenance.
+  const expectedEmbeddingIdentity = storage.getExpectedEmbeddingIdentity();
+  if (expectedEmbeddingIdentity && expectedEmbeddingIdentity !== embedding.identity) {
+    logger.warn({
+      event: 'embedding_identity_mismatch',
+      expected_identity: expectedEmbeddingIdentity,
+      active_identity: embedding.identity,
+      refuse_writes: config.embedding.refuse_writes_on_model_mismatch,
+      message: `Embedding identity changed: store expects "${expectedEmbeddingIdentity}" but active ` +
+        `configuration is "${embedding.identity}". Run the repair tool with mode: "re-embed" to migrate.`,
+    });
   }
 
   // Initialize services

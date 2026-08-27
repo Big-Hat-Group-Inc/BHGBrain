@@ -96,7 +96,10 @@ export interface SqliteStorage {
     retentionTier?: RetentionTier,
     reviewDue?: string | null,
   ): void;
-  markVectorSync(id: string, synced: boolean, options?: { allowDuringLifecycle?: boolean }): void;
+  markVectorSync(
+    id: string, synced: boolean,
+    options?: { allowDuringLifecycle?: boolean; embeddingModel?: string | null },
+  ): void;
   markVectorsSyncBatch(ids: string[], synced: boolean, options?: { allowDuringLifecycle?: boolean }): void;
   markAllVectorsSyncState(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number;
   recordAccessBatch(updates: AccessUpdate[]): void;
@@ -111,6 +114,13 @@ export interface SqliteStorage {
   countArchivedMemories(): number;
   countUnsyncedVectors(): number;
   listMemoriesNeedingVectorSync(limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
+  getExpectedEmbeddingIdentity(): string | null;
+  adoptEmbeddingIdentityIfAbsent(identity: string): void;
+  setExpectedEmbeddingIdentity(identity: string): void;
+  countMemoriesWithStaleEmbeddingStamp(activeIdentity: string, includeLegacy: boolean): number;
+  listMemoriesWithStaleEmbeddingStamp(
+    activeIdentity: string, includeLegacy: boolean, limit: number, cursor?: string,
+  ): MemoryRecordWithoutEmbedding[];
   listMemoryChecksums(): Array<{ id: string; checksum: string }>;
   archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void;
   listArchive(limit: number): ArchiveRecord[];
@@ -181,6 +191,7 @@ CREATE TABLE IF NOT EXISTS memories (
   archived INTEGER NOT NULL DEFAULT 0,
   vector_synced INTEGER NOT NULL DEFAULT 1,
   device_id TEXT,
+  embedding_model TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_accessed TEXT NOT NULL
@@ -291,6 +302,19 @@ CREATE TABLE IF NOT EXISTS retention_state (
   last_success_at TEXT,
   updated_at TEXT NOT NULL
 );
+
+-- Single-row record of the store's expected embedding identity
+-- (<provider>/<model>@<dimensions>), adopted on the first vector-producing
+-- write after this table is empty and updated only when a re-embed
+-- migration completes. Independent of Qdrant availability so startup/health
+-- mismatch detection works even when Qdrant is unreachable. See
+-- openspec/changes/stamp-embedding-provenance.
+CREATE TABLE IF NOT EXISTS embedding_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  identity TEXT NOT NULL,
+  adopted_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 `;
 
 // SQLite-lock retry/backoff (audit follow-up 2026-06-05, task 4.2): this
@@ -390,12 +414,13 @@ export class SqliteStore implements SqliteStorage {
     const archived = mem.archived ?? false;
     const vectorSynced = mem.vector_synced ?? true;
     const deviceId = mem.device_id ?? null;
+    const embeddingModel = mem.embedding_model ?? null;
     this.db.run(
       `INSERT INTO memories (
         id, namespace, collection, type, category, content, summary, tags, source, checksum,
         importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
-        last_operation, merged_from, stale, archived, vector_synced, device_id, created_at, updated_at, last_accessed
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        last_operation, merged_from, stale, archived, vector_synced, device_id, embedding_model, created_at, updated_at, last_accessed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         mem.id,
         mem.namespace,
@@ -419,6 +444,7 @@ export class SqliteStore implements SqliteStorage {
         archived ? 1 : 0,
         vectorSynced ? 1 : 0,
         deviceId,
+        embeddingModel,
         mem.created_at,
         mem.updated_at,
         mem.last_accessed,
@@ -448,6 +474,11 @@ export class SqliteStore implements SqliteStorage {
     const importance = typeof payload.importance === 'number' ? payload.importance : 0.5;
     const retentionTier = typeof payload.retention_tier === 'string' ? payload.retention_tier : 'T2';
     const deviceId = typeof payload.device_id === 'string' ? payload.device_id : null;
+    // Carry forward whatever identity (if any) the source vector was already
+    // stamped with — this is metadata recovery, not a new embedding, so it
+    // must not claim the active configuration's identity. A missing field
+    // means the point predates provenance stamping and stays "unknown" (null).
+    const embeddingModel = typeof payload.embedding_model === 'string' ? payload.embedding_model : null;
     const createdAt = typeof payload.created_at === 'string' ? payload.created_at : now;
     const source = typeof payload.source === 'string' ? payload.source : 'import';
     const category = typeof payload.category === 'string' ? payload.category : null;
@@ -478,13 +509,13 @@ export class SqliteStore implements SqliteStorage {
         `INSERT INTO memories (
           id, namespace, collection, type, category, content, summary, tags, source, checksum,
           importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
-          last_operation, merged_from, stale, archived, vector_synced, device_id, created_at, updated_at, last_accessed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          last_operation, merged_from, stale, archived, vector_synced, device_id, embedding_model, created_at, updated_at, last_accessed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id, namespace, collection, type, category, content, summary,
           JSON.stringify(tags), source, checksum, importance, retentionTier,
           expiresAt, decayEligible ? 1 : 0, null, 0,
-          'ADD', null, 0, 0, 1, deviceId, createdAt, now, now,
+          'ADD', null, 0, 0, 1, deviceId, embeddingModel, createdAt, now, now,
         ],
       );
       this.db.run(
@@ -798,11 +829,25 @@ export class SqliteStore implements SqliteStorage {
     this.markDirty();
   }
 
-  markVectorSync(id: string, synced: boolean, options?: { allowDuringLifecycle?: boolean }): void {
+  markVectorSync(
+    id: string, synced: boolean,
+    options?: { allowDuringLifecycle?: boolean; embeddingModel?: string | null },
+  ): void {
     if (!options?.allowDuringLifecycle) {
       this.assertMutableAllowed();
     }
-    this.db.run(`UPDATE memories SET vector_synced = ? WHERE id = ?`, [synced ? 1 : 0, id]);
+    // `embeddingModel` is set in the same statement (rather than a separate
+    // updateMemory call) so a re-embed running during a restore lifecycle
+    // window (allowDuringLifecycle: true) can stamp the new identity without
+    // tripping assertMutableAllowed, which updateMemory always enforces.
+    if (options && 'embeddingModel' in options) {
+      this.db.run(
+        `UPDATE memories SET vector_synced = ?, embedding_model = ? WHERE id = ?`,
+        [synced ? 1 : 0, options.embeddingModel ?? null, id],
+      );
+    } else {
+      this.db.run(`UPDATE memories SET vector_synced = ? WHERE id = ?`, [synced ? 1 : 0, id]);
+    }
     this.markDirty();
   }
 
@@ -989,6 +1034,94 @@ export class SqliteStore implements SqliteStorage {
   listMemoriesNeedingVectorSync(limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
     let sql = `SELECT * FROM memories WHERE archived = 0 AND vector_synced = 0`;
     const params: SqlParams = [];
+    if (cursor) {
+      const sepIdx = cursor.indexOf('|');
+      if (sepIdx !== -1) {
+        const cursorTime = cursor.substring(0, sepIdx);
+        const cursorId = cursor.substring(sepIdx + 1);
+        sql += ` AND (created_at > ? OR (created_at = ? AND id > ?))`;
+        params.push(cursorTime, cursorTime, cursorId);
+      } else {
+        sql += ` AND created_at > ?`;
+        params.push(cursor);
+      }
+    }
+    sql += ` ORDER BY created_at ASC, id ASC LIMIT ?`;
+    params.push(limit);
+    return this.queryMemories(sql, params);
+  }
+
+  /**
+   * Reads the store's persisted expected embedding identity, or null if no
+   * vector-producing write has adopted one yet (a fresh store, or one that
+   * hasn't written since upgrading to provenance stamping).
+   */
+  getExpectedEmbeddingIdentity(): string | null {
+    const stmt = this.db.prepare(`SELECT identity FROM embedding_state WHERE id = 1`);
+    if (!stmt.step()) {
+      stmt.free();
+      return null;
+    }
+    const row = stmt.getAsObject() as { identity: string };
+    stmt.free();
+    return row.identity;
+  }
+
+  /**
+   * Adopts `identity` as the store's expected embedding identity only if no
+   * expectation has been recorded yet ("first stamped write"). A no-op when
+   * a row already exists — the expected identity is only ever overwritten
+   * explicitly by `setExpectedEmbeddingIdentity` (a completed re-embed), so
+   * this can be called unconditionally after every compatible write without
+   * risk of masking a mismatch that was already recorded.
+   */
+  adoptEmbeddingIdentityIfAbsent(identity: string): void {
+    this.assertMutableAllowed();
+    const now = new Date().toISOString();
+    this.db.run(
+      `INSERT OR IGNORE INTO embedding_state (id, identity, adopted_at, updated_at) VALUES (1, ?, ?, ?)`,
+      [identity, now, now],
+    );
+    this.markDirty();
+  }
+
+  /** Unconditionally overwrites the store's expected embedding identity (a completed re-embed). */
+  setExpectedEmbeddingIdentity(identity: string): void {
+    this.assertMutableAllowed();
+    const now = new Date().toISOString();
+    this.db.run(
+      `INSERT INTO embedding_state (id, identity, adopted_at, updated_at) VALUES (1, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET identity = ?1, updated_at = ?3`,
+      [identity, now, now],
+    );
+    this.markDirty();
+  }
+
+  /**
+   * Rows whose embedding stamp differs from `activeIdentity` — the re-embed
+   * migration's selection set. Legacy rows (NULL stamp, predating
+   * provenance) are excluded unless `includeLegacy` is set, per "Legacy
+   * unstamped rows ... included in migration only when explicitly
+   * requested".
+   */
+  countMemoriesWithStaleEmbeddingStamp(activeIdentity: string, includeLegacy: boolean): number {
+    const stmt = this.db.prepare(
+      `SELECT COUNT(*) as cnt FROM memories
+       WHERE archived = 0 AND (embedding_model != ?1 OR (embedding_model IS NULL AND ?2))`,
+    );
+    stmt.bind([activeIdentity, includeLegacy ? 1 : 0]);
+    stmt.step();
+    const row = stmt.getAsObject() as { cnt: number };
+    stmt.free();
+    return row.cnt;
+  }
+
+  listMemoriesWithStaleEmbeddingStamp(
+    activeIdentity: string, includeLegacy: boolean, limit: number, cursor?: string,
+  ): MemoryRecordWithoutEmbedding[] {
+    let sql = `SELECT * FROM memories
+       WHERE archived = 0 AND (embedding_model != ?1 OR (embedding_model IS NULL AND ?2))`;
+    const params: SqlParams = [activeIdentity, includeLegacy ? 1 : 0];
     if (cursor) {
       const sepIdx = cursor.indexOf('|');
       if (sepIdx !== -1) {
@@ -1454,6 +1587,7 @@ export class SqliteStore implements SqliteStorage {
       archived: this.getBoolean(row, 'archived'),
       vector_synced: row.vector_synced === undefined ? true : this.getBoolean(row, 'vector_synced'),
       device_id: this.getNullableString(row, 'device_id'),
+      embedding_model: this.getNullableString(row, 'embedding_model'),
       created_at: this.getString(row, 'created_at'),
       updated_at: this.getString(row, 'updated_at'),
       last_accessed: this.getString(row, 'last_accessed'),
@@ -1595,6 +1729,7 @@ export class SqliteStore implements SqliteStorage {
       { name: 'archived', sql: `ALTER TABLE memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0` },
       { name: 'vector_synced', sql: `ALTER TABLE memories ADD COLUMN vector_synced INTEGER NOT NULL DEFAULT 1` },
       { name: 'device_id', sql: `ALTER TABLE memories ADD COLUMN device_id TEXT` },
+      { name: 'embedding_model', sql: `ALTER TABLE memories ADD COLUMN embedding_model TEXT` },
     ];
 
     for (const column of requiredColumns) {

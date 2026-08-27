@@ -4,6 +4,7 @@ import { QdrantStore } from './qdrant.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MemoryRecord, WriteOperation, AuditEntry, LifecycleAuditDetails } from '../domain/types.js';
 import type { MetricsCollector } from '../health/metrics.js';
+import type { BrainConfig } from '../config/index.js';
 import { internal, conflict } from '../errors/index.js';
 
 type MemoryRecordWithoutEmbedding = Omit<MemoryRecord, 'embedding'>;
@@ -41,6 +42,17 @@ export interface DeleteMemoriesResult {
   degraded: boolean;
 }
 
+export interface ReembedResult {
+  updated: number;
+  failed: number;
+  remaining: number;
+  boundReached: boolean;
+  // true when this run converged the store (no stale-stamped rows left under
+  // the same includeLegacy scope it ran with) and the store's expected
+  // identity was updated to clear the mismatch condition.
+  converged: boolean;
+}
+
 export class StorageManager {
   private backgroundReconciliationActive = false;
 
@@ -49,7 +61,54 @@ export class StorageManager {
     public readonly qdrant: QdrantStore,
     public readonly embedding: EmbeddingProvider,
     private readonly metrics?: MetricsCollector,
+    // Optional so every pre-existing test-double construction site keeps
+    // compiling; a missing config falls back to the schema default
+    // (refuse_writes_on_model_mismatch: true) wherever it's consulted.
+    private readonly config?: BrainConfig,
   ) {}
+
+  /**
+   * Provider-qualified identity the store expects new vectors to carry (see
+   * embedding-provenance). Null until the first vector-producing write
+   * adopts one.
+   */
+  getExpectedEmbeddingIdentity(): string | null {
+    return this.sqlite.getExpectedEmbeddingIdentity();
+  }
+
+  /**
+   * True when the store has an adopted expected identity that differs from
+   * the active embedding provider's identity — the condition that degrades
+   * `embedding` health and (by default) refuses vector-producing writes.
+   */
+  hasEmbeddingIdentityMismatch(): boolean {
+    const expected = this.sqlite.getExpectedEmbeddingIdentity();
+    return expected !== null && expected !== this.embedding.identity;
+  }
+
+  /**
+   * Refuses vector-producing writes while the store's expected embedding
+   * identity is adopted and differs from the active configuration, unless
+   * the operator has explicitly opted into mixing spaces via
+   * `embedding.refuse_writes_on_model_mismatch: false`. On success (no
+   * mismatch, or mismatch tolerated), adopts the active identity as the
+   * store's expectation if none has been recorded yet.
+   */
+  private ensureEmbeddingIdentityCompatible(): void {
+    const expected = this.sqlite.getExpectedEmbeddingIdentity();
+    const refuseOnMismatch = this.config?.embedding.refuse_writes_on_model_mismatch ?? true;
+    if (expected !== null && expected !== this.embedding.identity && refuseOnMismatch) {
+      throw conflict(
+        `Embedding identity mismatch: this store expects "${expected}" but the active ` +
+        `configuration is "${this.embedding.identity}". Vector-producing writes are refused ` +
+        `to avoid mixing embedding spaces. Run the repair tool with mode: "re-embed" ` +
+        `(or "bhgbrain repair --re-embed" from the CLI) to migrate existing vectors to the ` +
+        `active model, or set embedding.refuse_writes_on_model_mismatch to false to allow ` +
+        `writes to mix spaces.`,
+      );
+    }
+    this.sqlite.adoptEmbeddingIdentityIfAbsent(this.embedding.identity);
+  }
 
   isBackgroundReconciliationActive(): boolean {
     return this.backgroundReconciliationActive;
@@ -68,18 +127,24 @@ export class StorageManager {
     vector: number[],
   ): Promise<void> {
     this.ensureCollectionCompatible(mem.namespace, mem.collection);
+    this.ensureEmbeddingIdentityCompatible();
+
+    // Stamp the active provider-qualified identity on the row regardless of
+    // what the caller passed in — this is the single point of truth for
+    // "which model produced this vector" (see embedding-provenance).
+    const stamped: MemoryRecordWithoutEmbedding = { ...mem, embedding_model: this.embedding.identity };
 
     try {
-      this.sqlite.insertMemory(mem);
+      this.sqlite.insertMemory(stamped);
     } catch (err) {
       throw internal(`SQLite write failed: ${(err as Error).message}`);
     }
 
     try {
-      await this.qdrant.upsert(mem.namespace, mem.collection, mem.id, vector, toQdrantPayload(mem));
-      this.sqlite.markVectorSync(mem.id, true);
+      await this.qdrant.upsert(stamped.namespace, stamped.collection, stamped.id, vector, toQdrantPayload(stamped));
+      this.sqlite.markVectorSync(stamped.id, true);
     } catch (err) {
-      this.sqlite.markVectorSync(mem.id, false);
+      this.sqlite.markVectorSync(stamped.id, false);
       this.sqlite.flushIfDirty();
       throw internal(`Qdrant write failed after SQLite persistence: ${(err as Error).message}`);
     }
@@ -109,9 +174,19 @@ export class StorageManager {
     const existing = this.sqlite.getMemoryById(id);
     if (!existing) throw internal(`Memory ${id} not found for update`);
 
+    if (newVector) {
+      this.ensureEmbeddingIdentityCompatible();
+    }
+
+    // A new vector re-stamps the row with the active identity; a metadata-only
+    // update (no newVector) leaves whatever stamp the row already carries.
+    const effectiveFields: Partial<MemoryRecordWithoutEmbedding> = newVector
+      ? { ...fields, embedding_model: this.embedding.identity }
+      : fields;
+
     // Snapshot fields that will change for rollback
     const rollbackFields: Partial<MemoryRecordWithoutEmbedding> = {};
-    for (const key of Object.keys(fields) as Array<keyof MemoryRecordWithoutEmbedding>) {
+    for (const key of Object.keys(effectiveFields) as Array<keyof MemoryRecordWithoutEmbedding>) {
       const currentValue = existing[key];
       assignRollbackField(rollbackFields, key, currentValue);
     }
@@ -132,7 +207,7 @@ export class StorageManager {
       });
     }
 
-    this.sqlite.updateMemory(id, fields);
+    this.sqlite.updateMemory(id, effectiveFields);
 
     if (newVector) {
       try {
@@ -143,7 +218,7 @@ export class StorageManager {
           newVector,
           toQdrantPayload({
             ...existing,
-            ...fields,
+            ...effectiveFields,
             collection: existing.collection,
           }),
         );
@@ -464,6 +539,7 @@ export class StorageManager {
       for (const memory of memories) {
         this.ensureCollectionCompatible(memory.namespace, memory.collection);
       }
+      this.ensureEmbeddingIdentityCompatible();
 
       const vectors = await this.embedding.embedBatch(memories.map(memory => memory.content));
 
@@ -474,16 +550,18 @@ export class StorageManager {
           throw internal(`Missing embedding vector for memory ${memory.id}`);
         }
 
+        const stamped = { ...memory, embedding_model: this.embedding.identity };
         try {
           await this.qdrant.upsert(
-            memory.namespace,
-            memory.collection,
-            memory.id,
+            stamped.namespace,
+            stamped.collection,
+            stamped.id,
             vector,
-            toQdrantPayload(memory),
+            toQdrantPayload(stamped),
           );
           this.sqlite.markVectorSync(memory.id, true, {
             allowDuringLifecycle: options?.allowDuringLifecycle,
+            embeddingModel: stamped.embedding_model,
           });
           reconciled++;
         } catch (err) {
@@ -509,6 +587,105 @@ export class StorageManager {
     }
 
     return { reconciled, remaining: this.sqlite.countUnsyncedVectors(), boundReached };
+  }
+
+  /**
+   * Operator-initiated re-embed migration (openspec/changes/
+   * stamp-embedding-provenance, task 3): re-embeds memories whose stamp
+   * differs from the active embedding identity, in bounded, resumable
+   * batches. Deliberately bypasses `ensureEmbeddingIdentityCompatible` — this
+   * *is* the sanctioned remediation for the mismatch that method guards
+   * against, not a write it should refuse.
+   *
+   * The stamp itself is the progress marker (no separate checkpoint table):
+   * a batch's rows are re-queried fresh from `listMemoriesWithStaleEmbeddingStamp`
+   * each iteration, so interruption at any point is safe to resume — rows
+   * already re-stamped with the active identity simply stop matching the
+   * selection query.
+   *
+   * Failures are isolated per memory: one embed/upsert failure is counted
+   * and skipped (left for a future run) rather than aborting the batch, so
+   * a single bad row cannot block convergence of the rest of the store.
+   */
+  async reembedMismatchedVectors(
+    options?: {
+      includeLegacy?: boolean;
+      batchSize?: number;
+      timeoutMs?: number;
+      maxBatches?: number;
+      logger?: { info?: (obj: Record<string, unknown>) => void; warn?: (obj: Record<string, unknown>) => void };
+    },
+  ): Promise<ReembedResult> {
+    const includeLegacy = options?.includeLegacy ?? false;
+    const batchSize = options?.batchSize ?? 50;
+    const activeIdentity = this.embedding.identity;
+    const startedAt = Date.now();
+    let cursor: string | undefined;
+    let updated = 0;
+    let failed = 0;
+    let batches = 0;
+    let boundReached = false;
+
+    while (true) {
+      if (options?.timeoutMs !== undefined && Date.now() - startedAt >= options.timeoutMs) {
+        boundReached = true;
+        break;
+      }
+      if (options?.maxBatches !== undefined && batches >= options.maxBatches) {
+        boundReached = true;
+        break;
+      }
+
+      const memories = this.sqlite.listMemoriesWithStaleEmbeddingStamp(
+        activeIdentity, includeLegacy, batchSize, cursor,
+      );
+      if (memories.length === 0) {
+        break;
+      }
+
+      for (const memory of memories) {
+        try {
+          const vector = await this.embedding.embed(memory.content);
+          const stamped = { ...memory, embedding_model: activeIdentity };
+          await this.qdrant.upsert(stamped.namespace, stamped.collection, stamped.id, vector, toQdrantPayload(stamped));
+          this.sqlite.markVectorSync(stamped.id, true, { embeddingModel: activeIdentity });
+          updated++;
+        } catch (err) {
+          failed++;
+          options?.logger?.warn?.({
+            event: 're_embed_item_failed',
+            memory_id: memory.id,
+            error: (err as Error).message,
+          });
+        }
+      }
+
+      this.sqlite.flushIfDirty();
+      batches++;
+      options?.logger?.info?.({
+        event: 're_embed_batch_progress',
+        batch: batches,
+        updated,
+        failed,
+      });
+
+      if (memories.length < batchSize) {
+        break;
+      }
+      const last = memories[memories.length - 1]!;
+      cursor = `${last.created_at}|${last.id}`;
+    }
+
+    const remaining = this.sqlite.countMemoriesWithStaleEmbeddingStamp(activeIdentity, includeLegacy);
+    let converged = false;
+    if (remaining === 0) {
+      // Completed convergence (within the requested scope) clears the
+      // mismatch condition immediately, without requiring a restart.
+      this.sqlite.setExpectedEmbeddingIdentity(activeIdentity);
+      converged = true;
+    }
+
+    return { updated, failed, remaining, boundReached, converged };
   }
 
   logAudit(
@@ -537,10 +714,17 @@ export class StorageManager {
     const col = this.sqlite.getCollection(namespace, collection);
     if (col) {
       if (col.embedding_model !== this.embedding.model || col.embedding_dimensions !== this.embedding.dimensions) {
+        // Dimension mismatches are caught here before they ever reach Qdrant
+        // (whose own error would be an opaque vector-size rejection): this
+        // collection's vectors were created at `col.embedding_dimensions`,
+        // so a differing active dimension count can never be written into
+        // it without first migrating the existing vectors.
         throw conflict(
           `Collection "${collection}" uses ${col.embedding_model} (${col.embedding_dimensions}d), ` +
           `but current provider is ${this.embedding.model} (${this.embedding.dimensions}d). ` +
-          `Cannot mix embedding spaces.`,
+          `Cannot mix embedding spaces. Run the repair tool with mode: "re-embed" (or ` +
+          `"bhgbrain repair --re-embed" from the CLI) to migrate this collection's vectors ` +
+          `to the active model.`,
         );
       }
       return;
@@ -569,7 +753,7 @@ function toQdrantPayload(
     MemoryRecordWithoutEmbedding,
     'type' | 'tags' | 'collection' | 'content' | 'summary' | 'category' | 'source' |
     'importance' | 'retention_tier' | 'decay_eligible' | 'expires_at' | 'created_at' | 'checksum'
-  > & { device_id?: string | null },
+  > & { device_id?: string | null; embedding_model?: string | null },
 ): Record<string, unknown> {
   return {
     type: mem.type,
@@ -588,5 +772,9 @@ function toQdrantPayload(
     // Content checksum, used on restore to detect drift without re-embedding
     // (see StorageManager.detectAndMarkVectorDrift).
     checksum: mem.checksum,
+    // Provider-qualified embedding identity that produced this vector (see
+    // embedding-provenance). Null for legacy vectors written before
+    // provenance stamping.
+    embedding_model: mem.embedding_model ?? null,
   };
 }

@@ -21,6 +21,7 @@ BHGBrain stocke les souvenirs dans SQLite (métadonnées + recherche plein texte
    - [Résolution de l'identité de l'appareil](#résolution-de-lidentité-de-lappareil)
    - [Qdrant partagé, SQLite local](#qdrant-partagé-sqlite-local)
    - [Réparation et récupération](#réparation-et-récupération)
+   - [Migration du modèle d'embedding](#migration-du-modèle-dembedding)
 10. [Gestion de la mémoire](#gestion-de-la-mémoire)
     - [Modèle de données](#modèle-de-données)
     - [Types de mémoire](#types-de-mémoire)
@@ -243,7 +244,18 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     "api_key_env": "OPENAI_API_KEY",
     // Dimensions vectorielles produites par le modèle. Doit correspondre à la sortie du modèle.
     // IMPORTANT : Modifier cette valeur après la création de collections nécessite de les recréer.
-    "dimensions": 1536
+    "dimensions": 1536,
+    // Chaque vecteur est estampillé à l'écriture avec une identité qualifiée par
+    // fournisseur (`<provider>/<model>@<dimensions>`). Si l'identité attendue
+    // enregistrée par le store (adoptée à la première écriture suivant le
+    // démarrage) diffère de cette configuration — p. ex. après un changement de
+    // fournisseur ou de modèle — le composant de santé `embedding` se dégrade
+    // et, tant que ce drapeau vaut true, les écritures produisant des vecteurs
+    // sont refusées avec une erreur nommant le mode re-embed de l'outil
+    // `repair`. Ne le mettez à false que si vous voulez intentionnellement que
+    // les écritures mélangent des espaces d'embedding. Voir « Migration du
+    // modèle d'embedding » ci-dessous.
+    "refuse_writes_on_model_mismatch": true
   },
 
   // Configuration de connexion Qdrant
@@ -713,6 +725,71 @@ L'outil de réparation :
 - Rapporte : collections parcourues, points parcourues, récupérés, ignorés (sans contenu), erreurs
 
 **Note** : Les souvenirs stockés avant l'ajout de la fonctionnalité de contenu dans Qdrant (pré-1.3) n'ont pas de contenu dans leur charge utile Qdrant et ne peuvent pas être récupérés via l'outil de réparation. Seules les métadonnées (tags, type, importance) subsistent pour ces entrées.
+
+### Migration du modèle d'embedding
+
+Chaque vecteur est estampillé à l'écriture avec une identité qualifiée par
+fournisseur — `<provider>/<model>@<dimensions>` (p. ex. `openai/text-embedding-3-small@1536`)
+— à la fois sur la ligne SQLite et dans la charge utile Qdrant. Le store mémorise
+également cette identité comme attente, adoptée à la première écriture suivant le
+démarrage.
+
+Cela existe parce que mélanger des espaces d'embedding est une corruption
+silencieuse : si vous changez `embedding.provider` ou `embedding.model` dans
+`config.json` en gardant les mêmes dimensions (p. ex. en passant à un déploiement
+Azure de la même famille de modèles), rien au niveau de Qdrant ne le détecte — les
+nouveaux vecteurs se retrouvent dans la même collection que les anciens, la
+similarité cosinus entre les deux espaces n'a plus de sens, et la pertinence du
+recall comme la déduplication (les scores `similar[0]` alimentant les seuils
+0.92/0.98) se dégradent silencieusement. Un changement de dimensions échoue
+bruyamment avec une erreur Qdrant opaque à la place ; l'estampillage de provenance
+rend les deux cas bruyants et actionnables.
+
+**Ce qui se passe après un changement de modèle :**
+
+1. Au prochain démarrage (ou bilan de santé), l'identité attendue enregistrée par le
+   store ne correspond plus à la configuration active. Le composant de santé
+   `embedding` se dégrade avec un message nommant les deux identités, et un
+   avertissement structuré `embedding_identity_mismatch` est journalisé.
+2. Tant que `embedding.refuse_writes_on_model_mismatch` vaut `true` (par défaut),
+   les écritures produisant des vecteurs (remember, ré-embeddings déclenchés par
+   tag, réconciliation de restauration) échouent avec une erreur `CONFLICT`
+   actionnable nommant le chemin de ré-embedding. Les lectures continuent de
+   fonctionner — recall et search continuent de servir les anciens vecteurs, avec
+   simplement une santé dégradée.
+3. Exécutez la migration :
+
+   ```bash
+   bhgbrain repair --re-embed              # migrer les lignes à l'estampille obsolète
+   bhgbrain repair --re-embed --dry-run    # prévisualiser combien de lignes seraient ré-embeddées
+   bhgbrain repair --re-embed --include-legacy   # inclure aussi les lignes sans aucune estampille
+   ```
+
+   Ou via l'outil MCP `repair` avec `mode: "re-embed"` (voir
+   [Référence des outils MCP](#référence-des-outils-mcp)). La migration ré-embedde
+   les souvenirs non concordants par lots bornés et reprenables — l'estampille
+   elle-même sert de marqueur de progression, si bien qu'une exécution interrompue
+   reprend sans répéter les lignes déjà traitées, et l'échec d'un seul
+   embed/upsert est isolé plutôt que d'interrompre tout le lot.
+4. Une fois qu'il ne reste plus de lignes à l'estampille obsolète, l'identité
+   attendue du store se met à jour automatiquement et la dégradation de santé
+   `embedding` disparaît — sans redémarrage.
+
+**Notes :**
+- Les lignes héritées écrites avant l'estampillage de provenance n'ont aucune
+  estampille (`null`) et sont traitées comme « inconnues » — exclues du
+  ré-embedding sauf si `--include-legacy` / `include_legacy: true` est passé,
+  afin qu'une première mise à niveau ne déclenche pas par surprise un
+  ré-embedding complet du corpus (et son coût d'API d'embedding).
+- Le ré-embedding est toujours initié par l'opérateur — jamais automatiquement,
+  car il appelle l'API d'embedding payante une fois par souvenir migré.
+- Ne définissez `embedding.refuse_writes_on_model_mismatch` sur `false` que si
+  vous souhaitez intentionnellement que les écritures continuent en mélangeant
+  les espaces d'embedding (p. ex. une fenêtre de migration délibérée et
+  surveillée) — l'estampille continue d'enregistrer ce qui s'est passé.
+- Les souvenirs archivés ne sont jamais ré-embeddés ; leurs vecteurs sont déjà
+  supprimés par conception (voir
+  [Déclin, nettoyage et archivage](#déclin-nettoyage-et-archivage)).
 
 ### Exemple de configuration multi-appareils
 
@@ -1974,6 +2051,12 @@ bhgbrain audit                        # Afficher les entrées d'audit récentes
 bhgbrain repair --from-qdrant                # Hydrater le SQLite local depuis Qdrant (mémoires de l'appareil actuel uniquement, par défaut)
 bhgbrain repair --from-qdrant --all-devices  # Hydrater à partir des mémoires de tous les appareils, pas seulement de l'appareil actuel
 
+# Réparation (migration du modèle d'embedding — voir Migration du modèle d'embedding)
+bhgbrain repair --re-embed                   # Migrer les vecteurs à l'estampille d'embedding obsolète
+bhgbrain repair --re-embed --dry-run         # Prévisualiser combien de lignes seraient ré-embeddées
+bhgbrain repair --re-embed --include-legacy  # Inclure aussi les lignes sans aucune estampille
+bhgbrain repair --re-embed --batch-size 100  # Ajuster la taille de lot (par défaut 50)
+
 # Gestion des catégories
 bhgbrain category list                # Lister toutes les catégories
 bhgbrain category get <name>          # Afficher le contenu d'une catégorie
@@ -2331,19 +2414,28 @@ Créer, lister ou restaurer des sauvegardes de mémoire.
 
 ---
 
-### `repair` — Reconstruire SQLite depuis Qdrant
+### `repair` — Reconstruire SQLite depuis Qdrant, ou migrer les estampilles d'embedding obsolètes
 
-Récupère les souvenirs depuis Qdrant dans la base de données SQLite locale. Utilisé pour la configuration multi-appareils, la récupération après perte de données ou l'intégration d'un nouvel appareil. Voir [Réparation et récupération](#réparation-et-récupération).
+Répare l'état local à partir de sources externes. `mode: "from-qdrant"` (par défaut)
+récupère les souvenirs depuis Qdrant dans la base de données SQLite locale — utilisé
+pour la configuration multi-appareils, la récupération après perte de données ou
+l'intégration d'un nouvel appareil. `mode: "re-embed"` migre les souvenirs dont
+l'estampille d'embedding diffère du `embedding.provider`/`embedding.model` actif —
+voir [Migration du modèle d'embedding](#migration-du-modèle-dembedding). Voir aussi
+[Réparation et récupération](#réparation-et-récupération).
 
 **Entrée :**
 
 | Paramètre | Type | Obligatoire | Par défaut | Description |
 |---|---|---|---|---|
-| `dry_run` | `boolean` | Non | `false` | Lorsque `true`, rapporte ce qui serait récupéré sans effectuer de modifications. |
-| `device_id` | `string` | Non | — | Filtrer la récupération aux souvenirs créés par un appareil spécifique. Mutuellement exclusif avec `all_devices`. |
-| `all_devices` | `boolean` | Non | `false` | Récupérer explicitement les souvenirs de tous les appareils. Mutuellement exclusif avec `device_id`. C'est aussi le comportement par défaut lorsqu'aucun des deux champs n'est fourni. |
+| `mode` | `"from-qdrant" \| "re-embed"` | Non | `"from-qdrant"` | Quelle opération de réparation exécuter. |
+| `dry_run` | `boolean` | Non | `false` | Lorsque `true`, rapporte ce qui changerait sans effectuer de modifications. |
+| `device_id` | `string` | Non | — | (`from-qdrant` uniquement) Filtrer la récupération aux souvenirs créés par un appareil spécifique. Mutuellement exclusif avec `all_devices`. |
+| `all_devices` | `boolean` | Non | `false` | (`from-qdrant` uniquement) Récupérer explicitement les souvenirs de tous les appareils. Mutuellement exclusif avec `device_id`. C'est aussi le comportement par défaut lorsqu'aucun des deux champs n'est fourni. |
+| `include_legacy` | `boolean` | Non | `false` | (`re-embed` uniquement) Inclure aussi les lignes héritées sans aucune estampille d'embedding, pas seulement celles avec un modèle différent. |
+| `batch_size` | `number` | Non | `50` | (`re-embed` uniquement) Souvenirs ré-embeddés par lot (1-500). |
 
-**Sortie :**
+**Sortie (`mode: "from-qdrant"`) :**
 
 ```json
 {
@@ -2362,8 +2454,31 @@ Récupère les souvenirs depuis Qdrant dans la base de données SQLite locale. U
 **Notes :**
 - Seuls les points ayant du `content` dans leur charge utile Qdrant peuvent être récupérés. Les souvenirs pré-1.3 sans contenu dans Qdrant sont rapportés comme `skipped_no_content`.
 - Les souvenirs récupérés préservent leur `device_id` d'origine depuis la charge utile Qdrant. Si aucun `device_id` n'existe dans la charge utile, l'ID de l'appareil local est utilisé.
+- Les souvenirs récupérés préservent aussi l'identité d'embedding (le cas échéant) déjà estampillée sur leur vecteur source, plutôt que de revendiquer l'identité de la configuration active — la récupération reconstruit des métadonnées pour un vecteur existant, elle n'en produit pas un nouveau.
 - Fournir à la fois `device_id` et `all_devices: true` est rejeté comme entrée invalide.
 - Après la récupération, exécutez `npm run build` et redémarrez le serveur si nécessaire. Les souvenirs récupérés sont immédiatement disponibles pour la recherche et le rappel.
+
+**Sortie (`mode: "re-embed"`) :**
+
+```json
+{
+  "mode": "re-embed",
+  "dry_run": false,
+  "active_identity": "openai/text-embedding-3-small@1536",
+  "include_legacy": false,
+  "updated": 118,
+  "failed": 0,
+  "remaining": 0,
+  "bound_reached": false,
+  "converged": true
+}
+```
+
+**Notes :**
+- La sélection repose sur l'estampille elle-même, si bien qu'une exécution interrompue reprend en toute sécurité — les lignes déjà ré-estampillées avec l'identité active cessent simplement de correspondre à l'appel suivant.
+- Un échec embed/upsert par souvenir est isolé (compté dans `failed`, laissé pour une exécution future) plutôt que d'interrompre tout le lot.
+- `converged: true` signifie qu'il ne reste plus de lignes à l'estampille obsolète (dans le périmètre `include_legacy` demandé) ; l'identité attendue du store est mise à jour et la dégradation de santé `embedding` se résorbe immédiatement, sans redémarrage.
+- Également disponible depuis la CLI : `bhgbrain repair --re-embed [--include-legacy] [--batch-size <n>] [--dry-run]`.
 
 ---
 

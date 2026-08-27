@@ -153,6 +153,22 @@ Selected via `embedding.provider` in `config.json`:
   Note the per-model dimension constraints enforced by the Zod schema
   (e.g. `text-embedding-3-small` ≤ 1536, `text-embedding-3-large` ≤ 3072).
 
+Every `EmbeddingProvider` exposes `provider`/`model`/`dimensions` plus a derived
+`identity` string (`formatEmbeddingIdentity`, `<provider>/<model>@<dimensions>`),
+stamped on every vector-producing write onto both the `memories.embedding_model`
+SQLite column and the Qdrant payload (`StorageManager.writeMemory`/`updateMemory`/
+`reconcileVectorsFromSqlite`; see `toQdrantPayload`). The store's expected identity is
+tracked in the singleton `embedding_state` SQLite table (`getExpectedEmbeddingIdentity`/
+`adoptEmbeddingIdentityIfAbsent`/`setExpectedEmbeddingIdentity`); a mismatch against the
+active configuration degrades the `embedding` health component
+(`HealthService.checkEmbeddingIdentityMismatch`) and, while
+`embedding.refuse_writes_on_model_mismatch` (default `true`) is set, causes
+`StorageManager.ensureEmbeddingIdentityCompatible` to refuse vector-producing writes
+with a `CONFLICT` naming the `repair` tool's `mode: "re-embed"` path
+(`StorageManager.reembedMismatchedVectors`, also reachable via
+`bhgbrain repair --re-embed`). See `openspec/changes/stamp-embedding-provenance` and
+the README's "Embedding Model Migration" section.
+
 ## Error Handling
 
 - **Structured Errors**: Consistent error format with codes

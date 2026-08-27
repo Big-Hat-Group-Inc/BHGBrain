@@ -88,6 +88,17 @@ export class HealthService {
   }
 
   private async checkEmbedding(): Promise<ComponentHealth> {
+    // Identity mismatch takes priority over (and is independent of) the
+    // reachability probe below: a store expecting a different embedding
+    // identity than the active configuration is degraded even if the
+    // currently-configured provider is perfectly reachable — the risk is
+    // mixed vector spaces, not connectivity. Cheap (single SQLite read), so
+    // it is not subject to the 30s reachability cache below.
+    const mismatch = this.checkEmbeddingIdentityMismatch();
+    if (mismatch) {
+      return mismatch;
+    }
+
     // If running in degraded mode, skip the API call entirely
     if (this.embedding instanceof DegradedEmbeddingProvider) {
       return { status: 'degraded', message: 'Embedding provider unavailable (missing credentials)' };
@@ -109,6 +120,19 @@ export class HealthService {
     }
     this.cachedEmbeddingAt = now;
     return this.cachedEmbeddingHealth;
+  }
+
+  private checkEmbeddingIdentityMismatch(): ComponentHealth | null {
+    const expected = this.storage.sqlite.getExpectedEmbeddingIdentity();
+    if (expected && expected !== this.embedding.identity) {
+      return {
+        status: 'degraded',
+        message: `Embedding identity mismatch: store expects "${expected}" but active configuration ` +
+          `is "${this.embedding.identity}". Run the repair tool with mode: "re-embed" to migrate ` +
+          `existing vectors, or restore the previous embedding.provider/model configuration.`,
+      };
+    }
+    return null;
   }
 
   // `null` means cleanup has never completed successfully (a fresh install,

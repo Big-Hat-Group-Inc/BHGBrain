@@ -21,6 +21,7 @@ BHGBrain 将记忆存储在 SQLite（元数据 + 全文搜索）和 Qdrant（语
    - [设备身份解析](#设备身份解析)
    - [共享 Qdrant，本地 SQLite](#共享-qdrant本地-sqlite)
    - [修复与恢复](#修复与恢复)
+   - [嵌入模型迁移](#嵌入模型迁移)
 10. [记忆管理](#记忆管理)
     - [记忆数据模型](#记忆数据模型)
     - [记忆类型](#记忆类型)
@@ -242,7 +243,15 @@ BHGBrain 从以下位置加载配置文件：
     "api_key_env": "OPENAI_API_KEY",
     // 模型输出的向量维度，必须与模型输出匹配。
     // 重要：在集合创建后更改此项需要重建集合。
-    "dimensions": 1536
+    "dimensions": 1536,
+    // 每个向量在写入时都会打上带提供方限定的身份标记
+    // （`<provider>/<model>@<dimensions>`）。如果存储层记录的期望身份
+    // （在启动后首次写入时被采纳）与当前配置不一致——例如更换了提供方或
+    // 模型——`embedding` 健康组件会降级，并且只要该开关为 true，产生向量的
+    // 写入操作就会被拒绝，并返回一个指明 `repair` 工具 re-embed 模式的错误。
+    // 只有在你确实想让写入混用嵌入空间时才将其设为 false。参见下方的
+    // “嵌入模型迁移”。
+    "refuse_writes_on_model_mismatch": true
   },
 
   // Qdrant 连接配置
@@ -705,6 +714,56 @@ repair 工具：
 - 报告：扫描的集合数、扫描的点数、恢复数、跳过数（无内容）、错误数
 
 **注意**：在内容存入 Qdrant 功能添加之前存储的记忆（1.3 之前）在 Qdrant payload 中没有内容，无法通过 repair 恢复。这些条目只有元数据（标签、类型、重要性）能保留。
+
+### 嵌入模型迁移
+
+每个向量在写入时都会打上带提供方限定的身份标记 —
+`<provider>/<model>@<dimensions>`（例如 `openai/text-embedding-3-small@1536`）——
+同时记录在 SQLite 行和 Qdrant payload 中。存储层还会把该身份记为期望值，在启动后
+首次写入时被采纳。
+
+之所以这样做，是因为混用嵌入空间是一种静默的数据损坏：如果在维度不变的情况下更改
+`config.json` 中的 `embedding.provider` 或 `embedding.model`（例如切换到同一模型
+系列的 Azure 部署），Qdrant 层面不会检测到任何异常——新向量会混入与旧向量相同的
+集合，两个空间之间的余弦相似度毫无意义，召回相关性和去重（`similar[0]` 分数会
+输入到 0.92/0.98 阈值中）都会悄悄劣化。维度变化则会在 Qdrant 层直接报出一个含糊
+的错误而失败；来源标记让这两类问题都变得显而易见且可操作。
+
+**模型更改后会发生什么：**
+
+1. 在下一次启动（或健康检查）时，存储层记录的期望身份将不再与当前配置匹配。
+   `embedding` 健康组件会降级，并给出同时指出两个身份的说明，同时记录一条结构化的
+   `embedding_identity_mismatch` 警告。
+2. 只要 `embedding.refuse_writes_on_model_mismatch` 为 `true`（默认值），产生向量
+   的写入操作（remember、由标签触发的重新嵌入、恢复时的一致性校验）都会失败，
+   并返回一个指明 re-embed 路径的可操作 `CONFLICT` 错误。读取操作仍可正常工作——
+   recall 和 search 会继续使用旧向量，只是健康状态会降级。
+3. 运行迁移：
+
+   ```bash
+   bhgbrain repair --re-embed              # 迁移标记过期的行
+   bhgbrain repair --re-embed --dry-run    # 预览将有多少行会被重新嵌入
+   bhgbrain repair --re-embed --include-legacy   # 同时纳入完全没有标记的旧行
+   ```
+
+   或者通过 `repair` MCP 工具并传入 `mode: "re-embed"`（参见
+   [MCP 工具参考](#mcp-工具参考)）。迁移会以有界、可恢复的批次重新嵌入不匹配的
+   记忆——标记本身就是进度标记，因此被中断的运行可以安全地续跑而不会重复处理已
+   完成的行，单条记忆的 embed/upsert 失败也会被隔离，而不会中止整个批次。
+4. 一旦不再有标记过期的行，存储层的期望身份会自动更新，`embedding` 健康降级也会
+   立即消失——无需重启。
+
+**说明：**
+- 在来源标记功能上线之前写入的旧行没有任何标记（`null`），会被视为“未知”——除非
+  显式传入 `--include-legacy` / `include_legacy: true`，否则默认不会纳入
+  re-embed，这样首次升级不会意外触发对整个语料库的重新嵌入（及其嵌入 API 费用）。
+- 重新嵌入始终由运维人员主动发起——绝不会自动触发，因为它会为每条被迁移的记忆
+  调用一次付费的嵌入 API。
+- 只有在你确实希望写入继续并混用嵌入空间时（例如一次刻意且受监控的迁移窗口），
+  才将 `embedding.refuse_writes_on_model_mismatch` 设为 `false`——标记仍会如实
+  记录发生了什么。
+- 已归档的记忆永远不会被重新嵌入；按照设计，它们的向量已经被移除（参见
+  [衰减、清理与归档](#衰减清理与归档)）。
 
 ### 多设备配置示例
 
@@ -1962,6 +2021,12 @@ bhgbrain audit                        # 显示最近的审计条目
 bhgbrain repair --from-qdrant                # 从 Qdrant 恢复本地 SQLite（默认仅恢复当前设备的记忆）
 bhgbrain repair --from-qdrant --all-devices  # 恢复所有设备的记忆，而不仅仅是当前设备
 
+# 修复（嵌入模型迁移——参见嵌入模型迁移）
+bhgbrain repair --re-embed                   # 迁移带有过期嵌入标记的向量
+bhgbrain repair --re-embed --dry-run         # 预览将有多少行会被重新嵌入
+bhgbrain repair --re-embed --include-legacy  # 同时纳入完全没有标记的行
+bhgbrain repair --re-embed --batch-size 100  # 调整批次大小（默认 50）
+
 # 类别管理
 bhgbrain category list                # 列出所有类别
 bhgbrain category get <name>          # 显示类别内容
@@ -2319,19 +2384,25 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 
 ---
 
-### `repair`——从 Qdrant 重建 SQLite
+### `repair`——从 Qdrant 重建 SQLite，或迁移过期的嵌入标记
 
-从 Qdrant 恢复记忆到本地 SQLite 数据库。用于多设备设置、数据丢失恢复或新设备接入。参见[修复与恢复](#修复与恢复)。
+从外部来源修复本地状态。`mode: "from-qdrant"`（默认）从 Qdrant 恢复记忆到本地
+SQLite 数据库——用于多设备设置、数据丢失恢复或新设备接入。`mode: "re-embed"`
+迁移那些嵌入标记与当前 `embedding.provider`/`embedding.model` 不一致的记忆——参见
+[嵌入模型迁移](#嵌入模型迁移)。另参见[修复与恢复](#修复与恢复)。
 
 **输入：**
 
 | 参数 | 类型 | 是否必需 | 默认值 | 说明 |
 |---|---|---|---|---|
-| `dry_run` | `boolean` | 否 | `false` | 为 `true` 时，报告将恢复的内容但不做任何更改。 |
-| `device_id` | `string` | 否 | — | 过滤恢复范围到由特定设备创建的记忆。与 `all_devices` 互斥。 |
-| `all_devices` | `boolean` | 否 | `false` | 显式恢复所有设备的记忆。与 `device_id` 互斥。这也是两个字段都未提供时的默认行为。 |
+| `mode` | `"from-qdrant" \| "re-embed"` | 否 | `"from-qdrant"` | 要执行的修复操作。 |
+| `dry_run` | `boolean` | 否 | `false` | 为 `true` 时，报告将发生的变化但不做任何更改。 |
+| `device_id` | `string` | 否 | — | （仅 `from-qdrant`）过滤恢复范围到由特定设备创建的记忆。与 `all_devices` 互斥。 |
+| `all_devices` | `boolean` | 否 | `false` | （仅 `from-qdrant`）显式恢复所有设备的记忆。与 `device_id` 互斥。这也是两个字段都未提供时的默认行为。 |
+| `include_legacy` | `boolean` | 否 | `false` | （仅 `re-embed`）同时重新嵌入完全没有嵌入标记的旧行，而不仅仅是标记为不同模型的行。 |
+| `batch_size` | `number` | 否 | `50` | （仅 `re-embed`）每批重新嵌入的记忆数（1-500）。 |
 
-**输出：**
+**输出（`mode: "from-qdrant"`）：**
 
 ```json
 {
@@ -2350,8 +2421,31 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 **注意事项：**
 - 只有 Qdrant payload 中包含 `content` 的点才能被恢复。1.3 之前不包含 Qdrant 内容的记忆会被报告为 `skipped_no_content`。
 - 恢复的记忆保留其 Qdrant payload 中的原始 `device_id`。如果 payload 中不存在 `device_id`，则使用本地设备的 ID。
+- 恢复的记忆还会保留其源向量原本携带的嵌入身份（如果有），而不会声称自己拥有当前配置的身份——恢复操作是为已有向量重建元数据，而不是生成新向量。
 - 同时传入 `device_id` 和 `all_devices: true` 将被拒绝，视为无效输入。
 - 恢复后，如需要请运行 `npm run build` 并重启服务器。恢复的记忆可立即用于搜索和召回。
+
+**输出（`mode: "re-embed"`）：**
+
+```json
+{
+  "mode": "re-embed",
+  "dry_run": false,
+  "active_identity": "openai/text-embedding-3-small@1536",
+  "include_legacy": false,
+  "updated": 118,
+  "failed": 0,
+  "remaining": 0,
+  "bound_reached": false,
+  "converged": true
+}
+```
+
+**注意事项：**
+- 选择依据是标记本身，因此被中断的运行可以安全续跑——已经用当前身份重新标记的行在下一次调用时会自动不再匹配。
+- 单条记忆的 embed/upsert 失败会被隔离（计入 `failed`，留待后续运行处理），而不会中止整个批次。
+- `converged: true` 表示（在请求的 `include_legacy` 范围内）已不再有标记过期的行；存储层的期望身份会随之更新，`embedding` 健康降级会立即解除，无需重启。
+- 也可通过 CLI 使用：`bhgbrain repair --re-embed [--include-legacy] [--batch-size <n>] [--dry-run]`。
 
 ---
 

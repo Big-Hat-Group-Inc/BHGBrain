@@ -218,6 +218,74 @@ describe('repair device filtering', () => {
   });
 });
 
+// openspec/changes/stamp-embedding-provenance
+describe('repair mode: re-embed', () => {
+  type ReembedResult = {
+    mode: string;
+    dry_run: boolean;
+    active_identity: string;
+    include_legacy: boolean;
+    updated?: number;
+    failed?: number;
+    remaining?: number;
+    would_re_embed?: number;
+  };
+
+  function createReembedCtx(overrides: Partial<{
+    getExpectedEmbeddingIdentity: () => string | null;
+    countStale: () => number;
+    reembedMismatchedVectors: ReturnType<typeof vi.fn>;
+  }> = {}) {
+    const storage = {
+      sqlite: {
+        countMemories: vi.fn(() => 5),
+        countMemoriesWithStaleEmbeddingStamp: vi.fn(overrides.countStale ?? (() => 3)),
+      },
+      getExpectedEmbeddingIdentity: vi.fn(overrides.getExpectedEmbeddingIdentity ?? (() => 'azure-foundry/old@1536')),
+      reembedMismatchedVectors: overrides.reembedMismatchedVectors
+        ?? vi.fn(async () => ({ updated: 3, failed: 0, remaining: 0, boundReached: false, converged: true })),
+    } as unknown as StorageManager;
+    const ctx: ToolContext = {
+      config: {} as ToolContext['config'],
+      storage,
+      embedding: { provider: 'openai', model: 'm', dimensions: 3, identity: 'openai/m@3' } as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+    return { ctx, storage };
+  }
+
+  it('dry_run reports the stale count without calling reembedMismatchedVectors', async () => {
+    const { ctx, storage } = createReembedCtx();
+
+    const result = await handleTool(ctx, 'repair', { mode: 're-embed', dry_run: true }, 'c1') as ReembedResult;
+
+    expect(result.dry_run).toBe(true);
+    expect(result.would_re_embed).toBe(3);
+    expect(result.active_identity).toBe('openai/m@3');
+    expect(storage.reembedMismatchedVectors).not.toHaveBeenCalled();
+  });
+
+  it('a real run delegates to StorageManager.reembedMismatchedVectors and reports its outcome', async () => {
+    const { ctx, storage } = createReembedCtx();
+
+    const result = await handleTool(ctx, 'repair', {
+      mode: 're-embed', include_legacy: true, batch_size: 25,
+    }, 'c1') as ReembedResult;
+
+    expect(storage.reembedMismatchedVectors).toHaveBeenCalledWith(
+      expect.objectContaining({ includeLegacy: true, batchSize: 25 }),
+    );
+    expect(result.updated).toBe(3);
+    expect(result.failed).toBe(0);
+    expect(result.remaining).toBe(0);
+  });
+});
+
 describe('tool input contracts', () => {
   // Input validation happens (via strict Zod schemas) before any dependency is
   // touched, so a bare ctx with metrics + logger is enough to exercise rejection.

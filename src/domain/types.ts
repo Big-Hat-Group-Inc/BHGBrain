@@ -57,6 +57,12 @@ export interface MemoryRecord {
   archived: boolean;
   vector_synced: boolean;
   device_id?: string | null;
+  // Provider-qualified embedding identity (`<provider>/<model>@<dimensions>`)
+  // that produced this row's current vector. Null for legacy rows written
+  // before provenance stamping, and for rows written without a vector (the
+  // deterministic-fallback ADD path) — both are treated as "unknown" by
+  // mismatch detection and re-embed selection. See embedding-provenance.
+  embedding_model?: string | null;
   created_at: string;
   updated_at: string;
   last_accessed: string;

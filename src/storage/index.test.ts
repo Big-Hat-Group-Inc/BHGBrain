@@ -69,6 +69,11 @@ function createMockSqlite(): MockSqliteStore {
       }
       return memoryStore.size;
     }),
+    getExpectedEmbeddingIdentity: vi.fn(() => null),
+    adoptEmbeddingIdentityIfAbsent: vi.fn(),
+    setExpectedEmbeddingIdentity: vi.fn(),
+    countMemoriesWithStaleEmbeddingStamp: vi.fn(() => 0),
+    listMemoriesWithStaleEmbeddingStamp: vi.fn(() => []),
   } as unknown as MockSqliteStore;
 }
 
@@ -88,8 +93,10 @@ function createMockQdrant(shouldFail = false): MockQdrantStore {
 
 function createMockEmbedding(): EmbeddingProvider {
   return {
+    provider: 'openai',
     model: 'test',
     dimensions: 3,
+    identity: 'openai/test@3',
     embed: vi.fn(async () => [1, 2, 3]),
     embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [1, 2, 3])),
     healthCheck: vi.fn(async () => true),
@@ -186,9 +193,12 @@ describe('StorageManager cross-store consistency', () => {
 
       // SQLite updateMemory should have been called twice: once for update, once for rollback
       expect(sqlite.updateMemory).toHaveBeenCalledTimes(2);
-      // Second call should restore original values
+      // Second call should restore original values, including the
+      // pre-update embedding_model stamp — the earlier `writeMemory` call
+      // already stamped it with the active identity, so rollback restores
+      // that same value (it was never actually changed by this attempt).
       const rollbackCall = sqlite.updateMemory.mock.calls[1];
-      expect(rollbackCall[1]).toEqual({ importance: 0.5, tags: ['a'] });
+      expect(rollbackCall[1]).toEqual({ importance: 0.5, tags: ['a'], embedding_model: 'openai/test@3' });
     });
   });
 
@@ -308,9 +318,11 @@ describe('StorageManager cross-store consistency', () => {
       expect(qdrant.upsert).toHaveBeenCalledTimes(2);
       expect(sqlite.markVectorSync).toHaveBeenNthCalledWith(1, 'mem-a', true, {
         allowDuringLifecycle: undefined,
+        embeddingModel: 'openai/test@3',
       });
       expect(sqlite.markVectorSync).toHaveBeenNthCalledWith(2, 'mem-b', true, {
         allowDuringLifecycle: undefined,
+        embeddingModel: 'openai/test@3',
       });
       expect(result).toEqual({ reconciled: 2, remaining: 0, boundReached: false });
     });
@@ -725,6 +737,178 @@ describe('StorageManager cross-store consistency', () => {
 
       expect(result).toEqual({ deleted: 1, ids: ['mem-1'] });
       expect(sqlite.markVectorsSyncBatch).not.toHaveBeenCalled();
+    });
+  });
+
+  // openspec/changes/stamp-embedding-provenance
+  describe('embedding provenance', () => {
+    it('stamps the active identity on both the SQLite row and the Qdrant payload for a new write', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory(baseMem, [1, 2, 3]);
+
+      expect(sqlite.insertMemory).toHaveBeenCalledWith(
+        expect.objectContaining({ embedding_model: 'openai/test@3' }),
+      );
+      expect(qdrant.upsert).toHaveBeenCalledWith(
+        'global', 'general', 'mem-1', [1, 2, 3],
+        expect.objectContaining({ embedding_model: 'openai/test@3' }),
+      );
+      // First compatible write adopts the store's expected identity.
+      expect(sqlite.adoptEmbeddingIdentityIfAbsent).toHaveBeenCalledWith('openai/test@3');
+    });
+
+    it('stamps the active identity when updateMemory is given a new vector', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory(baseMem, [1, 2, 3]);
+      await storage.updateMemory('mem-1', { importance: 0.9 }, [4, 5, 6]);
+
+      expect(sqlite.updateMemory).toHaveBeenCalledWith(
+        'mem-1', expect.objectContaining({ embedding_model: 'openai/test@3' }),
+      );
+      expect(qdrant.upsert).toHaveBeenLastCalledWith(
+        'global', 'general', 'mem-1', [4, 5, 6],
+        expect.objectContaining({ embedding_model: 'openai/test@3' }),
+      );
+    });
+
+    it('does not stamp or gate a metadata-only updateMemory (no new vector)', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory(baseMem, [1, 2, 3]);
+      await storage.updateMemory('mem-1', { importance: 0.9 });
+
+      expect(sqlite.updateMemory).toHaveBeenLastCalledWith('mem-1', { importance: 0.9 });
+    });
+
+    it('refuses a vector-producing write when the store expects a different identity (default: refuse on)', async () => {
+      const sqlite = createMockSqlite();
+      sqlite.getExpectedEmbeddingIdentity = vi.fn(() => 'azure-foundry/old-model@1536');
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await expect(storage.writeMemory(baseMem, [1, 2, 3])).rejects.toThrow(
+        /Embedding identity mismatch.*azure-foundry\/old-model@1536.*openai\/test@3/s,
+      );
+      expect(sqlite.insertMemory).not.toHaveBeenCalled();
+      expect(qdrant.upsert).not.toHaveBeenCalled();
+    });
+
+    it('permits a mismatched write and stamps the new identity when refuse_writes_on_model_mismatch is false', async () => {
+      const sqlite = createMockSqlite();
+      sqlite.getExpectedEmbeddingIdentity = vi.fn(() => 'azure-foundry/old-model@1536');
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const config = { embedding: { refuse_writes_on_model_mismatch: false } } as unknown as import('../config/index.js').BrainConfig;
+      const storage = new StorageManager(sqlite, qdrant, embedding, undefined, config);
+
+      await storage.writeMemory(baseMem, [1, 2, 3]);
+
+      expect(sqlite.insertMemory).toHaveBeenCalledWith(
+        expect.objectContaining({ embedding_model: 'openai/test@3' }),
+      );
+      expect(qdrant.upsert).toHaveBeenCalled();
+    });
+
+    describe('reembedMismatchedVectors', () => {
+      function memWithStamp(id: string, embeddingModel: string | null): StoredMemory {
+        return { ...baseMem, id, embedding_model: embeddingModel } as StoredMemory;
+      }
+
+      it('re-embeds mismatched rows in batches and converges the store once none remain', async () => {
+        const sqlite = createMockSqlite();
+        const qdrant = createMockQdrant();
+        const embedding = createMockEmbedding();
+        const storage = new StorageManager(sqlite, qdrant, embedding);
+
+        sqlite.listMemoriesWithStaleEmbeddingStamp
+          .mockReturnValueOnce([memWithStamp('mem-a', 'azure-foundry/old@1536'), memWithStamp('mem-b', 'azure-foundry/old@1536')])
+          .mockReturnValueOnce([]);
+        sqlite.countMemoriesWithStaleEmbeddingStamp = vi.fn(() => 0);
+
+        const result = await storage.reembedMismatchedVectors({ batchSize: 2 });
+
+        expect(embedding.embed).toHaveBeenCalledTimes(2);
+        expect(qdrant.upsert).toHaveBeenCalledTimes(2);
+        expect(sqlite.markVectorSync).toHaveBeenCalledWith('mem-a', true, { embeddingModel: 'openai/test@3' });
+        expect(sqlite.markVectorSync).toHaveBeenCalledWith('mem-b', true, { embeddingModel: 'openai/test@3' });
+        expect(result).toEqual({ updated: 2, failed: 0, remaining: 0, boundReached: false, converged: true });
+        expect(sqlite.setExpectedEmbeddingIdentity).toHaveBeenCalledWith('openai/test@3');
+      });
+
+      it('isolates a per-item failure so the rest of the batch still converges, and leaves the failed row unmarked', async () => {
+        const sqlite = createMockSqlite();
+        const qdrant = createMockQdrant();
+        const embedding = createMockEmbedding();
+        (embedding.embed as ReturnType<typeof vi.fn>)
+          .mockRejectedValueOnce(new Error('embedding API down'))
+          .mockResolvedValueOnce([1, 2, 3]);
+        const storage = new StorageManager(sqlite, qdrant, embedding);
+
+        sqlite.listMemoriesWithStaleEmbeddingStamp
+          .mockReturnValueOnce([memWithStamp('mem-a', 'azure-foundry/old@1536'), memWithStamp('mem-b', 'azure-foundry/old@1536')])
+          .mockReturnValueOnce([]);
+        // One row (mem-a) never got re-stamped, so it is still reported stale.
+        sqlite.countMemoriesWithStaleEmbeddingStamp = vi.fn(() => 1);
+
+        const result = await storage.reembedMismatchedVectors({ batchSize: 2 });
+
+        expect(result.updated).toBe(1);
+        expect(result.failed).toBe(1);
+        expect(result.remaining).toBe(1);
+        expect(result.converged).toBe(false);
+        expect(sqlite.markVectorSync).toHaveBeenCalledTimes(1);
+        expect(sqlite.markVectorSync).toHaveBeenCalledWith('mem-b', true, { embeddingModel: 'openai/test@3' });
+        expect(sqlite.setExpectedEmbeddingIdentity).not.toHaveBeenCalled();
+      });
+
+      it('passes includeLegacy through to selection so legacy (NULL-stamped) rows are only swept in when requested', async () => {
+        const sqlite = createMockSqlite();
+        const qdrant = createMockQdrant();
+        const embedding = createMockEmbedding();
+        const storage = new StorageManager(sqlite, qdrant, embedding);
+        sqlite.countMemoriesWithStaleEmbeddingStamp = vi.fn(() => 0);
+
+        await storage.reembedMismatchedVectors({ includeLegacy: true, batchSize: 10 });
+
+        expect(sqlite.listMemoriesWithStaleEmbeddingStamp).toHaveBeenCalledWith(
+          'openai/test@3', true, 10, undefined,
+        );
+        expect(sqlite.countMemoriesWithStaleEmbeddingStamp).toHaveBeenCalledWith('openai/test@3', true);
+      });
+
+      it('resumes from where it left off: a bounded run does not re-process rows already re-stamped', async () => {
+        const sqlite = createMockSqlite();
+        const qdrant = createMockQdrant();
+        const embedding = createMockEmbedding();
+        const storage = new StorageManager(sqlite, qdrant, embedding);
+
+        // maxBatches: 1 stops after the first batch even though more rows
+        // remain — simulating an interrupted run. `listMemoriesWithStaleEmbeddingStamp`
+        // is re-queried fresh on the next call (not shown here), so a real
+        // store's next invocation naturally excludes rows this batch already
+        // re-stamped, since they no longer match the stale-stamp predicate.
+        sqlite.listMemoriesWithStaleEmbeddingStamp.mockReturnValueOnce([memWithStamp('mem-a', 'azure-foundry/old@1536')]);
+        sqlite.countMemoriesWithStaleEmbeddingStamp = vi.fn(() => 5);
+
+        const result = await storage.reembedMismatchedVectors({ batchSize: 1, maxBatches: 1 });
+
+        expect(result.boundReached).toBe(true);
+        expect(result.updated).toBe(1);
+        expect(result.converged).toBe(false);
+        expect(sqlite.setExpectedEmbeddingIdentity).not.toHaveBeenCalled();
+      });
     });
   });
 });

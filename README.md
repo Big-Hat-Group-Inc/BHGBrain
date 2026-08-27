@@ -21,6 +21,7 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
    - [Device Identity Resolution](#device-identity-resolution)
    - [Shared Qdrant, Local SQLite](#shared-qdrant-local-sqlite)
    - [Repair and Recovery](#repair-and-recovery)
+   - [Embedding Model Migration](#embedding-model-migration)
 10. [Memory Management](#memory-management)
    - [Memory Data Model](#memory-data-model)
    - [Memory Types](#memory-types)
@@ -269,6 +270,16 @@ The file is created automatically on first run with all defaults applied. Edit i
       "max_attempts": 3,
       "backoff_ms": 1000
     },
+    // Every vector is stamped with a provider-qualified identity
+    // (`<provider>/<model>@<dimensions>`) at write time. If the store's
+    // recorded expected identity (adopted on the first write after startup)
+    // differs from this configuration — e.g. after changing provider or
+    // model — the `embedding` health component degrades and, while this
+    // flag is true, vector-producing writes are refused with an error
+    // naming the `repair` tool's re-embed mode. Set to false only if you
+    // intentionally want writes to mix embedding spaces. See
+    // "Embedding Model Migration" below.
+    "refuse_writes_on_model_mismatch": true,
     // Name of the environment variable holding the OpenAI API key (ignored for Azure)
     "api_key_env": "OPENAI_API_KEY",
     // Azure-specific configuration (required when provider = "azure-foundry")
@@ -760,6 +771,61 @@ The repair tool:
 - Reports: collections scanned, points scanned, recovered, skipped (no content), errors
 
 **Note**: Memories stored before the content-in-Qdrant feature was added (pre-1.3) do not have content in their Qdrant payload and cannot be recovered via repair. Only metadata (tags, type, importance) survives for those entries.
+
+### Embedding Model Migration
+
+Every vector is stamped at write time with a provider-qualified identity —
+`<provider>/<model>@<dimensions>` (e.g. `openai/text-embedding-3-small@1536`) — on
+both the SQLite row and the Qdrant payload. The store also remembers this identity as
+its expectation, adopted the first time it is written after startup.
+
+This exists because mixing embedding spaces is silent corruption: if you change
+`embedding.provider` or `embedding.model` in `config.json` while dimensions stay the
+same (e.g. switching to an Azure deployment of the same model family), nothing at the
+Qdrant layer detects it — new vectors land in the same collection as old ones, cosine
+similarity across the two spaces is meaningless, and both recall relevance and
+deduplication (`similar[0]` scores feeding the 0.92/0.98 thresholds) silently corrode.
+A dimension change fails loudly with an opaque Qdrant error instead; provenance
+stamping makes the same class of problem loud and actionable in both cases.
+
+**What happens after a model change:**
+
+1. On the next startup (or health check), the store's recorded expected identity no
+   longer matches the active configuration. The `embedding` health component degrades
+   with a message naming both identities, and a structured `embedding_identity_mismatch`
+   warning is logged.
+2. While `embedding.refuse_writes_on_model_mismatch` is `true` (the default),
+   vector-producing writes (remember, tag-triggered re-embeds, restore reconciliation)
+   fail with an actionable `CONFLICT` error naming the re-embed path. Reads keep
+   working — recall and search still serve the old vectors, just at degraded health.
+3. Run the migration:
+
+   ```bash
+   bhgbrain repair --re-embed              # migrate stale-stamped rows
+   bhgbrain repair --re-embed --dry-run    # preview how many rows would be re-embedded
+   bhgbrain repair --re-embed --include-legacy   # also sweep up pre-provenance rows (no stamp at all)
+   ```
+
+   Or via the `repair` MCP tool with `mode: "re-embed"` (see
+   [MCP Tools Reference](#mcp-tools-reference)). The migration re-embeds mismatched
+   memories in bounded, resumable batches — the stamp itself is the progress marker,
+   so an interrupted run resumes without repeating completed rows, and a single
+   memory's embed/upsert failure is isolated rather than aborting the batch.
+4. Once no stale-stamped rows remain, the store's expected identity updates
+   automatically and the `embedding` health degradation clears — no restart needed.
+
+**Notes:**
+- Legacy rows written before provenance stamping have no stamp (`null`) and are
+  treated as "unknown" — excluded from re-embed unless `--include-legacy` /
+  `include_legacy: true` is passed, so a first upgrade doesn't trigger a surprise
+  full-corpus re-embed (and its embedding API cost) on its own.
+- Re-embedding is always operator-initiated — it is never triggered automatically,
+  because it calls the paid embedding API once per migrated memory.
+- Set `embedding.refuse_writes_on_model_mismatch` to `false` only if you intentionally
+  want writes to proceed and mix embedding spaces (e.g. a deliberate, monitored
+  migration window) — the stamp still records what happened.
+- Archived memories are never re-embedded; their vectors are already gone by design
+  (see [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving)).
 
 ### Multi-Device Configuration Example
 
@@ -2054,6 +2120,12 @@ bhgbrain audit                        # Show recent audit entries
 bhgbrain repair --from-qdrant                # Hydrate local SQLite from Qdrant (current device's memories only, by default)
 bhgbrain repair --from-qdrant --all-devices  # Hydrate from every device's memories, not just the current one
 
+# Repair (embedding model migration — see Embedding Model Migration)
+bhgbrain repair --re-embed                   # Migrate vectors stamped with a stale embedding identity
+bhgbrain repair --re-embed --dry-run         # Preview how many rows would be re-embedded
+bhgbrain repair --re-embed --include-legacy  # Also sweep up pre-provenance rows (no stamp at all)
+bhgbrain repair --re-embed --batch-size 100  # Tune the per-batch size (default 50)
+
 # Category management
 bhgbrain category list                # List all categories
 bhgbrain category get <name>          # Show category content
@@ -2485,19 +2557,27 @@ Import a structured profile or freeform document as discrete memories in one sho
 
 ---
 
-### `repair` — Rebuild SQLite from Qdrant
+### `repair` — Rebuild SQLite from Qdrant, or migrate stale embedding stamps
 
-Recover memories from Qdrant into the local SQLite database. Used for multi-device setup, data loss recovery, or new device onboarding. See [Repair and Recovery](#repair-and-recovery).
+Repairs local state from external sources. `mode: "from-qdrant"` (default) recovers
+memories from Qdrant into the local SQLite database — used for multi-device setup,
+data loss recovery, or new device onboarding. `mode: "re-embed"` migrates memories
+whose embedding stamp differs from the active `embedding.provider`/`embedding.model`
+— see [Embedding Model Migration](#embedding-model-migration). See also
+[Repair and Recovery](#repair-and-recovery).
 
 **Input:**
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `dry_run` | `boolean` | No | `false` | When `true`, reports what would be recovered without making changes. |
-| `device_id` | `string` | No | — | Filter recovery to memories created by a specific device. Mutually exclusive with `all_devices`. |
-| `all_devices` | `boolean` | No | `false` | Explicitly recover memories from every device. Mutually exclusive with `device_id`. This is also the default behavior when neither field is provided. |
+| `mode` | `"from-qdrant" \| "re-embed"` | No | `"from-qdrant"` | Which repair operation to run. |
+| `dry_run` | `boolean` | No | `false` | When `true`, reports what would change without making changes. |
+| `device_id` | `string` | No | — | (`from-qdrant` only) Filter recovery to memories created by a specific device. Mutually exclusive with `all_devices`. |
+| `all_devices` | `boolean` | No | `false` | (`from-qdrant` only) Explicitly recover memories from every device. Mutually exclusive with `device_id`. This is also the default behavior when neither field is provided. |
+| `include_legacy` | `boolean` | No | `false` | (`re-embed` only) Also re-embed legacy rows with no embedding stamp at all (predating provenance stamping), not just rows stamped with a different model. |
+| `batch_size` | `number` | No | `50` | (`re-embed` only) Memories re-embedded per batch (1-500). |
 
-**Output:**
+**Output (`mode: "from-qdrant"`):**
 
 ```json
 {
@@ -2516,8 +2596,31 @@ Recover memories from Qdrant into the local SQLite database. Used for multi-devi
 **Notes:**
 - Only points with `content` in their Qdrant payload can be recovered. Pre-1.3 memories without content in Qdrant are reported as `skipped_no_content`.
 - Recovered memories preserve their original `device_id` from the Qdrant payload. If no `device_id` exists in the payload, the local device's ID is used.
+- Recovered memories also preserve whatever embedding identity (if any) their source vector was already stamped with, rather than claiming the active configuration's identity — recovery reconstructs metadata for an existing vector, it does not produce a new one.
 - Passing both `device_id` and `all_devices: true` is rejected as invalid input.
 - After recovery, run `npm run build` and restart the server if needed. The recovered memories are immediately available for search and recall.
+
+**Output (`mode: "re-embed"`):**
+
+```json
+{
+  "mode": "re-embed",
+  "dry_run": false,
+  "active_identity": "openai/text-embedding-3-small@1536",
+  "include_legacy": false,
+  "updated": 118,
+  "failed": 0,
+  "remaining": 0,
+  "bound_reached": false,
+  "converged": true
+}
+```
+
+**Notes:**
+- Selection is based on the stamp itself, so an interrupted run resumes safely — rows already re-stamped with the active identity simply stop matching on the next call.
+- A per-memory embed/upsert failure is isolated (counted in `failed`, left for a future run) rather than aborting the whole batch.
+- `converged: true` means no stale-stamped rows remain (within the requested `include_legacy` scope); the store's expected identity is updated and the `embedding` health degradation clears immediately, without a restart.
+- Also available from the CLI: `bhgbrain repair --re-embed [--include-legacy] [--batch-size <n>] [--dry-run]`.
 
 ---
 

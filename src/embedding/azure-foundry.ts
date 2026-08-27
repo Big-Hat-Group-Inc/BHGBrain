@@ -2,7 +2,7 @@ import type { BrainConfig } from '../config/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { CircuitBreaker } from '../resilience/index.js';
 import { BrainError, embeddingUnavailable, rateLimited } from '../errors/index.js';
-import type { EmbeddingProvider } from './index.js';
+import { formatEmbeddingIdentity, type EmbeddingProvider } from './index.js';
 
 function shouldIncludeDimensions(model: string): boolean {
   return model === 'text-embedding-3-small' || model === 'text-embedding-3-large';
@@ -27,8 +27,10 @@ function getErrorMessage(err: unknown): string {
 }
 
 export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
+  readonly provider = 'azure-foundry';
   readonly model: string;
   readonly dimensions: number;
+  readonly identity: string;
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly requestTimeoutMs: number;
@@ -45,6 +47,7 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
   ) {
     this.model = config.embedding.model;
     this.dimensions = config.embedding.dimensions;
+    this.identity = formatEmbeddingIdentity(this.provider, this.model, this.dimensions);
     this.requestTimeoutMs = config.embedding.request_timeout_ms;
     this.maxBatchInputs = config.embedding.max_batch_inputs;
     this.retryMaxAttempts = config.embedding.retry.max_attempts;

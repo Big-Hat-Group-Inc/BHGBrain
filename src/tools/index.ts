@@ -11,6 +11,7 @@ import {
   RememberInputSchema, RecallInputSchema, ForgetInputSchema,
   SearchInputSchema, TagInputSchema, CollectionsInputSchema,
   CategoryInputSchema, BackupInputSchema, RepairInputSchema,
+  type RepairInput,
 } from '../domain/schemas.js';
 import type { WriteResult, SearchResult, MemoryRecord, RecallFilter } from '../domain/types.js';
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
@@ -362,6 +363,9 @@ async function handleBackup(ctx: ToolContext, args: unknown): Promise<unknown> {
 
 async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
   const input = parseInput(RepairInputSchema, args);
+  if (input.mode === 're-embed') {
+    return handleReembed(ctx, input);
+  }
   const dryRun = input.dry_run;
   // `all_devices` and `device_id` are mutually exclusive (enforced by the
   // schema); omitting both is the documented, backward-compatible
@@ -455,6 +459,12 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
         archived: false,
         vector_synced: true,
         device_id: recoveredDeviceId,
+        // Carry forward whatever identity the recovered vector was already
+        // stamped with — this reconstructs a SQLite row from an existing
+        // Qdrant point, not a new embedding, so it must not claim the active
+        // configuration's identity. Missing on the payload means the point
+        // predates provenance stamping and stays "unknown" (null).
+        embedding_model: typeof payload.embedding_model === 'string' ? payload.embedding_model : null,
         created_at: (payload.created_at as string) ?? now,
         updated_at: now,
         last_accessed: now,
@@ -485,5 +495,42 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
     skipped_device_filter: filterDeviceId ? skippedDeviceFilter : undefined,
     recovered: recoveredCount,
     errors: errors.length > 0 ? errors : undefined,
+  };
+}
+
+async function handleReembed(ctx: ToolContext, input: RepairInput): Promise<unknown> {
+  const activeIdentity = ctx.embedding.identity;
+  const expectedIdentity = ctx.storage.getExpectedEmbeddingIdentity();
+
+  if (input.dry_run) {
+    const staleCount = ctx.storage.sqlite.countMemoriesWithStaleEmbeddingStamp(activeIdentity, input.include_legacy);
+    return {
+      mode: 're-embed',
+      dry_run: true,
+      active_identity: activeIdentity,
+      expected_identity: expectedIdentity,
+      include_legacy: input.include_legacy,
+      would_re_embed: staleCount,
+    };
+  }
+
+  const result = await ctx.storage.reembedMismatchedVectors({
+    includeLegacy: input.include_legacy,
+    batchSize: input.batch_size,
+    logger: ctx.logger,
+  });
+
+  ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
+
+  return {
+    mode: 're-embed',
+    dry_run: false,
+    active_identity: activeIdentity,
+    include_legacy: input.include_legacy,
+    updated: result.updated,
+    failed: result.failed,
+    remaining: result.remaining,
+    bound_reached: result.boundReached,
+    converged: result.converged,
   };
 }

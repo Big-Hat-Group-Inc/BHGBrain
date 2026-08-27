@@ -50,6 +50,13 @@ const ConfigSchema = z.object({
       backoff_ms: z.number().int().positive().default(1000),
     }).default({}),
     azure: AzureEmbeddingSchema.optional(),
+    // Guards against silently mixing embedding spaces: when the store's
+    // persisted expected embedding identity (see embedding-provenance)
+    // differs from the active configuration, vector-producing writes fail
+    // with an actionable error instead of writing vectors from a different
+    // model into the same collection. Disable only if you intentionally
+    // want to mix spaces (e.g. a deliberate, monitored migration window).
+    refuse_writes_on_model_mismatch: z.boolean().default(true),
   }).superRefine((value, ctx) => {
     if (value.provider === 'azure-foundry' && !value.azure) {
       ctx.addIssue({

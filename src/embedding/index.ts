@@ -8,17 +8,37 @@ function isMissingCredentialError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith('Missing environment variable: ');
 }
 
+/**
+ * Canonical, provider-qualified embedding identity string:
+ * `<provider>/<model>@<dimensions>`. Provider-qualified because the same
+ * model name served by OpenAI vs an Azure deployment is not guaranteed
+ * byte-identical; dimensions included because Matryoshka-truncated variants
+ * of one model are different vector spaces. This is the single source of
+ * truth for the identity format — every stamp (SQLite row, Qdrant payload,
+ * the store's expected-identity record) is derived from this function so
+ * the format can never drift between call sites.
+ */
+export function formatEmbeddingIdentity(provider: string, model: string, dimensions: number): string {
+  return `${provider}/${model}@${dimensions}`;
+}
+
 export interface EmbeddingProvider {
+  readonly provider: string;
   readonly model: string;
   readonly dimensions: number;
+  // Provider-qualified identity for this provider's active configuration
+  // (see formatEmbeddingIdentity). Stamped on every vector-producing write.
+  readonly identity: string;
   embed(text: string): Promise<number[]>;
   embedBatch(texts: string[]): Promise<number[][]>;
   healthCheck(): Promise<boolean>;
 }
 
 export class OpenAIEmbeddingProvider implements EmbeddingProvider {
+  readonly provider = 'openai';
   readonly model: string;
   readonly dimensions: number;
+  readonly identity: string;
   private apiKey: string;
   private baseUrl = 'https://api.openai.com/v1';
 
@@ -29,6 +49,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   ) {
     this.model = config.embedding.model;
     this.dimensions = config.embedding.dimensions;
+    this.identity = formatEmbeddingIdentity(this.provider, this.model, this.dimensions);
     const key = process.env[config.embedding.api_key_env];
     if (!key) {
       throw new Error(`Missing environment variable: ${config.embedding.api_key_env}`);
@@ -104,13 +125,17 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
  * Allows the server to start but rejects embedding-dependent operations at request time.
  */
 export class DegradedEmbeddingProvider implements EmbeddingProvider {
+  readonly provider: string;
   readonly model: string;
   readonly dimensions: number;
+  readonly identity: string;
   readonly degraded = true;
 
   constructor(config: BrainConfig) {
+    this.provider = config.embedding.provider;
     this.model = config.embedding.model;
     this.dimensions = config.embedding.dimensions;
+    this.identity = formatEmbeddingIdentity(this.provider, this.model, this.dimensions);
   }
 
   async embed(): Promise<number[]> {

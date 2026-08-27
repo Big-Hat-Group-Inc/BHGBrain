@@ -309,7 +309,7 @@ describe('CLI', () => {
 
     await runProgram(['repair'], context);
 
-    expect(errorSpy).toHaveBeenCalledWith('Please specify a repair source. Available: --from-qdrant');
+    expect(errorSpy).toHaveBeenCalledWith('Please specify a repair source. Available: --from-qdrant, --re-embed');
     expect(process.exitCode).toBe(1);
   });
 });

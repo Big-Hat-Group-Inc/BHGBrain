@@ -21,6 +21,7 @@ BHGBrain almacena memorias en SQLite (metadatos + búsqueda de texto completo) y
    - [Resolución de Identidad de Dispositivo](#resolución-de-identidad-de-dispositivo)
    - [Qdrant Compartido, SQLite Local](#qdrant-compartido-sqlite-local)
    - [Reparación y Recuperación](#reparación-y-recuperación)
+   - [Migración de Modelo de Embedding](#migración-de-modelo-de-embedding)
 10. [Gestión de Memorias](#gestión-de-memorias)
     - [Modelo de Datos de Memoria](#modelo-de-datos-de-memoria)
     - [Tipos de Memoria](#tipos-de-memoria)
@@ -242,7 +243,18 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     "api_key_env": "OPENAI_API_KEY",
     // Dimensiones vectoriales producidas por el modelo. Debe coincidir con la salida del modelo.
     // IMPORTANTE: Cambiar esto después de crear colecciones requiere recrearlas.
-    "dimensions": 1536
+    "dimensions": 1536,
+    // Cada vector se marca con una identidad cualificada por proveedor
+    // (`<provider>/<model>@<dimensions>`) en el momento de la escritura. Si la
+    // identidad esperada registrada por el almacén (adoptada en la primera
+    // escritura tras el arranque) difiere de esta configuración — p. ej. tras
+    // cambiar de proveedor o modelo — el componente de salud `embedding` se
+    // degrada y, mientras este flag sea true, las escrituras que producen
+    // vectores se rechazan con un error que nombra el modo re-embed de la
+    // herramienta `repair`. Establézcalo en false solo si desea que las
+    // escrituras mezclen espacios de embedding intencionadamente. Ver
+    // "Migración de Modelo de Embedding" más abajo.
+    "refuse_writes_on_model_mismatch": true
   },
 
   // Configuración de conexión a Qdrant
@@ -711,6 +723,69 @@ La herramienta de reparación:
 - Reporta: colecciones escaneadas, puntos escaneados, recuperados, omitidos (sin contenido), errores
 
 **Nota**: Las memorias almacenadas antes de que se añadiera la función de contenido en Qdrant (pre-1.3) no tienen contenido en su payload de Qdrant y no pueden recuperarse vía reparación. Solo los metadatos (etiquetas, tipo, importancia) sobreviven para esas entradas.
+
+### Migración de Modelo de Embedding
+
+Cada vector se marca en el momento de la escritura con una identidad cualificada por
+proveedor — `<provider>/<model>@<dimensions>` (p. ej. `openai/text-embedding-3-small@1536`)
+— tanto en la fila de SQLite como en el payload de Qdrant. El almacén también recuerda
+esta identidad como su expectativa, adoptada la primera vez que se escribe tras el
+arranque.
+
+Esto existe porque mezclar espacios de embedding es una corrupción silenciosa: si
+cambia `embedding.provider` o `embedding.model` en `config.json` manteniendo las
+mismas dimensiones (p. ej. cambiando a un despliegue de Azure de la misma familia de
+modelos), nada a nivel de Qdrant lo detecta — los nuevos vectores se mezclan en la
+misma colección que los antiguos, la similitud coseno entre los dos espacios carece
+de sentido, y tanto la relevancia del recall como la deduplicación (los puntajes de
+`similar[0]` que alimentan los umbrales 0.92/0.98) se degradan silenciosamente. Un
+cambio de dimensiones falla ruidosamente con un error opaco de Qdrant; el marcado de
+procedencia hace que ambos casos sean ruidosos y accionables.
+
+**Qué ocurre tras un cambio de modelo:**
+
+1. En el siguiente arranque (o chequeo de salud), la identidad esperada registrada por
+   el almacén ya no coincide con la configuración activa. El componente de salud
+   `embedding` se degrada con un mensaje que nombra ambas identidades, y se registra
+   una advertencia estructurada `embedding_identity_mismatch`.
+2. Mientras `embedding.refuse_writes_on_model_mismatch` sea `true` (por defecto),
+   las escrituras que producen vectores (remember, re-embeddings disparados por
+   tags, reconciliación de restauración) fallan con un error `CONFLICT` accionable
+   que nombra la ruta de re-embedding. Las lecturas siguen funcionando — recall y
+   search siguen sirviendo los vectores antiguos, solo con salud degradada.
+3. Ejecute la migración:
+
+   ```bash
+   bhgbrain repair --re-embed              # migrar filas con marca obsoleta
+   bhgbrain repair --re-embed --dry-run    # previsualizar cuántas filas se re-embeberían
+   bhgbrain repair --re-embed --include-legacy   # incluir también filas sin marca alguna
+   ```
+
+   O mediante la herramienta MCP `repair` con `mode: "re-embed"` (ver
+   [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)). La migración
+   re-embebe las memorias no coincidentes en lotes acotados y reanudables — la
+   propia marca es el marcador de progreso, por lo que una ejecución interrumpida
+   se reanuda sin repetir filas ya completadas, y el fallo de un solo
+   embed/upsert se aísla en lugar de abortar todo el lote.
+4. Una vez que no quedan filas con marca obsoleta, la identidad esperada del
+   almacén se actualiza automáticamente y la degradación de salud `embedding`
+   desaparece — sin reinicio.
+
+**Notas:**
+- Las filas heredadas escritas antes del marcado de procedencia no tienen marca
+  (`null`) y se tratan como "desconocidas" — se excluyen del re-embedding a menos
+  que se pase `--include-legacy` / `include_legacy: true`, para que una primera
+  actualización no dispare por sorpresa un re-embedding completo del corpus (y su
+  coste de API de embedding).
+- El re-embedding siempre lo inicia el operador — nunca se dispara
+  automáticamente, porque llama a la API de pago de embeddings una vez por cada
+  memoria migrada.
+- Configure `embedding.refuse_writes_on_model_mismatch` en `false` solo si desea
+  intencionadamente que las escrituras continúen mezclando espacios de embedding
+  (p. ej. una ventana de migración deliberada y monitorizada) — la marca sigue
+  registrando lo que ocurrió.
+- Las memorias archivadas nunca se re-embeben; sus vectores ya se eliminaron por
+  diseño (ver [Decaimiento, Limpieza y Archivado](#decaimiento-limpieza-y-archivado)).
 
 ### Ejemplo de Configuración Multi-Dispositivo
 
@@ -1973,6 +2048,12 @@ bhgbrain audit                        # Mostrar entradas de auditoría recientes
 bhgbrain repair --from-qdrant                # Hidratar SQLite local desde Qdrant (solo memorias del dispositivo actual, por defecto)
 bhgbrain repair --from-qdrant --all-devices  # Hidratar desde las memorias de todos los dispositivos, no solo el actual
 
+# Reparación (migración de modelo de embedding — ver Migración de Modelo de Embedding)
+bhgbrain repair --re-embed                   # Migrar vectores con marca de embedding obsoleta
+bhgbrain repair --re-embed --dry-run         # Previsualizar cuántas filas se re-embeberían
+bhgbrain repair --re-embed --include-legacy  # Incluir también filas sin marca alguna
+bhgbrain repair --re-embed --batch-size 100  # Ajustar el tamaño de lote (por defecto 50)
+
 # Gestión de categorías
 bhgbrain category list                # Listar todas las categorías
 bhgbrain category get <name>          # Mostrar contenido de una categoría
@@ -2330,19 +2411,28 @@ Crea, lista o restaura copias de seguridad de memorias.
 
 ---
 
-### `repair` — Reconstruir SQLite desde Qdrant
+### `repair` — Reconstruir SQLite desde Qdrant, o migrar marcas de embedding obsoletas
 
-Recuperar memorias desde Qdrant a la base de datos SQLite local. Se usa para configuración multi-dispositivo, recuperación de pérdida de datos o incorporación de nuevos dispositivos. Ver [Reparación y Recuperación](#reparación-y-recuperación).
+Repara el estado local desde fuentes externas. `mode: "from-qdrant"` (predeterminado)
+recupera memorias desde Qdrant a la base de datos SQLite local — se usa para
+configuración multi-dispositivo, recuperación de pérdida de datos o incorporación de
+nuevos dispositivos. `mode: "re-embed"` migra memorias cuya marca de embedding
+difiere del `embedding.provider`/`embedding.model` activo — ver
+[Migración de Modelo de Embedding](#migración-de-modelo-de-embedding). Ver también
+[Reparación y Recuperación](#reparación-y-recuperación).
 
 **Entrada:**
 
 | Parámetro | Tipo | Requerido | Predeterminado | Descripción |
 |---|---|---|---|---|
-| `dry_run` | `boolean` | No | `false` | Cuando es `true`, reporta lo que se recuperaría sin hacer cambios. |
-| `device_id` | `string` | No | — | Filtrar la recuperación a memorias creadas por un dispositivo específico. Mutuamente excluyente con `all_devices`. |
-| `all_devices` | `boolean` | No | `false` | Recuperar explícitamente memorias de todos los dispositivos. Mutuamente excluyente con `device_id`. Este es también el comportamiento predeterminado cuando no se proporciona ninguno de los dos campos. |
+| `mode` | `"from-qdrant" \| "re-embed"` | No | `"from-qdrant"` | Qué operación de reparación ejecutar. |
+| `dry_run` | `boolean` | No | `false` | Cuando es `true`, reporta lo que cambiaría sin hacer cambios. |
+| `device_id` | `string` | No | — | (solo `from-qdrant`) Filtrar la recuperación a memorias creadas por un dispositivo específico. Mutuamente excluyente con `all_devices`. |
+| `all_devices` | `boolean` | No | `false` | (solo `from-qdrant`) Recuperar explícitamente memorias de todos los dispositivos. Mutuamente excluyente con `device_id`. Este es también el comportamiento predeterminado cuando no se proporciona ninguno de los dos campos. |
+| `include_legacy` | `boolean` | No | `false` | (solo `re-embed`) Incluir también filas heredadas sin marca de embedding alguna, no solo filas con un modelo distinto. |
+| `batch_size` | `number` | No | `50` | (solo `re-embed`) Memorias re-embebidas por lote (1-500). |
 
-**Salida:**
+**Salida (`mode: "from-qdrant"`):**
 
 ```json
 {
@@ -2361,8 +2451,31 @@ Recuperar memorias desde Qdrant a la base de datos SQLite local. Se usa para con
 **Notas:**
 - Solo los puntos con `content` en su payload de Qdrant pueden recuperarse. Las memorias pre-1.3 sin contenido en Qdrant se reportan como `skipped_no_content`.
 - Las memorias recuperadas preservan su `device_id` original del payload de Qdrant. Si no existe `device_id` en el payload, se usa el ID del dispositivo local.
+- Las memorias recuperadas también preservan la identidad de embedding (si existe) que su vector de origen ya tenía marcada, en lugar de reclamar la identidad de la configuración activa — la recuperación reconstruye metadatos para un vector existente, no produce uno nuevo.
 - Pasar tanto `device_id` como `all_devices: true` se rechaza como entrada inválida.
 - Después de la recuperación, ejecuta `npm run build` y reinicia el servidor si es necesario. Las memorias recuperadas están inmediatamente disponibles para búsqueda y recall.
+
+**Salida (`mode: "re-embed"`):**
+
+```json
+{
+  "mode": "re-embed",
+  "dry_run": false,
+  "active_identity": "openai/text-embedding-3-small@1536",
+  "include_legacy": false,
+  "updated": 118,
+  "failed": 0,
+  "remaining": 0,
+  "bound_reached": false,
+  "converged": true
+}
+```
+
+**Notas:**
+- La selección se basa en la propia marca, por lo que una ejecución interrumpida se reanuda de forma segura — las filas ya re-marcadas con la identidad activa simplemente dejan de coincidir en la siguiente llamada.
+- Un fallo de embed/upsert por memoria se aísla (se cuenta en `failed`, se deja para una ejecución futura) en lugar de abortar todo el lote.
+- `converged: true` significa que no quedan filas con marca obsoleta (dentro del alcance de `include_legacy` solicitado); la identidad esperada del almacén se actualiza y la degradación de salud `embedding` se resuelve de inmediato, sin reinicio.
+- También disponible desde la CLI: `bhgbrain repair --re-embed [--include-legacy] [--batch-size <n>] [--dry-run]`.
 
 ---
 

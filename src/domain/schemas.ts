@@ -83,9 +83,23 @@ export const BackupInputSchema = z.object({
 }).strict();
 
 export const RepairInputSchema = z.object({
+  // 'from-qdrant' (default): the pre-existing behavior — recover memories
+  // missing from SQLite by scrolling Qdrant payloads. 're-embed': the
+  // embedding-provenance migration — re-embed memories whose stamp differs
+  // from the active embedding identity. Kept on one tool (rather than a new
+  // one) per the design's "extend repair" decision: it already owns
+  // cross-store reconciliation UX, dry-run convention, and device scoping.
+  mode: z.enum(['from-qdrant', 're-embed']).optional().default('from-qdrant'),
   dry_run: z.boolean().optional().default(false),
   device_id: z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/).optional(),
   all_devices: z.boolean().optional().default(false),
+  // re-embed only: also re-embed legacy rows with no stamp at all (NULL),
+  // not just rows stamped with a different identity. Defaults false per
+  // "Legacy unstamped rows ... included in migration only when explicitly
+  // requested".
+  include_legacy: z.boolean().optional().default(false),
+  // re-embed only: memories re-embedded per batch.
+  batch_size: z.number().int().min(1).max(500).optional().default(50),
 }).strict().refine(
   data => !(data.all_devices && data.device_id !== undefined),
   { message: 'device_id and all_devices are mutually exclusive', path: ['all_devices'] },

@@ -36,7 +36,7 @@ async function createContext(): Promise<ToolContext> {
   const metrics = new MetricsCollector(config);
   const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
-  const storage = new StorageManager(sqlite, qdrant, embedding);
+  const storage = new StorageManager(sqlite, qdrant, embedding, undefined, config);
 
   const pipeline = new WritePipeline(config, storage, embedding);
   const searchService = new SearchService(config, storage, embedding, metrics, logger);
@@ -379,9 +379,27 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .description('Repair local state from external sources')
     .option('--from-qdrant', 'Hydrate local SQLite from Qdrant Cloud payloads')
     .option('--all-devices', 'Hydrate memories from every device, not just the current one (default: current device only)')
+    .option('--re-embed', 'Migrate memories whose embedding stamp differs from the active embedding.provider/model to the active identity')
+    .option('--include-legacy', 'With --re-embed, also re-embed legacy rows that predate provenance stamping (no stamp at all)')
+    .option('--batch-size <n>', 'With --re-embed, memories re-embedded per batch', '50')
+    .option('--dry-run', 'With --re-embed, report what would change without making changes')
     .action(async (opts) => {
+      if (opts.reEmbed) {
+        const ctx = await createContextImpl();
+        console.log('[repair] re-embed: scanning for stale embedding stamps...');
+        const result = await handleTool(ctx, 'repair', {
+          mode: 're-embed',
+          include_legacy: Boolean(opts.includeLegacy),
+          batch_size: parseInt(opts.batchSize, 10),
+          dry_run: Boolean(opts.dryRun),
+        });
+        console.log(JSON.stringify(result, null, 2));
+        ctx.storage.sqlite.close();
+        return;
+      }
+
       if (!opts.fromQdrant) {
-        console.error('Please specify a repair source. Available: --from-qdrant');
+        console.error('Please specify a repair source. Available: --from-qdrant, --re-embed');
         process.exitCode = 1;
         return;
       }

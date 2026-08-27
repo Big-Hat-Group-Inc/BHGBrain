@@ -91,6 +91,7 @@ describe('HealthService', () => {
         countUnsyncedVectors: vi.fn(() => 0),
         getLifecycleOperation: vi.fn(() => null),
         getRetentionDegraded: vi.fn(() => ({ degraded: false, message: null, last_success_at: null })),
+        getExpectedEmbeddingIdentity: vi.fn(() => null),
       },
       qdrant: {
         healthCheck: vi.fn(async () => true),
@@ -101,8 +102,10 @@ describe('HealthService', () => {
 
   function createEmbedding(embeddingOk = true): EmbeddingProvider {
     return {
+      provider: 'openai',
       model: 'test',
       dimensions: 3,
+      identity: 'openai/test@3',
       embed: vi.fn(async () => [1, 2, 3]),
       embedBatch: vi.fn(async () => [[1, 2, 3]]),
       healthCheck: vi.fn(async () => embeddingOk),
@@ -383,6 +386,54 @@ describe('HealthService', () => {
       state: 'reconciling',
       unsynced_vectors: 5,
       message: 'Bounded background vector reconciliation is in progress.',
+    });
+  });
+
+  // openspec/changes/stamp-embedding-provenance
+  describe('embedding identity mismatch', () => {
+    it('degrades embedding health with both identities when the store expects a different one than active config', async () => {
+      const storage = createStorage();
+      storage.sqlite.getExpectedEmbeddingIdentity = vi.fn(() => 'azure-foundry/old-model@1536');
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.status).toBe('degraded');
+      expect(result.components.embedding.status).toBe('degraded');
+      expect(result.components.embedding.message).toContain('azure-foundry/old-model@1536');
+      expect(result.components.embedding.message).toContain('openai/test@3');
+    });
+
+    it('reports healthy embedding when the store has no adopted expectation yet', async () => {
+      const storage = createStorage();
+      storage.sqlite.getExpectedEmbeddingIdentity = vi.fn(() => null);
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.components.embedding.status).toBe('healthy');
+    });
+
+    it('reports healthy embedding when the store expectation matches the active identity', async () => {
+      const storage = createStorage();
+      storage.sqlite.getExpectedEmbeddingIdentity = vi.fn(() => 'openai/test@3');
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.components.embedding.status).toBe('healthy');
+    });
+
+    it('degrades on identity mismatch even when the reachability probe itself is healthy', async () => {
+      const storage = createStorage();
+      storage.sqlite.getExpectedEmbeddingIdentity = vi.fn(() => 'azure-foundry/old-model@1536');
+
+      // embeddingOk=true: the provider is perfectly reachable, but the
+      // mismatch must still win — connectivity is not the risk here.
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.components.embedding.status).toBe('degraded');
     });
   });
 });

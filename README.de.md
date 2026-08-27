@@ -21,6 +21,7 @@ BHGBrain speichert Erinnerungen in SQLite (Metadaten + Volltextsuche) und Qdrant
    - [Geräteidentitätsauflösung](#geräteidentitätsauflösung)
    - [Gemeinsames Qdrant, lokales SQLite](#gemeinsames-qdrant-lokales-sqlite)
    - [Reparatur und Wiederherstellung](#reparatur-und-wiederherstellung)
+   - [Migration des Einbettungsmodells](#migration-des-einbettungsmodells)
 10. [Speicherverwaltung](#speicherverwaltung)
     - [Speicher-Datenmodell](#speicher-datenmodell)
     - [Speichertypen](#speichertypen)
@@ -242,7 +243,17 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "api_key_env": "OPENAI_API_KEY",
     // Vektordimensionen des Modells. Muss mit der Modellausgabe übereinstimmen.
     // WICHTIG: Eine Änderung nach dem Erstellen von Sammlungen erfordert deren Neuerstellung.
-    "dimensions": 1536
+    "dimensions": 1536,
+    // Jeder Vektor wird beim Schreiben mit einer anbieterqualifizierten Identität
+    // (`<provider>/<model>@<dimensions>`) gestempelt. Weicht die vom Store erwartete
+    // Identität (beim ersten Schreiben nach dem Start übernommen) von dieser
+    // Konfiguration ab — z. B. nach einem Provider- oder Modellwechsel —, degradiert
+    // die `embedding`-Health-Komponente, und solange dieses Flag `true` ist, werden
+    // vektorproduzierende Schreibvorgänge mit einem Fehler abgelehnt, der auf den
+    // Re-Embed-Modus des `repair`-Tools verweist. Nur auf `false` setzen, wenn
+    // Schreibvorgänge absichtlich Einbettungsräume mischen sollen. Siehe
+    // „Migration des Einbettungsmodells" unten.
+    "refuse_writes_on_model_mismatch": true
   },
 
   // Qdrant-Verbindungskonfiguration
@@ -713,6 +724,68 @@ Das repair-Tool:
 - Berichtet: durchsuchte Sammlungen, durchsuchte Punkte, wiederhergestellt, übersprungen (kein Inhalt), Fehler
 
 **Hinweis**: Erinnerungen, die vor dem Feature Content-in-Qdrant gespeichert wurden (vor 1.3), haben keinen Inhalt in ihrem Qdrant-Payload und können nicht über repair wiederhergestellt werden. Nur Metadaten (Tags, Typ, Wichtigkeit) bleiben für diese Einträge erhalten.
+
+### Migration des Einbettungsmodells
+
+Jeder Vektor wird beim Schreiben mit einer anbieterqualifizierten Identität versehen —
+`<provider>/<model>@<dimensions>` (z. B. `openai/text-embedding-3-small@1536`) — sowohl
+in der SQLite-Zeile als auch im Qdrant-Payload. Der Store merkt sich diese Identität
+zusätzlich als Erwartung, die beim ersten Schreibvorgang nach dem Start übernommen wird.
+
+Grund dafür: Das Mischen von Einbettungsräumen ist eine stille Korruption. Wenn Sie
+`embedding.provider` oder `embedding.model` in `config.json` bei gleichbleibender
+Dimensionalität ändern (z. B. Wechsel zu einer Azure-Deployment derselben Modellfamilie),
+erkennt dies auf Qdrant-Ebene nichts — neue Vektoren landen in derselben Sammlung wie
+alte, Kosinus-Ähnlichkeit zwischen den beiden Räumen ist bedeutungslos, und sowohl die
+Recall-Relevanz als auch die Deduplizierung (`similar[0]`-Scores, die in die
+0.92/0.98-Schwellenwerte einfließen) verschlechtern sich still. Eine Dimensionsänderung
+schlägt stattdessen laut mit einem kryptischen Qdrant-Fehler fehl; die Herkunfts-Stempel
+machen beide Fälle laut und handlungsfähig.
+
+**Ablauf nach einer Modelländerung:**
+
+1. Beim nächsten Start (oder Health-Check) stimmt die erwartete Identität des Stores
+   nicht mehr mit der aktiven Konfiguration überein. Die `embedding`-Health-Komponente
+   wird degradiert mit einer Meldung, die beide Identitäten nennt, und eine strukturierte
+   `embedding_identity_mismatch`-Warnung wird geloggt.
+2. Solange `embedding.refuse_writes_on_model_mismatch` auf `true` steht (Standard),
+   schlagen vektorproduzierende Schreibvorgänge (remember, tag-getriggerte
+   Re-Embeddings, Restore-Reconciliation) mit einem handlungsfähigen
+   `CONFLICT`-Fehler fehl, der auf den Re-Embed-Pfad verweist. Lesevorgänge
+   funktionieren weiter — Recall und Search bedienen weiterhin die alten Vektoren,
+   nur mit degradiertem Health-Status.
+3. Migration durchführen:
+
+   ```bash
+   bhgbrain repair --re-embed              # veraltete Stempel migrieren
+   bhgbrain repair --re-embed --dry-run    # Vorschau, wie viele Zeilen betroffen wären
+   bhgbrain repair --re-embed --include-legacy   # auch Zeilen ohne jeden Stempel einbeziehen
+   ```
+
+   Oder über das `repair`-MCP-Tool mit `mode: "re-embed"` (siehe
+   [MCP-Tools-Referenz](#mcp-tools-referenz)). Die Migration embedded betroffene
+   Erinnerungen in begrenzten, fortsetzbaren Batches — der Stempel selbst ist der
+   Fortschrittsmarker, sodass ein unterbrochener Lauf ohne Wiederholung bereits
+   abgeschlossener Zeilen fortgesetzt werden kann, und ein einzelner
+   Embed/Upsert-Fehler wird isoliert statt den ganzen Batch abzubrechen.
+4. Sobald keine veralteten Stempel mehr übrig sind, aktualisiert sich die erwartete
+   Identität des Stores automatisch, und die `embedding`-Degradation verschwindet —
+   ohne Neustart.
+
+**Hinweise:**
+- Alte Zeilen, die vor der Herkunfts-Stempelung geschrieben wurden, haben keinen
+  Stempel (`null`) und gelten als „unbekannt" — sie werden beim Re-Embed
+  ausgeschlossen, sofern nicht `--include-legacy` / `include_legacy: true`
+  übergeben wird, damit ein erstes Upgrade nicht überraschend ein vollständiges
+  Re-Embedding des gesamten Bestands (und dessen Embedding-API-Kosten) auslöst.
+- Re-Embedding wird immer vom Betreiber ausgelöst — nie automatisch, da es die
+  kostenpflichtige Embedding-API einmal pro migrierter Erinnerung aufruft.
+- Setzen Sie `embedding.refuse_writes_on_model_mismatch` nur dann auf `false`,
+  wenn Sie absichtlich zulassen möchten, dass Schreibvorgänge fortfahren und
+  Einbettungsräume mischen (z. B. ein bewusstes, überwachtes Migrationsfenster) —
+  der Stempel dokumentiert weiterhin, was passiert ist.
+- Archivierte Erinnerungen werden nie neu eingebettet; ihre Vektoren sind bereits
+  absichtlich entfernt (siehe [Verfall, Bereinigung und Archivierung](#verfall-bereinigung-und-archivierung)).
 
 ### Multi-Device-Konfigurationsbeispiel
 
@@ -1974,6 +2047,12 @@ bhgbrain audit                        # Aktuelle Audit-Einträge anzeigen
 bhgbrain repair --from-qdrant                # Lokale SQLite aus Qdrant wiederherstellen (standardmäßig nur Erinnerungen des aktuellen Geräts)
 bhgbrain repair --from-qdrant --all-devices  # Aus den Erinnerungen aller Geräte wiederherstellen, nicht nur des aktuellen
 
+# Reparatur (Migration des Einbettungsmodells — siehe Migration des Einbettungsmodells)
+bhgbrain repair --re-embed                   # Vektoren mit veraltetem Embedding-Stempel migrieren
+bhgbrain repair --re-embed --dry-run         # Vorschau, wie viele Zeilen betroffen wären
+bhgbrain repair --re-embed --include-legacy  # Auch Zeilen ohne jeden Stempel einbeziehen
+bhgbrain repair --re-embed --batch-size 100  # Batch-Größe anpassen (Standard 50)
+
 # Kategorieverwaltung
 bhgbrain category list                # Alle Kategorien auflisten
 bhgbrain category get <name>          # Kategorieninhalt anzeigen
@@ -2331,19 +2410,28 @@ Speichersicherungen erstellen, auflisten oder wiederherstellen.
 
 ---
 
-### `repair` — SQLite aus Qdrant wiederherstellen
+### `repair` — SQLite aus Qdrant wiederherstellen oder veraltete Embedding-Stempel migrieren
 
-Erinnerungen aus Qdrant in die lokale SQLite-Datenbank wiederherstellen. Wird für Multi-Device-Setups, Datenwiederherstellung nach Verlust oder Onboarding neuer Geräte verwendet. Siehe [Reparatur und Wiederherstellung](#reparatur-und-wiederherstellung).
+Repariert den lokalen Zustand aus externen Quellen. `mode: "from-qdrant"` (Standard)
+stellt Erinnerungen aus Qdrant in der lokalen SQLite-Datenbank wieder her — verwendet
+für Multi-Device-Setups, Datenwiederherstellung nach Verlust oder Onboarding neuer
+Geräte. `mode: "re-embed"` migriert Erinnerungen, deren Embedding-Stempel von
+`embedding.provider`/`embedding.model` abweicht — siehe
+[Migration des Einbettungsmodells](#migration-des-einbettungsmodells). Siehe auch
+[Reparatur und Wiederherstellung](#reparatur-und-wiederherstellung).
 
 **Eingabe:**
 
 | Parameter | Typ | Erforderlich | Standard | Beschreibung |
 |---|---|---|---|---|
-| `dry_run` | `boolean` | Nein | `false` | Wenn `true`, wird berichtet, was wiederhergestellt würde, ohne Änderungen vorzunehmen. |
-| `device_id` | `string` | Nein | — | Wiederherstellung auf Erinnerungen eines bestimmten Geräts beschränken. Schließt sich mit `all_devices` gegenseitig aus. |
-| `all_devices` | `boolean` | Nein | `false` | Erinnerungen von allen Geräten ausdrücklich wiederherstellen. Schließt sich mit `device_id` gegenseitig aus. Dies ist auch das Standardverhalten, wenn keines der beiden Felder angegeben wird. |
+| `mode` | `"from-qdrant" \| "re-embed"` | Nein | `"from-qdrant"` | Welche Reparaturoperation ausgeführt wird. |
+| `dry_run` | `boolean` | Nein | `false` | Wenn `true`, wird berichtet, was sich ändern würde, ohne Änderungen vorzunehmen. |
+| `device_id` | `string` | Nein | — | (nur `from-qdrant`) Wiederherstellung auf Erinnerungen eines bestimmten Geräts beschränken. Schließt sich mit `all_devices` gegenseitig aus. |
+| `all_devices` | `boolean` | Nein | `false` | (nur `from-qdrant`) Erinnerungen von allen Geräten ausdrücklich wiederherstellen. Schließt sich mit `device_id` gegenseitig aus. Dies ist auch das Standardverhalten, wenn keines der beiden Felder angegeben wird. |
+| `include_legacy` | `boolean` | Nein | `false` | (nur `re-embed`) Auch alte Zeilen ohne jeden Embedding-Stempel einbeziehen, nicht nur Zeilen mit abweichendem Modell. |
+| `batch_size` | `number` | Nein | `50` | (nur `re-embed`) Erinnerungen pro Batch (1-500). |
 
-**Ausgabe:**
+**Ausgabe (`mode: "from-qdrant"`):**
 
 ```json
 {
@@ -2362,8 +2450,31 @@ Erinnerungen aus Qdrant in die lokale SQLite-Datenbank wiederherstellen. Wird f�
 **Hinweise:**
 - Nur Punkte mit `content` in ihrem Qdrant-Payload können wiederhergestellt werden. Vor-1.3-Erinnerungen ohne Inhalt in Qdrant werden als `skipped_no_content` gemeldet.
 - Wiederhergestellte Erinnerungen bewahren ihre ursprüngliche `device_id` aus dem Qdrant-Payload. Wenn keine `device_id` im Payload existiert, wird die lokale Geräte-ID verwendet.
+- Wiederhergestellte Erinnerungen bewahren außerdem, welchen Embedding-Stempel (falls vorhanden) ihr Quellvektor bereits trug, statt die aktive Konfigurationsidentität zu beanspruchen — die Wiederherstellung rekonstruiert Metadaten für einen bestehenden Vektor, sie erzeugt keinen neuen.
 - Die gleichzeitige Angabe von `device_id` und `all_devices: true` wird als ungültige Eingabe abgelehnt.
 - Nach der Wiederherstellung führen Sie `npm run build` aus und starten Sie den Server bei Bedarf neu. Die wiederhergestellten Erinnerungen sind sofort für Suche und Recall verfügbar.
+
+**Ausgabe (`mode: "re-embed"`):**
+
+```json
+{
+  "mode": "re-embed",
+  "dry_run": false,
+  "active_identity": "openai/text-embedding-3-small@1536",
+  "include_legacy": false,
+  "updated": 118,
+  "failed": 0,
+  "remaining": 0,
+  "bound_reached": false,
+  "converged": true
+}
+```
+
+**Hinweise:**
+- Die Auswahl basiert auf dem Stempel selbst, sodass ein unterbrochener Lauf sicher fortgesetzt wird — bereits neu gestempelte Zeilen passen beim nächsten Aufruf einfach nicht mehr auf die Auswahlbedingung.
+- Ein Embed/Upsert-Fehler pro Erinnerung wird isoliert (in `failed` gezählt, für einen späteren Lauf belassen), statt den gesamten Batch abzubrechen.
+- `converged: true` bedeutet, dass keine veralteten Stempel mehr verbleiben (im Rahmen des angeforderten `include_legacy`); die erwartete Identität des Stores wird aktualisiert, und die `embedding`-Health-Degradation verschwindet sofort, ohne Neustart.
+- Auch über die CLI verfügbar: `bhgbrain repair --re-embed [--include-legacy] [--batch-size <n>] [--dry-run]`.
 
 ---
 

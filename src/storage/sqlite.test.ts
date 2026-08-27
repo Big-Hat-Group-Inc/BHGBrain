@@ -633,3 +633,119 @@ describe('SqliteStore', () => {
     });
   });
 });
+
+// openspec/changes/stamp-embedding-provenance
+describe('SqliteStore embedding provenance', () => {
+  let store: SqliteStore;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-'));
+    store = new SqliteStore(tempDir);
+    await store.init();
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function baseMemory() {
+    return {
+      id: '550e8400-e29b-41d4-a716-446655440000',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic' as const,
+      category: null,
+      content: 'test content',
+      summary: 'test content',
+      tags: [] as string[],
+      source: 'cli' as const,
+      checksum: 'abc123',
+      importance: 0.5,
+      access_count: 0,
+      last_operation: 'ADD' as const,
+      merged_from: null,
+      embedding_model: null as string | null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      last_accessed: new Date().toISOString(),
+    };
+  }
+  const sampleMemory = (overrides: Partial<ReturnType<typeof baseMemory>> = {}) => ({ ...baseMemory(), ...overrides });
+
+  it('a fresh store has no expected embedding identity', () => {
+    expect(store.getExpectedEmbeddingIdentity()).toBeNull();
+  });
+
+  it('adoptEmbeddingIdentityIfAbsent sets the expectation only the first time', () => {
+    store.adoptEmbeddingIdentityIfAbsent('openai/text-embedding-3-small@1536');
+    expect(store.getExpectedEmbeddingIdentity()).toBe('openai/text-embedding-3-small@1536');
+
+    // A second adopt call with a different identity is a no-op: adoption only
+    // ever happens once, absent an explicit setExpectedEmbeddingIdentity.
+    store.adoptEmbeddingIdentityIfAbsent('azure-foundry/other@1536');
+    expect(store.getExpectedEmbeddingIdentity()).toBe('openai/text-embedding-3-small@1536');
+  });
+
+  it('setExpectedEmbeddingIdentity unconditionally overwrites the expectation', () => {
+    store.adoptEmbeddingIdentityIfAbsent('openai/text-embedding-3-small@1536');
+    store.setExpectedEmbeddingIdentity('azure-foundry/other@1536');
+    expect(store.getExpectedEmbeddingIdentity()).toBe('azure-foundry/other@1536');
+  });
+
+  it('stores and round-trips a null embedding_model for a row that never specifies one', () => {
+    store.insertMemory(sampleMemory());
+    const mem = store.getMemoryById('550e8400-e29b-41d4-a716-446655440000');
+    expect(mem?.embedding_model).toBeNull();
+  });
+
+  it('stores and round-trips a non-null embedding_model', () => {
+    store.insertMemory(sampleMemory({ embedding_model: 'openai/text-embedding-3-small@1536' }));
+    const mem = store.getMemoryById('550e8400-e29b-41d4-a716-446655440000');
+    expect(mem?.embedding_model).toBe('openai/text-embedding-3-small@1536');
+  });
+
+  it('updateMemory can change the embedding_model stamp', () => {
+    store.insertMemory(sampleMemory({ embedding_model: 'openai/old@1536' }));
+    store.updateMemory('550e8400-e29b-41d4-a716-446655440000', { embedding_model: 'openai/new@1536' });
+    const mem = store.getMemoryById('550e8400-e29b-41d4-a716-446655440000');
+    expect(mem?.embedding_model).toBe('openai/new@1536');
+  });
+
+  describe('stale embedding stamp selection', () => {
+    const activeIdentity = 'openai/text-embedding-3-small@1536';
+
+    beforeEach(() => {
+      store.insertMemory(sampleMemory({
+        id: '00000000-0000-0000-0000-000000000001', embedding_model: activeIdentity,
+      }));
+      store.insertMemory(sampleMemory({
+        id: '00000000-0000-0000-0000-000000000002', embedding_model: 'azure-foundry/old@1536',
+      }));
+      store.insertMemory(sampleMemory({
+        id: '00000000-0000-0000-0000-000000000003', embedding_model: null,
+      }));
+    });
+
+    it('excludes rows already matching the active identity and legacy (NULL) rows by default', () => {
+      expect(store.countMemoriesWithStaleEmbeddingStamp(activeIdentity, false)).toBe(1);
+      const rows = store.listMemoriesWithStaleEmbeddingStamp(activeIdentity, false, 10);
+      expect(rows.map(r => r.id)).toEqual(['00000000-0000-0000-0000-000000000002']);
+    });
+
+    it('includes legacy (NULL) rows when includeLegacy is true', () => {
+      expect(store.countMemoriesWithStaleEmbeddingStamp(activeIdentity, true)).toBe(2);
+      const rows = store.listMemoriesWithStaleEmbeddingStamp(activeIdentity, true, 10);
+      expect(rows.map(r => r.id).sort()).toEqual([
+        '00000000-0000-0000-0000-000000000002',
+        '00000000-0000-0000-0000-000000000003',
+      ]);
+    });
+
+    it('a row re-stamped with the active identity stops matching the selection (convergence)', () => {
+      store.updateMemory('00000000-0000-0000-0000-000000000002', { embedding_model: activeIdentity });
+      expect(store.countMemoriesWithStaleEmbeddingStamp(activeIdentity, false)).toBe(0);
+    });
+  });
+});

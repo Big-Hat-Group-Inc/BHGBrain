@@ -154,13 +154,16 @@ export const MCP_TOOL_DEFINITIONS = [
   },
   {
     name: 'repair',
-    description: 'Recover memories from Qdrant that are missing in SQLite. Scrolls all Qdrant collections and re-inserts any points with content into SQLite.',
+    description: 'Repair local state from external sources. mode: "from-qdrant" (default) recovers memories from Qdrant that are missing in SQLite. mode: "re-embed" migrates memories whose embedding stamp differs from the active embedding model/provider (run after changing embedding.provider or embedding.model).',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        dry_run: { type: 'boolean', description: 'If true, only report what would be recovered without making changes', default: false },
-        device_id: { type: 'string', description: 'Filter recovery to only points matching this device_id. Mutually exclusive with all_devices.', pattern: '^[a-zA-Z0-9._-]{1,64}$' },
-        all_devices: { type: 'boolean', description: 'Explicitly recover points from all devices. Mutually exclusive with device_id. This is also the default behavior when neither field is provided.', default: false },
+        mode: { type: 'string', enum: ['from-qdrant', 're-embed'], description: 'Repair mode. "from-qdrant" recovers missing SQLite rows from Qdrant payloads; "re-embed" migrates vectors stamped with a stale embedding identity to the active one.', default: 'from-qdrant' },
+        dry_run: { type: 'boolean', description: 'If true, only report what would change without making changes', default: false },
+        device_id: { type: 'string', description: '(from-qdrant only) Filter recovery to only points matching this device_id. Mutually exclusive with all_devices.', pattern: '^[a-zA-Z0-9._-]{1,64}$' },
+        all_devices: { type: 'boolean', description: '(from-qdrant only) Explicitly recover points from all devices. Mutually exclusive with device_id. This is also the default behavior when neither field is provided.', default: false },
+        include_legacy: { type: 'boolean', description: '(re-embed only) Also re-embed legacy rows with no embedding stamp at all, not just rows stamped with a different model.', default: false },
+        batch_size: { type: 'number', description: '(re-embed only) Memories re-embedded per batch.', minimum: 1, maximum: 500, default: 50 },
       },
       additionalProperties: false,
     },
