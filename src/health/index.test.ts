@@ -208,13 +208,33 @@ describe('HealthService', () => {
 
   it('reports degraded when qdrant is unavailable but sqlite is healthy', async () => {
     const storage = createStorage();
-    storage.qdrant.healthCheck = vi.fn(async () => false);
+    storage.qdrant.healthCheck = vi.fn(async () => {
+      throw new Error('Qdrant unreachable');
+    });
 
     const health = new HealthService(storage, createEmbedding(true), createConfig());
     const result = await health.check();
 
     expect(result.status).toBe('degraded');
     expect(result.components.qdrant.status).toBe('unhealthy');
+  });
+
+  it('reports degraded with the underlying reason when the retrieval call fails on a reachable store', async () => {
+    // Regression guard for the 1.19 outage shape: the store is reachable but
+    // the retrieval call itself throws. The failure reason must be visible
+    // (distinct from a generic connectivity message) so an operator can tell
+    // a retrieval failure from a connectivity failure.
+    const storage = createStorage();
+    storage.qdrant.healthCheck = vi.fn(async () => {
+      throw new TypeError('this.client.query is not a function');
+    });
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.status).toBe('degraded');
+    expect(result.components.qdrant.status).toBe('unhealthy');
+    expect(result.components.qdrant.message).toBe('this.client.query is not a function');
   });
 
   it('reports unhealthy when sqlite is unavailable', async () => {

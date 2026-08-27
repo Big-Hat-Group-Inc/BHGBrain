@@ -1715,7 +1715,7 @@ Returns a `HealthSnapshot`:
 | Component | Healthy condition | Degraded condition | Unhealthy condition |
 |---|---|---|---|
 | `sqlite` | `SELECT 1` succeeds | - | Query throws |
-| `qdrant` | `getCollections()` succeeds | - | Connection refused |
+| `qdrant` | A bounded, read-only vector query succeeds (an empty result or a not-yet-created collection both count as healthy) | - | The vector query itself fails, even while the server is reachable |
 | `embedding` | Embed API call succeeds | Missing credentials or unreachable | - |
 | `retention` | All budgets within limits, no unsynced vectors | Budget exceeded OR unsynced vectors > 0 | - |
 

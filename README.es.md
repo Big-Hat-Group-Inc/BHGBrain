@@ -1662,7 +1662,7 @@ Devuelve un `HealthSnapshot`:
 | Componente | Condición saludable | Condición degradada | Condición no saludable |
 |---|---|---|---|
 | `sqlite` | `SELECT 1` tiene éxito | — | La consulta lanza excepción |
-| `qdrant` | `getCollections()` tiene éxito | — | Conexión rechazada |
+| `qdrant` | Una consulta vectorial acotada y de solo lectura tiene éxito (un resultado vacío o una colección que aún no existe también cuentan como saludable) | — | La consulta vectorial en sí falla, incluso con el servidor accesible |
 | `embedding` | La llamada a la API de embed tiene éxito | Credenciales faltantes o no accesible | — |
 | `retention` | Todos los presupuestos dentro de los límites, sin vectores no sincronizados | Presupuesto excedido O vectores no sincronizados > 0 | — |
 

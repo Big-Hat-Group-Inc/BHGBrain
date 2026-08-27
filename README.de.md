@@ -1665,7 +1665,7 @@ Gibt einen `HealthSnapshot` zurück:
 | Komponente | Gesunder Zustand | Degradierter Zustand | Fehlerhafter Zustand |
 |---|---|---|---|
 | `sqlite` | `SELECT 1` erfolgreich | — | Abfrage wirft Fehler |
-| `qdrant` | `getCollections()` erfolgreich | — | Verbindung abgelehnt |
+| `qdrant` | Eine begrenzte, lesende Vektorabfrage ist erfolgreich (ein leeres Ergebnis oder eine noch nicht angelegte Collection gelten ebenfalls als gesund) | — | Die Vektorabfrage selbst schlägt fehl, auch wenn der Server erreichbar ist |
 | `embedding` | Embed-API-Aufruf erfolgreich | Fehlende Anmeldedaten oder nicht erreichbar | — |
 | `retention` | Alle Budgets innerhalb der Limits, keine nicht synchronisierten Vektoren | Budget überschritten ODER nicht synchronisierte Vektoren > 0 | — |
 

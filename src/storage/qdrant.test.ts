@@ -17,6 +17,7 @@ function createStore(client: MockClient): QdrantStore {
   const config = {
     embedding: { dimensions: 3 },
     qdrant: { mode: 'embedded' },
+    defaults: { namespace: 'global', collection: 'general' },
   } as unknown as BrainConfig;
   const store = new QdrantStore(config);
   // Inject the mock transport (no breaker -> executeWithBreaker calls through).
@@ -150,5 +151,51 @@ describe('QdrantStore.searchSimilar', () => {
     await expect(store.searchSimilar('global', 'work', [1, 2, 3], 10)).rejects.toThrow(
       'this.client.query is not a function',
     );
+  });
+});
+
+describe('QdrantStore.healthCheck', () => {
+  // Regression guard for the 1.19 outage: the server was reachable
+  // (`getCollections` succeeded) but every retrieval call threw. A probe
+  // that only checks connectivity cannot detect this.
+  it('reports unhealthy when the retrieval call throws even though the store is reachable', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(async () => ({ collections: [] })),
+      query: vi.fn<QdrantClient['query']>(async () => {
+        throw new TypeError('this.client.query is not a function');
+      }),
+    };
+    const store = createStore(client);
+
+    await expect(store.healthCheck()).rejects.toThrow('this.client.query is not a function');
+    expect(client.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports healthy on a successful probe that returns zero results', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+
+    await expect(store.healthCheck()).resolves.toBe(true);
+    // Bounded and side-effect free: a minimal limit, no payload hydration.
+    const call = client.query.mock.calls[0]![1] as { limit: number; with_payload: boolean };
+    expect(call.limit).toBe(1);
+    expect(call.with_payload).toBe(false);
+  });
+
+  it('reports healthy when the probed collection does not exist yet', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => {
+        const err = new Error('Collection `bhgbrain_global_general` doesn\'t exist!') as Error & { status?: number };
+        err.status = 404;
+        throw err;
+      }),
+    };
+    const store = createStore(client);
+
+    await expect(store.healthCheck()).resolves.toBe(true);
   });
 });

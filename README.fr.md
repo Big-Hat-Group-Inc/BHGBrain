@@ -1664,7 +1664,7 @@ Renvoie un `HealthSnapshot` :
 | Composant | Condition saine | Condition dégradée | Condition défaillante |
 |---|---|---|---|
 | `sqlite` | `SELECT 1` réussit | — | La requête génère une exception |
-| `qdrant` | `getCollections()` réussit | — | Connexion refusée |
+| `qdrant` | Une requête vectorielle bornée et en lecture seule réussit (un résultat vide ou une collection pas encore créée comptent aussi comme sains) | — | La requête vectorielle elle-même échoue, même si le serveur est joignable |
 | `embedding` | L'appel API d'intégration réussit | Identifiants manquants ou injoignable | — |
 | `retention` | Tous les budgets dans les limites, aucun vecteur non synchronisé | Budget dépassé OU vecteurs non synchronisés > 0 | — |
 

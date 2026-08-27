@@ -225,11 +225,28 @@ export class QdrantStore {
   }
 
   async healthCheck(): Promise<boolean> {
+    // Probe the retrieval path itself (the same `query` call `search`/
+    // `searchSimilar` use), not just connectivity: a reachable server that
+    // rejects or cannot execute queries (removed client method, incompatible
+    // request shape, server-side rejection) must not report healthy just
+    // because `getCollections()` succeeds. The probe is bounded (limit 1)
+    // and skips payload hydration so polling stays cheap and side-effect
+    // free. It targets the default namespace/collection so a fresh install
+    // with no data yet still exercises the call; a missing collection or an
+    // empty result set are both healthy - only a raised failure is not.
+    const name = this.collectionName(this.config.defaults.namespace, this.config.defaults.collection);
     try {
-      await this.client.getCollections();
+      await this.client.query(name, {
+        query: new Array(this.dimensions).fill(0),
+        limit: 1,
+        with_payload: false,
+      });
       return true;
-    } catch {
-      return false;
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return true;
+      }
+      throw err;
     }
   }
 
