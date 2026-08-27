@@ -279,6 +279,30 @@ describe('CLI', () => {
     expect(logSpy).toHaveBeenCalledWith('[repair] hydrated 42 memories from Qdrant');
   });
 
+  it('repair --from-qdrant scopes to the configured device by default', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const context = createMockContext();
+    (context.config as unknown as { device: { id: string } }).device = { id: 'device-a' };
+    const bootstrapMock = vi.fn(async () => 5);
+    (context.storage as unknown as Record<string, unknown>).bootstrapFromQdrant = bootstrapMock;
+
+    await runProgram(['repair', '--from-qdrant'], context);
+
+    expect(bootstrapMock).toHaveBeenCalledWith(undefined, { deviceId: 'device-a', allDevices: false });
+  });
+
+  it('repair --from-qdrant --all-devices hydrates every device', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const context = createMockContext();
+    (context.config as unknown as { device: { id: string } }).device = { id: 'device-a' };
+    const bootstrapMock = vi.fn(async () => 9);
+    (context.storage as unknown as Record<string, unknown>).bootstrapFromQdrant = bootstrapMock;
+
+    await runProgram(['repair', '--from-qdrant', '--all-devices'], context);
+
+    expect(bootstrapMock).toHaveBeenCalledWith(undefined, { deviceId: 'device-a', allDevices: true });
+  });
+
   it('repair without flags shows error', async () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const context = createMockContext();

@@ -77,6 +77,109 @@ describe('resource pagination bounds', () => {
     expect(result.total_results).toBe(2);
   });
 
+  it('excludes an expired decay-eligible T2/T3 memory from memory://{id}', async () => {
+    const expiredMemory = {
+      id: '550e8400-e29b-41d4-a716-446655440002',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic',
+      content: 'stale content',
+      summary: 'stale summary',
+      tags: [],
+      retention_tier: 'T3',
+      expires_at: '2020-01-01T00:00:00.000Z',
+      decay_eligible: true,
+    };
+    const storage = {
+      sqlite: {
+        getMemoryById: () => expiredMemory,
+        touchMemory: () => undefined,
+        scheduleDeferredFlush: () => undefined,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global' } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+
+    const result = await handler.handle(`memory://${expiredMemory.id}`) as ResourceResult;
+    expect(result.error.code).toBe('NOT_FOUND');
+  });
+
+  it('keeps an expired T1 memory visible through memory://{id} (only T2/T3 are filtered)', async () => {
+    const expiredT1 = {
+      id: '550e8400-e29b-41d4-a716-446655440003',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic',
+      content: 'institutional content',
+      summary: 'institutional summary',
+      tags: [],
+      retention_tier: 'T1',
+      expires_at: '2020-01-01T00:00:00.000Z',
+      decay_eligible: true,
+    };
+    const storage = {
+      sqlite: {
+        getMemoryById: () => expiredT1,
+        touchMemory: () => undefined,
+        scheduleDeferredFlush: () => undefined,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global' } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+
+    const result = await handler.handle(`memory://${expiredT1.id}`) as { id?: string; error?: unknown };
+    expect(result.error).toBeUndefined();
+    expect(result.id).toBe(expiredT1.id);
+  });
+
+  it('excludes expired T2/T3 memories from a memory://list page', async () => {
+    const active = {
+      id: '550e8400-e29b-41d4-a716-446655440004',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic',
+      content: 'active content',
+      summary: 'active summary',
+      tags: [],
+      retention_tier: 'T2',
+      expires_at: null,
+      decay_eligible: true,
+      created_at: '2026-01-01T00:00:00.000Z',
+    };
+    const expired = {
+      ...active,
+      id: '550e8400-e29b-41d4-a716-446655440005',
+      retention_tier: 'T3',
+      expires_at: '2020-01-01T00:00:00.000Z',
+    };
+    const storage = {
+      sqlite: {
+        listMemories: (_ns: string, limit: number) => [active, expired].slice(0, limit),
+        countMemories: () => 2,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global' } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+
+    const result = await handler.handle('memory://list?limit=10') as ResourceResult;
+    expect(result.items).toEqual([active]);
+  });
+
   it('builds inject payload within budget without concatenating all category content', async () => {
     const config = {
       defaults: { namespace: 'global', auto_inject_limit: 5 },
@@ -85,7 +188,7 @@ describe('resource pagination bounds', () => {
     const storage = {
       sqlite: {
         listCategoryHeaders: () => [{ name: 'Policy', slot: 'custom', revision: 1, updated_at: '2026-01-01T00:00:00Z', content_length: 200 }],
-        getCategoryContentSlice: (_name: string, maxChars: number) => 'x'.repeat(maxChars),
+        getCategoryContentSlice: (_name: string, maxChars: number) => ({ content: 'x'.repeat(maxChars), length: maxChars }),
         listMemories: () => [],
         countMemories: () => 0,
         getMemoryById: () => null,
@@ -106,6 +209,44 @@ describe('resource pagination bounds', () => {
     const result = await handler.handle('memory://inject') as ResourceResult;
     expect(result.content.length).toBeLessThanOrEqual(24);
     expect(result.truncated).toBe(true);
+  });
+
+  it('flags truncation for multibyte/astral category content near the budget boundary', async () => {
+    // Regression for the JS UTF-16 vs. SQLite character-count mismatch: an astral
+    // character (e.g. an emoji outside the BMP) is 1 SQLite character but 2 JS
+    // UTF-16 code units. The full category content is 5 astral characters
+    // (content_length: 5), but only 3 of them were sliced due to the budget. The
+    // sliced JS string's `.length` is 6 (3 * 2 surrogate units) which is >= 5 —
+    // comparing that against content_length would wrongly report "fully
+    // included". Comparing SQLite-counted lengths on both sides must not.
+    const config = {
+      defaults: { namespace: 'global', auto_inject_limit: 5 },
+      auto_inject: { max_chars: 500 },
+    } as unknown as BrainConfig;
+    const storage = {
+      sqlite: {
+        listCategoryHeaders: () => [{ name: 'Policy', slot: 'custom', revision: 1, updated_at: '2026-01-01T00:00:00Z', content_length: 5 }],
+        getCategoryContentSlice: () => ({ content: '\u{1F600}'.repeat(3), length: 3 }),
+        listMemories: () => [],
+        countMemories: () => 0,
+        getMemoryById: () => null,
+        touchMemory: () => undefined,
+        scheduleDeferredFlush: () => undefined,
+        listCategories: () => [],
+        listCollections: () => [],
+        getCategory: () => null,
+      },
+    } as unknown as StorageManager;
+    const handler = new ResourceHandler(
+      config,
+      storage,
+      {} as SearchService,
+      { check: async () => ({ status: 'healthy' }) } as HealthService,
+    );
+
+    const result = await handler.handle('memory://inject') as ResourceResult;
+    expect(result.truncated).toBe(true);
+    expect([...result.content.matchAll(/\u{1F600}/gu)]).toHaveLength(3);
   });
 });
 

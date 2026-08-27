@@ -1,15 +1,22 @@
 ## ADDED Requirements
 
 ### Requirement: Memory writes SHALL be namespace-scoped by default
-The system SHALL scope write, read, deduplication, and similarity retrieval operations to the request namespace unless an explicit cross-namespace mode is requested.
+The system SHALL scope write, read, deduplication, and similarity retrieval operations to the request namespace. There is no explicit cross-namespace query mode in v1: every write, read, deduplication, and similarity retrieval path is namespace-scoped unconditionally.
 
 #### Scenario: Default retrieval excludes other namespaces
-- **WHEN** a query is executed without cross-namespace mode
+- **WHEN** a query is executed
 - **THEN** results include only memories in the specified or default namespace
 
-#### Scenario: Explicit cross-namespace mode includes multiple namespaces
-- **WHEN** a query is executed with explicit cross-namespace configuration
-- **THEN** results may include memories from more than one namespace
+### Non-Goal: Explicit cross-namespace query mode
+
+De-scoped for v1 (audit follow-up 4.6, `codeaudit/bootstrap-memory-core-2026-06-05-02-19.md`).
+No code path accepts a cross-namespace flag today — `QdrantStore.searchSimilar`,
+`QdrantStore.search`, and every SQLite read helper filter to a single namespace with
+no override. Introducing a real cross-namespace mode touches the write pipeline,
+search API, MCP tool schemas, and resource handlers simultaneously and risks a
+namespace-isolation regression if rushed, so it is deferred to a dedicated follow-up
+change rather than bolted on here. Until that change lands, namespace scoping is
+always-on and non-optional.
 
 ### Requirement: SQLite and Qdrant persistence SHALL remain logically consistent
 The system SHALL persist memory metadata and vector records with matching IDs and namespace/collection metadata, and SHALL not report successful writes unless required records are committed.

@@ -14,10 +14,12 @@ import { loadConfig, ensureDataDir } from './config/index.js';
 import { SqliteStore } from './storage/sqlite.js';
 import { QdrantStore } from './storage/qdrant.js';
 import { StorageManager } from './storage/index.js';
-import { createEmbeddingProvider, getEmbeddingBreakerKey } from './embedding/index.js';
+import { createEmbeddingProvider, getEmbeddingBreakerKey, warnIfEmbeddingDegraded } from './embedding/index.js';
 import { WritePipeline } from './pipeline/index.js';
 import { SearchService } from './search/index.js';
 import { BackupService } from './backup/index.js';
+import { RetentionService } from './backup/retention.js';
+import { CleanupScheduler } from './backup/scheduler.js';
 import { HealthService } from './health/index.js';
 import { MetricsCollector } from './health/metrics.js';
 import { createLogger } from './health/logger.js';
@@ -49,12 +51,14 @@ async function main() {
     openWindowMs: config.resilience.circuit_breaker.open_window_ms,
     halfOpenProbeCount: config.resilience.circuit_breaker.half_open_probe_count,
   };
-  const embeddingBreaker = new CircuitBreaker(breakerOptions);
-  const qdrantBreaker = new CircuitBreaker(breakerOptions);
+  const embeddingBreakerKey = getEmbeddingBreakerKey(config.embedding.provider);
+  const embeddingBreaker = new CircuitBreaker({ ...breakerOptions, key: embeddingBreakerKey, logger });
+  const qdrantBreaker = new CircuitBreaker({ ...breakerOptions, key: 'qdrant', logger });
   const metrics = new MetricsCollector(config);
-  const qdrant = new QdrantStore(config, qdrantBreaker);
+  const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
-  const storage = new StorageManager(sqlite, qdrant, embedding);
+  warnIfEmbeddingDegraded(embedding, config, logger);
+  const storage = new StorageManager(sqlite, qdrant, embedding, metrics);
 
   // Bootstrap: hydrate SQLite from Qdrant if this is a new device
   try {
@@ -71,13 +75,20 @@ async function main() {
   }
 
   // Initialize services
-  const pipeline = new WritePipeline(config, storage, embedding);
+  const pipeline = new WritePipeline(config, storage, embedding, logger);
   const searchService = new SearchService(config, storage, embedding, metrics, logger);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {
-    [getEmbeddingBreakerKey(config.embedding.provider)]: embeddingBreaker,
+    [embeddingBreakerKey]: embeddingBreaker,
     qdrant: qdrantBreaker,
   });
+
+  // Scheduled cleanup: same execution path as `bhgbrain gc`, run on
+  // `retention.cleanup_schedule` for the lifetime of this long-running
+  // process (both stdio and HTTP transports keep the process alive).
+  const retentionService = new RetentionService(config, storage, logger, metrics);
+  const cleanupScheduler = new CleanupScheduler(config, retentionService, logger);
+  cleanupScheduler.start();
 
   const ctx: ToolContext = {
     config, storage, embedding, pipeline,

@@ -8,7 +8,9 @@ BHGBrain is a persistent, vector-backed memory system for MCP (Model Context Pro
 - TypeScript with Node.js (>=20.0.0)
 - ES modules (`"type": "module"`)
 - SQLite for metadata storage (via sql.js)
-- Qdrant for vector storage
+- Qdrant for vector storage (client `@qdrant/js-client-rest` `~1.19.0`; requires Qdrant
+  server ≥ 1.10 for the `query` API the adapter uses in `src/storage/qdrant.ts` - keep the
+  client range and server floor in `README.md` § Prerequisites in sync with each other)
 - OpenAI or Azure Foundry for embeddings (selectable via `embedding.provider`)
 - Express.js for HTTP transport
 - MCP SDK for stdio transport
@@ -27,7 +29,7 @@ npm test                 # Run all tests once
 npm run test:watch       # Run tests in watch mode
 
 # Build & Type Checking
-npm run lint             # TypeScript type checking (no emit)
+npm run lint             # Type check (tsc --noEmit) + eslint src
 ```
 
 ## Codebase Structure
@@ -49,6 +51,7 @@ src/
 ├── backup/               # Backup/restore with retention
 ├── errors/               # Error handling utilities
 ├── domain/               # Domain logic (normalization, schemas)
+├── resilience/           # Circuit breakers for external dependencies
 └── cli/                  # CLI entry point
 ```
 
@@ -159,8 +162,14 @@ Selected via `embedding.provider` in `config.json`:
 
 ## Security Considerations
 
-- **Authentication**: Bearer token for HTTP transport
-- **Rate Limiting**: IP-based with configurable limits
+- **Authentication**: Bearer token for HTTP transport, compared with a constant-time
+  check (`crypto.timingSafeEqual`) to avoid leaking timing information about the secret
+- **Rate Limiting**: IP-based with configurable limits, keyed on `req.ip` as derived per
+  `security.trust_proxy` (default `false` — direct socket peer, loopback-accurate;
+  `true` — honors `X-Forwarded-For`, only safe behind a trusted reverse proxy).
+  Limiter state is scoped per middleware/server instance, not module-global, so
+  independent instances (including in tests) never share buckets. A request with no
+  derivable client IP fails closed (HTTP 400) rather than sharing a fallback bucket.
 - **Input Validation**: Size limits, sanitization
 - **Network Binding**: Loopback-only by default
 - **Audit Logging**: All operations logged

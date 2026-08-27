@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Writable } from 'node:stream';
 import type { BrainConfig } from '../config/index.js';
 
 describe('logger helpers', () => {
@@ -30,6 +31,7 @@ describe('logger helpers', () => {
         sliding_window_enabled: true,
         archive_before_delete: true,
         cleanup_schedule: '0 2 * * *',
+        scheduled_cleanup_enabled: true,
         pre_expiry_warning_days: 7,
         compaction_deleted_threshold: 0.1,
       },
@@ -91,6 +93,36 @@ describe('logger helpers', () => {
       }),
       process.stdout,
     );
+  });
+
+  it('redacts content/preview/summary fields in actual log output when log_redaction is enabled', async () => {
+    vi.doUnmock('pino');
+    const chunks: string[] = [];
+    const destination = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+
+    const { createLogger } = await import('./logger.js');
+    const logger = createLogger(createConfig(true), destination);
+    logger.warn({
+      event: 'tool_call',
+      content: 'super secret memory content',
+      preview: 'secret preview text',
+      summary: 'secret summary text',
+      nested: { content: 'nested secret content' },
+      tool: 'remember',
+    });
+
+    const output = chunks.join('');
+    expect(output).not.toContain('super secret memory content');
+    expect(output).not.toContain('secret preview text');
+    expect(output).not.toContain('secret summary text');
+    expect(output).not.toContain('nested secret content');
+    expect(output).toContain('remember');
+    expect(output).toContain('[Redacted]');
   });
 
   it('omits redact config when redaction is disabled', async () => {

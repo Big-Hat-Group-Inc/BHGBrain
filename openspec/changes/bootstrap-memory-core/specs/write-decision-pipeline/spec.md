@@ -92,3 +92,18 @@ SHALL NOT unconditionally ADD every non-checksum-matching candidate.
 #### Scenario: Below-threshold candidate yields ADD in fallback mode
 - **WHEN** fallback mode finds nearest similarity below threshold
 - **THEN** the candidate is classified as ADD
+
+### Requirement: Write pipeline SHALL support extraction into atomic candidates
+The system SHALL transform input content into exactly one atomic memory candidate per
+`process()` call in v1. Multi-fact splitting (submitted content containing multiple
+distinct memory facts becoming multiple candidates) is de-scoped for v1 (audit
+follow-up 4.4, `codeaudit/bootstrap-memory-core-2026-06-05-02-19.md`): it requires a
+model-backed extraction stage that has not been implemented, and `extract()` returning
+one candidate regardless of `pipeline.extraction_enabled` was found to diverge from
+this requirement's original multi-candidate scenario. `pipeline.extraction_enabled` /
+`pipeline.extraction_model` remain reserved configuration for that future stage and
+currently have no effect on candidate count.
+
+#### Scenario: A single candidate is emitted regardless of extraction configuration
+- **WHEN** content is submitted for a write, whether or not `extraction_enabled` is set
+- **THEN** the pipeline emits exactly one candidate containing normalized input content

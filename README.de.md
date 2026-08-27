@@ -2,7 +2,7 @@
 
 Persistentes, vektorbasiertes Gedächtnis für MCP-Clients (Claude, Codex, OpenClaw usw.).
 
-BHGBrain speichert Erinnerungen in SQLite (Metadaten + Volltextsuche) und Qdrant (semantische Vektoren) und stellt sie über das Model Context Protocol (MCP) per stdio oder HTTP bereit. Es ist darauf ausgelegt, KI-Agenten ein dauerhaftes, durchsuchbares Zweitgehirn zu geben, das sitzungsübergreifend bestehen bleibt – mit vollständiger Lebenszyklusverwaltung, automatischer Deduplizierung, gestufter Aufbewahrung und Hybridsuche.
+BHGBrain speichert Erinnerungen in SQLite (Metadaten + Volltextsuche) und Qdrant (semantische Vektoren) und stellt sie über das Model Context Protocol (MCP) per stdio bereit, ergänzt um eine REST-API über HTTP. Es ist darauf ausgelegt, KI-Agenten ein dauerhaftes, durchsuchbares Zweitgehirn zu geben, das sitzungsübergreifend bestehen bleibt – mit vollständiger Lebenszyklusverwaltung, automatischer Deduplizierung, gestufter Aufbewahrung und Hybridsuche.
 
 ---
 
@@ -64,7 +64,7 @@ graph TD
     subgraph Client["MCP Client<br/><i>Claude Desktop / OpenClaw / Codex</i>"]
     end
 
-    Client -->|"MCP (stdio or HTTP)"| Server
+    Client -->|"MCP (stdio) or REST (HTTP)"| Server
 
     subgraph Server["BHGBrain Server"]
         WP["Write Pipeline"]
@@ -121,7 +121,7 @@ graph TD
 | Anforderung | Version | Hinweise |
 |---|---|---|
 | Node.js | ≥ 20.0.0 | LTS empfohlen |
-| Qdrant | ≥ 1.9 | Muss vor dem Start von BHGBrain laufen |
+| Qdrant | ≥ 1.10 | Muss vor dem Start von BHGBrain laufen. Der mitgelieferte Client (`@qdrant/js-client-rest` `~1.19.0`) ruft die in Qdrant 1.10 eingeführte `query`-API auf; ältere Server schlagen bei der semantischen Suche fehl. |
 | OpenAI API-Schlüssel | — | Für Einbettungen (`text-embedding-3-small` standardmäßig). Der Server startet im Degraded-Modus, wenn er fehlt. |
 
 ---
@@ -234,7 +234,9 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
   "embedding": {
     // Derzeit wird nur "openai" unterstützt
     "provider": "openai",
-    // OpenAI-Modell für Einbettungen
+    // OpenAI-Modell für Einbettungen. Muss eines der unterstützten Modelle sein:
+    // "text-embedding-ada-002", "text-embedding-3-small", "text-embedding-3-large".
+    // Ein nicht unterstütztes Modell führt beim Start zu einem Konfigurationsfehler.
     "model": "text-embedding-3-small",
     // Name der Umgebungsvariable mit dem OpenAI API-Schlüssel
     "api_key_env": "OPENAI_API_KEY",
@@ -327,8 +329,14 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Wenn true, werden abgelaufene Erinnerungen vor dem Löschen in die Archivtabelle geschrieben
     "archive_before_delete": true,
 
-    // Cron-Zeitplan für den Hintergrund-Bereinigungsauftrag (Standard: täglich 2 Uhr)
+    // Cron-Zeitplan für den Hintergrund-Bereinigungsauftrag (Standard: täglich 2 Uhr UTC)
     "cleanup_schedule": "0 2 * * *",
+
+    // Wenn true, führt der Serverprozess `cleanup_schedule` automatisch über einen
+    // internen Scheduler aus (derselbe Ausführungspfad wie `bhgbrain gc`). Auf false
+    // setzen, um sich nur auf manuelle `bhgbrain gc`-Läufe oder einen externen
+    // Cron-Trigger zu verlassen.
+    "scheduled_cleanup_enabled": true,
 
     // Tage vor Ablauf, ab denen Erinnerungen als expiring_soon markiert werden
     "pre_expiry_warning_days": 7,
@@ -367,7 +375,11 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Maximale Anfragen pro Minute pro Client-IP für den HTTP-Transport
     "rate_limit_rpm": 100,
     // Maximale HTTP-Anfrage-Body-Größe in Bytes
-    "max_request_size_bytes": 1048576
+    "max_request_size_bytes": 1048576,
+    // Express-Einstellung "trust proxy". false (Standard) = req.ip ist der direkte
+    // Socket-Peer (Loopback-genau); true = X-Forwarded-For vom vorgeschalteten
+    // Reverse-Proxy berücksichtigen. Nur hinter einem vertrauenswürdigen Proxy aktivieren.
+    "trust_proxy": false
   },
 
   // Auto-Inject-Payload-Budget (für die memory://inject-Ressource)
@@ -396,7 +408,7 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "extraction_model": "gpt-4o-mini",
     // Name der Umgebungsvariable für den API-Schlüssel des Extraktionsmodells
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
-    // Wenn true, Fallback auf nur-Prüfsummen-Deduplizierung, falls Einbettung nicht verfügbar
+    // Wenn true, Fallback auf Prüfsummen- + Volltext-Ähnlichkeits-Deduplizierung, falls Einbettung nicht verfügbar
     "fallback_to_threshold_dedup": true
   },
 
@@ -445,6 +457,10 @@ node dist/index.js --stdio --config=/path/to/config.json
 ```
 
 ### HTTP-Modus
+
+> Dieser Transport ist eine reine REST-API für Skripte, Health-Probes und die CLI. Er
+> implementiert **kein** MCP Streamable HTTP — MCP-Clients müssen stattdessen stdio
+> verwenden (siehe „MCP-Client-Konfiguration").
 
 HTTP ist standardmäßig auf `127.0.0.1:3721` aktiviert. Setzen Sie `BHGBRAIN_TOKEN` vor dem Start, wenn Sie authentifizierten Zugriff wünschen:
 
@@ -514,31 +530,21 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter (HTTP-Transport)
+### OpenClaw / mcporter (stdio-Transport)
 
-```json
-{
-  "mcpServers": {
-    "bhgbrain": {
-      "transport": "http",
-      "url": "http://127.0.0.1:3721",
-      "headers": {
-        "Authorization": "Bearer <your-token>"
-      }
-    }
-  }
-}
-```
-
-Oder mit Umgebungsvariablen-Lookup, wenn Ihr mcporter dies unterstützt:
+BHGBrain spricht MCP **ausschließlich über stdio**. Der unter „HTTP-Modus"
+beschriebene HTTP-Server ist eine reine REST-API (`POST /tool/:name`,
+`GET /resource`) — er ist *kein* MCP-Streamable-HTTP-Endpunkt, MCP-Clients können sich
+also nicht damit verbinden. Verweisen Sie stattdessen auf die Binärdatei
+`bhgbrain-server`:
 
 ```json
 {
   "mcpServers": {
     "bhgbrain": {
       "transport": "stdio",
-      "command": "node",
-      "args": ["C:/Temp/GitHub/BHGBrain/dist/index.js"],
+      "command": "bhgbrain-server",
+      "args": ["--stdio"],
       "env": {
         "OPENAI_API_KEY": "sk-...",
         "QDRANT_API_KEY": "..."
@@ -547,6 +553,31 @@ Oder mit Umgebungsvariablen-Lookup, wenn Ihr mcporter dies unterstützt:
   }
 }
 ```
+
+Oder gegen ein Quellcode-Checkout statt der global installierten Binärdatei:
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["/pfad/zu/BHGBrain/dist/index.js", "--stdio"],
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "QDRANT_API_KEY": "..."
+      }
+    }
+  }
+}
+```
+
+> **OpenClaw läuft in WSL oder einem Container?** BHGBrain muss in derselben Umgebung
+> installiert sein. stdio bedeutet, dass der Client den Server als Kindprozess startet
+> — der Server kann also nicht in einer separaten Distribution oder einem separaten
+> Container liegen. Um Speicher umgebungsübergreifend zu teilen, geben Sie jeder
+> Installation ihre eigene SQLite-Datenbank und richten Sie alle auf denselben
+> Qdrant-Cluster aus (siehe „Multi-Device-Speicher").
 
 ---
 
@@ -596,11 +627,11 @@ Jeder Speicherschreibvorgang speichert den vollständigen Inhalt sowohl in SQLit
 
 Jede BHGBrain-Instanz löst beim Start eine stabile `device_id` auf, wobei folgende Prioritätsreihenfolge gilt:
 
-1. **Explizite Konfiguration**: Feld `device.id` in `config.json`
-2. **Umgebungsvariable**: `BHGBRAIN_DEVICE_ID`
+1. **Umgebungsvariable**: `BHGBRAIN_DEVICE_ID` — hat Vorrang vor einem persistierten Wert, entsprechend dem "Umgebungsvariablen gewinnen"-Vertrag, der für jeden anderen `BHGBRAIN_*`-Override gilt (siehe [Konfiguration vs. Umgebung](#konfiguration)). Überschreibt sie ein zuvor persistiertes `device.id`, wird der neue Wert erneut persistiert.
+2. **Explizite/persistierte Konfiguration**: Feld `device.id` in `config.json`
 3. **Automatisch generiert**: Abgeleitet von `os.hostname()`, in Kleinbuchstaben umgewandelt und auf `[a-zA-Z0-9._-]` bereinigt
 
-Beim ersten Start wird die aufgelöste ID in `config.json` persistiert, damit sie über Neustarts hinweg stabil bleibt, auch wenn sich der Hostname später ändert.
+Beim ersten Start wird die aufgelöste ID in `config.json` persistiert, damit sie über Neustarts hinweg stabil bleibt, auch wenn sich der Hostname später ändert. `config.json` wird nur neu geschrieben, wenn die Geräte-ID neu generiert oder durch einen Umgebungsvariablen-Override geändert wurde — ein Start im stabilen Zustand mit bereits persistierter, unveränderter ID schreibt nicht.
 
 ```jsonc
 // config.json — device-Abschnitt
@@ -1038,13 +1069,16 @@ checksum = SHA-256(normalizeContent(content))
 
 #### Phase 2: Semantische Deduplizierung (Vektorähnlichkeit)
 
-Wenn keine exakte Übereinstimmung gefunden wird, wird der Inhalt eingebettet und die 10 ähnlichsten vorhandenen Erinnerungen in der Sammlung werden aus Qdrant abgerufen. Basierend auf Kosinus-Ähnlichkeitsscores und der zugewiesenen Stufe der Erinnerung wird eine von drei Entscheidungen getroffen:
+Wenn keine exakte Übereinstimmung gefunden wird, wird der Inhalt eingebettet und die 10 ähnlichsten vorhandenen Erinnerungen in der Sammlung werden aus Qdrant abgerufen. Basierend auf Kosinus-Ähnlichkeitsscores und der zugewiesenen Stufe der Erinnerung wird eine von vier Entscheidungen getroffen:
 
 | Entscheidung | Bedingung | Auswirkung |
 |---|---|---|
 | `NOOP` | Score ≥ NOOP-Schwellenwert | Inhalt gilt als Duplikat; ID der vorhandenen Erinnerung wird ohne Schreibvorgang zurückgegeben |
+| `DELETE` | Score ≥ UPDATE-Schwellenwert **und** der Inhalt macht die Übereinstimmung explizit ungültig (z. B. "nicht mehr wahr", "Korrektur:", "vergiss das") | Die vorhandene Erinnerung wird gelöscht und der Kandidat wird als neue Erinnerung gespeichert, die über `merged_from` darauf verweist |
 | `UPDATE` | Score ≥ UPDATE-Schwellenwert | Inhalt ist eine Aktualisierung einer vorhandenen; Tags zusammenführen, Inhalt und Prüfsumme aktualisieren, ID beibehalten |
 | `ADD` | Score < UPDATE-Schwellenwert | Wirklich neue Erinnerung; mit neuer UUID erstellen |
+
+Das obige Diagramm zeigt die Pfade NOOP/UPDATE/ADD; DELETE ist eine Variante des UPDATE-Pfads, die nur ausgelöst wird, wenn die Ungültigkeits-Heuristik anschlägt.
 
 **Stufenspezifische Deduplizierungsschwellenwerte:**
 
@@ -1064,7 +1098,7 @@ Der Basis-`similarity_threshold` (Standard 0.92) wird pro Stufe angepasst, da T0
 - Aufbewahrungsstufe und Ablaufzeit werden aus der Klassifizierung des neuen Inhalts neu berechnet
 
 **Fallback-Verhalten:**
-Wenn der Einbettungsanbieter nicht verfügbar ist und `pipeline.fallback_to_threshold_dedup: true`, fällt die Pipeline auf nur-Prüfsummen-Deduplizierung zurück und schreibt die Erinnerung nur in SQLite (mit `vector_synced: false`). Die Erinnerung ist für die Volltextsuche verfügbar, aber nicht für die semantische Suche, bis die Qdrant-Synchronisation wiederhergestellt ist.
+Wenn der Einbettungsanbieter nicht verfügbar ist und `pipeline.fallback_to_threshold_dedup: true`, wechselt die Pipeline auf einen vektorlosen Dedup-Pfad, statt den Schreibvorgang fehlschlagen zu lassen. Exakte Prüfsummen-Treffer führen weiterhin sofort zu `NOOP` wie in Phase 1. Für alles andere nutzt die Pipeline die SQLite-Volltextsuche über denselben Namensraum/dieselbe Sammlung, um die ähnlichste vorhandene Erinnerung zu finden, und bewertet sie mit einer deterministischen Wortüberlappungs-Ähnlichkeit (nicht dem Vektor-Kosinuswert); bei Erreichen oder Überschreiten des `UPDATE`-Schwellenwerts wird der Inhalt in diese Erinnerung zusammengeführt (`UPDATE`, mit `vector_synced: false`), andernfalls wird er als neue Erinnerung nur in SQLite geschrieben (`ADD`, `vector_synced: false`). In beiden Fällen ist die Erinnerung für die Volltextsuche verfügbar, aber nicht für die semantische Suche, bis die Qdrant-Synchronisation wiederhergestellt ist, und das Erreichen dieses Pfads protokolliert eine strukturierte `degraded_write`-Warnung.
 
 ---
 
@@ -1175,13 +1209,15 @@ Jede Kategorie wird einem von vier benannten Slots zugewiesen:
 
 #### Hintergrund-Bereinigung
 
-Das Aufbewahrungssystem führt einen geplanten Bereinigungsauftrag aus (Standard: täglich um 2:00 Uhr, konfigurierbar über `retention.cleanup_schedule` als Cron-Ausdruck). Sie können die Bereinigung auch manuell über `bhgbrain gc` auslösen.
+Der Server führt einen geplanten Bereinigungsauftrag aus (Standard: täglich um 2:00 Uhr UTC, konfigurierbar über `retention.cleanup_schedule` als Cron-Ausdruck; deaktivierbar mit `retention.scheduled_cleanup_enabled: false`). Er läuft über denselben Codepfad wie der manuelle Befehl `bhgbrain gc`, sodass geplante und manuelle Läufe sich identisch verhalten.
 
 **Bereinigungsphasen:**
 
-1. **Abgelaufene Erinnerungen identifizieren:** SQLite nach allen Erinnerungen abfragen, bei denen `decay_eligible = true` UND `expires_at < now()`. T0-Erinnerungen sind immer ausgeschlossen (T0 ist nie verfallsberechtigt).
+1. **Abgelaufene Erinnerungen identifizieren:** SQLite nach allen Erinnerungen abfragen, bei denen `decay_eligible = true` UND `expires_at < now()`. Nur `T2`/`T3` sind für direktes Archivieren-und-Löschen berechtigt:
+   - `T0` ist immer ausgeschlossen (T0 ist nie verfallsberechtigt).
+   - `T1` wird nie direkt gelöscht. Abgelaufene oder `review_due`-überfällige `T1`-Erinnerungen werden stattdessen im GC-Ergebnis als **Review-Kandidaten** ausgewiesen, damit ein Operator entscheiden kann, ob sie befördert, neu gespeichert oder manuell gelöscht werden.
 
-2. **Vor dem Löschen archivieren (wenn aktiviert):** Für jede abgelaufene Erinnerung wird ein Zusammenfassungsdatensatz in die Tabelle `memory_archive` geschrieben:
+2. **Vor dem Löschen archivieren (wenn aktiviert):** Für jeden `T2`/`T3`-Kandidaten wird ein Zusammenfassungsdatensatz in die Tabelle `memory_archive` geschrieben und ein eigenständiges `ARCHIVE`-Audit-Ereignis protokolliert:
 
    ```sql
    memory_archive {
@@ -1197,13 +1233,21 @@ Das Aufbewahrungssystem führt einen geplanten Bereinigungsauftrag aus (Standard
    }
    ```
 
+   Schlägt die Archivierung einer Erinnerung fehl, wird diese Erinnerung von der Löschung ausgenommen (bei aktivierter Archivierung wird nie ohne dauerhaften Archivdatensatz gelöscht) und der Lauf als degradiert gemeldet, statt abzubrechen oder eine Ausnahme zu werfen.
+
 3. **Aus Qdrant löschen:** Alle abgelaufenen Punkt-IDs stapelweise aus den jeweiligen Qdrant-Sammlungen löschen.
 
 4. **Aus SQLite löschen:** Abgelaufene Zeilen aus den Tabellen `memories` und `memories_fts` entfernen.
 
-5. **Audit-Protokoll:** Jede Löschung wird in der Tabelle `audit_log` mit `operation: FORGET` und `client_id: "system"` aufgezeichnet.
+5. **Audit-Protokoll:** Jede bestätigte Löschung wird in der Tabelle `audit_log` mit `operation: FORGET` und `client_id: "system"` aufgezeichnet. Archivierung, Beförderung, T0-Revision und Archiv-Wiederherstellung erhalten jeweils einen eigenen Operationscode (`ARCHIVE`, `PROMOTE`, `REVISE`, `RESTORE`) statt in generischen `ADD`/`UPDATE`/`FORGET`-Einträgen zu verschwinden — jedes Lifecycle-Übergangsereignis trägt in der Spalte `details` eine JSON-Nutzlast `{memory_id, prior_tier, new_tier, actor, timestamp, action}`.
 
-6. **Flush:** SQLite wird nach allen Löschungen atomar auf die Festplatte geschrieben.
+6. **Kompaktierung (schwellenwertgesteuert, nicht pro Löschung):** Für jeden Namespace/Collection-Bereich, in dem dieser Lauf gelöscht hat, wird der Qdrant-Segmentoptimierer über `optimizers_config.deleted_threshold` zur Freigabe von Speicherplatz angestoßen, sobald der Anteil gelöschter Vektoren `retention.compaction_deleted_threshold` überschreitet.
+
+7. **Flush:** SQLite wird nach allen Löschungen atomar auf die Festplatte geschrieben.
+
+8. **Gesundheitssignal:** Ist während eines Laufs ein Archivierungs- oder Löschschritt fehlgeschlagen, wird das Ergebnis gespeichert und erscheint bis zum nächsten sauberen GC-Lauf als degradierte `retention`-Komponente in `health://status`.
+
+Ein GC-Lauf — manuell oder geplant — wirft nie eine Ausnahme an seinen Aufrufer: Unerwartete Fehler werden abgefangen, die laufende Lifecycle-Sperre wird immer freigegeben, und das Ergebnis wird als `degraded: true` mit dem bereits abgeschlossenen Arbeitsstand gemeldet.
 
 #### T0-Revisionsverlauf
 
@@ -1506,7 +1550,7 @@ sequenceDiagram
             S->>DB: Hot-reload in-memory SQLite
             S->>DB: Run schema migrations
             DB-->>S: Ready
-            S-->>C: memory_count, activated: true
+            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
         end
     end
 ```
@@ -1546,7 +1590,7 @@ Der JSON-Header enthält:
 **Was NICHT in der Sicherung enthalten ist:**
 - Qdrant-Vektordaten sind **nicht** enthalten. Nach der Wiederherstellung aus einer Sicherung müssen Qdrant-Sammlungen durch erneutes Einbetten der Inhalte neu aufgebaut werden. Bis dahin funktioniert die Volltextsuche, aber nicht die semantische Suche.
 
-**Sicherungsintegrität:** Ein SHA-256-Prüfsumme der Datenbankdaten wird im Header gespeichert und bei der Wiederherstellung überprüft. Wenn die Datei beschädigt ist, schlägt die Wiederherstellung mit `INVALID_INPUT: Backup integrity check failed` fehl.
+**Sicherungsintegrität:** Ein SHA-256-Prüfsumme der Datenbankdaten wird im Header gespeichert und bei der Wiederherstellung überprüft. Wenn die Datei beschädigt ist, schlägt die Wiederherstellung mit `INVALID_INPUT: Backup integrity check failed` fehl. Nachdem die wiederhergestellte Datenbank aktiviert wurde, wird ihre Erinnerungsanzahl außerdem gegen `memory_count` im Header abgeglichen — eine Abweichung lässt die Wiederherstellung mit `INTERNAL` fehlschlagen (protokolliert als `backup_restore_count_mismatch`), statt eine erfolgreiche Antwort über stillschweigend falsche Daten zurückzugeben.
 
 **Sicherungsmetadaten** werden in der SQLite-Tabelle `backup_metadata` verfolgt, damit `backup list` Informationen über historische Sicherungen zurückgeben kann.
 
@@ -1585,11 +1629,15 @@ Gibt zurück:
 2. Die eingebettete SQLite-Datenbank atomar in das Datenverzeichnis schreiben (Schreiben-in-Temp-dann-Umbenennen).
 3. Die im-Arbeitsspeicher-SQLite-Datenbank aus der wiederhergestellten Datei ohne Neustart des Prozesses neu laden.
 4. Schema-Migrationen auf der neu geladenen Datenbank ausführen, um Vorwärtskompatibilität sicherzustellen.
-5. `{ memory_count: <Anzahl>, activated: true }` zurückgeben.
+5. Vektoren gegen tatsächliche Abweichungen (Drift) abgleichen (siehe unten) und `{ memory_count: <Anzahl>, metadata_activated: true, vector_reconciliation: {...} }` zurückgeben.
 
-**Wiederherstellung ist live:** Die wiederhergestellte Datenbank ist sofort aktiv. Ein Neustart des Servers ist nicht erforderlich. Die Antwort enthält `activated: true` zur Bestätigung.
+**Wiederherstellung ist live:** Die wiederhergestellte Datenbank ist sofort aktiv. Ein Neustart des Servers ist nicht erforderlich. Die Antwort enthält `metadata_activated: true` zur Bestätigung.
 
-**Schutz vor gleichzeitiger Wiederherstellung:** Wenn bereits eine Wiederherstellung läuft, geben nachfolgende Wiederherstellungsanfragen `INVALID_INPUT: Backup restore already in progress` zurück.
+**Prüfung der Erinnerungsanzahl nach der Aktivierung:** Da ein Backup ein Byte-für-Byte-Export der SQLite-Datenbank ist, muss die Erinnerungsanzahl nach der Aktivierung exakt `memory_count` aus dem Header entsprechen. Andernfalls wirft die Wiederherstellung `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` und protokolliert ein `backup_restore_count_mismatch`-Ereignis — der Aufruf gibt keine erfolgreiche Antwort zurück.
+
+**Die Vektor-Abgleichung ist drift-basiert und begrenzt.** Die Wiederherstellung leert und re-embedded nicht bedingungslos den gesamten Bestand: Sie vergleicht die Inhalts-Prüfsumme jeder wiederhergestellten Erinnerung mit dem bereits in Qdrant gespeicherten Vektor und markiert nur neue oder inhaltlich geänderte Erinnerungen für ein erneutes Embedding. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben oder der Qdrant-Zustand nicht gelesen werden kann, greift stattdessen ein vollständiger Neuaufbau. Sobald diese Drift-Prüfung abgeschlossen ist, wird die Restore-Lifecycle-Sperre freigegeben — `vector_reconciliation.state` ist sofort `"reconciled"`, wenn nichts abgewichen ist, oder `"reconciling"`, wenn das erneute Embedding der abweichenden Teilmenge in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf, mit automatischen Wiederholungsversuchen) fortgesetzt wird, nachdem der Aufruf bereits zurückgekehrt ist. Fragen Sie `health://status` (`components.vector_reconciliation`) ab, um den Fortschritt zu beobachten.
+
+**Schutz vor gleichzeitiger Wiederherstellung:** Wenn bereits eine Wiederherstellung läuft, geben nachfolgende Wiederherstellungsanfragen `INVALID_INPUT: Backup restore already in progress` zurück. Diese Sperre deckt nur die Metadaten-Aktivierung und die Drift-Prüfung ab, nicht das Hintergrund-Re-Embedding, und wird daher auch bei einer großen Wiederherstellung schnell wieder freigegeben.
 
 ---
 
@@ -1627,10 +1675,13 @@ Gibt einen `HealthSnapshot` zurück:
     "expiring_soon": 5,
     "archived_count": 128,
     "unsynced_vectors": 0,
-    "over_capacity": false
+    "over_capacity": false,
+    "cleanup_lag_seconds": 120
   }
 }
 ```
+
+`components.retention` wird ebenfalls `"degraded"` (mit Nachricht), wenn der letzte GC-Lauf — geplant oder manuell — einen teilweisen Fehler gemeldet hat (ein Archivierungs- oder Löschschritt ist fehlgeschlagen), unabhängig vom Kapazitätsdruck der Stufen. Der Status wird beim nächsten sauberen GC-Lauf wieder auf `"healthy"` zurückgesetzt.
 
 **Gesamtstatus-Logik:**
 - `unhealthy` — wenn SQLite oder Qdrant fehlerhaft ist
@@ -1642,7 +1693,7 @@ Gibt einen `HealthSnapshot` zurück:
 | Komponente | Gesunder Zustand | Degradierter Zustand | Fehlerhafter Zustand |
 |---|---|---|---|
 | `sqlite` | `SELECT 1` erfolgreich | — | Abfrage wirft Fehler |
-| `qdrant` | `getCollections()` erfolgreich | — | Verbindung abgelehnt |
+| `qdrant` | Eine begrenzte, lesende Vektorabfrage ist erfolgreich (ein leeres Ergebnis oder eine noch nicht angelegte Collection gelten ebenfalls als gesund) | — | Die Vektorabfrage selbst schlägt fehl, auch wenn der Server erreichbar ist |
 | `embedding` | Embed-API-Aufruf erfolgreich | Fehlende Anmeldedaten oder nicht erreichbar | — |
 | `retention` | Alle Budgets innerhalb der Limits, keine nicht synchronisierten Vektoren | Budget überschritten ODER nicht synchronisierte Vektoren > 0 | — |
 
@@ -1660,18 +1711,37 @@ Wenn `observability.metrics_enabled: true`, ist ein Metriken-Endpunkt verfügbar
 GET /metrics
 ```
 
-Gibt Nur-Text-Schlüssel-Wert-Metriken zurück (Prometheus-kompatibles Format):
+Gibt Metriken im Prometheus-Textformat zurück: eine `# TYPE <name> <counter|gauge|histogram>`-Zeile
+einmal pro Metrikname, gefolgt von `name{label="value",...} value`-Zeilen (der `{...}`-Teil entfällt bei
+Metriken ohne Labels, sodass die Ausgabe abwärtskompatibel zum vorherigen labellosen Format bleibt).
 
 | Metrik | Typ | Beschreibung |
 |---|---|---|
 | `bhgbrain_tool_calls_total` | Zähler | Gesamte Tool-Aufrufe |
-| `bhgbrain_tool_duration_seconds_avg` | Histogramm | Durchschnittliche Tool-Aufruf-Dauer |
-| `bhgbrain_tool_duration_seconds_count` | Zähler | Anzahl der Tool-Aufruf-Dauermessungen |
+| `bhgbrain_tool_handler_ms_avg` | Histogramm | Durchschnittliche Tool-Handler-Latenz in Millisekunden, mit den Labels `tool` (Tool-Name) und `status` (`ok`/`error`). Wird bei jedem Aufruf erfasst, auch bei Fehlern. |
+| `bhgbrain_tool_handler_ms_p50` | Histogramm | 50. Perzentil der Tool-Handler-Latenz, mit den Labels `tool` und `status` |
+| `bhgbrain_tool_handler_ms_p95` | Histogramm | 95. Perzentil der Tool-Handler-Latenz, mit den Labels `tool` und `status` |
+| `bhgbrain_tool_handler_ms_p99` | Histogramm | 99. Perzentil der Tool-Handler-Latenz, mit den Labels `tool` und `status` |
+| `bhgbrain_tool_handler_ms_count` | Zähler | Anzahl der Tool-Handler-Latenzmessungen, mit den Labels `tool` und `status` |
+| `embedding_embed_batch_ms_p95` | Histogramm | 95. Perzentil der Embedding-Batch-Latenz |
+| `search_total_ms_p95` | Histogramm | 95. Perzentil der End-to-End-Suchlatenz |
 | `bhgbrain_memory_count` | Messuhr | Aktuelle Gesamt-Erinnerungsanzahl (bei Schreiben/Löschen aktualisiert) |
 | `bhgbrain_rate_limit_buckets` | Messuhr | Aktive Rate-Limit-Verfolgungseimer |
 | `bhgbrain_rate_limited_total` | Zähler | Gesamt rate-limitierte Anfragen |
 
-Histogramme verwenden einen begrenzten Ringpuffer der letzten 1.000 Messungen. Metriken sind nur im Prozess – es gibt keinen externen Push.
+Zum Beispiel:
+
+```
+# TYPE bhgbrain_tool_handler_ms_p95 histogram
+bhgbrain_tool_handler_ms_p95{tool="recall",status="ok"} 12
+bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
+```
+
+Histogramme verwenden einen begrenzten Ringpuffer der letzten 1.000 Messungen **pro Label-Kombination**
+(jede Tool-/Status-Kombination erhält also ihr eigenes 1.000-Messungen-Fenster). Metriken sind nur im
+Prozess – es gibt keinen externen Push. Da Fehler jetzt in `bhgbrain_tool_handler_ms` enthalten sind,
+spiegeln p95/p99 den langsamen Fehler-Tail wider (Timeouts, geöffnete Circuit-Breaker usw.) und können
+höher ausfallen als bevor diese Metrik Fehler erfasste.
 
 ---
 
@@ -1686,6 +1756,8 @@ Authorization: Bearer <your-token>
 ```
 
 Der Token-Wert wird aus der in `transport.http.bearer_token_env` genannten Umgebungsvariable gelesen (Standard: `BHGBRAIN_TOKEN`). Wenn die Umgebungsvariable nicht gesetzt ist, werden alle HTTP-Anfragen durchgelassen (eine Warnung wird protokolliert, aber Auth wird nicht durchgesetzt – für nur-Loopback-Bindungen ist dies akzeptabel).
+
+Das übermittelte Token wird mit einem zeitkonstanten Vergleich (`crypto.timingSafeEqual`) gegen das konfigurierte Geheimnis geprüft, sodass eine Abweichung keine Zeitinformationen darüber preisgibt, welches Byte abweicht. Tokens mit einer anderen Länge als das konfigurierte Geheimnis schlagen sofort fehl (fail-closed), ohne den zeitkonstanten Vergleich zu versuchen.
 
 **Fail-Closed für externe Bindungen:** Wenn der HTTP-Host nicht Loopback ist (nicht `127.0.0.1`, `localhost` oder `::1`) und kein Token konfiguriert ist, **verweigert der Server den Start**:
 
@@ -1718,15 +1790,28 @@ Um an eine nicht-Loopback-Adresse zu binden (z. B. für Remote-Clients in einem 
 
 Stellen Sie sicher, dass `BHGBRAIN_TOKEN` in dieser Konfiguration gesetzt ist.
 
+### Proxy-Vertrauen
+
+`security.trust_proxy` (Standard `false`) wird direkt an Express' `app.set('trust proxy', ...)` übergeben und bestimmt damit, wie `req.ip` abgeleitet wird und auf welche Identität der Rate-Limiter sich stützt:
+
+- **Deaktiviert (Standard):** `req.ip` ist der direkte Socket-Peer. Das ist für die dokumentierte, nur-Loopback-Bereitstellung korrekt. Steht dennoch ein Reverse-Proxy davor, werden alle proxierten Clients auf die einzelne IP des Proxys zusammengefasst, und vom Aufrufer gesetzte `X-Forwarded-For`-Header werden ignoriert (sie können also nicht zum Aufsplitten oder Umgehen von Rate-Limits gefälscht werden).
+- **Aktiviert:** `req.ip` berücksichtigt das vom direkten Peer gesetzte `X-Forwarded-For`. Nur hinter einem Reverse-Proxy aktivieren, dem Sie vertrauen, diesen Header korrekt zu setzen – ohne einen solchen vertrauenswürdigen Proxy davor kann jeder Client seine Rate-Limit-Identität fälschen.
+
+```json
+{ "security": { "trust_proxy": true } }
+```
+
 ### Rate Limiting
 
 HTTP-Anfragen werden pro Client-IP-Adresse rate-limitiert:
 
 - Standard: 100 Anfragen pro Minute (`security.rate_limit_rpm`)
-- Rate-Limit-Status ist auf die vertrauenswürdige IP geknüpft (nicht den `x-client-id`-Header)
+- Rate-Limit-Status ist auf die vertrauenswürdige IP geknüpft, wie oben über `security.trust_proxy` abgeleitet (nicht den `x-client-id`-Header)
 - Überschreitende Clients erhalten HTTP 429 mit `{ error: { code: "RATE_LIMITED", retryable: true } }`
+- Anfragen ohne ableitbare Client-IP schlagen fail-closed mit HTTP 400 (`INVALID_INPUT`) fehl, statt sich einen gemeinsamen Ausweich-Bucket zu teilen
 - Antwortheader enthalten `X-RateLimit-Limit` und `X-RateLimit-Remaining`
 - Abgelaufene Rate-Limit-Eimer werden alle 30 Sekunden bereinigt
+- Der Rate-Limit-Status ist pro Server-/Middleware-Instanz gekapselt, sodass unabhängige Instanzen (z. B. in Tests) sich nie Buckets teilen
 
 ### Begrenzung der Anfragegröße
 
@@ -1734,7 +1819,7 @@ HTTP-Anfrage-Bodies sind auf `security.max_request_size_bytes` begrenzt (Standar
 
 ### Log-Redigierung
 
-Wenn `security.log_redaction: true` (Standard), werden in der Log-Ausgabe erscheinende Bearer-Tokens redigiert. Logs über Authentifizierungsfehler zeigen nur eine verkürzte Vorschau ungültiger Tokens.
+Wenn `security.log_redaction: true` (Standard), werden in der Log-Ausgabe erscheinende Bearer-Tokens redigiert. Logs über Authentifizierungsfehler zeigen nur eine verkürzte Vorschau ungültiger Tokens. Erinnerungsinhaltsfelder (`content`, `preview`, `summary` sowie jedes verschachtelte `*.content`) werden auf dieselbe Weise aus der strukturierten Log-Ausgabe redigiert — durchgesetzt über die konfigurierten Redact-Pfade des Loggers, nicht durch Auslassung an einzelnen Log-Aufrufstellen.
 
 ### Geheimnis-Erkennung im Inhalt
 
@@ -1782,6 +1867,8 @@ Antwort:
 ```
 
 Die Paginierung verwendet zusammengesetzte Cursor (`created_at|id`) für stabile Sortierung. Gleichstände mit demselben Zeitstempel werden durch die ID aufgelöst, sodass keine Zeile über Seiten hinweg übersprungen oder dupliziert wird.
+
+`memory://list` und `memory://{id}` wenden dieselbe Lifecycle-Sichtbarkeitsregel wie `search`/`recall` an: Eine abgelaufene, verfallsberechtigte `T2`/`T3`-Erinnerung wird ausgeschlossen (Abfragen über `memory://{id}` liefern `NOT_FOUND`). `T0`- und `T1`-Erinnerungen bleiben unabhängig von einem vorübergehenden Ablauf sichtbar.
 
 ### `memory://inject` — Sitzungskontext-Injektion
 
@@ -1870,15 +1957,21 @@ bhgbrain stats --by-tier              # Erinnerungsanzahl aufgeteilt nach Aufbew
 bhgbrain stats --expiring             # Erinnerungen anzeigen, die in den nächsten 7 Tagen ablaufen
 bhgbrain health                       # Vollständige Systemgesundheitsprüfung
 
-# Garbage Collection
-bhgbrain gc                           # Bereinigung ausführen (abgelaufene Nicht-T0-Erinnerungen löschen)
-bhgbrain gc --dry-run                 # Zeigen, was bereinigt würde, ohne zu löschen
+# Garbage Collection (archiviert + löscht abgelaufene T2/T3; T1 wird als
+# reviewCandidates ausgewiesen statt gelöscht; Qdrant-Kompaktierung läuft
+# automatisch, sobald der Anteil gelöschter Vektoren einer betroffenen
+# Collection den konfigurierten Schwellenwert überschreitet — siehe
+# retention.compaction_deleted_threshold)
+bhgbrain gc                           # Bereinigung ausführen
+bhgbrain gc --dry-run                 # Kandidaten und Review-Elemente anzeigen, ohne zu löschen
 bhgbrain gc --tier T3                 # Nur T3-Erinnerungen bereinigen
-bhgbrain gc --consolidate             # GC + Stale-Markierungs-Konsolidierungsdurchgang
-bhgbrain gc --force-compact           # Qdrant-Segment-Kompaktierung nach GC erzwingen
 
 # Audit-Protokoll
 bhgbrain audit                        # Aktuelle Audit-Einträge anzeigen
+
+# Reparatur (Multi-Geräte-Wiederherstellung)
+bhgbrain repair --from-qdrant                # Lokale SQLite aus Qdrant wiederherstellen (standardmäßig nur Erinnerungen des aktuellen Geräts)
+bhgbrain repair --from-qdrant --all-devices  # Aus den Erinnerungen aller Geräte wiederherstellen, nicht nur des aktuellen
 
 # Kategorieverwaltung
 bhgbrain category list                # Alle Kategorien auflisten
@@ -2222,8 +2315,18 @@ Speichersicherungen erstellen, auflisten oder wiederherstellen.
 
 **`restore`-Ausgabe:**
 ```json
-{ "memory_count": 1234, "activated": true }
+{
+  "memory_count": 1234,
+  "metadata_activated": true,
+  "vector_reconciliation": {
+    "status": "degraded",
+    "state": "reconciling",
+    "unsynced_vectors": 42,
+    "message": "Restore activated SQLite metadata; vector reconciliation for the drifted subset is continuing in the background."
+  }
+}
 ```
+`vector_reconciliation.state` ist `"reconciled"`, wenn kein Vektor tatsächlich abgewichen ist (nichts erneut einzubetten), oder `"reconciling"`, während eine begrenzte Hintergrundaufgabe die abweichende/fehlende Teilmenge erneut einbettet. Siehe [Aus Sicherung wiederherstellen](#aus-sicherung-wiederherstellen).
 
 ---
 
@@ -2236,12 +2339,16 @@ Erinnerungen aus Qdrant in die lokale SQLite-Datenbank wiederherstellen. Wird f�
 | Parameter | Typ | Erforderlich | Standard | Beschreibung |
 |---|---|---|---|---|
 | `dry_run` | `boolean` | Nein | `false` | Wenn `true`, wird berichtet, was wiederhergestellt würde, ohne Änderungen vorzunehmen. |
-| `device_id` | `string` | Nein | — | Wiederherstellung auf Erinnerungen eines bestimmten Geräts beschränken. Weglassen, um alle wiederherzustellen. |
+| `device_id` | `string` | Nein | — | Wiederherstellung auf Erinnerungen eines bestimmten Geräts beschränken. Schließt sich mit `all_devices` gegenseitig aus. |
+| `all_devices` | `boolean` | Nein | `false` | Erinnerungen von allen Geräten ausdrücklich wiederherstellen. Schließt sich mit `device_id` gegenseitig aus. Dies ist auch das Standardverhalten, wenn keines der beiden Felder angegeben wird. |
 
 **Ausgabe:**
 
 ```json
 {
+  "dry_run": false,
+  "all_devices": true,
+  "device_id_filter": null,
   "collections_scanned": 2,
   "points_scanned": 47,
   "already_in_sqlite": 12,
@@ -2254,6 +2361,7 @@ Erinnerungen aus Qdrant in die lokale SQLite-Datenbank wiederherstellen. Wird f�
 **Hinweise:**
 - Nur Punkte mit `content` in ihrem Qdrant-Payload können wiederhergestellt werden. Vor-1.3-Erinnerungen ohne Inhalt in Qdrant werden als `skipped_no_content` gemeldet.
 - Wiederhergestellte Erinnerungen bewahren ihre ursprüngliche `device_id` aus dem Qdrant-Payload. Wenn keine `device_id` im Payload existiert, wird die lokale Geräte-ID verwendet.
+- Die gleichzeitige Angabe von `device_id` und `all_devices: true` wird als ungültige Eingabe abgelehnt.
 - Nach der Wiederherstellung führen Sie `npm run build` aus und starten Sie den Server bei Bedarf neu. Die wiederhergestellten Erinnerungen sind sofort für Suche und Recall verfügbar.
 
 ---
@@ -2284,6 +2392,13 @@ Was beim ersten Start nach dem Upgrade passiert:
 ```
 
 **Abwärtskompatibel**: Vor-1.3-Erinnerungen ohne `device_id` oder Inhalt in Qdrant funktionieren weiterhin normal. Sie können lediglich nicht über das `repair`-Tool wiederhergestellt werden.
+
+**Verfeinerungen nach 1.3 (1.4.10)**: Ein Audit des Multi-Device-Features fand und behob eine echte Migrationslücke sowie einige Vertragsabweichungen:
+
+- Der `device_id`-Qdrant-Payload-Index wird jetzt bei jedem `ensureCollection`-Aufruf **bedingungslos** sichergestellt, nicht nur bei der Erstellung einer neuen Sammlung — Sammlungen, die vor diesem Feature erstellt wurden, werden nun ebenfalls migriert.
+- `BHGBRAIN_DEVICE_ID` hat jetzt **Vorrang** vor einer persistierten `device.id`, entsprechend dem an anderer Stelle verwendeten „Umgebungsvariablen gewinnen"-Vertrag. Überschreibt sie einen persistierten Wert, wird der neue Wert erneut persistiert.
+- `config.json` wird nur neu geschrieben, wenn die Geräte-ID neu generiert oder durch einen Umgebungsvariablen-Override geändert wurde, nicht bei jedem Start.
+- Das `repair`-Tool erhielt ein explizites `all_devices`-Boolean, das sich mit `device_id` gegenseitig ausschließt, als dokumentierter All-Devices-Pfad (das bisherige implizite Verhalten „`device_id` weglassen" funktioniert unverändert weiter).
 
 ---
 
@@ -2325,12 +2440,17 @@ Die Sicherung wird im Datenverzeichnis gespeichert (`%LOCALAPPDATA%\BHGBrain\` u
 
 ### Aktivierung der Sicherungswiederherstellung
 
-`backup.restore` lädt den Laufzeit-SQLite-Zustand vor der Rückgabe des Erfolgs neu. Wiederherstellungsantworten enthalten `activated: true`, wenn die wiederhergestellten Daten sofort aktiv sind. Der Server muss nicht neu gestartet werden.
+`backup.restore` lädt den Laufzeit-SQLite-Zustand vor der Rückgabe des Erfolgs neu. Wiederherstellungsantworten enthalten `metadata_activated: true`, wenn die wiederhergestellten Daten sofort aktiv sind. Der Server muss nicht neu gestartet werden.
+
+Die Wiederherstellung erwirbt eine Fail-Safe-Sperre (`beginRestoreOperation()`), die gleichzeitige Schreibvorgänge nur so lange blockiert, wie SQLite aktiviert und die wiederhergestellten Vektoren auf Abweichungen (Drift) gegenüber Qdrant geprüft werden. Vektoren werden **nicht** bedingungslos geleert und neu eingebettet: Nur Erinnerungen, deren Inhalts-Prüfsumme von Qdrant abweicht (oder dort fehlt), werden für ein erneutes Embedding markiert, sodass eine Wiederherstellung ohne Abweichungen abgeschlossen wird, ohne den Embedding-Anbieter überhaupt aufzurufen. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben oder der Qdrant-Zustand nicht gelesen werden kann, greift stattdessen ein vollständiger Neuaufbau.
+
+Sobald die Drift-Prüfung abgeschlossen ist, wird die Sperre freigegeben — das erneute Embedding der abweichenden Teilmenge (falls vorhanden) läuft in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf), anstatt den Wiederherstellungsaufruf zu blockieren oder andere Schreibvorgänge währenddessen aufzuhalten. Bei vorübergehenden Fehlern wird automatisch mit Backoff wiederholt; falls die Abgleichung nie vollständig aufholt, meldet `health://status` weiterhin `vector_reconciliation.state: "pending"` (oder `"reconciling"`, während ein Durchlauf läuft), anstatt die semantische Suche stillschweigend leer zu lassen. Der Fortschritt wird in Batch-Granularität auf die Festplatte geschrieben, sodass ein harter Absturz während der Abgleichung höchstens einen Batch an Arbeit verliert — ein Neustart setzt über idempotentes Re-Upsert sicher bei der verbleibenden nicht synchronisierten Menge fort.
 
 ### HTTP-Absicherung
 
 - `/health` ist absichtlich unauthentifiziert für Probe-Kompatibilität.
 - Rate Limiting verwendet die vertrauenswürdige Anfragen-Identität (IP) und ignoriert `x-client-id` für die Durchsetzung.
+- Die `client_id` in Audit-/Anfrageprotokollen wird ebenso von der vertrauenswürdigen Anfragen-Identität (`req.ip`) abgeleitet, niemals vom vom Aufrufer angegebenen `x-client-id`-Header — dieser Header wird nur als nicht-maßgeblicher Debug-Hinweis akzeptiert und nie für die Audit-Spur vertraut.
 - `memory://list` erzwingt `limit`-Grenzen von `1..100`; ungültige Werte geben `INVALID_INPUT` zurück.
 
 ### Fail-Closed-Authentifizierung

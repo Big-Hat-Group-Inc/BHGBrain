@@ -28,7 +28,7 @@
 
 ## 4. Wrap Qdrant Storage
 
-- [x] 4.1 Add `breaker?: CircuitBreaker` parameter to `QdrantStorage` constructor
+- [x] 4.1 Add `breaker?: CircuitBreaker` parameter to `QdrantStore` constructor
 - [x] 4.2 Wrap `search`, `upsert`, and `delete` method bodies with `this.breaker?.execute(...)` 
 - [x] 4.3 Confirm that a tripped breaker throws an `internal` BrainError (not a raw `CircuitOpenError`) so callers receive a consistent error type
 
@@ -36,7 +36,7 @@
 
 - [x] 5.1 In `src/index.ts`, instantiate `CircuitBreaker` instances for `openai_embedding` and `qdrant` using config from `config.resilience.circuit_breaker`
 - [x] 5.2 Pass the embedding breaker to `OpenAIEmbeddingProvider` constructor
-- [x] 5.3 Pass the Qdrant breaker to `QdrantStorage` constructor
+- [x] 5.3 Pass the Qdrant breaker to `QdrantStore` constructor
 - [x] 5.4 Pass both breaker instances to `HealthService` for state reporting
 
 ## 6. Health Visibility

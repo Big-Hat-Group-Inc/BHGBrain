@@ -13,6 +13,7 @@ export class QdrantStore {
   constructor(
     private config: BrainConfig,
     private readonly breaker?: CircuitBreaker,
+    private readonly logger?: { warn: (obj: Record<string, unknown>) => void },
   ) {
     this.dimensions = config.embedding.dimensions;
 
@@ -66,10 +67,27 @@ export class QdrantStore {
         field_name: 'expires_at',
         field_schema: 'integer',
       });
+    }
+
+    // Ensured unconditionally (not just on first create) so that collections
+    // created before device provenance shipped — the exact post-upgrade,
+    // multi-device Qdrant Cloud scenario this feature targets — still get the
+    // index. Idempotent: a second call against an already-indexed collection
+    // is a tolerated no-op.
+    await this.ensureDeviceIdIndex(name);
+  }
+
+  private async ensureDeviceIdIndex(name: string): Promise<void> {
+    try {
       await this.client.createPayloadIndex(name, {
         field_name: 'device_id',
         field_schema: 'keyword',
       });
+    } catch (err) {
+      if (this.isAlreadyExistsError(err)) {
+        return;
+      }
+      throw err;
     }
   }
 
@@ -167,13 +185,13 @@ export class QdrantStore {
     }
 
     const perCollection = await Promise.all(targets.map(name =>
-      this.executeWithBreaker(() => this.client.search(name, {
-        vector,
+      this.executeWithBreaker(() => this.client.query(name, {
+        query: vector,
         limit,
         filter: must.length > 0 ? { must } : undefined,
         score_threshold: filters?.minScore,
         with_payload: true,
-      })).catch((err: unknown) => {
+      })).then(response => response.points).catch((err: unknown) => {
         // A target collection that no longer exists simply contributes no results.
         if (this.isNotFoundError(err)) return [];
         throw err;
@@ -201,26 +219,59 @@ export class QdrantStore {
   ): Promise<Array<{ id: string; score: number }>> {
     const name = this.collectionName(namespace, collection);
     try {
-      const results = await this.client.search(name, {
-        vector,
+      const response = await this.executeWithBreaker(() => this.client.query(name, {
+        query: vector,
         limit: topK,
         filter: {
           must: [{ key: 'namespace', match: { value: namespace } }],
         },
         with_payload: false,
+      }));
+      return response.points.map(r => ({ id: r.id as string, score: r.score }));
+    } catch (err) {
+      // A collection that has never been written to (namespace/collection pair
+      // with no prior memories) simply has no similar vectors. Any other
+      // failure (transport, auth, a removed client method, an open circuit
+      // breaker) must not be presented to the write pipeline as "no near
+      // duplicates" - it is logged and propagated so the caller can
+      // distinguish an empty result from a failed similarity check instead
+      // of silently proceeding as a novel write.
+      if (this.isNotFoundError(err)) {
+        return [];
+      }
+      this.logger?.warn({
+        event: 'similarity_search_failed',
+        namespace,
+        collection,
+        error: (err as Error).message,
       });
-      return results.map(r => ({ id: r.id as string, score: r.score }));
-    } catch {
-      return [];
+      throw err;
     }
   }
 
   async healthCheck(): Promise<boolean> {
+    // Probe the retrieval path itself (the same `query` call `search`/
+    // `searchSimilar` use), not just connectivity: a reachable server that
+    // rejects or cannot execute queries (removed client method, incompatible
+    // request shape, server-side rejection) must not report healthy just
+    // because `getCollections()` succeeds. The probe is bounded (limit 1)
+    // and skips payload hydration so polling stays cheap and side-effect
+    // free. It targets the default namespace/collection so a fresh install
+    // with no data yet still exercises the call; a missing collection or an
+    // empty result set are both healthy - only a raised failure is not.
+    const name = this.collectionName(this.config.defaults.namespace, this.config.defaults.collection);
     try {
-      await this.client.getCollections();
+      await this.client.query(name, {
+        query: new Array(this.dimensions).fill(0),
+        limit: 1,
+        with_payload: false,
+      });
       return true;
-    } catch {
-      return false;
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return true;
+      }
+      throw err;
     }
   }
 
@@ -232,6 +283,30 @@ export class QdrantStore {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Nudges Qdrant's segment optimizer to reclaim space in a collection whose
+   * deleted-vector ratio has crossed the configured threshold. Qdrant has no
+   * "compact now" endpoint; re-applying `optimizers_config.deleted_threshold`
+   * via `updateCollection` is the documented way to make the optimizer
+   * re-evaluate deleted segments on its next pass. A missing collection is a
+   * tolerated no-op (nothing to compact).
+   */
+  async compact(namespace: string, collection: string, deletedThreshold: number): Promise<void> {
+    await this.executeWithBreaker(async () => {
+      const name = this.collectionName(namespace, collection);
+      try {
+        await this.client.updateCollection(name, {
+          optimizers_config: { deleted_threshold: deletedThreshold },
+        });
+      } catch (err) {
+        if (this.isNotFoundError(err)) {
+          return;
+        }
+        throw err;
+      }
+    });
   }
 
   async deleteCollection(namespace: string, collection: string): Promise<void> {
@@ -299,6 +374,15 @@ export class QdrantStore {
     if (status === 404) return true;
     const message = maybeErr.message?.toLowerCase() ?? '';
     return message.includes('not found') || message.includes('does not exist');
+  }
+
+  private isAlreadyExistsError(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false;
+    const maybeErr = err as { status?: number; response?: { status?: number }; message?: string };
+    const status = maybeErr.status ?? maybeErr.response?.status;
+    if (status === 409) return true;
+    const message = maybeErr.message?.toLowerCase() ?? '';
+    return message.includes('already exists') || message.includes('conflict');
   }
 
   private async executeWithBreaker<T>(fn: () => Promise<T>): Promise<T> {

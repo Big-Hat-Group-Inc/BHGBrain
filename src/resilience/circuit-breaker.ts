@@ -1,9 +1,18 @@
 export type CircuitBreakerState = 'closed' | 'open' | 'half-open';
 
+export interface CircuitBreakerLogger {
+  warn(obj: Record<string, unknown>): void;
+  info(obj: Record<string, unknown>): void;
+}
+
 export interface CircuitBreakerOptions {
   failureThreshold: number;
   openWindowMs: number;
   halfOpenProbeCount: number;
+  /** Identifier included in transition log events (e.g. "qdrant", "openai_embedding"). */
+  key?: string;
+  /** Optional structured logger; when omitted, transitions are not logged. */
+  logger?: CircuitBreakerLogger;
 }
 
 export class CircuitOpenError extends Error {
@@ -18,6 +27,7 @@ export class CircuitBreaker {
   private failures = 0;
   private lastOpenedAt: Date | null = null;
   private halfOpenSuccesses = 0;
+  private probeInFlight = false;
 
   constructor(
     private readonly options: CircuitBreakerOptions,
@@ -31,6 +41,14 @@ export class CircuitBreaker {
       throw new CircuitOpenError();
     }
 
+    const isProbe = this.state === 'half-open';
+    if (isProbe) {
+      if (this.probeInFlight) {
+        throw new CircuitOpenError();
+      }
+      this.probeInFlight = true;
+    }
+
     try {
       const result = await fn();
       this.onSuccess();
@@ -38,6 +56,10 @@ export class CircuitBreaker {
     } catch (error) {
       this.onFailure();
       throw error;
+    } finally {
+      if (isProbe) {
+        this.probeInFlight = false;
+      }
     }
   }
 
@@ -83,21 +105,55 @@ export class CircuitBreaker {
     }
 
     if ((this.now() - this.lastOpenedAt.getTime()) >= this.options.openWindowMs) {
+      const from = this.state;
       this.state = 'half-open';
       this.halfOpenSuccesses = 0;
+      this.probeInFlight = false;
+      this.logTransition('info', from, this.state);
     }
   }
 
   private open(): void {
+    const from = this.state;
     this.state = 'open';
     this.failures = this.options.failureThreshold;
     this.halfOpenSuccesses = 0;
+    this.probeInFlight = false;
     this.lastOpenedAt = new Date(this.now());
+    this.logTransition(from === 'closed' ? 'warn' : 'info', from, this.state, { failures: this.failures });
   }
 
   private close(): void {
+    const from = this.state;
     this.state = 'closed';
     this.failures = 0;
     this.halfOpenSuccesses = 0;
+    this.probeInFlight = false;
+    this.logTransition('info', from, this.state);
+  }
+
+  private logTransition(
+    level: 'warn' | 'info',
+    from: CircuitBreakerState,
+    to: CircuitBreakerState,
+    extra?: Record<string, unknown>,
+  ): void {
+    if (!this.options.logger) {
+      return;
+    }
+
+    const payload = {
+      event: 'circuit_breaker_transition',
+      breaker: this.options.key ?? 'unknown',
+      from,
+      to,
+      ...extra,
+    };
+
+    if (level === 'warn') {
+      this.options.logger.warn(payload);
+    } else {
+      this.options.logger.info(payload);
+    }
   }
 }

@@ -6,6 +6,13 @@ const REDACT_PATHS = [
   'token',
   'bearer',
   'api_key',
+  // Memory content previews: enforced by config (redact paths below), not by
+  // omission at call sites — see the `content-preview redaction` audit
+  // follow-up (2026-06-05, add-operations-security-reliability task 4.3).
+  'content',
+  'preview',
+  'summary',
+  '*.content',
 ];
 
 const CONTENT_PREVIEW_MAX = 50;

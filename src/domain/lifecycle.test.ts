@@ -46,6 +46,33 @@ describe('MemoryLifecycleService', () => {
     expect(service.shouldPromote('T1', 10)).toBeNull();
   });
 
+  describe('dedupThresholdFor', () => {
+    it('raises thresholds for protected tiers (T0/T1) above the base threshold', () => {
+      const t0 = service.dedupThresholdFor('T0', 0.92);
+      const t1 = service.dedupThresholdFor('T1', 0.92);
+      expect(t0).toEqual({ noop: 0.98, update: 0.95 });
+      expect(t1).toEqual({ noop: 0.98, update: 0.95 });
+    });
+
+    it('caps the transient tier (T3) noop threshold below T0/T1, using the base threshold as the update floor', () => {
+      // update = Math.max(baseThreshold, 0.9): with a 0.92 base threshold, the
+      // base wins since it's already above T3's 0.9 floor.
+      expect(service.dedupThresholdFor('T3', 0.92)).toEqual({ noop: 0.95, update: 0.92 });
+      // With a lower base threshold, T3's 0.9 floor takes over.
+      expect(service.dedupThresholdFor('T3', 0.85)).toEqual({ noop: 0.95, update: 0.9 });
+    });
+
+    it('leaves the operational tier (T2) at the configured base threshold', () => {
+      expect(service.dedupThresholdFor('T2', 0.92)).toEqual({ noop: 0.98, update: 0.92 });
+    });
+
+    it('never lowers a protected/transient floor below a higher configured base threshold', () => {
+      // A caller-configured base threshold above the tier's floor must win via Math.max.
+      expect(service.dedupThresholdFor('T1', 0.99).update).toBe(0.99);
+      expect(service.dedupThresholdFor('T3', 0.99).update).toBe(0.99);
+    });
+  });
+
   describe('nextExpiryForAccess', () => {
     const now = new Date('2026-06-05T00:00:00.000Z');
 

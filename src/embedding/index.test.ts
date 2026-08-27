@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AzureFoundryEmbeddingProvider } from './azure-foundry.js';
-import { DegradedEmbeddingProvider, OpenAIEmbeddingProvider, createEmbeddingProvider } from './index.js';
+import { DegradedEmbeddingProvider, OpenAIEmbeddingProvider, createEmbeddingProvider, warnIfEmbeddingDegraded } from './index.js';
 import type { BrainConfig } from '../config/index.js';
 import type { CircuitBreaker } from '../resilience/index.js';
 
@@ -44,6 +44,7 @@ describe('OpenAIEmbeddingProvider', () => {
         sliding_window_enabled: true,
         archive_before_delete: true,
         cleanup_schedule: '0 2 * * *',
+        scheduled_cleanup_enabled: true,
         pre_expiry_warning_days: 7,
         compaction_deleted_threshold: 0.1,
       },
@@ -200,6 +201,31 @@ describe('OpenAIEmbeddingProvider', () => {
     };
 
     expect(() => createEmbeddingProvider(config)).toThrow('embedding.azure configuration is required for Azure provider');
+  });
+
+  it('warns at startup when the resolved provider is degraded', () => {
+    const config = createConfig();
+    const degraded = new DegradedEmbeddingProvider(config);
+    const logger = { warn: vi.fn() };
+
+    warnIfEmbeddingDegraded(degraded, config, logger);
+
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'degraded_startup',
+      provider: 'openai',
+      reason: expect.stringContaining('credentials'),
+    }));
+  });
+
+  it('does not warn at startup when the provider resolved normally', () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    const config = createConfig();
+    const provider = new OpenAIEmbeddingProvider(config);
+    const logger = { warn: vi.fn() };
+
+    warnIfEmbeddingDegraded(provider, config, logger);
+
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 
   it('throws when createEmbeddingProvider receives an unknown provider', () => {

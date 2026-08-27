@@ -49,6 +49,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
         sliding_window_enabled: true,
         archive_before_delete: true,
         cleanup_schedule: '0 2 * * *',
+        scheduled_cleanup_enabled: true,
         pre_expiry_warning_days: 7,
         compaction_deleted_threshold: 0.1,
       },
@@ -276,6 +277,27 @@ describe('AzureFoundryEmbeddingProvider', () => {
     expect(breaker.execute).toHaveBeenCalledTimes(1);
   });
 
+  it('records at most one breaker failure per embedBatch even when retries are exhausted', async () => {
+    process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
+    const breaker = {
+      execute: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
+    } as unknown as CircuitBreaker;
+
+    // Every attempt fails with a retryable 5xx.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 502 })));
+
+    const config = createConfig();
+    config.embedding.retry.max_attempts = 3;
+    config.embedding.retry.backoff_ms = 1;
+    const provider = new AzureFoundryEmbeddingProvider(config, breaker);
+
+    await expect(provider.embed('hello')).rejects.toThrow();
+
+    // requestWithRetry wraps the whole retry loop in a single breaker.execute
+    // call, so exhausting 3 attempts still counts as one logical failure.
+    expect(breaker.execute).toHaveBeenCalledTimes(1);
+  });
+
   it('healthCheck bypasses circuit breaker', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
     const breaker = {
@@ -294,6 +316,30 @@ describe('AzureFoundryEmbeddingProvider', () => {
   it('healthCheck returns false on auth failure', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
     vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 401 })));
+
+    const provider = new AzureFoundryEmbeddingProvider(createConfig());
+    await expect(provider.healthCheck()).resolves.toBe(false);
+  });
+
+  it('healthCheck issues a single request with no retry/backoff on a retryable failure', async () => {
+    process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
+    const fetchMock = vi.fn(async () => new Response('', { status: 503 })); // retryable in embedBatch, but health should not retry
+    vi.stubGlobal('fetch', fetchMock);
+
+    const config = createConfig();
+    config.embedding.retry.max_attempts = 3;
+    config.embedding.retry.backoff_ms = 1;
+    const provider = new AzureFoundryEmbeddingProvider(config);
+
+    await expect(provider.healthCheck()).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('healthCheck does not throw and returns false when the request itself rejects', async () => {
+    process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('network down');
+    }));
 
     const provider = new AzureFoundryEmbeddingProvider(createConfig());
     await expect(provider.healthCheck()).resolves.toBe(false);

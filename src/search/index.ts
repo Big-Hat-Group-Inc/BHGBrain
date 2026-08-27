@@ -1,13 +1,36 @@
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
-import type { SearchMode, SearchResult, MemoryRecord } from '../domain/types.js';
+import type { SearchMode, SearchResult, MemoryRecord, MemoryType, RetentionTier } from '../domain/types.js';
 import type { AccessUpdate } from '../storage/sqlite.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { embeddingUnavailable, internal } from '../errors/index.js';
 
 const RRF_K = 60;
+
+const MEMORY_TYPES: readonly MemoryType[] = ['episodic', 'semantic', 'procedural'];
+const RETENTION_TIERS: readonly RetentionTier[] = ['T0', 'T1', 'T2', 'T3'];
+
+// Narrowing helpers for the cross-device Qdrant fallback: the payload is
+// untrusted external data (a different device/version may have written it), so
+// every field is validated before it can reach a SearchResult rather than
+// asserted with an unchecked cast.
+function narrowString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(v => typeof v === 'string');
+}
+
+function isMemoryType(value: unknown): value is MemoryType {
+  return typeof value === 'string' && (MEMORY_TYPES as readonly string[]).includes(value);
+}
+
+function isRetentionTier(value: unknown): value is RetentionTier {
+  return typeof value === 'string' && (RETENTION_TIERS as readonly string[]).includes(value);
+}
 
 interface RankedItem {
   id: string;
@@ -203,24 +226,9 @@ export class SearchService {
 
       // Fallback to Qdrant payload if SQLite miss (cross-device memory)
       if (!mem) {
-        if (item.qdrantPayload && typeof item.qdrantPayload.content === 'string') {
-          const payload = item.qdrantPayload;
-          searchResults.push({
-            id: item.id,
-            content: payload.content as string,
-            summary: (payload.summary as string) ?? '',
-            type: (payload.type as SearchResult['type']) ?? 'semantic',
-            tags: Array.isArray(payload.tags) ? payload.tags as string[] : [],
-            score: item.score,
-            semantic_score: item.semantic_score,
-            fulltext_score: item.fulltext_score,
-            retention_tier: (payload.retention_tier as SearchResult['retention_tier']) ?? 'T2',
-            expires_at: null,
-            expiring_soon: false,
-            device_id: (payload.device_id as string) ?? null,
-            created_at: (payload.created_at as string) ?? nowIso,
-            last_accessed: nowIso,
-          });
+        if (item.qdrantPayload) {
+          const result = this.buildResultFromQdrantPayload(item, item.qdrantPayload, nowIso);
+          if (result) searchResults.push(result);
         }
         continue;
       }
@@ -259,8 +267,38 @@ export class SearchService {
     return searchResults;
   }
 
+  // Validates/narrows an untrusted Qdrant payload before constructing a
+  // SearchResult for the cross-device fallback branch (a ranked id present in
+  // Qdrant but with no local SQLite row). `content` has no safe default — a
+  // payload missing it is treated as unusable and dropped. Every other field
+  // falls back to the same defaults the previous unchecked-cast code used.
+  private buildResultFromQdrantPayload(
+    item: { id: string; score: number; semantic_score?: number; fulltext_score?: number },
+    payload: Record<string, unknown>,
+    nowIso: string,
+  ): SearchResult | null {
+    const content = narrowString(payload.content);
+    if (content === undefined) return null;
+    return {
+      id: item.id,
+      content,
+      summary: narrowString(payload.summary) ?? '',
+      type: isMemoryType(payload.type) ? payload.type : 'semantic',
+      tags: isStringArray(payload.tags) ? payload.tags : [],
+      score: item.score,
+      semantic_score: item.semantic_score,
+      fulltext_score: item.fulltext_score,
+      retention_tier: isRetentionTier(payload.retention_tier) ? payload.retention_tier : 'T2',
+      expires_at: null,
+      expiring_soon: false,
+      device_id: narrowString(payload.device_id) ?? null,
+      created_at: narrowString(payload.created_at) ?? nowIso,
+      last_accessed: nowIso,
+    };
+  }
+
   private buildAccessUpdate(
-    mem: Pick<MemoryRecord, 'id' | 'access_count' | 'retention_tier' | 'expires_at'>,
+    mem: Pick<MemoryRecord, 'id' | 'namespace' | 'access_count' | 'retention_tier' | 'expires_at'>,
     now: Date,
     nowIso: string,
   ): AccessUpdate {
@@ -272,6 +310,24 @@ export class SearchService {
     const nextReviewDue = promotedTier === 'T1'
       ? this.lifecycle.computeExpiry('T1', now)
       : undefined;
+
+    if (promotedTier !== mem.retention_tier) {
+      // Promotion is a distinct lifecycle transition, not a generic content
+      // write, so it gets its own structured audit event rather than being
+      // folded into the ADD/UPDATE/FORGET log.
+      this.storage.logAudit('PROMOTE', mem.id, mem.namespace, 'system', {
+        flush: false,
+        details: {
+          memory_id: mem.id,
+          prior_tier: mem.retention_tier,
+          new_tier: promotedTier,
+          actor: 'system',
+          timestamp: nowIso,
+          action: 'promote',
+        },
+      });
+    }
+
     return {
       id: mem.id,
       access_count: nextAccessCount,

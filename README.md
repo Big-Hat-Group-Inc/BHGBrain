@@ -2,7 +2,7 @@
 
 Persistent, vector-backed memory for MCP clients (Claude, Codex, OpenClaw, etc.).
 
-BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (semantic vectors), exposing them over the Model Context Protocol (MCP) via stdio or HTTP. It is designed to give AI agents a durable, searchable second brain that persists across sessions - with full lifecycle management, automatic deduplication, tiered retention, and hybrid search.
+BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (semantic vectors), exposing them over the Model Context Protocol (MCP) via stdio, plus a REST API over HTTP. It is designed to give AI agents a durable, searchable second brain that persists across sessions - with full lifecycle management, automatic deduplication, tiered retention, and hybrid search.
 
 ---
 
@@ -65,7 +65,7 @@ graph TD
     subgraph Client["MCP Client<br/><i>Claude Desktop / OpenClaw / Codex</i>"]
     end
 
-    Client -->|"MCP (stdio or HTTP)"| Server
+    Client -->|"MCP (stdio) or REST (HTTP)"| Server
 
     subgraph Server["BHGBrain Server"]
         WP["Write Pipeline"]
@@ -122,7 +122,7 @@ graph TD
 | Requirement | Version | Notes |
 |---|---|---|
 | Node.js | ≥ 20.0.0 | LTS recommended |
-| Qdrant | ≥ 1.9 | Must be running before starting BHGBrain |
+| Qdrant | ≥ 1.10 | Must be running before starting BHGBrain. The bundled client (`@qdrant/js-client-rest` `~1.19.0`) calls the `query` API introduced in Qdrant 1.10; older servers will fail semantic search. |
 | OpenAI API key | - | For embeddings (`text-embedding-3-small` by default). Server starts in degraded mode if missing. |
 
 ---
@@ -189,6 +189,8 @@ Set `qdrant.mode` to `external` in your config and point `external_url` at your 
 
 For Azure, `embedding.model` is the deployment name sent upstream, not the public model-family label. Azure credentials are loaded once at startup from `AZURE_FOUNDRY_API_KEY`; rotating that secret requires a restart or explicit config reload.
 
+`embedding.model` MUST be one of the supported models — `text-embedding-ada-002`, `text-embedding-3-small`, or `text-embedding-3-large` — for **both** `openai` and `azure-foundry`. This is enforced at startup: an unsupported or typo'd model (or a deployment name that doesn't match a supported model family, for Azure) fails config validation immediately with an error listing the supported models, rather than starting and silently producing wrong-dimension vectors.
+
 > **Provisioning from scratch?** The PowerShell scripts in [`scripts/azure/`](./scripts/azure/README.md) stand up an Azure AI Foundry / Azure OpenAI resource, deploy an embedding model (with the deployment name set to match the model name, as required), and wire BHGBrain's `config.json` + `AZURE_FOUNDRY_API_KEY` for you — starting from nothing but an Azure subscription.
 
 ---
@@ -250,7 +252,10 @@ The file is created automatically on first run with all defaults applied. Edit i
   "embedding": {
     // Provider: "openai" or "azure-foundry"
     "provider": "openai",
-    // Model name (for OpenAI) or Azure deployment name (for Azure)
+    // Model name (for OpenAI) or Azure deployment name (for Azure).
+    // Must be one of the supported models: "text-embedding-ada-002",
+    // "text-embedding-3-small", "text-embedding-3-large". An unsupported
+    // value fails config validation at startup for either provider.
     "model": "text-embedding-3-small",
     // Vector dimensions produced by the model. Must match the model's output.
     // IMPORTANT: Changing this after collections are created requires recreating collections.
@@ -359,8 +364,13 @@ The file is created automatically on first run with all defaults applied. Edit i
     // When true, expired memories are written to the archive table before deletion
     "archive_before_delete": true,
 
-    // Cron schedule for the background cleanup job (default: 2am daily)
+    // Cron schedule for the background cleanup job (default: 2am daily), evaluated in UTC
     "cleanup_schedule": "0 2 * * *",
+
+    // When true, the server process runs `cleanup_schedule` automatically via an
+    // internal scheduler (same execution path as `bhgbrain gc`). Set false to
+    // rely solely on manual `bhgbrain gc` runs or an external cron trigger.
+    "scheduled_cleanup_enabled": true,
 
     // Days before expiry at which memories are flagged as expiring_soon
     "pre_expiry_warning_days": 7,
@@ -411,7 +421,11 @@ The file is created automatically on first run with all defaults applied. Edit i
     // Max requests per minute per client IP for HTTP transport
     "rate_limit_rpm": 100,
     // Maximum HTTP request body size in bytes
-    "max_request_size_bytes": 1048576
+    "max_request_size_bytes": 1048576,
+    // Express "trust proxy" setting. false (default) = req.ip is the direct
+    // socket peer (loopback-accurate); true = honor X-Forwarded-For from the
+    // reverse proxy in front of the server. Only enable behind a trusted proxy.
+    "trust_proxy": false
   },
 
   // Auto-inject payload budget (for memory://inject resource)
@@ -440,7 +454,7 @@ The file is created automatically on first run with all defaults applied. Edit i
     "extraction_model": "gpt-4o-mini",
     // Env var name for the extraction model API key
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
-    // When true, fall back to checksum-only dedup if embedding is unavailable
+    // When true, fall back to checksum + full-text-similarity dedup if embedding is unavailable
     "fallback_to_threshold_dedup": true
   },
 
@@ -492,6 +506,10 @@ node dist/index.js --stdio --config=/path/to/config.json
 > **Log routing in stdio mode:** When `--stdio` is active, all structured logs (pino) are automatically redirected to **stderr**. This is required because stdout is exclusively reserved for the MCP JSON-RPC protocol. Mixing log output into stdout would corrupt the MCP handshake and cause clients to fail to load the server. To capture logs when running in stdio mode, redirect stderr: `node dist/index.js --stdio 2>bhgbrain.log`
 
 ### HTTP mode
+
+> This transport is a plain REST API for scripts, health probes, and the CLI. It does
+> **not** implement MCP Streamable HTTP, so MCP clients must use stdio instead — see
+> [MCP Client Configuration](#mcp-client-configuration).
 
 HTTP is enabled by default on `127.0.0.1:3721`. Set `BHGBRAIN_TOKEN` before starting if you want authenticated access:
 
@@ -561,31 +579,20 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter (HTTP transport)
+### OpenClaw / mcporter (stdio transport)
 
-```json
-{
-  "mcpServers": {
-    "bhgbrain": {
-      "transport": "http",
-      "url": "http://127.0.0.1:3721",
-      "headers": {
-        "Authorization": "Bearer <your-token>"
-      }
-    }
-  }
-}
-```
-
-Or using environment variable lookup if your mcporter supports it:
+BHGBrain speaks MCP over **stdio only**. The HTTP server described in
+[HTTP mode](#http-mode) is a plain REST API (`POST /tool/:name`, `GET /resource`) — it
+is *not* an MCP Streamable HTTP endpoint, so MCP clients cannot connect to it. Point
+them at the `bhgbrain-server` binary instead:
 
 ```json
 {
   "mcpServers": {
     "bhgbrain": {
       "transport": "stdio",
-      "command": "node",
-      "args": ["C:/Temp/GitHub/BHGBrain/dist/index.js"],
+      "command": "bhgbrain-server",
+      "args": ["--stdio"],
       "env": {
         "OPENAI_API_KEY": "sk-...",
         "QDRANT_API_KEY": "..."
@@ -594,6 +601,30 @@ Or using environment variable lookup if your mcporter supports it:
   }
 }
 ```
+
+Or against a source checkout rather than the globally installed binary:
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["/path/to/BHGBrain/dist/index.js", "--stdio"],
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "QDRANT_API_KEY": "..."
+      }
+    }
+  }
+}
+```
+
+> **Running OpenClaw inside WSL or a container?** BHGBrain must be installed in that
+> same environment. stdio means the client spawns the server as a child process, so
+> the server cannot live in a separate distro or container. To share memory across
+> environments, give each install its own SQLite and point them all at the same Qdrant
+> cluster — see [Multi-Device Memory](#multi-device-memory).
 
 ---
 
@@ -643,11 +674,11 @@ Every memory write stores the full content in both SQLite (local) and the Qdrant
 
 Each BHGBrain instance resolves a stable `device_id` on startup, using this priority order:
 
-1. **Explicit config**: `device.id` field in `config.json`
-2. **Environment variable**: `BHGBRAIN_DEVICE_ID`
+1. **Environment variable**: `BHGBRAIN_DEVICE_ID` — takes precedence over a persisted value, matching the "env vars win" contract used for every other `BHGBRAIN_*` override (see [Config vs. environment](#configuration)). When it overrides a previously persisted `device.id`, the new value is re-persisted.
+2. **Explicit/persisted config**: `device.id` field in `config.json`
 3. **Auto-generated**: Derived from `os.hostname()`, lowercased and sanitized to `[a-zA-Z0-9._-]`
 
-On first run, the resolved ID is persisted to `config.json` so it remains stable across restarts, even if the hostname changes later.
+On first run, the resolved ID is persisted to `config.json` so it remains stable across restarts, even if the hostname changes later. `config.json` is rewritten only when the device id was newly synthesized or changed by an env override — a steady-state boot with an already-persisted, unchanged id performs no write.
 
 ```jsonc
 // config.json — device section
@@ -1085,13 +1116,16 @@ checksum = SHA-256(normalizeContent(content))
 
 #### Phase 2: Semantic Deduplication (Vector Similarity)
 
-If no exact match is found, the content is embedded and the top 10 most similar existing memories in the collection are retrieved from Qdrant. Based on cosine similarity scores and the memory's assigned tier, one of three decisions is made:
+If no exact match is found, the content is embedded and the top 10 most similar existing memories in the collection are retrieved from Qdrant. Based on cosine similarity scores and the memory's assigned tier, one of four decisions is made:
 
 | Decision | Condition | Effect |
 |---|---|---|
 | `NOOP` | Score ≥ noop threshold | Content is considered a duplicate; return the existing memory's ID without writing |
+| `DELETE` | Score ≥ update threshold **and** the content explicitly invalidates the match (e.g. "no longer true", "correction:", "forget that") | The existing memory is deleted and the candidate is stored as a new memory referencing it via `merged_from` |
 | `UPDATE` | Score ≥ update threshold | Content is an update of existing; merge tags, update content and checksum, preserve ID |
 | `ADD` | Score < update threshold | Genuinely new memory; create with a new UUID |
+
+The diagram above shows the NOOP/UPDATE/ADD paths; DELETE is a variant of the UPDATE path taken only when the invalidation heuristic fires.
 
 **Tier-specific deduplication thresholds:**
 
@@ -1111,7 +1145,7 @@ The base `similarity_threshold` (default 0.92) is adjusted per tier because T0/T
 - Retention tier and expiry are recalculated from the new content's classification
 
 **Fallback behavior:**
-If the embedding provider is unavailable and `pipeline.fallback_to_threshold_dedup: true`, the pipeline falls back to checksum-only deduplication and writes the memory to SQLite only (with `vector_synced: false`). The memory will be available for fulltext search but not semantic search until Qdrant sync is restored.
+If the embedding provider is unavailable and `pipeline.fallback_to_threshold_dedup: true`, the pipeline degrades to a vectorless dedup path instead of failing the write. Exact-checksum matches still short-circuit to `NOOP` as in Phase 1. For everything else, the pipeline uses SQLite full-text search over the same namespace/collection to find the closest existing memory and scores it with a deterministic word-overlap similarity (not the vector cosine score); at or above the `update` threshold the content is merged into that memory (`UPDATE`, with `vector_synced: false`), otherwise it is written as a new memory in SQLite only (`ADD`, `vector_synced: false`). Either way the memory is available for fulltext search but not semantic search until Qdrant sync is restored, and entering this path logs a structured `degraded_write` warning.
 
 ---
 
@@ -1222,13 +1256,15 @@ Each category is assigned to one of four named slots:
 
 #### Background Cleanup
 
-The retention system runs a scheduled cleanup job (default: daily at 2:00 AM, configurable via `retention.cleanup_schedule` as a cron expression). You can also trigger cleanup manually via `bhgbrain gc`.
+The server runs a scheduled cleanup job (default: daily at 2:00 AM UTC, configurable via `retention.cleanup_schedule` as a cron expression; disable with `retention.scheduled_cleanup_enabled: false`). It runs on the same code path as the manual `bhgbrain gc` command, so scheduled and manual runs behave identically.
 
 **Cleanup phases:**
 
-1. **Identify expired memories:** Query SQLite for all memories where `decay_eligible = true` AND `expires_at < now()`. T0 memories are always excluded (T0 is never decay eligible).
+1. **Identify expired memories:** Query SQLite for all memories where `decay_eligible = true` AND `expires_at < now()`. Only `T2`/`T3` are eligible for direct archive-and-delete:
+   - `T0` is always excluded (T0 is never decay eligible).
+   - `T1` is never directly deleted. Expired or `review_due`-past `T1` memories are surfaced as **review candidates** in the GC result instead, so an operator can decide whether to promote, re-save, or manually delete them.
 
-2. **Archive before delete (if enabled):** For each expired memory, write a summary record to the `memory_archive` table:
+2. **Archive before delete (if enabled):** For each `T2`/`T3` candidate, write a summary record to the `memory_archive` table and log a distinct `ARCHIVE` audit event:
 
    ```sql
    memory_archive {
@@ -1244,13 +1280,21 @@ The retention system runs a scheduled cleanup job (default: daily at 2:00 AM, co
    }
    ```
 
+   If archiving a given memory fails, that memory is skipped for deletion (never deleted without a durable archive row when archival is enabled) and the run is reported degraded rather than aborting or throwing.
+
 3. **Delete from Qdrant:** Batch delete all expired point IDs from their respective Qdrant collections.
 
 4. **Delete from SQLite:** Remove expired rows from the `memories` and `memories_fts` tables.
 
-5. **Audit log:** Each deletion is recorded in the `audit_log` table with `operation: FORGET` and `client_id: "system"`.
+5. **Audit log:** Each confirmed deletion is recorded in the `audit_log` table with `operation: FORGET` and `client_id: "system"`. Archival, promotion, T0 revision, and archive restore each get their own distinct operation code (`ARCHIVE`, `PROMOTE`, `REVISE`, `RESTORE`) rather than collapsing into generic `ADD`/`UPDATE`/`FORGET` entries — every lifecycle-transition event's `details` column carries a JSON payload of `{memory_id, prior_tier, new_tier, actor, timestamp, action}`.
 
-6. **Flush:** SQLite is flushed atomically to disk after all deletions.
+6. **Compaction (threshold-driven, not per-delete):** For each namespace/collection this run deleted from, once the deleted-vector ratio crosses `retention.compaction_deleted_threshold`, the run nudges Qdrant's segment optimizer to reclaim space via `optimizers_config.deleted_threshold`.
+
+7. **Flush:** SQLite is flushed atomically to disk after all deletions.
+
+8. **Health signal:** If any archive or delete step failed partway through, the run's outcome is persisted and surfaces as a degraded `retention` component in `health://status` until the next clean GC run.
+
+A GC run — manual or scheduled — never throws out to its caller: unexpected failures are caught, the in-progress lifecycle lock is always released, and the result is reported as `degraded: true` with whatever work completed intact.
 
 #### T0 Revision History
 
@@ -1552,7 +1596,7 @@ sequenceDiagram
             S->>DB: Hot-reload in-memory SQLite
             S->>DB: Run schema migrations
             DB-->>S: Ready
-            S-->>C: memory_count, activated: true
+            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
         end
     end
 ```
@@ -1592,7 +1636,7 @@ The JSON header contains:
 **What is NOT in the backup:**
 - Qdrant vector data is **not** included. After restoring from a backup, Qdrant collections must be rebuilt by re-embedding content. Until then, fulltext search works but semantic search does not.
 
-**Backup integrity:** A SHA-256 checksum of the database data is stored in the header and verified on restore. If the file is corrupted, restore fails with `INVALID_INPUT: Backup integrity check failed`.
+**Backup integrity:** A SHA-256 checksum of the database data is stored in the header and verified on restore. If the file is corrupted, restore fails with `INVALID_INPUT: Backup integrity check failed`. After the restored database is activated, its memory count is also cross-checked against `memory_count` in the header — a mismatch fails the restore with `INTERNAL` (logged as `backup_restore_count_mismatch`) rather than returning a successful response over silently wrong data.
 
 **Backup metadata** is tracked in the SQLite `backup_metadata` table so `backup list` can return information about historical backups.
 
@@ -1630,11 +1674,15 @@ Returns:
 2. Write the embedded SQLite database atomically to the data directory (write-to-temp-then-rename).
 3. Hot-reload the in-memory SQLite database from the restored file without restarting the process.
 4. Run schema migrations on the reloaded database to ensure forward compatibility.
-5. Return `{ memory_count: <count>, activated: true }`.
+5. Reconcile vectors against actual drift (see below) and return `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
 
-**Restore is live:** The restored database is immediately active. There is no need to restart the server. The response includes `activated: true` to confirm this.
+**Restore is live:** The restored database is immediately active. There is no need to restart the server. The response includes `metadata_activated: true` to confirm this.
 
-**Concurrent restore protection:** If a restore is already in progress, subsequent restore requests return `INVALID_INPUT: Backup restore already in progress`.
+**Post-activation memory-count check:** Because a backup is a byte-for-byte export of the SQLite database, the memory count after activation must exactly equal `memory_count` from the header. If it doesn't, restore throws `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` and logs a `backup_restore_count_mismatch` event — the call does not return a successful response.
+
+**Vector reconciliation is drift-only and bounded.** Restore does not unconditionally clear and re-embed the whole corpus: it compares each restored memory's content checksum against the vector already stored in Qdrant and marks only memories that are new or whose content changed for re-embedding. When the embedding model/dimensions changed since the backup was created, or Qdrant's existing state can't be read, restore falls back to a full rebuild instead. Once this drift check completes, the restore lifecycle lock is released — `vector_reconciliation.state` is `"reconciled"` immediately if nothing drifted, or `"reconciling"` if re-embedding the drifted subset continues in a bounded background task (a timeout and batch cap per pass, with automatic retries on transient failures) after the call has already returned. Poll `health://status` (`components.vector_reconciliation`) to watch it finish.
+
+**Concurrent restore protection:** If a restore is already in progress, subsequent restore requests return `INVALID_INPUT: Backup restore already in progress`. That guard only covers metadata activation and the drift check, not the background re-embed, so it releases quickly even for a large restore.
 
 ---
 
@@ -1672,7 +1720,8 @@ Returns a `HealthSnapshot`:
     "expiring_soon": 5,
     "archived_count": 128,
     "unsynced_vectors": 0,
-    "over_capacity": false
+    "over_capacity": false,
+    "cleanup_lag_seconds": 120
   },
   "circuitBreakers": {
     "openai_embedding": "closed",
@@ -1680,6 +1729,8 @@ Returns a `HealthSnapshot`:
   }
 }
 ```
+
+`components.retention` also goes `"degraded"` (with a message) when the most recent GC run — scheduled or manual — reported a partial failure (an archive or delete step failed), independent of tier-capacity pressure. It clears back to `"healthy"` on the next clean GC run.
 
 **Overall status logic:**
 - `unhealthy` - if SQLite or Qdrant is unhealthy
@@ -1691,7 +1742,7 @@ Returns a `HealthSnapshot`:
 | Component | Healthy condition | Degraded condition | Unhealthy condition |
 |---|---|---|---|
 | `sqlite` | `SELECT 1` succeeds | - | Query throws |
-| `qdrant` | `getCollections()` succeeds | - | Connection refused |
+| `qdrant` | A bounded, read-only vector query succeeds (an empty result or a not-yet-created collection both count as healthy) | - | The vector query itself fails, even while the server is reachable |
 | `embedding` | Embed API call succeeds | Missing credentials or unreachable | - |
 | `retention` | All budgets within limits, no unsynced vectors | Budget exceeded OR unsynced vectors > 0 | - |
 
@@ -1711,23 +1762,37 @@ If `observability.metrics_enabled: true`, a metrics endpoint is available:
 GET /metrics
 ```
 
-Returns plain-text key-value metrics (Prometheus-compatible format):
+Returns plain-text metrics in Prometheus text-exposition format: a `# TYPE <name> <counter|gauge|histogram>`
+line once per metric name, followed by `name{label="value",...} value` lines (the `{...}` segment is
+omitted for metrics with no labels, keeping the output backward-compatible with the previous
+label-less format).
 
 | Metric | Type | Description |
 |---|---|---|
 | `bhgbrain_tool_calls_total` | counter | Total tool invocations |
-| `bhgbrain_tool_handler_ms_avg` | histogram | Average tool handler latency in milliseconds |
-| `bhgbrain_tool_handler_ms_p50` | histogram | 50th percentile tool handler latency |
-| `bhgbrain_tool_handler_ms_p95` | histogram | 95th percentile tool handler latency |
-| `bhgbrain_tool_handler_ms_p99` | histogram | 99th percentile tool handler latency |
-| `bhgbrain_tool_handler_ms_count` | counter | Number of tool handler latency samples |
+| `bhgbrain_tool_handler_ms_avg` | histogram | Average tool handler latency in milliseconds, labeled `tool` (tool name) and `status` (`ok`/`error`). Recorded on every call, including failures. |
+| `bhgbrain_tool_handler_ms_p50` | histogram | 50th percentile tool handler latency, labeled `tool` and `status` |
+| `bhgbrain_tool_handler_ms_p95` | histogram | 95th percentile tool handler latency, labeled `tool` and `status` |
+| `bhgbrain_tool_handler_ms_p99` | histogram | 99th percentile tool handler latency, labeled `tool` and `status` |
+| `bhgbrain_tool_handler_ms_count` | counter | Number of tool handler latency samples, labeled `tool` and `status` |
 | `embedding_embed_batch_ms_p95` | histogram | 95th percentile embedding batch latency |
 | `search_total_ms_p95` | histogram | 95th percentile end-to-end search latency |
 | `bhgbrain_memory_count` | gauge | Current total memory count (updated on write/delete) |
 | `bhgbrain_rate_limit_buckets` | gauge | Active rate limit tracking buckets |
 | `bhgbrain_rate_limited_total` | counter | Total rate-limited requests |
 
-Histograms use a bounded circular buffer of the last 1,000 samples. Metrics are in-process only - there is no external push.
+For example:
+
+```
+# TYPE bhgbrain_tool_handler_ms_p95 histogram
+bhgbrain_tool_handler_ms_p95{tool="recall",status="ok"} 12
+bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
+```
+
+Histograms use a bounded circular buffer of the last 1,000 samples **per label combination** (e.g. each
+tool/status pair gets its own 1,000-sample window). Metrics are in-process only - there is no external push.
+Because failures are now included in `bhgbrain_tool_handler_ms`, its p95/p99 reflect the slow failure tail
+(timeouts, circuit-breaker opens, etc.) and may read higher than before this metric recorded failures.
 
 ---
 
@@ -1742,6 +1807,8 @@ Authorization: Bearer <your-token>
 ```
 
 The token value is read from the environment variable named in `transport.http.bearer_token_env` (default: `BHGBRAIN_TOKEN`). If the environment variable is not set, all HTTP requests are allowed through (a warning is logged but auth is not enforced - for loopback-only bindings this is acceptable).
+
+The supplied token is compared against the configured secret using a constant-time comparison (`crypto.timingSafeEqual`), so a mismatch does not leak timing information about which byte differs. Tokens of a different length than the configured secret fail closed immediately without attempting the constant-time comparison.
 
 **Fail-closed for external bindings:** If the HTTP host is non-loopback (not `127.0.0.1`, `localhost`, or `::1`) and no token is configured, the server **refuses to start**:
 
@@ -1774,15 +1841,28 @@ To bind to a non-loopback address (e.g., for remote clients on a LAN):
 
 Make sure `BHGBRAIN_TOKEN` is set in this configuration.
 
+### Proxy Trust
+
+`security.trust_proxy` (default `false`) is passed directly to Express's `app.set('trust proxy', ...)`, which controls how `req.ip` is derived and therefore which identity the rate limiter keys on:
+
+- **Disabled (default):** `req.ip` is the direct socket peer. This is accurate for the documented loopback-only deployment. If a reverse proxy sits in front of the server anyway, every proxied client collapses into the proxy's single IP and caller-supplied `X-Forwarded-For` headers are ignored (so they cannot be spoofed to split or evade rate limits).
+- **Enabled:** `req.ip` honors `X-Forwarded-For` set by the immediate peer. Only enable this behind a reverse proxy you trust to set that header correctly — enabling it without a trusted proxy in front lets any client spoof its rate-limit identity.
+
+```json
+{ "security": { "trust_proxy": true } }
+```
+
 ### Rate Limiting
 
 HTTP requests are rate-limited per client IP address:
 
 - Default: 100 requests per minute (`security.rate_limit_rpm`)
-- Rate limit state is keyed on the trusted IP (not the `x-client-id` header)
+- Rate limit state is keyed on the trusted IP as derived per `security.trust_proxy` above (not the `x-client-id` header)
 - Exceeded clients receive HTTP 429 with `{ error: { code: "RATE_LIMITED", retryable: true } }`
+- Requests with no derivable client IP fail closed with HTTP 400 (`INVALID_INPUT`) rather than sharing a single fallback bucket
 - Response headers include `X-RateLimit-Limit` and `X-RateLimit-Remaining`
 - Expired rate limit buckets are swept every 30 seconds
+- Rate-limit state is scoped per server/middleware instance, so independent instances (e.g. in tests) never share buckets
 
 ### Request Size Limiting
 
@@ -1790,7 +1870,7 @@ HTTP request bodies are limited to `security.max_request_size_bytes` (default 1 
 
 ### Log Redaction
 
-When `security.log_redaction: true` (default), bearer tokens appearing in log output are redacted. Authentication failure logs show only a truncated preview of invalid tokens.
+When `security.log_redaction: true` (default), bearer tokens appearing in log output are redacted. Authentication failure logs show only a truncated preview of invalid tokens. Memory content fields (`content`, `preview`, `summary`, and any nested `*.content`) are redacted from structured log output the same way — enforced by the logger's configured redact paths, not by omission at individual log call sites.
 
 ### Secret Detection in Content
 
@@ -1838,6 +1918,8 @@ Response:
 ```
 
 Pagination uses composite cursors (`created_at|id`) for stable ordering. Ties at the same timestamp are broken by ID, ensuring no row is skipped or duplicated across pages.
+
+`memory://list` and `memory://{id}` apply the same lifecycle-visibility rule as `search`/`recall`: an expired, decay-eligible `T2`/`T3` memory is excluded (reads on `memory://{id}` return `NOT_FOUND`). `T0` and `T1` memories remain visible regardless of transient expiry.
 
 ### `memory://inject` - Session Context Injection
 
@@ -1894,7 +1976,7 @@ The tool returns the next section's questions after each submission, so the agen
 If you already have a completed profile document (from a previous bootstrap, a wiki, or structured notes), use the `import` tool to ingest it in one shot:
 
 ```json
-// Import a 12-section bootstrap profile
+// Import a 10-section bootstrap profile
 { "name": "import", "arguments": { "format": "profile", "content": "## 1. Identity & Role\n..." } }
 
 // Import arbitrary markdown as memories
@@ -1956,15 +2038,20 @@ bhgbrain stats --by-tier              # Memory count breakdown by retention tier
 bhgbrain stats --expiring             # Show memories expiring in next 7 days
 bhgbrain health                       # Full system health check
 
-# Garbage collection
-bhgbrain gc                           # Run cleanup (delete expired non-T0 memories)
-bhgbrain gc --dry-run                 # Show what would be cleaned without deleting
+# Garbage collection (archives + deletes expired T2/T3; T1 is surfaced as
+# reviewCandidates instead of deleted; Qdrant compaction runs automatically
+# once a touched collection's deleted-vector ratio crosses the configured
+# threshold — see retention.compaction_deleted_threshold)
+bhgbrain gc                           # Run cleanup
+bhgbrain gc --dry-run                 # Show candidates and review items without deleting
 bhgbrain gc --tier T3                 # Clean up only T3 memories
-bhgbrain gc --consolidate             # GC + stale marking consolidation pass
-bhgbrain gc --force-compact           # Force Qdrant segment compaction after GC
 
 # Audit log
 bhgbrain audit                        # Show recent audit entries
+
+# Repair (multi-device recovery)
+bhgbrain repair --from-qdrant                # Hydrate local SQLite from Qdrant (current device's memories only, by default)
+bhgbrain repair --from-qdrant --all-devices  # Hydrate from every device's memories, not just the current one
 
 # Category management
 bhgbrain category list                # List all categories
@@ -2308,8 +2395,18 @@ Create, list, or restore memory backups.
 
 **`restore` output:**
 ```json
-{ "memory_count": 1234, "activated": true }
+{
+  "memory_count": 1234,
+  "metadata_activated": true,
+  "vector_reconciliation": {
+    "status": "degraded",
+    "state": "reconciling",
+    "unsynced_vectors": 42,
+    "message": "Restore activated SQLite metadata; vector reconciliation for the drifted subset is continuing in the background."
+  }
+}
 ```
+`vector_reconciliation.state` is `"reconciled"` when no memory's vector actually drifted (nothing to re-embed), or `"reconciling"` while a bounded background task re-embeds the drifted/missing subset. See [Restoring from Backup](#restoring-from-backup).
 
 ---
 
@@ -2360,7 +2457,7 @@ Import a structured profile or freeform document as discrete memories in one sho
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `format` | `"profile" \| "freeform"` | **Yes** | - | `"profile"` for 12-section bootstrap output, `"freeform"` for arbitrary markdown. |
+| `format` | `"profile" \| "freeform"` | **Yes** | - | `"profile"` for 10-section bootstrap output, `"freeform"` for arbitrary markdown. |
 | `content` | `string` | **Yes** | - | The document text to import. Max 500,000 characters. |
 | `namespace` | `string` | No | `"profile"` | Namespace scope. |
 | `dry_run` | `boolean` | No | `false` | When `true`, returns a preview of what would be stored without writing. |
@@ -2383,6 +2480,7 @@ Import a structured profile or freeform document as discrete memories in one sho
 - `format: "freeform"` splits by headings and paragraph boundaries with default metadata (collection: `general`, tier: `T2`).
 - Deduplication applies via the existing write pipeline — safe to re-import.
 - `dry_run: true` returns memory previews with zero writes.
+- Headings numbered outside the 10 storage-mapped sections (e.g. a document written against an older 12-section template) are not silently dropped — their numbers are reported in `sections_ignored` so you know content was skipped instead of losing it without notice.
 
 ---
 
@@ -2395,12 +2493,16 @@ Recover memories from Qdrant into the local SQLite database. Used for multi-devi
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `dry_run` | `boolean` | No | `false` | When `true`, reports what would be recovered without making changes. |
-| `device_id` | `string` | No | — | Filter recovery to memories created by a specific device. Omit to recover all. |
+| `device_id` | `string` | No | — | Filter recovery to memories created by a specific device. Mutually exclusive with `all_devices`. |
+| `all_devices` | `boolean` | No | `false` | Explicitly recover memories from every device. Mutually exclusive with `device_id`. This is also the default behavior when neither field is provided. |
 
 **Output:**
 
 ```json
 {
+  "dry_run": false,
+  "all_devices": true,
+  "device_id_filter": null,
   "collections_scanned": 2,
   "points_scanned": 47,
   "already_in_sqlite": 12,
@@ -2413,6 +2515,7 @@ Recover memories from Qdrant into the local SQLite database. Used for multi-devi
 **Notes:**
 - Only points with `content` in their Qdrant payload can be recovered. Pre-1.3 memories without content in Qdrant are reported as `skipped_no_content`.
 - Recovered memories preserve their original `device_id` from the Qdrant payload. If no `device_id` exists in the payload, the local device's ID is used.
+- Passing both `device_id` and `all_devices: true` is rejected as invalid input.
 - After recovery, run `npm run build` and restart the server if needed. The recovered memories are immediately available for search and recall.
 
 ---
@@ -2504,7 +2607,7 @@ The `/data` volume persists the SQLite database, resolved `config.json`, and bac
 
 ### Bootstrap on First Run
 
-When a container starts with an empty `/data` volume and connects to a Qdrant instance that already has memories, BHGBrain automatically hydrates the local SQLite database from Qdrant via `bootstrapFromQdrant()`. No manual `repair` step is needed.
+When a container starts with an empty `/data` volume and connects to a Qdrant instance that already has memories, BHGBrain automatically hydrates the local SQLite database from Qdrant via `bootstrapFromQdrant()`. No manual `repair` step is needed. This automatic hydration is intentionally unscoped by device — it recovers every device's memories onto the fresh, empty database. Running `bhgbrain repair --from-qdrant` manually afterward defaults to the current device's memories only (pass `--all-devices` to widen it); see [CLI Reference](#cli-reference).
 
 ### Building the Image
 
@@ -2587,6 +2690,13 @@ What happens on first start after upgrade:
 
 **Backward compatible**: Pre-1.3 memories without `device_id` or content in Qdrant continue to work normally. They simply cannot be recovered via the `repair` tool.
 
+**Post-1.3 refinements (1.4.10)**: An audit of the multi-device feature found and fixed a real migration gap plus a couple of contract drifts:
+
+- The `device_id` Qdrant payload index is now ensured **unconditionally** on every `ensureCollection` call, not just when a collection is first created — collections created before this feature shipped now get migrated too.
+- `BHGBRAIN_DEVICE_ID` now **takes precedence** over a persisted `device.id`, matching the "env vars win" contract used elsewhere. When it overrides a persisted value, the new value is re-persisted.
+- `config.json` is rewritten only when the device id was newly synthesized or changed by an env override, not on every startup.
+- The `repair` tool gained an explicit `all_devices` boolean, mutually exclusive with `device_id`, as the documented all-devices path (the previous implicit "omit `device_id`" behavior still works unchanged).
+
 ---
 
 ### 1.0 → 1.2 (Tiered Memory Lifecycle)
@@ -2627,14 +2737,17 @@ The backup is stored in the data directory (`%LOCALAPPDATA%\BHGBrain\` on Window
 
 ### Backup Restore Activation
 
-`backup.restore` reloads runtime SQLite state before returning success. Restore responses include `activated: true` when restored data is immediately active. The server does not need to be restarted.
+`backup.restore` reloads runtime SQLite state before returning success. Restore responses include `metadata_activated: true` when restored data is immediately active. The server does not need to be restarted.
 
-As of v1.4, restore acquires a fail-safe guard (`beginRestoreOperation()`) so concurrent writes are blocked during recovery. Vector reconciliation runs per-step with isolated error handling - if Qdrant is unavailable during restore, SQLite is still activated and the response returns `readiness: "degraded"` instead of failing entirely. Progress is flushed incrementally, so a crash mid-reconciliation does not lose already-recovered records.
+Restore acquires a fail-safe guard (`beginRestoreOperation()`) that blocks concurrent writes only while SQLite is being activated and restored vectors are checked for drift against Qdrant. Vectors are **not** unconditionally cleared and re-embedded: only memories whose content checksum differs from (or is missing in) Qdrant are marked for re-embedding, so a no-drift restore completes without calling the embedding provider at all. If the embedding model/dimensions changed since the backup was taken, or Qdrant's existing state can't be read, restore falls back to a full rebuild instead.
+
+Once the drift check finishes, the guard is released — re-embedding the drifted subset (if any) runs in a bounded background task (a timeout and batch cap per pass) instead of holding up the restore call or blocking other writers for its duration. It retries automatically with backoff on transient failures; if it never fully catches up, `health://status` keeps reporting `vector_reconciliation.state: "pending"` (or `"reconciling"` while a pass is in flight) rather than silently leaving semantic search blank. Progress is flushed to disk at batch granularity, so a hard crash mid-reconciliation loses at most one batch of work — restart safely resumes from the remaining unsynced set via idempotent re-upsert.
 
 ### HTTP Hardening
 
 - `/health` is intentionally unauthenticated for probe compatibility.
 - Rate limiting keys on trusted request identity (IP) and ignores `x-client-id` for enforcement.
+- Audit/request-log `client_id` is likewise derived from the trusted request identity (`req.ip`), never from the caller-supplied `x-client-id` header — that header is accepted only as a non-authoritative debug hint and is never trusted for the audit trail.
 - `memory://list` enforces `limit` bounds of `1..100`; invalid values return `INVALID_INPUT`.
 
 ### Fail-Closed Authentication
@@ -2649,6 +2762,7 @@ As of v1.4, restore acquires a fail-safe guard (`beginRestoreOperation()`) so co
 - Embedding-dependent operations (semantic search, memory ingestion) return `EMBEDDING_UNAVAILABLE` at request time.
 - Fulltext search and category reads still work in degraded mode.
 - Health probes report embedding status as `degraded` without making real API calls.
+- When a provider is configured, its embedding health probe is a **single-shot, bounded request** (respecting `embedding.request_timeout_ms`) with no retry/backoff — consistent across `openai` and `azure-foundry`. The probe bypasses the circuit breaker and reports a boolean; it does not run the production retry loop, so it reflects current provider health quickly instead of blocking for several seconds during an outage.
 
 ### MCP Response Contracts
 
@@ -2683,6 +2797,8 @@ Collections lock their embedding model and dimensions at creation time. If you c
 - **Azure Foundry**: The `embedding.model` field specifies the Azure deployment name. The `embedding.dimensions` must match the output dimensions configured for that deployment.
 
 Make sure to set `embedding.provider` to `"openai"` or `"azure-foundry"` accordingly.
+
+**Supported models and fail-fast validation:** `embedding.model` is validated at startup against a fixed supported-model set — `text-embedding-ada-002` (fixed 1536 dimensions), `text-embedding-3-small` (up to 1536 dimensions), `text-embedding-3-large` (up to 3072 dimensions) — for both providers. An unsupported model, or `dimensions` outside the chosen model's cap, fails config validation before the server starts, with an error naming the configured model and listing the supported set. For Azure, the deployment name configured in `embedding.model` must match one of these supported model families; deployments named after unsupported models will not start. This replaced silent behavior where an unrecognized model could produce vectors with the wrong dimensionality against the Qdrant collection.
 
 **Migration guidance:**
 - Use a canary namespace or collection before switching production traffic to Azure.

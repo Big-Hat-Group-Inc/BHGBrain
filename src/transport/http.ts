@@ -9,8 +9,45 @@ import {
   createSizeLimitMiddleware,
   validateLoopbackBinding,
   validateExternalAuthBinding,
+  deriveTrustedClientId,
 } from './middleware.js';
+import type { MetricEntry } from '../health/metrics.js';
 import type pino from 'pino';
+
+// Prometheus text-exposition label-value escaping: backslash, then quote,
+// then newline (order matters so a literal backslash isn't re-escaped).
+function escapeLabelValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+}
+
+function formatLabels(labels: Record<string, string> | undefined): string {
+  if (!labels) return '';
+  const keys = Object.keys(labels);
+  if (keys.length === 0) return '';
+  const pairs = keys.map(k => `${k}="${escapeLabelValue(labels[k]!)}"`);
+  return `{${pairs.join(',')}}`;
+}
+
+/**
+ * Renders metrics in Prometheus text-exposition form: a `# TYPE` line once
+ * per metric name, followed by `name{label="value",...} value` lines (the
+ * `{...}` segment omitted when a metric has no labels). Additive relative to
+ * the prior plain `name value` output — unlabeled lines are unchanged.
+ */
+export function renderPrometheusText(metrics: MetricEntry[]): string {
+  const lines: string[] = [];
+  const typedNames = new Set<string>();
+
+  for (const m of metrics) {
+    if (!typedNames.has(m.name)) {
+      lines.push(`# TYPE ${m.name} ${m.type}`);
+      typedNames.add(m.name);
+    }
+    lines.push(`${m.name}${formatLabels(m.labels)} ${m.value}`);
+  }
+
+  return lines.join('\n');
+}
 
 export function createHttpServer(
   config: BrainConfig,
@@ -22,6 +59,11 @@ export function createHttpServer(
   validateExternalAuthBinding(config, logger);
 
   const app = express();
+
+  // Controls how `req.ip` / `req.ips` are derived from `X-Forwarded-For`.
+  // Default `false` means the direct socket peer is used (loopback-accurate);
+  // enable only behind a trusted reverse proxy that sets forwarding headers.
+  app.set('trust proxy', config.security.trust_proxy);
 
   app.use(express.json({ limit: config.security.max_request_size_bytes }));
 
@@ -39,7 +81,14 @@ export function createHttpServer(
 
   // Tool endpoint
   app.post('/tool/:name', async (req, res) => {
-    const clientId = req.headers['x-client-id'] as string ?? 'http-client';
+    // Audit/log client identity is derived from the authenticated principal
+    // (`req.ip`, subject to the `trust proxy` setting above) — the same
+    // trusted source the rate limiter keys on — never from the
+    // caller-supplied `x-client-id` header, which is fully spoofable and is
+    // not used to identify the caller for audit purposes. See
+    // `add-operations-security-reliability` audit follow-up 2026-06-05,
+    // task 4.4.
+    const clientId = deriveTrustedClientId(req) ?? 'http-client';
     const result = await handleTool(ctx, req.params.name, req.body, clientId);
     res.json(result);
   });
@@ -60,8 +109,7 @@ export function createHttpServer(
     app.get('/metrics', (_req, res) => {
       // Histogram families emit `_avg`, `_p50`, `_p95`, `_p99`, and `_count` lines.
       const metrics = ctx.metrics.getMetrics();
-      const lines = metrics.map(m => `${m.name} ${m.value}`);
-      res.type('text/plain').send(lines.join('\n'));
+      res.type('text/plain').send(renderPrometheusText(metrics));
     });
   }
 

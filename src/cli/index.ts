@@ -34,7 +34,7 @@ async function createContext(): Promise<ToolContext> {
   const embeddingBreaker = new CircuitBreaker(breakerOptions);
   const qdrantBreaker = new CircuitBreaker(breakerOptions);
   const metrics = new MetricsCollector(config);
-  const qdrant = new QdrantStore(config, qdrantBreaker);
+  const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
   const storage = new StorageManager(sqlite, qdrant, embedding);
 
@@ -232,7 +232,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .option('--tier <tier>', 'Limit cleanup to a single tier (T1|T2|T3)')
     .action(async (opts) => {
       const ctx = await createContextImpl();
-      const retention = new RetentionService(ctx.config, ctx.storage);
+      const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger, ctx.metrics);
       const result = await retention.runGc({ dryRun: Boolean(opts.dryRun), tier: opts.tier });
       console.log(JSON.stringify(result, null, 2));
       ctx.storage.sqlite.close();
@@ -245,7 +245,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .option('--expiring', 'Show memories expiring soon')
     .action(async (opts) => {
       const ctx = await createContextImpl();
-      const retention = new RetentionService(ctx.config, ctx.storage);
+      const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger, ctx.metrics);
       const total = ctx.storage.sqlite.countMemories();
       const collections = ctx.storage.sqlite.listCollections();
       const categories = ctx.storage.sqlite.listCategories();
@@ -311,7 +311,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
         console.error(`Memory ${id} not found.`);
         process.exitCode = 1;
       } else {
-        const retention = new RetentionService(ctx.config, ctx.storage);
+        const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger, ctx.metrics);
         const metadata = retention.buildMetadataForTier(tier);
         ctx.storage.sqlite.updateMemory(id, {
           retention_tier: tier,
@@ -349,7 +349,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .description('List archived memory summaries')
     .action(async () => {
       const ctx = await createContextImpl();
-      const retention = new RetentionService(ctx.config, ctx.storage);
+      const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger, ctx.metrics);
       console.log(JSON.stringify(retention.listArchive(), null, 2));
       ctx.storage.sqlite.close();
     });
@@ -359,7 +359,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .description('Search archived memory summaries')
     .action(async (query) => {
       const ctx = await createContextImpl();
-      const retention = new RetentionService(ctx.config, ctx.storage);
+      const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger, ctx.metrics);
       console.log(JSON.stringify(retention.searchArchive(query), null, 2));
       ctx.storage.sqlite.close();
     });
@@ -369,7 +369,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .description('Restore an archived summary into active memory')
     .action(async (id) => {
       const ctx = await createContextImpl();
-      const retention = new RetentionService(ctx.config, ctx.storage);
+      const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger, ctx.metrics);
       console.log(JSON.stringify(await retention.restoreArchive(id), null, 2));
       ctx.storage.sqlite.close();
     });
@@ -378,6 +378,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .command('repair')
     .description('Repair local state from external sources')
     .option('--from-qdrant', 'Hydrate local SQLite from Qdrant Cloud payloads')
+    .option('--all-devices', 'Hydrate memories from every device, not just the current one (default: current device only)')
     .action(async (opts) => {
       if (!opts.fromQdrant) {
         console.error('Please specify a repair source. Available: --from-qdrant');
@@ -386,7 +387,14 @@ export function createProgram(createContextImpl: typeof createContext = createCo
       }
       const ctx = await createContextImpl();
       console.log('[repair] scanning Qdrant collections...');
-      const hydrated = await ctx.storage.bootstrapFromQdrant();
+      const deviceId = ctx.config.device?.id ?? null;
+      const allDevices = Boolean(opts.allDevices);
+      if (allDevices) {
+        console.log('[repair] scope: all devices');
+      } else if (deviceId) {
+        console.log(`[repair] scope: current device only (device_id=${deviceId}); use --all-devices to hydrate every device`);
+      }
+      const hydrated = await ctx.storage.bootstrapFromQdrant(undefined, { deviceId, allDevices });
       console.log(`[repair] hydrated ${hydrated} memories from Qdrant`);
       ctx.storage.sqlite.close();
     });

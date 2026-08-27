@@ -1,20 +1,20 @@
 ## Context
 
-BHGBrain's onboarding relies on the MCP-aware bootstrap prompt — a 12-section interview that the user pastes into their MCP client. The client's agent drives the conversation, calling `bhgbrain.remember` for each piece of information. This works but requires the user to manage the prompt externally. There is no persistence if the conversation is interrupted, and no way to check which sections are done.
+BHGBrain's onboarding relies on the MCP-aware bootstrap prompt — a 10-section interview that the user pastes into their MCP client. The client's agent drives the conversation, calling `bhgbrain.remember` for each piece of information. This works but requires the user to manage the prompt externally. There is no persistence if the conversation is interrupted, and no way to check which sections are done.
 
 The bulk-profile-import tool (separate change) handles batch ingestion of completed profiles. This change complements it by providing a guided, incremental interview flow managed entirely within BHGBrain.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- Provide a stateful MCP tool that drives the 12-section interview from within BHGBrain
+- Provide a stateful MCP tool that drives the 10-section interview from within BHGBrain
 - Persist session state in SQLite so users can resume across conversations
 - Allow resetting individual sections without affecting others
 - Reuse the existing write pipeline for memory storage
 - Return clear progress indicators at each step
 
 **Non-Goals:**
-- Custom question sets or user-defined sections (hardcoded to the 12-section format)
+- Custom question sets or user-defined sections (hardcoded to the 10-section format)
 - Multi-user session management (one active session per namespace)
 - UI/frontend — this is a tool-level API; the MCP client renders the interaction
 - Replacing the existing bootstrap prompt — both paths coexist
@@ -29,7 +29,7 @@ The bulk-profile-import tool (separate change) handles batch ingestion of comple
 
 ### 2. Section definitions as a static configuration module
 
-**Decision:** Create `src/bootstrap/sections.ts` containing the 12 section definitions: title, questions/prompts, and metadata mapping (collection, tier, type, importance, tags). This is the same mapping table used by the profile parser in bulk-profile-import.
+**Decision:** Create `src/bootstrap/sections.ts` containing the 10 section definitions: title, questions/prompts, and metadata mapping (collection, tier, type, importance, tags). This is the same mapping table used by the profile parser in bulk-profile-import.
 
 **Rationale:** Centralizes the section knowledge. Both the bootstrap tool and the profile parser can import from the same source, preventing drift. Alternative: Store sections in the database — rejected because they're static content, not user data.
 
@@ -80,6 +80,6 @@ operation so the ID list survives failure) keeps the two stores consistent.
 
 ## Risks / Trade-offs
 
-- **Section definition coupling** — The 12-section format is hardcoded; changes to the bootstrap prompt require code updates → Mitigation: Extract section definitions into a shared module that both bootstrap and import tools reference.
+- **Section definition coupling** — The 10-section format is hardcoded; changes to the bootstrap prompt require code updates → Mitigation: Extract section definitions into a shared module that both bootstrap and import tools reference.
 - **Memory deletion on reset** — If a user manually modified a memory that was originally created by bootstrap, reset will delete it → Mitigation: Acceptable trade-off; document that reset removes section memories.
 - **Large tool response sizes** — Returning full section questions in a single tool response may be verbose → Mitigation: Keep question text concise; the MCP client's agent can elaborate.

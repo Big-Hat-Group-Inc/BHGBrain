@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ToolContext } from './index.js';
+import type { ToolContext, ToolLogContext } from './index.js';
 import type { WriteResult } from '../domain/types.js';
 import { ProfileParser, type ParsedMemory } from '../pipeline/parser.js';
 import { invalidInput } from '../errors/index.js';
@@ -29,18 +29,26 @@ interface ImportSummary {
   duplicates_skipped: number;
   collections: string[];
   sections_processed?: number;
+  sections_ignored?: number[];
   previews?: MemoryPreview[];
 }
 
-export async function handleImport(ctx: ToolContext, args: unknown): Promise<ImportSummary> {
+export async function handleImport(
+  ctx: ToolContext, args: unknown, logCtx?: ToolLogContext,
+): Promise<ImportSummary> {
   const input = parseImportInput(args);
+  if (logCtx) logCtx.namespace = input.namespace;
   const parser = new ProfileParser();
 
-  let parsed: { memories: ParsedMemory[]; sectionsProcessed?: number[] };
+  let parsed: { memories: ParsedMemory[]; sectionsProcessed?: number[]; sectionsIgnored?: number[] };
 
   if (input.format === 'profile') {
     const result = parser.parseProfile(input.content);
-    parsed = { memories: result.memories, sectionsProcessed: result.sectionsProcessed };
+    parsed = {
+      memories: result.memories,
+      sectionsProcessed: result.sectionsProcessed,
+      sectionsIgnored: result.sectionsIgnored,
+    };
   } else {
     parsed = parser.parseFreeform(input.content);
   }
@@ -66,7 +74,7 @@ function parseImportInput(args: unknown): ImportInput {
 
 function buildDryRunSummary(
   input: ImportInput,
-  parsed: { memories: ParsedMemory[]; sectionsProcessed?: number[] },
+  parsed: { memories: ParsedMemory[]; sectionsProcessed?: number[]; sectionsIgnored?: number[] },
 ): ImportSummary {
   const collections = [...new Set(parsed.memories.map(m => m.collection))];
   const previews: MemoryPreview[] = parsed.memories.map(m => ({
@@ -85,6 +93,7 @@ function buildDryRunSummary(
     duplicates_skipped: 0,
     collections,
     ...(parsed.sectionsProcessed ? { sections_processed: parsed.sectionsProcessed.length } : {}),
+    ...(parsed.sectionsIgnored?.length ? { sections_ignored: parsed.sectionsIgnored } : {}),
     previews,
   };
 }
@@ -92,7 +101,7 @@ function buildDryRunSummary(
 async function processMemories(
   ctx: ToolContext,
   input: ImportInput,
-  parsed: { memories: ParsedMemory[]; sectionsProcessed?: number[] },
+  parsed: { memories: ParsedMemory[]; sectionsProcessed?: number[]; sectionsIgnored?: number[] },
 ): Promise<ImportSummary> {
   let memoriesCreated = 0;
   let duplicatesSkipped = 0;
@@ -130,5 +139,6 @@ async function processMemories(
     duplicates_skipped: duplicatesSkipped,
     collections: [...collectionsSet],
     ...(parsed.sectionsProcessed ? { sections_processed: parsed.sectionsProcessed.length } : {}),
+    ...(parsed.sectionsIgnored?.length ? { sections_ignored: parsed.sectionsIgnored } : {}),
   };
 }

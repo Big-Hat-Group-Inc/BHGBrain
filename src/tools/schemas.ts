@@ -139,11 +139,11 @@ export const MCP_TOOL_DEFINITIONS = [
   },
   {
     name: 'import',
-    description: 'Import a structured profile or freeform document as discrete memories. Supports the 12-section bootstrap format and arbitrary markdown text.',
+    description: 'Import a structured profile or freeform document as discrete memories. Supports the 10-section bootstrap format and arbitrary markdown text.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        format: { type: 'string', enum: ['profile', 'freeform'], description: 'Input format: "profile" for 12-section bootstrap output, "freeform" for arbitrary text' },
+        format: { type: 'string', enum: ['profile', 'freeform'], description: 'Input format: "profile" for 10-section bootstrap output, "freeform" for arbitrary text' },
         content: { type: 'string', description: 'The document text to import', maxLength: 500000 },
         namespace: { type: 'string', description: 'Namespace scope (default: profile)', pattern: '^[a-zA-Z0-9/-]{1,200}$' },
         dry_run: { type: 'boolean', description: 'If true, returns a preview of what would be stored without writing', default: false },
@@ -159,7 +159,8 @@ export const MCP_TOOL_DEFINITIONS = [
       type: 'object' as const,
       properties: {
         dry_run: { type: 'boolean', description: 'If true, only report what would be recovered without making changes', default: false },
-        device_id: { type: 'string', description: 'Filter recovery to only points matching this device_id. If omitted, recovers all points.', pattern: '^[a-zA-Z0-9._-]{1,64}$' },
+        device_id: { type: 'string', description: 'Filter recovery to only points matching this device_id. Mutually exclusive with all_devices.', pattern: '^[a-zA-Z0-9._-]{1,64}$' },
+        all_devices: { type: 'boolean', description: 'Explicitly recover points from all devices. Mutually exclusive with device_id. This is also the default behavior when neither field is provided.', default: false },
       },
       additionalProperties: false,
     },

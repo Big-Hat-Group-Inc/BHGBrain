@@ -31,6 +31,16 @@ export interface ToolContext {
   logger: pino.Logger;
 }
 
+// Mutable out-param populated by tool handlers as soon as they resolve the
+// namespace a call operates on, so `handleTool`'s request/error logs can
+// include it even though namespace resolution happens deep inside
+// tool-specific handlers (see `add-operations-security-reliability` audit
+// follow-up 2026-06-05, task 4.5). Left empty for tools with no single
+// applicable namespace (e.g. `repair`, which spans all namespaces).
+export interface ToolLogContext {
+  namespace?: string;
+}
+
 function parseInput<T>(schema: { parse: (d: unknown) => T }, data: unknown): T {
   try {
     return schema.parse(data);
@@ -51,21 +61,42 @@ export async function handleTool(
 ): Promise<unknown> {
   const start = Date.now();
   ctx.metrics.incCounter('bhgbrain_tool_calls_total');
+  const logCtx: ToolLogContext = {};
+  // Hoisted so the `finally` block below can record the tool-handler latency
+  // histogram exactly once, on every path (success, BrainError, and
+  // unexpected error) — see `record-tool-latency-on-all-paths`. Logging stays
+  // in the try/catch branches, each computing `duration` once per branch.
+  let duration = 0;
+  let status: 'ok' | 'error' = 'ok';
 
   try {
-    const result = await dispatch(ctx, toolName, args, clientId);
-    const duration = Date.now() - start;
-    ctx.metrics.recordHistogram('bhgbrain_tool_handler_ms', duration);
-    ctx.logger.info({ event: 'tool_call', tool: toolName, duration_ms: duration, client_id: clientId });
+    const result = await dispatch(ctx, toolName, args, clientId, logCtx);
+    duration = Date.now() - start;
+    ctx.logger.info({
+      event: 'tool_call', tool: toolName, duration_ms: duration, client_id: clientId,
+      namespace: logCtx.namespace ?? null,
+    });
     return result;
   } catch (err) {
-    const duration = Date.now() - start;
+    status = 'error';
+    duration = Date.now() - start;
     if (err instanceof BrainError) {
-      ctx.logger.warn({ event: 'tool_error', tool: toolName, error_code: err.code, duration_ms: duration, client_id: clientId });
+      ctx.logger.warn({
+        event: 'tool_error', tool: toolName, error_code: err.code, duration_ms: duration, client_id: clientId,
+        namespace: logCtx.namespace ?? null,
+      });
       return err.toEnvelope();
     }
-    ctx.logger.error({ event: 'tool_error', tool: toolName, error: (err as Error).message, duration_ms: duration, client_id: clientId });
+    ctx.logger.error({
+      event: 'tool_error', tool: toolName, error: (err as Error).message, duration_ms: duration, client_id: clientId,
+      namespace: logCtx.namespace ?? null,
+    });
     return { error: { code: 'INTERNAL', message: 'An unexpected error occurred', retryable: true } };
+  } finally {
+    // Per-tool identification via a `tool` label (design decision 2), plus an
+    // `ok`/`error` status label so the success/failure split is preserved
+    // without excluding failures from the latency histogram itself.
+    ctx.metrics.recordHistogram('bhgbrain_tool_handler_ms', duration, { tool: toolName, status });
   }
 }
 
@@ -74,26 +105,30 @@ async function dispatch(
   toolName: string,
   args: unknown,
   clientId: string,
+  logCtx: ToolLogContext,
 ): Promise<unknown> {
   switch (toolName) {
-    case 'remember': return handleRemember(ctx, args, clientId);
-    case 'recall': return handleRecall(ctx, args);
-    case 'forget': return handleForget(ctx, args, clientId);
-    case 'search': return handleSearch(ctx, args);
-    case 'tag': return handleTag(ctx, args);
-    case 'collections': return handleCollections(ctx, args);
+    case 'remember': return handleRemember(ctx, args, clientId, logCtx);
+    case 'recall': return handleRecall(ctx, args, logCtx);
+    case 'forget': return handleForget(ctx, args, clientId, logCtx);
+    case 'search': return handleSearch(ctx, args, logCtx);
+    case 'tag': return handleTag(ctx, args, logCtx);
+    case 'collections': return handleCollections(ctx, args, logCtx);
     case 'category': return handleCategory(ctx, args);
     case 'backup': return handleBackup(ctx, args);
-    case 'bootstrap': return handleBootstrap(ctx, args);
-    case 'import': return handleImport(ctx, args);
+    case 'bootstrap': return handleBootstrap(ctx, args, logCtx);
+    case 'import': return handleImport(ctx, args, logCtx);
     case 'repair': return handleRepair(ctx, args);
     default:
       throw invalidInput(`Unknown tool: ${toolName}`);
   }
 }
 
-async function handleRemember(ctx: ToolContext, args: unknown, clientId: string): Promise<WriteResult | WriteResult[]> {
+async function handleRemember(
+  ctx: ToolContext, args: unknown, clientId: string, logCtx: ToolLogContext,
+): Promise<WriteResult | WriteResult[]> {
   const input = parseInput(RememberInputSchema, args);
+  logCtx.namespace = input.namespace;
   const results = await ctx.pipeline.process({
     content: input.content,
     namespace: input.namespace,
@@ -112,8 +147,11 @@ async function handleRemember(ctx: ToolContext, args: unknown, clientId: string)
   return results.length === 1 ? results[0]! : results;
 }
 
-async function handleRecall(ctx: ToolContext, args: unknown): Promise<{ results: SearchResult[] }> {
+async function handleRecall(
+  ctx: ToolContext, args: unknown, logCtx: ToolLogContext,
+): Promise<{ results: SearchResult[] }> {
   const input = parseInput(RecallInputSchema, args);
+  logCtx.namespace = input.namespace;
   const results = await ctx.search.search(
     input.query, input.namespace, input.collection, 'semantic', input.limit,
   );
@@ -130,10 +168,13 @@ async function handleRecall(ctx: ToolContext, args: unknown): Promise<{ results:
   return { results: filtered };
 }
 
-async function handleForget(ctx: ToolContext, args: unknown, clientId: string): Promise<{ deleted: boolean; id: string }> {
+async function handleForget(
+  ctx: ToolContext, args: unknown, clientId: string, logCtx: ToolLogContext,
+): Promise<{ deleted: boolean; id: string }> {
   const input = parseInput(ForgetInputSchema, args);
   const mem = ctx.storage.sqlite.getMemoryById(input.id);
   if (!mem) throw notFound(`Memory ${input.id} not found`);
+  logCtx.namespace = mem.namespace;
 
   const deleted = await ctx.storage.deleteMemory(input.id);
   if (deleted) {
@@ -144,8 +185,11 @@ async function handleForget(ctx: ToolContext, args: unknown, clientId: string): 
   return { deleted, id: input.id };
 }
 
-async function handleSearch(ctx: ToolContext, args: unknown): Promise<{ results: SearchResult[]; degraded: boolean }> {
+async function handleSearch(
+  ctx: ToolContext, args: unknown, logCtx: ToolLogContext,
+): Promise<{ results: SearchResult[]; degraded: boolean }> {
   const input = parseInput(SearchInputSchema, args);
+  logCtx.namespace = input.namespace;
   const signal: { degraded?: boolean } = {};
   const results = await ctx.search.search(
     input.query, input.namespace, input.collection, input.mode, input.limit, signal,
@@ -155,10 +199,13 @@ async function handleSearch(ctx: ToolContext, args: unknown): Promise<{ results:
   return { results, degraded: signal.degraded ?? false };
 }
 
-async function handleTag(ctx: ToolContext, args: unknown): Promise<{ id: string; tags: string[] }> {
+async function handleTag(
+  ctx: ToolContext, args: unknown, logCtx: ToolLogContext,
+): Promise<{ id: string; tags: string[] }> {
   const input = parseInput(TagInputSchema, args);
   const mem = ctx.storage.sqlite.getMemoryById(input.id);
   if (!mem) throw notFound(`Memory ${input.id} not found`);
+  logCtx.namespace = mem.namespace;
 
   let tags = [...mem.tags];
   if (input.add.length > 0) {
@@ -178,9 +225,12 @@ async function handleTag(ctx: ToolContext, args: unknown): Promise<{ id: string;
   return { id: input.id, tags };
 }
 
-async function handleCollections(ctx: ToolContext, args: unknown): Promise<unknown> {
+async function handleCollections(
+  ctx: ToolContext, args: unknown, logCtx: ToolLogContext,
+): Promise<unknown> {
   const input = parseInput(CollectionsInputSchema, args);
   const namespace = input.namespace;
+  logCtx.namespace = namespace;
 
   switch (input.action) {
     case 'list':
@@ -210,7 +260,7 @@ async function handleCollections(ctx: ToolContext, args: unknown): Promise<unkno
 
       let deletedMemoryCount = 0;
       if (input.force) {
-        const removed = await ctx.storage.deleteCollectionData(namespace, input.name);
+        const removed = await ctx.storage.deleteCollectionData(namespace, input.name, { logger: ctx.logger });
         deletedMemoryCount = removed.deleted;
         for (const memoryId of removed.ids) {
           ctx.storage.logAudit('FORGET', memoryId, namespace);
@@ -283,7 +333,10 @@ async function handleBackup(ctx: ToolContext, args: unknown): Promise<unknown> {
 async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
   const input = parseInput(RepairInputSchema, args);
   const dryRun = input.dry_run;
-  const filterDeviceId = input.device_id;
+  // `all_devices` and `device_id` are mutually exclusive (enforced by the
+  // schema); omitting both is the documented, backward-compatible
+  // all-devices default, same as passing `all_devices: true` explicitly.
+  const filterDeviceId = input.all_devices ? undefined : input.device_id;
   const localDeviceId = ctx.config.device.id ?? null;
 
   const collections = await ctx.storage.qdrant.listAllCollections();
@@ -393,6 +446,7 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
 
   return {
     dry_run: dryRun,
+    all_devices: input.all_devices || filterDeviceId === undefined,
     device_id_filter: filterDeviceId ?? null,
     collections_scanned: collections.length,
     points_scanned: scannedPoints,

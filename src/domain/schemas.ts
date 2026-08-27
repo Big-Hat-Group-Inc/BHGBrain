@@ -85,7 +85,11 @@ export const BackupInputSchema = z.object({
 export const RepairInputSchema = z.object({
   dry_run: z.boolean().optional().default(false),
   device_id: z.string().regex(/^[a-zA-Z0-9._-]{1,64}$/).optional(),
-}).strict();
+  all_devices: z.boolean().optional().default(false),
+}).strict().refine(
+  data => !(data.all_devices && data.device_id !== undefined),
+  { message: 'device_id and all_devices are mutually exclusive', path: ['all_devices'] },
+);
 
 export type RememberInput = z.infer<typeof RememberInputSchema>;
 export type RecallInput = z.infer<typeof RecallInputSchema>;

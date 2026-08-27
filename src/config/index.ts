@@ -5,6 +5,26 @@ import { hostname } from 'node:os';
 
 const DEVICE_ID_RE = /^[a-zA-Z0-9._-]{1,64}$/;
 
+/**
+ * Canonical set of embedding models supported across both providers, keyed by
+ * dimension constraint. `fixedDimensions` means the model only accepts that
+ * exact dimension count; `maxDimensions` means any positive value up to the
+ * cap is accepted. This is the single source of truth referenced by config
+ * validation so the supported-model list can never drift from the dimension
+ * caps enforced at startup.
+ */
+export const SUPPORTED_EMBEDDING_MODELS = {
+  'text-embedding-ada-002': { fixedDimensions: 1536 },
+  'text-embedding-3-small': { maxDimensions: 1536 },
+  'text-embedding-3-large': { maxDimensions: 3072 },
+} as const satisfies Record<string, { fixedDimensions?: number; maxDimensions?: number }>;
+
+export type SupportedEmbeddingModel = keyof typeof SUPPORTED_EMBEDDING_MODELS;
+
+function isSupportedEmbeddingModel(model: string): model is SupportedEmbeddingModel {
+  return Object.prototype.hasOwnProperty.call(SUPPORTED_EMBEDDING_MODELS, model);
+}
+
 const AzureEmbeddingSchema = z.object({
   resource_name: z.string()
     .trim()
@@ -39,30 +59,31 @@ const ConfigSchema = z.object({
       });
     }
 
-    if (value.provider === 'azure-foundry') {
-      if (value.model === 'text-embedding-ada-002' && value.dimensions !== 1536) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'text-embedding-ada-002 requires dimensions = 1536',
-          path: ['dimensions'],
-        });
-      }
+    // Supported-model validation applies to both providers: the constraint is
+    // a property of the model, not of which API serves it.
+    if (!isSupportedEmbeddingModel(value.model)) {
+      const supported = Object.keys(SUPPORTED_EMBEDDING_MODELS).join(', ');
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Unsupported embedding model '${value.model}'. Supported models: ${supported}`,
+        path: ['model'],
+      });
+      return;
+    }
 
-      if (value.model === 'text-embedding-3-small' && value.dimensions > 1536) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'text-embedding-3-small supports at most 1536 dimensions',
-          path: ['dimensions'],
-        });
-      }
-
-      if (value.model === 'text-embedding-3-large' && value.dimensions > 3072) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'text-embedding-3-large supports at most 3072 dimensions',
-          path: ['dimensions'],
-        });
-      }
+    const constraint = SUPPORTED_EMBEDDING_MODELS[value.model];
+    if ('fixedDimensions' in constraint && value.dimensions !== constraint.fixedDimensions) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `${value.model} requires dimensions = ${constraint.fixedDimensions}`,
+        path: ['dimensions'],
+      });
+    } else if ('maxDimensions' in constraint && value.dimensions > constraint.maxDimensions) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `${value.model} supports at most ${constraint.maxDimensions} dimensions`,
+        path: ['dimensions'],
+      });
     }
   }).default({}),
   qdrant: z.object({
@@ -111,6 +132,7 @@ const ConfigSchema = z.object({
     sliding_window_enabled: z.boolean().default(true),
     archive_before_delete: z.boolean().default(true),
     cleanup_schedule: z.string().default('0 2 * * *'),
+    scheduled_cleanup_enabled: z.boolean().default(true),
     pre_expiry_warning_days: z.number().int().nonnegative().default(7),
     compaction_deleted_threshold: z.number().min(0).max(1).default(0.10),
   }).default({}),
@@ -137,6 +159,10 @@ const ConfigSchema = z.object({
     log_redaction: z.boolean().default(true),
     rate_limit_rpm: z.number().int().positive().default(100),
     max_request_size_bytes: z.number().int().positive().default(1048576),
+    // Passed directly to Express `app.set('trust proxy', ...)`. Default `false`
+    // means `req.ip` is the direct socket peer (loopback-accurate); enable only
+    // behind a trusted reverse proxy that sets `X-Forwarded-For` correctly.
+    trust_proxy: z.boolean().default(false),
   }).default({}),
   auto_inject: z.object({
     max_chars: z.number().int().positive().default(30000),
@@ -244,33 +270,42 @@ export function applyEnvOverrides(config: BrainConfig): void {
 /**
  * Sanitize a string for use as a device_id by lowercasing and replacing
  * invalid characters with hyphens, then trimming to 64 characters.
+ *
+ * Truncation happens *after* leading-hyphen collapse but *before* trailing-
+ * hyphen removal: slicing a long hostname to 64 chars can itself land on a
+ * hyphen, so the trailing strip must run last or a truncated id could still
+ * end in `-`.
  */
 function sanitizeDeviceId(raw: string): string {
-  return raw
+  const normalized = raw
     .toLowerCase()
     .replace(/[^a-zA-Z0-9._-]/g, '-')
     .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 64) || 'unknown';
+    .replace(/^-+/, '');
+  const truncated = normalized.slice(0, 64).replace(/-+$/, '');
+  return truncated || 'unknown';
 }
 
 /**
  * Resolve the device_id using the priority chain:
- * 1. config.device.id (explicit)
- * 2. BHGBRAIN_DEVICE_ID environment variable
+ * 1. BHGBRAIN_DEVICE_ID environment variable — matches the project-wide
+ *    contract that `BHGBRAIN_*` env overrides always win over persisted
+ *    `config.json` values, including on devices where a device_id was
+ *    already resolved and saved on a previous run.
+ * 2. config.device.id (explicit / previously persisted)
  * 3. os.hostname() (lowercased, sanitized)
  *
  * Mutates config.device.id with the resolved value.
  */
 export function resolveDeviceId(config: BrainConfig): string {
-  if (config.device.id) {
-    return config.device.id;
-  }
-
   const envId = process.env.BHGBRAIN_DEVICE_ID;
   if (envId && DEVICE_ID_RE.test(envId)) {
     config.device.id = envId;
     return envId;
+  }
+
+  if (config.device.id) {
+    return config.device.id;
   }
 
   const hostId = sanitizeDeviceId(hostname());
@@ -283,10 +318,21 @@ export function ensureDataDir(config: BrainConfig): void {
   mkdirSync(dir, { recursive: true });
   mkdirSync(join(dir, 'backups'), { recursive: true });
 
-  // Resolve device identity and persist to config.json
+  const configPath = join(dir, 'config.json');
+  const configFileExisted = existsSync(configPath);
+  const previousDeviceId = config.device.id;
+
+  // Resolve device identity (env override, persisted value, or a fresh
+  // hostname-derived id).
   resolveDeviceId(config);
 
-  const configPath = join(dir, 'config.json');
-  // Always write config to persist resolved device_id on first run
-  writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+  // Only rewrite config.json when there is something new to persist: the
+  // file doesn't exist yet, or resolution actually changed device.id (a
+  // freshly synthesized id, or BHGBRAIN_DEVICE_ID overriding a persisted
+  // value). A steady-state boot with an unchanged, already-persisted id
+  // performs no write, so user formatting/comments in config.json survive
+  // and startup avoids a needless disk write.
+  if (!configFileExisted || config.device.id !== previousDeviceId) {
+    writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+  }
 }

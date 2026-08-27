@@ -23,17 +23,30 @@ const SECTION_HEADING_RE = /^##\s+(\d{1,2})\.\s+/m;
 
 export class ProfileParser {
   /**
-   * Parses a 12-section bootstrap profile document into discrete memory candidates.
+   * Parses a 10-section bootstrap profile document into discrete memory candidates.
    * Splits by `## N.` headings and maps each section to its storage metadata.
+   *
+   * Headings whose number does not correspond to one of the 10 storage-mapped
+   * sections (e.g. a document authored against an older 12-section template)
+   * are not silently dropped — their numbers are returned in `sectionsIgnored`
+   * so callers can surface them instead of losing the content without notice.
    */
-  parseProfile(content: string): { memories: ParsedMemory[]; sectionsProcessed: number[] } {
+  parseProfile(content: string): {
+    memories: ParsedMemory[];
+    sectionsProcessed: number[];
+    sectionsIgnored: number[];
+  } {
     const sections = this.splitSections(content);
     const memories: ParsedMemory[] = [];
     const sectionsProcessed: number[] = [];
+    const sectionsIgnored: number[] = [];
 
     for (const { sectionNumber, body } of sections) {
       const mapping = SECTION_MAPPINGS.find(m => m.section === sectionNumber);
-      if (!mapping) continue;
+      if (!mapping) {
+        sectionsIgnored.push(sectionNumber);
+        continue;
+      }
 
       sectionsProcessed.push(sectionNumber);
       const chunks = this.splitByParagraphs(body);
@@ -51,7 +64,7 @@ export class ProfileParser {
       }
     }
 
-    return { memories, sectionsProcessed };
+    return { memories, sectionsProcessed, sectionsIgnored };
   }
 
   /**

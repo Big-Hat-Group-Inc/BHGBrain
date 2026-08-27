@@ -8,7 +8,7 @@ codereview2.md calls this out explicitly under Operational Readiness: "Implement
 
 - Introduce a `CircuitBreaker` class in `src/resilience/circuit-breaker.ts` with standard three-state semantics: **Closed** (normal), **Open** (fast-fail), **Half-Open** (probe).
 - Wrap `OpenAIEmbeddingProvider.embedBatch` with a circuit breaker instance.
-- Wrap `QdrantStorage.search`, `QdrantStorage.upsert`, and `QdrantStorage.delete` with a circuit breaker instance.
+- Wrap `QdrantStore.search`, `QdrantStore.upsert`, and `QdrantStore.delete` with a circuit breaker instance.
 - Expose circuit breaker state in the health check response (`/health`) so degradation from a tripped breaker is externally observable.
 - Add configuration keys under `resilience.circuit_breaker.*` to control failure threshold, open window duration, and half-open probe count.
 
@@ -26,7 +26,7 @@ codereview2.md calls this out explicitly under Operational Readiness: "Implement
 - New file: `src/resilience/circuit-breaker.ts`
 - New file: `src/resilience/index.ts` (re-export)
 - `src/embedding/index.ts` — `OpenAIEmbeddingProvider` wraps `embedBatch` with breaker
-- `src/storage/qdrant.ts` — `QdrantStorage` wraps outbound methods with breaker
+- `src/storage/qdrant.ts` — `QdrantStore` wraps outbound methods with breaker
 - `src/health/index.ts` — Health check includes breaker state per service
 - `src/config/index.ts` — Add `resilience.circuit_breaker` config block with Zod schema
 - `src/index.ts` — Instantiate and inject circuit breakers at startup

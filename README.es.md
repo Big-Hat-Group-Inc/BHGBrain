@@ -2,7 +2,7 @@
 
 Memoria persistente respaldada por vectores para clientes MCP (Claude, Codex, OpenClaw, etc.).
 
-BHGBrain almacena memorias en SQLite (metadatos + búsqueda de texto completo) y Qdrant (vectores semánticos), exponiéndolas a través del Model Context Protocol (MCP) vía stdio o HTTP. Está diseñado para dar a los agentes de IA un segundo cerebro duradero y consultable que persiste entre sesiones — con gestión completa del ciclo de vida, deduplicación automática, retención por niveles y búsqueda híbrida.
+BHGBrain almacena memorias en SQLite (metadatos + búsqueda de texto completo) y Qdrant (vectores semánticos), exponiéndolas a través del Model Context Protocol (MCP) vía stdio, más una API REST sobre HTTP. Está diseñado para dar a los agentes de IA un segundo cerebro duradero y consultable que persiste entre sesiones — con gestión completa del ciclo de vida, deduplicación automática, retención por niveles y búsqueda híbrida.
 
 ---
 
@@ -64,7 +64,7 @@ graph TD
     subgraph Client["MCP Client<br/><i>Claude Desktop / OpenClaw / Codex</i>"]
     end
 
-    Client -->|"MCP (stdio or HTTP)"| Server
+    Client -->|"MCP (stdio) or REST (HTTP)"| Server
 
     subgraph Server["BHGBrain Server"]
         WP["Write Pipeline"]
@@ -121,7 +121,7 @@ graph TD
 | Requisito | Versión | Notas |
 |---|---|---|
 | Node.js | ≥ 20.0.0 | Se recomienda LTS |
-| Qdrant | ≥ 1.9 | Debe estar en ejecución antes de iniciar BHGBrain |
+| Qdrant | ≥ 1.10 | Debe estar en ejecución antes de iniciar BHGBrain. El cliente incluido (`@qdrant/js-client-rest` `~1.19.0`) llama a la API `query` introducida en Qdrant 1.10; los servidores más antiguos fallarán en la búsqueda semántica. |
 | Clave API de OpenAI | — | Para embeddings (`text-embedding-3-small` por defecto). El servidor inicia en modo degradado si no está presente. |
 
 ---
@@ -234,7 +234,9 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
   "embedding": {
     // Solo se admite "openai" actualmente
     "provider": "openai",
-    // Modelo de OpenAI a usar para embeddings
+    // Modelo de OpenAI a usar para embeddings. Debe ser uno de los modelos admitidos:
+    // "text-embedding-ada-002", "text-embedding-3-small", "text-embedding-3-large".
+    // Un modelo no admitido provoca un error de validación de configuración al iniciar.
     "model": "text-embedding-3-small",
     // Nombre de la variable de entorno que contiene la clave API de OpenAI
     "api_key_env": "OPENAI_API_KEY",
@@ -327,8 +329,14 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     // Cuando es true, las memorias expiradas se escriben en la tabla de archivo antes de eliminarlas
     "archive_before_delete": true,
 
-    // Horario cron para el trabajo de limpieza en segundo plano (por defecto: 2am diariamente)
+    // Horario cron para el trabajo de limpieza en segundo plano (por defecto: 2am UTC diariamente)
     "cleanup_schedule": "0 2 * * *",
+
+    // Cuando es true, el proceso del servidor ejecuta `cleanup_schedule` automáticamente
+    // mediante un planificador interno (mismo camino de ejecución que `bhgbrain gc`).
+    // Ponlo en false para depender solo de ejecuciones manuales de `bhgbrain gc` o de
+    // un disparador cron externo.
+    "scheduled_cleanup_enabled": true,
 
     // Días antes de la expiración en los que las memorias se marcan como expiring_soon
     "pre_expiry_warning_days": 7,
@@ -367,7 +375,11 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     // Número máximo de solicitudes por minuto por IP de cliente para transporte HTTP
     "rate_limit_rpm": 100,
     // Tamaño máximo del cuerpo de solicitudes HTTP en bytes
-    "max_request_size_bytes": 1048576
+    "max_request_size_bytes": 1048576,
+    // Configuración "trust proxy" de Express. false (predeterminado) = req.ip es el
+    // peer de socket directo (preciso para loopback); true = respeta X-Forwarded-For
+    // del proxy inverso frente al servidor. Actívalo solo detrás de un proxy confiable.
+    "trust_proxy": false
   },
 
   // Presupuesto del payload de auto-inject (para el recurso memory://inject)
@@ -396,7 +408,7 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     "extraction_model": "gpt-4o-mini",
     // Nombre de la variable de entorno para la clave API del modelo de extracción
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
-    // Cuando es true, recurre a dedup solo por checksum si el embedding no está disponible
+    // Cuando es true, recurre a dedup por checksum + similitud de texto completo si el embedding no está disponible
     "fallback_to_threshold_dedup": true
   },
 
@@ -445,6 +457,10 @@ node dist/index.js --stdio --config=/path/to/config.json
 ```
 
 ### Modo HTTP
+
+> Este transporte es una API REST simple para scripts, sondas de salud y la CLI. **No**
+> implementa MCP Streamable HTTP: los clientes MCP deben usar stdio en su lugar (ver
+> «Configuración de clientes MCP»).
 
 HTTP está habilitado por defecto en `127.0.0.1:3721`. Establece `BHGBRAIN_TOKEN` antes de iniciar si deseas acceso autenticado:
 
@@ -514,31 +530,20 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter (transporte HTTP)
+### OpenClaw / mcporter (transporte stdio)
 
-```json
-{
-  "mcpServers": {
-    "bhgbrain": {
-      "transport": "http",
-      "url": "http://127.0.0.1:3721",
-      "headers": {
-        "Authorization": "Bearer <your-token>"
-      }
-    }
-  }
-}
-```
-
-O usando búsqueda de variable de entorno si tu mcporter lo admite:
+BHGBrain habla MCP **únicamente por stdio**. El servidor HTTP descrito en «Modo HTTP»
+es una API REST simple (`POST /tool/:name`, `GET /resource`): *no* es un endpoint MCP
+Streamable HTTP, por lo que los clientes MCP no pueden conectarse a él. Apúntalos al
+binario `bhgbrain-server` en su lugar:
 
 ```json
 {
   "mcpServers": {
     "bhgbrain": {
       "transport": "stdio",
-      "command": "node",
-      "args": ["C:/Temp/GitHub/BHGBrain/dist/index.js"],
+      "command": "bhgbrain-server",
+      "args": ["--stdio"],
       "env": {
         "OPENAI_API_KEY": "sk-...",
         "QDRANT_API_KEY": "..."
@@ -547,6 +552,30 @@ O usando búsqueda de variable de entorno si tu mcporter lo admite:
   }
 }
 ```
+
+O contra una copia del código fuente en lugar del binario instalado globalmente:
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "stdio",
+      "command": "node",
+      "args": ["/ruta/a/BHGBrain/dist/index.js", "--stdio"],
+      "env": {
+        "OPENAI_API_KEY": "sk-...",
+        "QDRANT_API_KEY": "..."
+      }
+    }
+  }
+}
+```
+
+> **¿Ejecutas OpenClaw dentro de WSL o de un contenedor?** BHGBrain debe estar
+> instalado en ese mismo entorno. stdio significa que el cliente lanza el servidor como
+> proceso hijo, así que el servidor no puede vivir en otra distribución o contenedor.
+> Para compartir memoria entre entornos, da a cada instalación su propia base SQLite y
+> apunta todas al mismo clúster de Qdrant (ver «Memoria Multi-Dispositivo»).
 
 ---
 
@@ -596,11 +625,11 @@ Cada escritura de memoria almacena el contenido completo tanto en SQLite (local)
 
 Cada instancia de BHGBrain resuelve un `device_id` estable al iniciar, usando este orden de prioridad:
 
-1. **Configuración explícita**: Campo `device.id` en `config.json`
-2. **Variable de entorno**: `BHGBRAIN_DEVICE_ID`
+1. **Variable de entorno**: `BHGBRAIN_DEVICE_ID` — tiene prioridad sobre un valor persistido, siguiendo el contrato de "las variables de entorno ganan" usado para cualquier otro override `BHGBRAIN_*` (ver [Configuración vs. entorno](#configuración)). Cuando anula un `device.id` previamente persistido, el nuevo valor se vuelve a persistir.
+2. **Configuración explícita/persistida**: Campo `device.id` en `config.json`
 3. **Auto-generado**: Derivado de `os.hostname()`, en minúsculas y sanitizado a `[a-zA-Z0-9._-]`
 
-En la primera ejecución, el ID resuelto se persiste en `config.json` para que permanezca estable entre reinicios, incluso si el hostname cambia posteriormente.
+En la primera ejecución, el ID resuelto se persiste en `config.json` para que permanezca estable entre reinicios, incluso si el hostname cambia posteriormente. `config.json` solo se reescribe cuando el device id fue recién generado o cambiado por un override de entorno — un arranque en estado estable con un id ya persistido y sin cambios no realiza ninguna escritura.
 
 ```jsonc
 // config.json — sección de dispositivo
@@ -1038,13 +1067,16 @@ checksum = SHA-256(normalizeContent(content))
 
 #### Fase 2: Deduplicación Semántica (Similitud Vectorial)
 
-Si no se encuentra ninguna coincidencia exacta, el contenido se embede y se recuperan de Qdrant las 10 memorias existentes más similares en la colección. Basándose en las puntuaciones de similitud coseno y el nivel asignado a la memoria, se toma una de tres decisiones:
+Si no se encuentra ninguna coincidencia exacta, el contenido se embede y se recuperan de Qdrant las 10 memorias existentes más similares en la colección. Basándose en las puntuaciones de similitud coseno y el nivel asignado a la memoria, se toma una de cuatro decisiones:
 
 | Decisión | Condición | Efecto |
 |---|---|---|
 | `NOOP` | Puntuación ≥ umbral noop | El contenido se considera un duplicado; devuelve el ID de la memoria existente sin escribir |
+| `DELETE` | Puntuación ≥ umbral update **y** el contenido invalida explícitamente la coincidencia (p. ej. "ya no es cierto", "corrección:", "olvida eso") | La memoria existente se elimina y el candidato se guarda como una nueva memoria que la referencia mediante `merged_from` |
 | `UPDATE` | Puntuación ≥ umbral update | El contenido es una actualización del existente; fusiona etiquetas, actualiza contenido y checksum, preserva el ID |
 | `ADD` | Puntuación < umbral update | Memoria genuinamente nueva; crea con un nuevo UUID |
+
+El diagrama anterior muestra las rutas NOOP/UPDATE/ADD; DELETE es una variante de la ruta UPDATE que solo se toma cuando se activa la heurística de invalidación.
 
 **Umbrales de deduplicación específicos por nivel:**
 
@@ -1064,7 +1096,7 @@ El `similarity_threshold` base (por defecto 0.92) se ajusta por nivel porque las
 - El nivel de retención y la expiración se recalculan desde la clasificación del nuevo contenido
 
 **Comportamiento de reserva:**
-Si el proveedor de embeddings no está disponible y `pipeline.fallback_to_threshold_dedup: true`, el pipeline recurre a la deduplicación solo por checksum y escribe la memoria solo en SQLite (con `vector_synced: false`). La memoria estará disponible para búsqueda de texto completo pero no para búsqueda semántica hasta que se restaure la sincronización con Qdrant.
+Si el proveedor de embeddings no está disponible y `pipeline.fallback_to_threshold_dedup: true`, el pipeline pasa a una ruta de deduplicación sin vectores en lugar de fallar la escritura. Las coincidencias exactas de checksum siguen resolviéndose directamente como `NOOP`, igual que en la Fase 1. Para el resto, el pipeline usa la búsqueda de texto completo de SQLite sobre el mismo namespace/colección para encontrar la memoria existente más cercana y la puntúa con una similitud determinista de solapamiento de palabras (no la puntuación coseno vectorial); en o por encima del umbral `update` el contenido se fusiona en esa memoria (`UPDATE`, con `vector_synced: false`), de lo contrario se escribe como una nueva memoria solo en SQLite (`ADD`, `vector_synced: false`). En cualquier caso, la memoria estará disponible para búsqueda de texto completo pero no para búsqueda semántica hasta que se restaure la sincronización con Qdrant, y entrar en esta ruta registra una advertencia estructurada `degraded_write`.
 
 ---
 
@@ -1175,13 +1207,15 @@ Cada categoría se asigna a uno de cuatro slots con nombre:
 
 #### Limpieza en Segundo Plano
 
-El sistema de retención ejecuta un trabajo de limpieza programado (por defecto: diariamente a las 2:00 AM, configurable vía `retention.cleanup_schedule` como expresión cron). También puedes desencadenar la limpieza manualmente vía `bhgbrain gc`.
+El servidor ejecuta un trabajo de limpieza programado (por defecto: diariamente a las 2:00 AM UTC, configurable vía `retention.cleanup_schedule` como expresión cron; desactivable con `retention.scheduled_cleanup_enabled: false`). Se ejecuta por el mismo camino de código que el comando manual `bhgbrain gc`, por lo que las ejecuciones programadas y manuales se comportan de forma idéntica.
 
 **Fases de limpieza:**
 
-1. **Identificar memorias expiradas:** Consultar SQLite para todas las memorias donde `decay_eligible = true` Y `expires_at < now()`. Las memorias T0 siempre se excluyen (T0 nunca es elegible para decaimiento).
+1. **Identificar memorias expiradas:** Consultar SQLite para todas las memorias donde `decay_eligible = true` Y `expires_at < now()`. Solo `T2`/`T3` son elegibles para archivar-y-eliminar directamente:
+   - `T0` siempre se excluye (T0 nunca es elegible para decaimiento).
+   - `T1` nunca se elimina directamente. Las memorias `T1` expiradas o con `review_due` vencido se muestran como **candidatas de revisión** en el resultado de GC, para que un operador decida si promoverlas, volver a guardarlas o eliminarlas manualmente.
 
-2. **Archivar antes de eliminar (si está habilitado):** Para cada memoria expirada, escribir un registro de resumen en la tabla `memory_archive`:
+2. **Archivar antes de eliminar (si está habilitado):** Para cada candidata `T2`/`T3`, se escribe un registro de resumen en la tabla `memory_archive` y se registra un evento de auditoría `ARCHIVE` distinto:
 
    ```sql
    memory_archive {
@@ -1197,13 +1231,21 @@ El sistema de retención ejecuta un trabajo de limpieza programado (por defecto:
    }
    ```
 
+   Si el archivado de una memoria falla, esa memoria se omite de la eliminación (nunca se elimina sin un registro de archivo duradero cuando el archivado está habilitado) y la ejecución se reporta como degradada en lugar de abortar o lanzar un error.
+
 3. **Eliminar de Qdrant:** Eliminar en lote todos los IDs de puntos expirados de sus respectivas colecciones de Qdrant.
 
 4. **Eliminar de SQLite:** Eliminar filas expiradas de las tablas `memories` y `memories_fts`.
 
-5. **Log de auditoría:** Cada eliminación se registra en la tabla `audit_log` con `operation: FORGET` y `client_id: "system"`.
+5. **Log de auditoría:** Cada eliminación confirmada se registra en la tabla `audit_log` con `operation: FORGET` y `client_id: "system"`. El archivado, la promoción, la revisión T0 y la restauración de archivo obtienen cada uno su propio código de operación distinto (`ARCHIVE`, `PROMOTE`, `REVISE`, `RESTORE`) en lugar de mezclarse en entradas genéricas `ADD`/`UPDATE`/`FORGET` — cada evento de transición de ciclo de vida lleva en la columna `details` una carga JSON `{memory_id, prior_tier, new_tier, actor, timestamp, action}`.
 
-6. **Volcado:** SQLite se vuelca atómicamente a disco después de todas las eliminaciones.
+6. **Compactación (dirigida por umbral, no por eliminación):** Para cada par namespace/colección del que esta ejecución eliminó memorias, una vez que la proporción de vectores eliminados supera `retention.compaction_deleted_threshold`, la ejecución impulsa al optimizador de segmentos de Qdrant a recuperar espacio vía `optimizers_config.deleted_threshold`.
+
+7. **Volcado:** SQLite se vuelca atómicamente a disco después de todas las eliminaciones.
+
+8. **Señal de salud:** Si algún paso de archivado o eliminación falla a mitad de camino, el resultado de la ejecución se persiste y aparece como un componente `retention` degradado en `health://status` hasta la próxima ejecución de GC limpia.
+
+Una ejecución de GC — manual o programada — nunca lanza un error a quien la invoca: los fallos inesperados se capturan, el bloqueo de ciclo de vida en curso siempre se libera, y el resultado se reporta como `degraded: true` con el trabajo ya completado intacto.
 
 #### Historial de Revisiones T0
 
@@ -1505,7 +1547,7 @@ sequenceDiagram
             S->>DB: Hot-reload in-memory SQLite
             S->>DB: Run schema migrations
             DB-->>S: Ready
-            S-->>C: memory_count, activated: true
+            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
         end
     end
 ```
@@ -1545,7 +1587,7 @@ La cabecera JSON contiene:
 **Lo que NO está en la copia de seguridad:**
 - Los datos vectoriales de Qdrant **no** están incluidos. Después de restaurar desde una copia de seguridad, las colecciones de Qdrant deben reconstruirse re-embediendo el contenido. Hasta entonces, la búsqueda de texto completo funciona pero la búsqueda semántica no.
 
-**Integridad de la copia de seguridad:** Un checksum SHA-256 de los datos de la base de datos se almacena en la cabecera y se verifica en la restauración. Si el archivo está corrompido, la restauración falla con `INVALID_INPUT: Backup integrity check failed`.
+**Integridad de la copia de seguridad:** Un checksum SHA-256 de los datos de la base de datos se almacena en la cabecera y se verifica en la restauración. Si el archivo está corrompido, la restauración falla con `INVALID_INPUT: Backup integrity check failed`. Tras activar la base de datos restaurada, su recuento de memorias también se contrasta con `memory_count` de la cabecera; si no coinciden, la restauración falla con `INTERNAL` (registrado como `backup_restore_count_mismatch`) en lugar de devolver una respuesta exitosa sobre datos silenciosamente incorrectos.
 
 Los **metadatos de copia de seguridad** se rastrean en la tabla SQLite `backup_metadata` para que `backup list` pueda devolver información sobre copias de seguridad históricas.
 
@@ -1584,11 +1626,15 @@ Devuelve:
 2. Escribir atómicamente la base de datos SQLite embebida en el directorio de datos (escritura-en-temporal-luego-renombrar).
 3. Recargar en caliente la base de datos SQLite en memoria desde el archivo restaurado sin reiniciar el proceso.
 4. Ejecutar migraciones de esquema en la base de datos recargada para garantizar compatibilidad futura.
-5. Devolver `{ memory_count: <count>, activated: true }`.
+5. Reconciliar los vectores contra el drift real (ver abajo) y devolver `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
 
-**La restauración es en vivo:** La base de datos restaurada está inmediatamente activa. No es necesario reiniciar el servidor. La respuesta incluye `activated: true` para confirmar esto.
+**La restauración es en vivo:** La base de datos restaurada está inmediatamente activa. No es necesario reiniciar el servidor. La respuesta incluye `metadata_activated: true` para confirmar esto.
 
-**Protección contra restauración concurrente:** Si ya hay una restauración en progreso, las solicitudes de restauración posteriores devuelven `INVALID_INPUT: Backup restore already in progress`.
+**Comprobación del recuento de memorias tras la activación:** Dado que una copia de seguridad es una exportación byte a byte de la base de datos SQLite, el recuento de memorias tras la activación debe coincidir exactamente con `memory_count` de la cabecera. Si no coincide, la restauración lanza `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` y registra un evento `backup_restore_count_mismatch`; la llamada no devuelve una respuesta exitosa.
+
+**La reconciliación de vectores es solo por drift y está acotada.** La restauración no vacía y reincrusta incondicionalmente todo el corpus: compara el checksum de contenido de cada memoria restaurada con el vector ya almacenado en Qdrant y marca para reincrustación solo las memorias nuevas o cuyo contenido cambió. Si el modelo/dimensiones de embedding cambiaron desde que se creó la copia de seguridad, o el estado de Qdrant no se puede leer, la restauración recurre a una reconstrucción completa. Una vez que termina esta comprobación de drift, se libera el bloqueo del ciclo de vida de restauración — `vector_reconciliation.state` es `"reconciled"` de inmediato si nada cambió, o `"reconciling"` si la reincrustación del subconjunto con drift continúa en una tarea de fondo acotada (un timeout y un límite de lotes por pasada, con reintentos automáticos) después de que la llamada ya haya devuelto la respuesta. Consulta `health://status` (`components.vector_reconciliation`) para ver cuándo termina.
+
+**Protección contra restauración concurrente:** Si ya hay una restauración en progreso, las solicitudes de restauración posteriores devuelven `INVALID_INPUT: Backup restore already in progress`. Ese bloqueo solo cubre la activación de metadatos y la comprobación de drift, no la reincrustación en segundo plano, así que se libera rápidamente incluso en una restauración grande.
 
 ---
 
@@ -1626,10 +1672,13 @@ Devuelve un `HealthSnapshot`:
     "expiring_soon": 5,
     "archived_count": 128,
     "unsynced_vectors": 0,
-    "over_capacity": false
+    "over_capacity": false,
+    "cleanup_lag_seconds": 120
   }
 }
 ```
+
+`components.retention` también pasa a `"degraded"` (con un mensaje) cuando la última ejecución de GC — programada o manual — reportó un fallo parcial (falló un paso de archivado o eliminación), independientemente de la presión de capacidad por nivel. Vuelve a `"healthy"` en la siguiente ejecución de GC limpia.
 
 **Lógica del estado general:**
 - `unhealthy` — si SQLite o Qdrant no están en buen estado
@@ -1641,7 +1690,7 @@ Devuelve un `HealthSnapshot`:
 | Componente | Condición saludable | Condición degradada | Condición no saludable |
 |---|---|---|---|
 | `sqlite` | `SELECT 1` tiene éxito | — | La consulta lanza excepción |
-| `qdrant` | `getCollections()` tiene éxito | — | Conexión rechazada |
+| `qdrant` | Una consulta vectorial acotada y de solo lectura tiene éxito (un resultado vacío o una colección que aún no existe también cuentan como saludable) | — | La consulta vectorial en sí falla, incluso con el servidor accesible |
 | `embedding` | La llamada a la API de embed tiene éxito | Credenciales faltantes o no accesible | — |
 | `retention` | Todos los presupuestos dentro de los límites, sin vectores no sincronizados | Presupuesto excedido O vectores no sincronizados > 0 | — |
 
@@ -1659,18 +1708,39 @@ Si `observability.metrics_enabled: true`, hay un endpoint de métricas disponibl
 GET /metrics
 ```
 
-Devuelve métricas de valor clave en texto plano (formato compatible con Prometheus):
+Devuelve métricas en formato de exposición de texto de Prometheus: una línea `# TYPE <name>
+<counter|gauge|histogram>` una vez por nombre de métrica, seguida de líneas `name{label="value",...}
+value` (el segmento `{...}` se omite en las métricas sin etiquetas, manteniendo la salida compatible
+con el formato anterior sin etiquetas).
 
 | Métrica | Tipo | Descripción |
 |---|---|---|
 | `bhgbrain_tool_calls_total` | contador | Total de invocaciones de herramientas |
-| `bhgbrain_tool_duration_seconds_avg` | histograma | Duración promedio de llamadas a herramientas |
-| `bhgbrain_tool_duration_seconds_count` | contador | Número de muestras de duración de llamadas a herramientas |
+| `bhgbrain_tool_handler_ms_avg` | histograma | Latencia promedio del manejador de herramientas en milisegundos, etiquetada con `tool` (nombre de la herramienta) y `status` (`ok`/`error`). Se registra en cada llamada, incluidos los fallos. |
+| `bhgbrain_tool_handler_ms_p50` | histograma | Percentil 50 de la latencia del manejador de herramientas, etiquetada con `tool` y `status` |
+| `bhgbrain_tool_handler_ms_p95` | histograma | Percentil 95 de la latencia del manejador de herramientas, etiquetada con `tool` y `status` |
+| `bhgbrain_tool_handler_ms_p99` | histograma | Percentil 99 de la latencia del manejador de herramientas, etiquetada con `tool` y `status` |
+| `bhgbrain_tool_handler_ms_count` | contador | Número de muestras de latencia del manejador de herramientas, etiquetada con `tool` y `status` |
+| `embedding_embed_batch_ms_p95` | histograma | Percentil 95 de la latencia del lote de embeddings |
+| `search_total_ms_p95` | histograma | Percentil 95 de la latencia de búsqueda de extremo a extremo |
 | `bhgbrain_memory_count` | medidor | Recuento total de memorias actual (actualizado en escritura/eliminación) |
 | `bhgbrain_rate_limit_buckets` | medidor | Cubos de seguimiento de límite de tasa activos |
 | `bhgbrain_rate_limited_total` | contador | Total de solicitudes con límite de tasa excedido |
 
-Los histogramas usan un búfer circular acotado de las últimas 1.000 muestras. Las métricas son solo en proceso — no hay push externo.
+Por ejemplo:
+
+```
+# TYPE bhgbrain_tool_handler_ms_p95 histogram
+bhgbrain_tool_handler_ms_p95{tool="recall",status="ok"} 12
+bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
+```
+
+Los histogramas usan un búfer circular acotado de las últimas 1.000 muestras **por combinación de
+etiquetas** (cada par herramienta/estado tiene su propia ventana de 1.000 muestras). Las métricas son
+solo en proceso — no hay push externo. Dado que los fallos ahora se incluyen en
+`bhgbrain_tool_handler_ms`, sus p95/p99 reflejan la cola lenta de fallos (tiempos de espera agotados,
+aperturas de disyuntor de circuito, etc.) y pueden mostrar valores más altos que antes de que esta
+métrica registrara fallos.
 
 ---
 
@@ -1685,6 +1755,8 @@ Authorization: Bearer <your-token>
 ```
 
 El valor del token se lee desde la variable de entorno nombrada en `transport.http.bearer_token_env` (predeterminado: `BHGBRAIN_TOKEN`). Si la variable de entorno no está configurada, todas las solicitudes HTTP pasan (se registra una advertencia pero la autenticación no se aplica — para enlaces solo de loopback esto es aceptable).
+
+El token proporcionado se compara con el secreto configurado usando una comparación de tiempo constante (`crypto.timingSafeEqual`), de modo que una discrepancia no filtra información temporal sobre qué byte difiere. Los tokens con una longitud distinta a la del secreto configurado fallan de forma cerrada inmediatamente, sin intentar la comparación de tiempo constante.
 
 **Fail-closed para enlaces externos:** Si el host HTTP es no-loopback (no `127.0.0.1`, `localhost` o `::1`) y no se ha configurado ningún token, el servidor **se niega a iniciar**:
 
@@ -1717,15 +1789,28 @@ Para enlazarse a una dirección no-loopback (p.ej., para clientes remotos en una
 
 Asegúrate de que `BHGBRAIN_TOKEN` esté configurado en esta configuración.
 
+### Confianza de Proxy
+
+`security.trust_proxy` (predeterminado `false`) se pasa directamente a `app.set('trust proxy', ...)` de Express, lo que controla cómo se deriva `req.ip` y, por lo tanto, qué identidad usa el limitador de tasa:
+
+- **Deshabilitado (predeterminado):** `req.ip` es el peer de socket directo. Esto es preciso para el despliegue solo-loopback documentado. Si de todos modos hay un proxy inverso delante, todos los clientes proxied colapsan en la única IP del proxy, y los encabezados `X-Forwarded-For` suministrados por el llamador se ignoran (por lo que no pueden falsificarse para dividir o evadir límites de tasa).
+- **Habilitado:** `req.ip` respeta `X-Forwarded-For` establecido por el peer inmediato. Habilítalo solo detrás de un proxy inverso en el que confíes para establecer ese encabezado correctamente — habilitarlo sin un proxy confiable delante permite que cualquier cliente falsifique su identidad de límite de tasa.
+
+```json
+{ "security": { "trust_proxy": true } }
+```
+
 ### Límite de Tasa
 
 Las solicitudes HTTP tienen límite de tasa por dirección IP de cliente:
 
 - Predeterminado: 100 solicitudes por minuto (`security.rate_limit_rpm`)
-- El estado del límite de tasa se basa en la IP confiable (no en el encabezado `x-client-id`)
+- El estado del límite de tasa se basa en la IP confiable, derivada según `security.trust_proxy` arriba (no en el encabezado `x-client-id`)
 - Los clientes que exceden el límite reciben HTTP 429 con `{ error: { code: "RATE_LIMITED", retryable: true } }`
+- Las solicitudes sin IP de cliente derivable fallan de forma cerrada con HTTP 400 (`INVALID_INPUT`) en lugar de compartir un único cubo de reserva
 - Los encabezados de respuesta incluyen `X-RateLimit-Limit` y `X-RateLimit-Remaining`
 - Los cubos de límite de tasa expirados se barren cada 30 segundos
+- El estado del límite de tasa está delimitado por instancia de servidor/middleware, de modo que instancias independientes (p. ej. en pruebas) nunca comparten cubos
 
 ### Límite de Tamaño de Solicitud
 
@@ -1733,7 +1818,7 @@ Los cuerpos de solicitudes HTTP están limitados a `security.max_request_size_by
 
 ### Redacción de Logs
 
-Cuando `security.log_redaction: true` (predeterminado), los bearer tokens que aparecen en la salida de logs se redactan. Los logs de fallo de autenticación muestran solo una vista previa truncada de los tokens inválidos.
+Cuando `security.log_redaction: true` (predeterminado), los bearer tokens que aparecen en la salida de logs se redactan. Los logs de fallo de autenticación muestran solo una vista previa truncada de los tokens inválidos. Los campos de contenido de memoria (`content`, `preview`, `summary` y cualquier `*.content` anidado) se redactan de la misma forma en la salida de logs estructurados, aplicado mediante las rutas de redacción configuradas del logger, no por omisión en cada punto de registro.
 
 ### Detección de Secretos en el Contenido
 
@@ -1781,6 +1866,8 @@ Respuesta:
 ```
 
 La paginación usa cursores compuestos (`created_at|id`) para un orden estable. Los empates en la misma marca de tiempo se desempatan por ID, asegurando que ninguna fila se omita o duplique entre páginas.
+
+`memory://list` y `memory://{id}` aplican la misma regla de visibilidad de ciclo de vida que `search`/`recall`: una memoria `T2`/`T3` expirada y elegible para decaimiento se excluye (las lecturas en `memory://{id}` devuelven `NOT_FOUND`). Las memorias `T0` y `T1` permanecen visibles sin importar la expiración transitoria.
 
 ### `memory://inject` — Inyección de Contexto de Sesión
 
@@ -1869,15 +1956,21 @@ bhgbrain stats --by-tier              # Desglose del recuento de memorias por ni
 bhgbrain stats --expiring             # Mostrar memorias que expiran en los próximos 7 días
 bhgbrain health                       # Verificación completa del estado del sistema
 
-# Recolección de basura
-bhgbrain gc                           # Ejecutar limpieza (eliminar memorias no-T0 expiradas)
-bhgbrain gc --dry-run                 # Mostrar qué se limpiaría sin eliminar
+# Recolección de basura (archiva + elimina T2/T3 expiradas; T1 se muestra
+# como reviewCandidates en lugar de eliminarse; la compactación de Qdrant se
+# ejecuta automáticamente cuando la proporción de vectores eliminados de una
+# colección afectada supera el umbral configurado — ver
+# retention.compaction_deleted_threshold)
+bhgbrain gc                           # Ejecutar limpieza
+bhgbrain gc --dry-run                 # Mostrar candidatos y elementos de revisión sin eliminar
 bhgbrain gc --tier T3                 # Limpiar solo memorias T3
-bhgbrain gc --consolidate             # GC + paso de consolidación de marcado de obsolescencia
-bhgbrain gc --force-compact           # Forzar compactación de segmentos de Qdrant después de GC
 
 # Log de auditoría
 bhgbrain audit                        # Mostrar entradas de auditoría recientes
+
+# Reparación (recuperación multi-dispositivo)
+bhgbrain repair --from-qdrant                # Hidratar SQLite local desde Qdrant (solo memorias del dispositivo actual, por defecto)
+bhgbrain repair --from-qdrant --all-devices  # Hidratar desde las memorias de todos los dispositivos, no solo el actual
 
 # Gestión de categorías
 bhgbrain category list                # Listar todas las categorías
@@ -2221,8 +2314,18 @@ Crea, lista o restaura copias de seguridad de memorias.
 
 **Salida de `restore`:**
 ```json
-{ "memory_count": 1234, "activated": true }
+{
+  "memory_count": 1234,
+  "metadata_activated": true,
+  "vector_reconciliation": {
+    "status": "degraded",
+    "state": "reconciling",
+    "unsynced_vectors": 42,
+    "message": "Restore activated SQLite metadata; vector reconciliation for the drifted subset is continuing in the background."
+  }
+}
 ```
+`vector_reconciliation.state` es `"reconciled"` cuando ningún vector tuvo drift real (nada que reincrustar), o `"reconciling"` mientras una tarea de fondo acotada reincrusta el subconjunto con drift o faltante. Ver [Restauración desde una Copia de Seguridad](#restauración-desde-una-copia-de-seguridad).
 
 ---
 
@@ -2235,12 +2338,16 @@ Recuperar memorias desde Qdrant a la base de datos SQLite local. Se usa para con
 | Parámetro | Tipo | Requerido | Predeterminado | Descripción |
 |---|---|---|---|---|
 | `dry_run` | `boolean` | No | `false` | Cuando es `true`, reporta lo que se recuperaría sin hacer cambios. |
-| `device_id` | `string` | No | — | Filtrar la recuperación a memorias creadas por un dispositivo específico. Omitir para recuperar todas. |
+| `device_id` | `string` | No | — | Filtrar la recuperación a memorias creadas por un dispositivo específico. Mutuamente excluyente con `all_devices`. |
+| `all_devices` | `boolean` | No | `false` | Recuperar explícitamente memorias de todos los dispositivos. Mutuamente excluyente con `device_id`. Este es también el comportamiento predeterminado cuando no se proporciona ninguno de los dos campos. |
 
 **Salida:**
 
 ```json
 {
+  "dry_run": false,
+  "all_devices": true,
+  "device_id_filter": null,
   "collections_scanned": 2,
   "points_scanned": 47,
   "already_in_sqlite": 12,
@@ -2253,6 +2360,7 @@ Recuperar memorias desde Qdrant a la base de datos SQLite local. Se usa para con
 **Notas:**
 - Solo los puntos con `content` en su payload de Qdrant pueden recuperarse. Las memorias pre-1.3 sin contenido en Qdrant se reportan como `skipped_no_content`.
 - Las memorias recuperadas preservan su `device_id` original del payload de Qdrant. Si no existe `device_id` en el payload, se usa el ID del dispositivo local.
+- Pasar tanto `device_id` como `all_devices: true` se rechaza como entrada inválida.
 - Después de la recuperación, ejecuta `npm run build` y reinicia el servidor si es necesario. Las memorias recuperadas están inmediatamente disponibles para búsqueda y recall.
 
 ---
@@ -2283,6 +2391,13 @@ Lo que ocurre en el primer inicio después de la actualización:
 ```
 
 **Retrocompatible**: Las memorias pre-1.3 sin `device_id` o contenido en Qdrant continúan funcionando normalmente. Simplemente no pueden recuperarse vía la herramienta `repair`.
+
+**Refinamientos post-1.3 (1.4.10)**: Una auditoría de la función multi-dispositivo encontró y corrigió una brecha de migración real más un par de desviaciones de contrato:
+
+- El índice de payload de Qdrant `device_id` ahora se garantiza **incondicionalmente** en cada llamada a `ensureCollection`, no solo cuando se crea una colección por primera vez — las colecciones creadas antes de que esta función se lanzara ahora también se migran.
+- `BHGBRAIN_DEVICE_ID` ahora **tiene prioridad** sobre un `device.id` persistido, siguiendo el contrato de "las variables de entorno ganan" usado en otros lugares. Cuando anula un valor persistido, el nuevo valor se vuelve a persistir.
+- `config.json` se reescribe solo cuando el device id fue recién generado o cambiado por un override de entorno, no en cada arranque.
+- La herramienta `repair` obtuvo un booleano `all_devices` explícito, mutuamente excluyente con `device_id`, como la ruta documentada de todos los dispositivos (el comportamiento implícito anterior de "omitir `device_id`" sigue funcionando sin cambios).
 
 ---
 
@@ -2324,12 +2439,17 @@ La copia de seguridad se almacena en el directorio de datos (`%LOCALAPPDATA%\BHG
 
 ### Activación de Restauración de Copia de Seguridad
 
-`backup.restore` recarga el estado SQLite en tiempo de ejecución antes de devolver el éxito. Las respuestas de restauración incluyen `activated: true` cuando los datos restaurados están inmediatamente activos. No es necesario reiniciar el servidor.
+`backup.restore` recarga el estado SQLite en tiempo de ejecución antes de devolver el éxito. Las respuestas de restauración incluyen `metadata_activated: true` cuando los datos restaurados están inmediatamente activos. No es necesario reiniciar el servidor.
+
+La restauración adquiere un bloqueo de seguridad (`beginRestoreOperation()`) que solo bloquea las escrituras concurrentes mientras SQLite se activa y los vectores restaurados se comprueban contra Qdrant en busca de drift. Los vectores **no** se vacían y reincrustan incondicionalmente: solo se marcan para reincrustación las memorias cuyo checksum de contenido difiere de (o falta en) Qdrant, de modo que una restauración sin drift se completa sin llamar en absoluto al proveedor de embeddings. Si el modelo/dimensiones de embedding cambiaron desde que se tomó la copia de seguridad, o el estado de Qdrant no se puede leer, la restauración recurre en su lugar a una reconstrucción completa.
+
+Una vez que termina la comprobación de drift, se libera el bloqueo — la reincrustación del subconjunto con drift (si lo hay) se ejecuta en una tarea de fondo acotada (un timeout y un límite de lotes por pasada) en lugar de retener la llamada de restauración o bloquear otras escrituras durante ese tiempo. Reintenta automáticamente con backoff ante fallos transitorios; si nunca llega a ponerse al día del todo, `health://status` sigue reportando `vector_reconciliation.state: "pending"` (o `"reconciling"` mientras una pasada está en curso) en lugar de dejar la búsqueda semántica en blanco silenciosamente. El progreso se vuelca a disco por lotes, así que un fallo brusco durante la reconciliación pierde como máximo un lote de trabajo — al reiniciar se reanuda de forma segura desde el conjunto no sincronizado restante mediante un re-upsert idempotente.
 
 ### Fortalecimiento HTTP
 
 - `/health` es intencionalmente sin autenticación para compatibilidad con sondas.
 - El límite de tasa se basa en la identidad de solicitud confiable (IP) e ignora `x-client-id` para su aplicación.
+- El `client_id` de los logs de auditoría/solicitud también se deriva de la identidad de solicitud confiable (`req.ip`), nunca del encabezado `x-client-id` proporcionado por el llamante; ese encabezado solo se acepta como una pista de depuración no autoritativa y nunca se confía en él para el registro de auditoría.
 - `memory://list` aplica límites de `limit` de `1..100`; los valores inválidos devuelven `INVALID_INPUT`.
 
 ### Autenticación Fail-Closed
@@ -2344,6 +2464,7 @@ La copia de seguridad se almacena en el directorio de datos (`%LOCALAPPDATA%\BHG
 - Las operaciones que dependen de embeddings (búsqueda semántica, ingesta de memorias) devuelven `EMBEDDING_UNAVAILABLE` en el momento de la solicitud.
 - La búsqueda de texto completo y las lecturas de categorías siguen funcionando en modo degradado.
 - Las sondas de salud informan el estado del embedding como `degraded` sin realizar llamadas reales a la API.
+- Cuando hay un proveedor configurado, su sonda de salud de embeddings es una **solicitud única y acotada** (respetando `embedding.request_timeout_ms`), sin reintentos ni backoff, de forma consistente entre `openai` y `azure-foundry`. La sonda omite el circuit breaker e informa un valor booleano, reflejando el estado actual del proveedor rápidamente en lugar de bloquearse varios segundos durante una interrupción.
 
 ### Contratos de Respuesta MCP
 

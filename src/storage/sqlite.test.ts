@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SqliteStore } from './sqlite.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -100,6 +100,55 @@ describe('SqliteStore', () => {
     store.touchMemory(mem.id);
     const updated = store.getMemoryById(mem.id)!;
     expect(updated.access_count).toBe(1);
+  });
+
+  it('recordAccessBatch applies per-row updates via a reused prepared statement', () => {
+    const mem1 = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440020' };
+    const mem2 = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440021', checksum: 'def456' };
+    store.insertMemory(mem1);
+    store.insertMemory(mem2);
+
+    store.recordAccessBatch([
+      {
+        id: mem1.id,
+        access_count: 5,
+        last_accessed: '2026-02-01T00:00:00Z',
+        expires_at: '2026-03-01T00:00:00Z',
+        retention_tier: 'T1',
+        review_due: '2026-02-15T00:00:00Z',
+      },
+      // mem2: only the always-present fields are supplied — the tri-state
+      // optional fields (expires_at/retention_tier/review_due) are omitted and
+      // must be left untouched by the shared prepared statement.
+      { id: mem2.id, access_count: 3, last_accessed: '2026-02-02T00:00:00Z' },
+    ]);
+
+    const r1 = store.getMemoryById(mem1.id)!;
+    expect(r1.access_count).toBe(5);
+    expect(r1.last_accessed).toBe('2026-02-01T00:00:00Z');
+    expect(r1.expires_at).toBe('2026-03-01T00:00:00Z');
+    expect(r1.retention_tier).toBe('T1');
+    expect(r1.review_due).toBe('2026-02-15T00:00:00Z');
+
+    const r2 = store.getMemoryById(mem2.id)!;
+    expect(r2.access_count).toBe(3);
+    expect(r2.last_accessed).toBe('2026-02-02T00:00:00Z');
+    expect(r2.expires_at).toBeNull();
+    expect(r2.retention_tier).toBe('T2');
+    expect(r2.review_due).toBeNull();
+  });
+
+  it('recordAccessBatch clears expires_at when explicitly passed null', () => {
+    const mem = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440022' };
+    store.insertMemory(mem);
+    store.updateMemory(mem.id, { expires_at: '2026-05-01T00:00:00Z' });
+
+    store.recordAccessBatch([
+      { id: mem.id, access_count: 1, last_accessed: '2026-02-01T00:00:00Z', expires_at: null },
+    ]);
+
+    const updated = store.getMemoryById(mem.id)!;
+    expect(updated.expires_at).toBeNull();
   });
 
   it('lists stale candidate ids before cutoff and excludes categorized memories', () => {
@@ -253,6 +302,87 @@ describe('SqliteStore', () => {
     store.endLifecycleOperation('restore');
   });
 
+  // -- Restore/flush race coverage (real SqliteStore, not mocked) --
+  //
+  // src/backup/index.test.ts stubs SqliteStore entirely (beginLifecycleOperation /
+  // endLifecycleOperation / reloadSqliteFromDisk are all vi.fn()), so the real
+  // cancelDeferredFlush() call inside beginLifecycleOperation/reloadFromDisk is
+  // never exercised there. These tests drive the real timer and real reload path
+  // directly against SqliteStore to close that gap.
+
+  it('cancels a pending deferred flush before restore bytes land, so the stale write never overwrites them', async () => {
+    vi.useFakeTimers();
+    try {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      store.flush(); // baseline bytes on disk contain `mem`
+
+      // Dirty the in-memory DB without flushing, then arm the real deferred
+      // flush timer -- this is the "pending deferred flush" race scenario.
+      store.touchMemory(mem.id);
+      store.scheduleDeferredFlush();
+
+      // Mirrors BackupService.beginRestoreOperation(): acquiring the restore
+      // lifecycle lock must cancel the pending timer synchronously, before any
+      // restored bytes are written to disk.
+      store.beginLifecycleOperation('restore');
+
+      // Simulate the restore write: different bytes land on disk directly
+      // (bypassing this store's flush()), exactly as atomicWriteFileSync does
+      // in BackupService.restore before reloadFromDisk() is called.
+      const restoredDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-restored-'));
+      const restoredStore = new SqliteStore(restoredDir);
+      await restoredStore.init();
+      const restoredMem = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440099', checksum: 'restored-chk' };
+      restoredStore.insertMemory(restoredMem);
+      restoredStore.flush();
+      const restoredBytes = readFileSync(restoredStore.getDatabasePath());
+      restoredStore.close();
+      rmSync(restoredDir, { recursive: true, force: true });
+
+      writeFileSync(store.getDatabasePath(), restoredBytes);
+
+      // Advance well past the deferred-flush delay. If the timer had survived
+      // (i.e. cancelDeferredFlush() were not actually called), its callback
+      // would flush the stale pre-restore in-memory state over the just-written
+      // restored bytes.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(readFileSync(store.getDatabasePath()).equals(restoredBytes)).toBe(true);
+
+      // The real reload path: reads afterward observe the restored dataset.
+      await store.reloadFromDisk();
+      store.endLifecycleOperation('restore');
+
+      expect(store.getMemoryById(mem.id)).toBeNull();
+      expect(store.getMemoryById(restoredMem.id)).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects markStale, archiveMemory, and ordinary mutations while a restore reload is in flight', async () => {
+    const mem = sampleMemory();
+    store.insertMemory(mem);
+    store.flush();
+
+    store.beginLifecycleOperation('restore');
+    const reloadPromise = store.reloadFromDisk();
+
+    // While the reload is in flight -- mirroring the window between
+    // BackupService's beginRestoreOperation() and endRestoreLifecycleLock() --
+    // every state-mutating path is rejected, including the retention-driven
+    // paths (markStale/archiveMemory) that used to bypass the guard.
+    expect(() => store.markStale(mem.id)).toThrow(/lifecycle operation/);
+    expect(() => store.archiveMemory(mem, new Date().toISOString())).toThrow(/lifecycle operation/);
+    expect(() => store.insertMemory({ ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440098', checksum: 'racer' })).toThrow(/lifecycle operation/);
+
+    await reloadPromise;
+    store.endLifecycleOperation('restore');
+
+    // Guard lifted once the lifecycle operation ends.
+    expect(() => store.markStale(mem.id)).not.toThrow();
+  });
+
   // -- upsertMemoryFromPayload (bootstrap) --
 
   it('upsertMemoryFromPayload inserts a record from Qdrant payload', () => {
@@ -327,6 +457,57 @@ describe('SqliteStore', () => {
     expect(results.some(r => r.id === 'fts-id')).toBe(true);
   });
 
+  // -- upsertMemoryFromPayload atomicity regression (audit follow-up 7.x) --
+
+  it('upsertMemoryFromPayload normalizes an out-of-enum type instead of silently dropping the row', () => {
+    // A payload whose `type` violates the `memories.type` CHECK constraint must be
+    // normalized to the documented default ('semantic'), not silently dropped by
+    // INSERT OR IGNORE while an orphan memories_fts row survives.
+    const inserted = store.upsertMemoryFromPayload('bad-type-id', {
+      content: 'payload with an invalid type field',
+      summary: 'invalid type summary',
+      type: 'not-a-real-type',
+      checksum: 'bad-type-chk',
+    });
+
+    expect(inserted).toBe(true);
+
+    const mem = store.getMemoryById('bad-type-id');
+    expect(mem).not.toBeNull();
+    expect(mem!.type).toBe('semantic');
+
+    // No orphan FTS row: the memory is discoverable via full-text search exactly
+    // because the backing `memories` row exists.
+    const results = store.fullTextSearch('global', 'invalid type summary', 10);
+    expect(results.some(r => r.id === 'bad-type-id')).toBe(true);
+  });
+
+  it('upsertMemoryFromPayload rolls back the memories insert if the FTS insert fails, leaving no orphan row and no over-reported success', () => {
+    const dbInternal = (store as unknown as { db: { run: (sql: string, params?: unknown[]) => void } }).db;
+    const originalRun = dbInternal.run.bind(dbInternal);
+    dbInternal.run = (sql: string, params?: unknown[]) => {
+      if (sql.includes('INSERT OR IGNORE INTO memories_fts')) {
+        throw new Error('simulated fts insert failure');
+      }
+      return originalRun(sql, params);
+    };
+
+    try {
+      expect(() => store.upsertMemoryFromPayload('atomic-fail-id', {
+        content: 'should not persist',
+        summary: 'should not persist',
+        checksum: 'atomic-fail-chk',
+      })).toThrow('simulated fts insert failure');
+    } finally {
+      dbInternal.run = originalRun;
+    }
+
+    // The transaction must have rolled back: no orphan `memories` row either.
+    expect(store.getMemoryById('atomic-fail-id')).toBeNull();
+    const results = store.fullTextSearch('global', 'should not persist', 10);
+    expect(results.some(r => r.id === 'atomic-fail-id')).toBe(false);
+  });
+
   it('fullTextSearch ranks by term-frequency relevance instead of a constant', () => {
     // Low relevance: one body mention.
     store.insertMemory({
@@ -372,5 +553,41 @@ describe('SqliteStore', () => {
 
   it('passes health check', () => {
     expect(store.healthCheck()).toBe(true);
+  });
+
+  // -- Retention state (GC degraded signal + cleanup lag) --
+
+  it('reports no degraded retention state and null last_success_at before any GC run', () => {
+    expect(store.getRetentionDegraded()).toEqual({ degraded: false, message: null, last_success_at: null });
+  });
+
+  it('records last_success_at on a clean run and clears it back to healthy', () => {
+    store.setRetentionDegraded(false, null, '2026-03-10T02:00:00.000Z');
+    expect(store.getRetentionDegraded()).toEqual({
+      degraded: false,
+      message: null,
+      last_success_at: '2026-03-10T02:00:00.000Z',
+    });
+  });
+
+  it('preserves last_success_at across a subsequent degraded run (cleanup lag keeps growing)', () => {
+    store.setRetentionDegraded(false, null, '2026-03-10T02:00:00.000Z');
+    store.setRetentionDegraded(true, 'archive failed', '2026-03-11T02:00:00.000Z');
+    expect(store.getRetentionDegraded()).toEqual({
+      degraded: true,
+      message: 'archive failed',
+      last_success_at: '2026-03-10T02:00:00.000Z', // unchanged: the failed run didn't complete cleanly
+    });
+  });
+
+  it('advances last_success_at again once a later run completes cleanly', () => {
+    store.setRetentionDegraded(false, null, '2026-03-10T02:00:00.000Z');
+    store.setRetentionDegraded(true, 'archive failed', '2026-03-11T02:00:00.000Z');
+    store.setRetentionDegraded(false, null, '2026-03-12T02:00:00.000Z');
+    expect(store.getRetentionDegraded()).toEqual({
+      degraded: false,
+      message: null,
+      last_success_at: '2026-03-12T02:00:00.000Z',
+    });
   });
 });

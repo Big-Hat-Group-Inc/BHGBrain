@@ -46,6 +46,7 @@ describe('HealthService', () => {
         sliding_window_enabled: true,
         archive_before_delete: true,
         cleanup_schedule: '0 2 * * *',
+        scheduled_cleanup_enabled: true,
         pre_expiry_warning_days: 7,
         compaction_deleted_threshold: 0.1,
       },
@@ -88,10 +89,12 @@ describe('HealthService', () => {
         countArchivedMemories: vi.fn(() => 0),
         countUnsyncedVectors: vi.fn(() => 0),
         getLifecycleOperation: vi.fn(() => null),
+        getRetentionDegraded: vi.fn(() => ({ degraded: false, message: null, last_success_at: null })),
       },
       qdrant: {
         healthCheck: vi.fn(async () => true),
       },
+      isBackgroundReconciliationActive: vi.fn(() => false),
     } as unknown as StorageManager;
   }
 
@@ -196,6 +199,30 @@ describe('HealthService', () => {
     expect(embedding.healthCheck).toHaveBeenCalledTimes(1);
   });
 
+  it('re-invokes the embedding health check once the 30s cache window has elapsed (task 5.4 / 8.7)', async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = createStorage();
+      const embedding = createEmbedding(true);
+      const health = new HealthService(storage, embedding, createConfig());
+
+      await health.check();
+      expect(embedding.healthCheck).toHaveBeenCalledTimes(1);
+
+      // Still within the 30s window: cache hit, no re-invocation.
+      await vi.advanceTimersByTimeAsync(29_000);
+      await health.check();
+      expect(embedding.healthCheck).toHaveBeenCalledTimes(1);
+
+      // Past the 30s window: cache expires and the sub-check re-runs.
+      await vi.advanceTimersByTimeAsync(2_000);
+      await health.check();
+      expect(embedding.healthCheck).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('returns memory count and db size', async () => {
     const storage = createStorage();
     const embedding = createEmbedding(true);
@@ -207,13 +234,33 @@ describe('HealthService', () => {
 
   it('reports degraded when qdrant is unavailable but sqlite is healthy', async () => {
     const storage = createStorage();
-    storage.qdrant.healthCheck = vi.fn(async () => false);
+    storage.qdrant.healthCheck = vi.fn(async () => {
+      throw new Error('Qdrant unreachable');
+    });
 
     const health = new HealthService(storage, createEmbedding(true), createConfig());
     const result = await health.check();
 
     expect(result.status).toBe('degraded');
     expect(result.components.qdrant.status).toBe('unhealthy');
+  });
+
+  it('reports degraded with the underlying reason when the retrieval call fails on a reachable store', async () => {
+    // Regression guard for the 1.19 outage shape: the store is reachable but
+    // the retrieval call itself throws. The failure reason must be visible
+    // (distinct from a generic connectivity message) so an operator can tell
+    // a retrieval failure from a connectivity failure.
+    const storage = createStorage();
+    storage.qdrant.healthCheck = vi.fn(async () => {
+      throw new TypeError('this.client.query is not a function');
+    });
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.status).toBe('degraded');
+    expect(result.components.qdrant.status).toBe('unhealthy');
+    expect(result.components.qdrant.message).toBe('this.client.query is not a function');
   });
 
   it('reports unhealthy when sqlite is unavailable', async () => {
@@ -257,6 +304,67 @@ describe('HealthService', () => {
       state: 'reconciling',
       unsynced_vectors: 2,
       message: 'Restore is active and vector reconciliation is in progress.',
+    });
+  });
+
+  it('reports degraded retention when the last GC run recorded a partial failure', async () => {
+    const storage = createStorage();
+    storage.sqlite.getRetentionDegraded = vi.fn(() => ({
+      degraded: true,
+      message: 'Archive step failed for 1 memory',
+      last_success_at: null,
+    }));
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.status).toBe('degraded');
+    expect(result.components.retention).toEqual({
+      status: 'degraded',
+      message: 'Archive step failed for 1 memory',
+    });
+  });
+
+  it('reports cleanup_lag_seconds as null when cleanup has never completed successfully', async () => {
+    const storage = createStorage();
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+    expect(result.retention?.cleanup_lag_seconds).toBeNull();
+  });
+
+  it('computes cleanup_lag_seconds from the last successful GC run', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-03-10T02:05:00.000Z'));
+      const storage = createStorage();
+      storage.sqlite.getRetentionDegraded = vi.fn(() => ({
+        degraded: false,
+        message: null,
+        last_success_at: '2026-03-10T02:00:00.000Z',
+      }));
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+      expect(result.retention?.cleanup_lag_seconds).toBe(300);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports reconciling while bounded background reconciliation runs after the restore lock is released', async () => {
+    const storage = createStorage();
+    storage.sqlite.getLifecycleOperation = vi.fn(() => null);
+    storage.sqlite.countUnsyncedVectors = vi.fn(() => 5);
+    storage.isBackgroundReconciliationActive = vi.fn(() => true);
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.status).toBe('degraded');
+    expect(result.components.vector_reconciliation).toEqual({
+      status: 'degraded',
+      state: 'reconciling',
+      unsynced_vectors: 5,
+      message: 'Bounded background vector reconciliation is in progress.',
     });
   });
 });

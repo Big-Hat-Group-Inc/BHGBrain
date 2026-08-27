@@ -1,6 +1,6 @@
 ## Why
 
-First-time users currently need to paste the bootstrap prompt into their MCP client and manually drive the 12-section interview. There is no way to pause mid-interview and resume later, nor is there built-in progress tracking. A stateful `bhgbrain.bootstrap` tool would provide a fully guided onboarding experience managed by BHGBrain itself, with session persistence across conversations.
+First-time users currently need to paste the bootstrap prompt into their MCP client and manually drive the 10-section interview. There is no way to pause mid-interview and resume later, nor is there built-in progress tracking. A stateful `bhgbrain.bootstrap` tool would provide a fully guided onboarding experience managed by BHGBrain itself, with session persistence across conversations.
 
 ## What Changes
 

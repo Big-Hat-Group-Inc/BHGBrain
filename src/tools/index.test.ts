@@ -31,6 +31,7 @@ describe('collections delete semantics', () => {
         getCollection: vi.fn(() => ({ name: 'general' })),
         deleteCollection: vi.fn(() => true),
         countMemories: vi.fn(() => 0),
+        listCategories: vi.fn(() => []),
       },
       countMemoriesInCollection: vi.fn(() => 3),
       deleteCollectionData: vi.fn(async () => ({ deleted: 3, ids: ['a', 'b', 'c'] })),
@@ -67,10 +68,26 @@ describe('collections delete semantics', () => {
 
     expect(result.ok).toBe(true);
     expect(result.deleted_memory_count).toBe(3);
-    expect(storage.deleteCollectionData).toHaveBeenCalledWith('global', 'general');
+    expect(storage.deleteCollectionData).toHaveBeenCalledWith('global', 'general', { logger: ctx.logger });
     expect(storage.sqlite.deleteCollection).toHaveBeenCalledWith('global', 'general');
     expect(storage.logAudit).toHaveBeenCalledTimes(3);
     expect(ctx.metrics.setGauge).toHaveBeenCalled();
+  });
+
+  it('includes the resolved namespace in the tool_call log', async () => {
+    await handleTool(ctx, 'collections', { action: 'list', namespace: 'team-a' }, 'c1');
+
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'tool_call', tool: 'collections', namespace: 'team-a' }),
+    );
+  });
+
+  it('includes a null namespace in the tool_call log for namespace-agnostic tools', async () => {
+    await handleTool(ctx, 'category', { action: 'list' }, 'c1');
+
+    expect(ctx.logger.info).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'tool_call', tool: 'category', namespace: null }),
+    );
   });
 
   it('deletes empty collection without force', async () => {
@@ -102,6 +119,101 @@ describe('collections delete semantics', () => {
 
     expect(result.error.code).toBe('INTERNAL');
     expect(storage.sqlite.deleteCollection).not.toHaveBeenCalled();
+  });
+});
+
+type RepairResult = {
+  dry_run: boolean;
+  all_devices: boolean;
+  device_id_filter: string | null;
+  recovered: number;
+  skipped_device_filter?: number;
+};
+
+describe('repair device filtering', () => {
+  function createRepairCtx(points: Array<{ id: string; payload: Record<string, unknown> }>) {
+    const qdrant = {
+      listAllCollections: vi.fn(async () => ['bhgbrain_global_general']),
+      scrollAll: vi.fn(async () => points),
+    };
+    const sqlite = {
+      getMemoryById: vi.fn(() => null),
+      getCollection: vi.fn(() => ({ name: 'general' })),
+      createCollection: vi.fn(),
+      insertMemory: vi.fn(),
+      flushIfDirty: vi.fn(),
+      countMemories: vi.fn(() => 0),
+    };
+    const storage = { qdrant, sqlite } as unknown as StorageManager;
+    const ctx: ToolContext = {
+      config: { device: { id: 'local-device' } } as ToolContext['config'],
+      storage,
+      embedding: { model: 'm', dimensions: 1 } as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+    return { ctx, sqlite };
+  }
+
+  const twoDevicePoints = [
+    { id: 'p-a', payload: { content: 'from device a', device_id: 'device-a', namespace: 'global', collection: 'general' } },
+    { id: 'p-b', payload: { content: 'from device b', device_id: 'device-b', namespace: 'global', collection: 'general' } },
+  ];
+
+  it('recovers only the requested device when device_id is provided', async () => {
+    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+
+    const result = await handleTool(ctx, 'repair', { device_id: 'device-a' }, 'c1') as RepairResult;
+
+    expect(result.recovered).toBe(1);
+    expect(result.device_id_filter).toBe('device-a');
+    expect(result.all_devices).toBe(false);
+    expect(sqlite.insertMemory).toHaveBeenCalledTimes(1);
+    expect(sqlite.insertMemory).toHaveBeenCalledWith(expect.objectContaining({ id: 'p-a', device_id: 'device-a' }));
+  });
+
+  it('recovers points from every device when all_devices is explicitly true', async () => {
+    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+
+    const result = await handleTool(ctx, 'repair', { all_devices: true }, 'c1') as RepairResult;
+
+    expect(result.recovered).toBe(2);
+    expect(result.all_devices).toBe(true);
+    expect(result.device_id_filter).toBeNull();
+    expect(sqlite.insertMemory).toHaveBeenCalledTimes(2);
+  });
+
+  it('recovers points from every device when neither filter is provided (backward-compatible default)', async () => {
+    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+
+    const result = await handleTool(ctx, 'repair', {}, 'c1') as RepairResult;
+
+    expect(result.recovered).toBe(2);
+    expect(result.all_devices).toBe(true);
+    expect(sqlite.insertMemory).toHaveBeenCalledTimes(2);
+  });
+
+  it('sets the local device_id on a recovered record whose original payload has none', async () => {
+    const { ctx, sqlite } = createRepairCtx([
+      { id: 'p-legacy', payload: { content: 'pre-migration memory', namespace: 'global', collection: 'general' } },
+    ]);
+
+    const result = await handleTool(ctx, 'repair', {}, 'c1') as RepairResult;
+
+    expect(result.recovered).toBe(1);
+    expect(sqlite.insertMemory).toHaveBeenCalledWith(expect.objectContaining({ id: 'p-legacy', device_id: 'local-device' }));
+  });
+
+  it('rejects device_id and all_devices together as mutually exclusive', async () => {
+    const { ctx } = createRepairCtx(twoDevicePoints);
+
+    const result = await handleTool(ctx, 'repair', { device_id: 'device-a', all_devices: true }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
   });
 });
 
@@ -145,4 +257,87 @@ describe('tool input contracts', () => {
       expect(result.error.code).toBe('INVALID_INPUT');
     });
   }
+});
+
+describe('tool-handler latency recording (record-tool-latency-on-all-paths)', () => {
+  // A bare ctx is enough: dispatch fails validation/lookup before touching
+  // storage, embedding, etc. — same rationale as `tool input contracts` above.
+  function createCtx(overrides?: { storage?: Partial<StorageManager> }): ToolContext {
+    return {
+      config: {} as ToolContext['config'],
+      storage: (overrides?.storage ?? {}) as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('records a tool-handler latency sample when dispatch throws a BrainError (task 4.1)', async () => {
+    const ctx = createCtx();
+
+    const result = await handleTool(ctx, 'unknown_tool', {}, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(ctx.metrics.recordHistogram).toHaveBeenCalledWith(
+      'bhgbrain_tool_handler_ms',
+      expect.any(Number),
+      { tool: 'unknown_tool', status: 'error' },
+    );
+  });
+
+  it('records a tool-handler latency sample when dispatch throws an unexpected error (task 4.1)', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        getCategory: () => { throw new Error('boom'); },
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    const result = await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INTERNAL');
+    expect(ctx.metrics.recordHistogram).toHaveBeenCalledWith(
+      'bhgbrain_tool_handler_ms',
+      expect.any(Number),
+      { tool: 'category', status: 'error' },
+    );
+  });
+
+  it('identifies latency per tool so two different tools produce distinguishable entries (task 4.2)', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        listCategories: () => [],
+        listCollections: () => [],
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    await handleTool(ctx, 'category', { action: 'list' }, 'c1');
+    await handleTool(ctx, 'collections', { action: 'list', namespace: 'global' }, 'c1');
+
+    const recordHistogram = ctx.metrics.recordHistogram as ReturnType<typeof vi.fn>;
+    const toolLabels = recordHistogram.mock.calls
+      .filter(call => call[0] === 'bhgbrain_tool_handler_ms')
+      .map(call => (call[2] as { tool: string }).tool);
+
+    expect(toolLabels).toContain('category');
+    expect(toolLabels).toContain('collections');
+    expect(new Set(toolLabels).size).toBe(2);
+  });
+
+  it('records a tool-handler latency sample on the success path with an "ok" status label', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: { listCategories: () => [] } } as unknown as Partial<StorageManager>,
+    });
+
+    await handleTool(ctx, 'category', { action: 'list' }, 'c1');
+
+    expect(ctx.metrics.recordHistogram).toHaveBeenCalledWith(
+      'bhgbrain_tool_handler_ms',
+      expect.any(Number),
+      { tool: 'category', status: 'ok' },
+    );
+  });
 });
