@@ -81,16 +81,16 @@ new logic is effectively untested.
 **Severity**: High
 **Effort**: Small
 
-- [ ] 10.1 The `device_id` keyword index is created **only inside the
+- [x] 10.1 The `device_id` keyword index is created **only inside the
   collection-not-found `catch` branch** (`:42-73`), so any collection that already
   exists returns early at `:41` and never gets the index — this is exactly the
   post-upgrade multi-device Qdrant Cloud case the proposal targets.
-- [ ] 10.2 Move the `createPayloadIndex` call for `device_id` out of the `catch` so it
+- [x] 10.2 Move the `createPayloadIndex` call for `device_id` out of the `catch` so it
   runs **unconditionally and idempotently** on existing collections too (run it after
   the try/catch, or in both branches).
-- [ ] 10.3 Make it idempotent: wrap in a try/catch that tolerates an "already exists"
+- [x] 10.3 Make it idempotent: wrap in a try/catch that tolerates an "already exists"
   conflict from Qdrant so repeated startups are no-ops.
-- [ ] 10.4 Add a regression test asserting the `device_id` index is created when the
+- [x] 10.4 Add a regression test asserting the `device_id` index is created when the
   collection already exists (see 14.x).
 
 ### 11. DRIFT: config.json rewritten unconditionally on every boot
@@ -98,10 +98,10 @@ new logic is effectively untested.
 **Severity**: Medium
 **Effort**: Small
 
-- [ ] 11.1 `ensureDataDir` always `writeFileSync(configPath, ...)` after resolving the
+- [x] 11.1 `ensureDataDir` always `writeFileSync(configPath, ...)` after resolving the
   device id, rewriting the fully Zod-defaulted config every startup (strips user
   comments/formatting, avoidable disk write). Task 1 specifies "if not already set".
-- [ ] 11.2 Track whether `resolveDeviceId` actually **synthesized** a new id (return a
+- [x] 11.2 Track whether `resolveDeviceId` actually **synthesized** a new id (return a
   flag or compare before/after) and only write `config.json` when the file is missing
   or `device.id` was newly assigned.
 
@@ -110,13 +110,13 @@ new logic is effectively untested.
 **Severity**: Low (contract correctness)
 **Effort**: Small
 
-- [ ] 12.1 `resolveDeviceId` returns `config.device.id` first (`:266-267`), before
+- [x] 12.1 `resolveDeviceId` returns `config.device.id` first (`:266-267`), before
   consulting `BHGBRAIN_DEVICE_ID` (`:270`); combined with persistence (#11) the env var
   is permanently ignored after first run. This contradicts the documented "env wins"
   contract (`:196-197`, `.env.example`).
-- [ ] 12.2 Make `BHGBRAIN_DEVICE_ID` take precedence over the persisted `device.id`:
+- [x] 12.2 Make `BHGBRAIN_DEVICE_ID` take precedence over the persisted `device.id`:
   check the env var ahead of the file value, and re-persist when env overrides.
-- [ ] 12.3 Reconcile `sanitizeDeviceId` truncation while here: slice to 64 chars
+- [x] 12.3 Reconcile `sanitizeDeviceId` truncation while here: slice to 64 chars
   **then** strip a trailing hyphen (`.slice(0,64).replace(/-+$/,'') || 'unknown'`) so
   truncation cannot re-introduce a trailing `-` (`:248-254`).
 
@@ -126,9 +126,9 @@ new logic is effectively untested.
 **Severity**: Low
 **Effort**: Small
 
-- [ ] 13.1 Today "all devices" is implicit: omitting `device_id` recovers every device
+- [x] 13.1 Today "all devices" is implicit: omitting `device_id` recovers every device
   (`:316`). The proposal documents an explicit `--all-devices` capability.
-- [ ] 13.2 Add an explicit boolean `all_devices` field to `RepairInputSchema` and the
+- [x] 13.2 Add an explicit boolean `all_devices` field to `RepairInputSchema` and the
   repair MCP schema, and have `handleRepair` treat it as the documented all-devices
   path (mutually exclusive with `device_id`); keep omit-behavior backward-compatible or
   document the precedence.
@@ -139,15 +139,15 @@ new logic is effectively untested.
 **Severity**: Medium
 **Effort**: Small/Medium
 
-- [ ] 14.1 `resolveDeviceId` priority chain: explicit id / `BHGBRAIN_DEVICE_ID` /
+- [x] 14.1 `resolveDeviceId` priority chain: explicit id / `BHGBRAIN_DEVICE_ID` /
   hostname fallback, **and the env-wins-over-persisted case** from #12.
-- [ ] 14.2 `sanitizeDeviceId` edge cases incl. the truncation/trailing-hyphen fix.
-- [ ] 14.3 Device tagging round-trip: a `remember` write tags `device_id` into both
+- [x] 14.2 `sanitizeDeviceId` edge cases incl. the truncation/trailing-hyphen fix.
+- [x] 14.3 Device tagging round-trip: a `remember` write tags `device_id` into both
   SQLite and the Qdrant payload, and search surfaces it (including the Qdrant-fallback
   path).
-- [ ] 14.4 Repair device filter: seed two devices' points, assert the filter recovers
+- [x] 14.4 Repair device filter: seed two devices' points, assert the filter recovers
   only the requested device, and that the local id is set on recovered records lacking
   one.
-- [ ] 14.5 Qdrant index migration: assert `ensureCollection` creates the `device_id`
+- [x] 14.5 Qdrant index migration: assert `ensureCollection` creates the `device_id`
   index when the collection **already exists** (regression for #10), and that a second
   call is a no-op.

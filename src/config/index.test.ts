@@ -1,8 +1,21 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { loadConfig, applyEnvOverrides, type BrainConfig } from './index.js';
+import { hostname, tmpdir } from 'node:os';
+import { loadConfig, applyEnvOverrides, resolveDeviceId, ensureDataDir, type BrainConfig } from './index.js';
+
+// `node:os`.hostname and `node:fs`.writeFileSync are ESM builtin exports —
+// their module namespace is non-configurable, so `vi.spyOn` cannot patch
+// them directly. Partially mocking the module (falling through to the real
+// implementation via `importOriginal`) gives a spy-able wrapper instead.
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  return { ...actual, hostname: vi.fn(actual.hostname) };
+});
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, writeFileSync: vi.fn(actual.writeFileSync) };
+});
 
 describe('loadConfig Azure embedding validation', () => {
   const tempDirs: string[] = [];
@@ -266,5 +279,155 @@ describe('env-var config overlay', () => {
     expect(config.qdrant.mode).toBe('embedded');
     expect(config.security.require_loopback_http).toBe(true);
     expect(config.observability.log_level).toBe('info');
+  });
+});
+
+function makeConfig(deviceId?: string): BrainConfig {
+  return {
+    device: { id: deviceId },
+  } as unknown as BrainConfig;
+}
+
+describe('resolveDeviceId priority chain', () => {
+  const savedEnv = process.env.BHGBRAIN_DEVICE_ID;
+
+  beforeEach(() => {
+    delete process.env.BHGBRAIN_DEVICE_ID;
+    vi.mocked(hostname).mockReturnValue('My Host Box');
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) {
+      delete process.env.BHGBRAIN_DEVICE_ID;
+    } else {
+      process.env.BHGBRAIN_DEVICE_ID = savedEnv;
+    }
+    vi.mocked(hostname).mockReset();
+  });
+
+  it('uses the persisted config.device.id when set and no env override is present', () => {
+    const config = makeConfig('explicit-device');
+    expect(resolveDeviceId(config)).toBe('explicit-device');
+    expect(config.device.id).toBe('explicit-device');
+  });
+
+  it('falls back to a sanitized os.hostname() when neither config nor env provide an id', () => {
+    const config = makeConfig(undefined);
+    expect(resolveDeviceId(config)).toBe('my-host-box');
+    expect(config.device.id).toBe('my-host-box');
+  });
+
+  it('BHGBRAIN_DEVICE_ID overrides a persisted config.device.id (env wins)', () => {
+    process.env.BHGBRAIN_DEVICE_ID = 'env-device';
+    const config = makeConfig('previously-persisted');
+    expect(resolveDeviceId(config)).toBe('env-device');
+    expect(config.device.id).toBe('env-device');
+  });
+
+  it('BHGBRAIN_DEVICE_ID is used even with no persisted config.device.id', () => {
+    process.env.BHGBRAIN_DEVICE_ID = 'env-device-2';
+    const config = makeConfig(undefined);
+    expect(resolveDeviceId(config)).toBe('env-device-2');
+  });
+
+  it('ignores an env value that fails the device_id pattern, falling back to persisted config', () => {
+    process.env.BHGBRAIN_DEVICE_ID = 'not a valid id!!';
+    const config = makeConfig('persisted-device');
+    expect(resolveDeviceId(config)).toBe('persisted-device');
+  });
+
+  it('sanitizes a hostname whose 65th character would land on a hyphen, without leaving a trailing hyphen', () => {
+    // 63 'a's followed by a run of separators that collapse to a single '-'
+    // right at the truncation boundary: naive strip-then-slice would already
+    // have removed a *terminal* hyphen before slicing, but a slice that lands
+    // exactly on a hyphen must still be cleaned up afterward.
+    const raw = 'a'.repeat(63) + '-' + 'b'.repeat(10);
+    vi.mocked(hostname).mockReturnValue(raw);
+    const config = makeConfig(undefined);
+    const id = resolveDeviceId(config);
+    expect(id.length).toBeLessThanOrEqual(64);
+    expect(id.endsWith('-')).toBe(false);
+    expect(id.startsWith('-')).toBe(false);
+  });
+
+  it('falls back to "unknown" when the hostname sanitizes to an empty string', () => {
+    vi.mocked(hostname).mockReturnValue('!!!!!');
+    const config = makeConfig(undefined);
+    expect(resolveDeviceId(config)).toBe('unknown');
+  });
+});
+
+describe('ensureDataDir config.json write behavior', () => {
+  const tempDirs: string[] = [];
+  const savedEnv = process.env.BHGBRAIN_DEVICE_ID;
+
+  beforeEach(() => {
+    delete process.env.BHGBRAIN_DEVICE_ID;
+  });
+
+  afterEach(() => {
+    if (savedEnv === undefined) {
+      delete process.env.BHGBRAIN_DEVICE_ID;
+    } else {
+      process.env.BHGBRAIN_DEVICE_ID = savedEnv;
+    }
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function tempDataDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-ensuredir-'));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  it('writes config.json on first run when the file is missing', () => {
+    const dir = tempDataDir();
+    const config = loadConfig(join(dir, 'config.json'));
+    config.data_dir = dir;
+
+    ensureDataDir(config);
+
+    const configPath = join(dir, 'config.json');
+    expect(existsSync(configPath)).toBe(true);
+    const written = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(written.device.id).toBe(config.device.id);
+  });
+
+  it('does not rewrite config.json on a steady-state boot with an unchanged device id', () => {
+    const dir = tempDataDir();
+    const configPath = join(dir, 'config.json');
+    const config = loadConfig(configPath);
+    config.data_dir = dir;
+    ensureDataDir(config);
+
+    // Simulate a second boot with the config already resolved/persisted.
+    const secondConfig = loadConfig(configPath);
+    secondConfig.data_dir = dir;
+    vi.mocked(writeFileSync).mockClear();
+    ensureDataDir(secondConfig);
+
+    expect(secondConfig.device.id).toBe(config.device.id);
+    expect(writeFileSync).not.toHaveBeenCalled();
+  });
+
+  it('rewrites config.json when BHGBRAIN_DEVICE_ID overrides the persisted device id', () => {
+    const dir = tempDataDir();
+    const configPath = join(dir, 'config.json');
+    const config = loadConfig(configPath);
+    config.data_dir = dir;
+    ensureDataDir(config);
+    expect(config.device.id).not.toBe('overridden-device');
+
+    process.env.BHGBRAIN_DEVICE_ID = 'overridden-device';
+    const secondConfig = loadConfig(configPath);
+    secondConfig.data_dir = dir;
+    ensureDataDir(secondConfig);
+
+    expect(secondConfig.device.id).toBe('overridden-device');
+    const written = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(written.device.id).toBe('overridden-device');
   });
 });

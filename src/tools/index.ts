@@ -283,7 +283,10 @@ async function handleBackup(ctx: ToolContext, args: unknown): Promise<unknown> {
 async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
   const input = parseInput(RepairInputSchema, args);
   const dryRun = input.dry_run;
-  const filterDeviceId = input.device_id;
+  // `all_devices` and `device_id` are mutually exclusive (enforced by the
+  // schema); omitting both is the documented, backward-compatible
+  // all-devices default, same as passing `all_devices: true` explicitly.
+  const filterDeviceId = input.all_devices ? undefined : input.device_id;
   const localDeviceId = ctx.config.device.id ?? null;
 
   const collections = await ctx.storage.qdrant.listAllCollections();
@@ -393,6 +396,7 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
 
   return {
     dry_run: dryRun,
+    all_devices: input.all_devices || filterDeviceId === undefined,
     device_id_filter: filterDeviceId ?? null,
     collections_scanned: collections.length,
     points_scanned: scannedPoints,

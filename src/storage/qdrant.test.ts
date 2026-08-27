@@ -11,6 +11,9 @@ import type { QdrantClient } from '@qdrant/js-client-rest';
 type MockClient = {
   getCollections: Mock<QdrantClient['getCollections']>;
   query: Mock<QdrantClient['query']>;
+  getCollection?: Mock<QdrantClient['getCollection']>;
+  createCollection?: Mock<QdrantClient['createCollection']>;
+  createPayloadIndex?: Mock<QdrantClient['createPayloadIndex']>;
 };
 
 function createStore(client: MockClient): QdrantStore {
@@ -150,6 +153,91 @@ describe('QdrantStore.searchSimilar', () => {
     const store = createStore(client);
     await expect(store.searchSimilar('global', 'work', [1, 2, 3], 10)).rejects.toThrow(
       'this.client.query is not a function',
+    );
+  });
+});
+
+describe('QdrantStore.ensureCollection device_id index migration', () => {
+  // Regression guard: the index was originally created only inside the
+  // collection-not-found branch, so a collection that already exists (the
+  // post-upgrade multi-device Qdrant Cloud case) never got the device_id
+  // index. It must now be ensured unconditionally.
+  it('creates the device_id index when the collection already exists', async () => {
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => ({}) as never),
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await store.ensureCollection('global', 'general');
+
+    expect(client.getCollection).toHaveBeenCalledTimes(1);
+    expect(client.createCollection).not.toHaveBeenCalled();
+    expect(createPayloadIndex).toHaveBeenCalledWith(
+      'bhgbrain_global_general',
+      { field_name: 'device_id', field_schema: 'keyword' },
+    );
+  });
+
+  it('still creates the device_id index (plus the rest) when the collection is newly created', async () => {
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => {
+        const err = new Error('Collection `bhgbrain_global_general` doesn\'t exist!') as Error & { status?: number };
+        err.status = 404;
+        throw err;
+      }),
+      createCollection: vi.fn<QdrantClient['createCollection']>(async () => ({}) as never),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await store.ensureCollection('global', 'general');
+
+    expect(client.createCollection).toHaveBeenCalledTimes(1);
+    const deviceIdCalls = createPayloadIndex.mock.calls.filter(c => c[1]?.field_name === 'device_id');
+    expect(deviceIdCalls).toHaveLength(1);
+  });
+
+  it('is idempotent: tolerates an already-exists conflict from a repeat call', async () => {
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => {
+      const err = new Error('Index already exists') as Error & { status?: number };
+      err.status = 409;
+      throw err;
+    });
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => ({}) as never),
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await expect(store.ensureCollection('global', 'general')).resolves.toBeUndefined();
+  });
+
+  it('propagates a non-conflict failure from the device_id index call', async () => {
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => {
+      throw new TypeError('this.client.createPayloadIndex is not a function');
+    });
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => ({}) as never),
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await expect(store.ensureCollection('global', 'general')).rejects.toThrow(
+      'this.client.createPayloadIndex is not a function',
     );
   });
 });

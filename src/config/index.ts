@@ -269,33 +269,42 @@ export function applyEnvOverrides(config: BrainConfig): void {
 /**
  * Sanitize a string for use as a device_id by lowercasing and replacing
  * invalid characters with hyphens, then trimming to 64 characters.
+ *
+ * Truncation happens *after* leading-hyphen collapse but *before* trailing-
+ * hyphen removal: slicing a long hostname to 64 chars can itself land on a
+ * hyphen, so the trailing strip must run last or a truncated id could still
+ * end in `-`.
  */
 function sanitizeDeviceId(raw: string): string {
-  return raw
+  const normalized = raw
     .toLowerCase()
     .replace(/[^a-zA-Z0-9._-]/g, '-')
     .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 64) || 'unknown';
+    .replace(/^-+/, '');
+  const truncated = normalized.slice(0, 64).replace(/-+$/, '');
+  return truncated || 'unknown';
 }
 
 /**
  * Resolve the device_id using the priority chain:
- * 1. config.device.id (explicit)
- * 2. BHGBRAIN_DEVICE_ID environment variable
+ * 1. BHGBRAIN_DEVICE_ID environment variable — matches the project-wide
+ *    contract that `BHGBRAIN_*` env overrides always win over persisted
+ *    `config.json` values, including on devices where a device_id was
+ *    already resolved and saved on a previous run.
+ * 2. config.device.id (explicit / previously persisted)
  * 3. os.hostname() (lowercased, sanitized)
  *
  * Mutates config.device.id with the resolved value.
  */
 export function resolveDeviceId(config: BrainConfig): string {
-  if (config.device.id) {
-    return config.device.id;
-  }
-
   const envId = process.env.BHGBRAIN_DEVICE_ID;
   if (envId && DEVICE_ID_RE.test(envId)) {
     config.device.id = envId;
     return envId;
+  }
+
+  if (config.device.id) {
+    return config.device.id;
   }
 
   const hostId = sanitizeDeviceId(hostname());
@@ -308,10 +317,21 @@ export function ensureDataDir(config: BrainConfig): void {
   mkdirSync(dir, { recursive: true });
   mkdirSync(join(dir, 'backups'), { recursive: true });
 
-  // Resolve device identity and persist to config.json
+  const configPath = join(dir, 'config.json');
+  const configFileExisted = existsSync(configPath);
+  const previousDeviceId = config.device.id;
+
+  // Resolve device identity (env override, persisted value, or a fresh
+  // hostname-derived id).
   resolveDeviceId(config);
 
-  const configPath = join(dir, 'config.json');
-  // Always write config to persist resolved device_id on first run
-  writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+  // Only rewrite config.json when there is something new to persist: the
+  // file doesn't exist yet, or resolution actually changed device.id (a
+  // freshly synthesized id, or BHGBRAIN_DEVICE_ID overriding a persisted
+  // value). A steady-state boot with an unchanged, already-persisted id
+  // performs no write, so user formatting/comments in config.json survive
+  // and startup avoids a needless disk write.
+  if (!configFileExisted || config.device.id !== previousDeviceId) {
+    writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+  }
 }

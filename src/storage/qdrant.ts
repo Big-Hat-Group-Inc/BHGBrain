@@ -66,10 +66,27 @@ export class QdrantStore {
         field_name: 'expires_at',
         field_schema: 'integer',
       });
+    }
+
+    // Ensured unconditionally (not just on first create) so that collections
+    // created before device provenance shipped — the exact post-upgrade,
+    // multi-device Qdrant Cloud scenario this feature targets — still get the
+    // index. Idempotent: a second call against an already-indexed collection
+    // is a tolerated no-op.
+    await this.ensureDeviceIdIndex(name);
+  }
+
+  private async ensureDeviceIdIndex(name: string): Promise<void> {
+    try {
       await this.client.createPayloadIndex(name, {
         field_name: 'device_id',
         field_schema: 'keyword',
       });
+    } catch (err) {
+      if (this.isAlreadyExistsError(err)) {
+        return;
+      }
+      throw err;
     }
   }
 
@@ -325,6 +342,15 @@ export class QdrantStore {
     if (status === 404) return true;
     const message = maybeErr.message?.toLowerCase() ?? '';
     return message.includes('not found') || message.includes('does not exist');
+  }
+
+  private isAlreadyExistsError(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false;
+    const maybeErr = err as { status?: number; response?: { status?: number }; message?: string };
+    const status = maybeErr.status ?? maybeErr.response?.status;
+    if (status === 409) return true;
+    const message = maybeErr.message?.toLowerCase() ?? '';
+    return message.includes('already exists') || message.includes('conflict');
   }
 
   private async executeWithBreaker<T>(fn: () => Promise<T>): Promise<T> {

@@ -621,11 +621,11 @@ Chaque écriture de souvenir stocke le contenu complet dans SQLite (local) et da
 
 Chaque instance BHGBrain résout un `device_id` stable au démarrage, en utilisant cet ordre de priorité :
 
-1. **Configuration explicite** : champ `device.id` dans `config.json`
-2. **Variable d'environnement** : `BHGBRAIN_DEVICE_ID`
+1. **Variable d'environnement** : `BHGBRAIN_DEVICE_ID` — a la priorité sur une valeur persistée, conformément au contrat « les variables d'environnement gagnent » appliqué à tout autre override `BHGBRAIN_*` (voir [Configuration vs. environnement](#configuration)). Lorsqu'elle remplace un `device.id` déjà persisté, la nouvelle valeur est re-persistée.
+2. **Configuration explicite/persistée** : champ `device.id` dans `config.json`
 3. **Auto-généré** : Dérivé de `os.hostname()`, mis en minuscules et assaini en `[a-zA-Z0-9._-]`
 
-Au premier lancement, l'ID résolu est persisté dans `config.json` afin qu'il reste stable entre les redémarrages, même si le hostname change ultérieurement.
+Au premier lancement, l'ID résolu est persisté dans `config.json` afin qu'il reste stable entre les redémarrages, même si le hostname change ultérieurement. `config.json` n'est réécrit que lorsque l'id de l'appareil a été nouvellement généré ou modifié par un override d'environnement — un démarrage en état stable avec un id déjà persisté et inchangé n'entraîne aucune écriture.
 
 ```jsonc
 // config.json — section device
@@ -2291,12 +2291,16 @@ Récupère les souvenirs depuis Qdrant dans la base de données SQLite locale. U
 | Paramètre | Type | Obligatoire | Par défaut | Description |
 |---|---|---|---|---|
 | `dry_run` | `boolean` | Non | `false` | Lorsque `true`, rapporte ce qui serait récupéré sans effectuer de modifications. |
-| `device_id` | `string` | Non | — | Filtrer la récupération aux souvenirs créés par un appareil spécifique. Omettre pour tout récupérer. |
+| `device_id` | `string` | Non | — | Filtrer la récupération aux souvenirs créés par un appareil spécifique. Mutuellement exclusif avec `all_devices`. |
+| `all_devices` | `boolean` | Non | `false` | Récupérer explicitement les souvenirs de tous les appareils. Mutuellement exclusif avec `device_id`. C'est aussi le comportement par défaut lorsqu'aucun des deux champs n'est fourni. |
 
 **Sortie :**
 
 ```json
 {
+  "dry_run": false,
+  "all_devices": true,
+  "device_id_filter": null,
   "collections_scanned": 2,
   "points_scanned": 47,
   "already_in_sqlite": 12,
@@ -2309,6 +2313,7 @@ Récupère les souvenirs depuis Qdrant dans la base de données SQLite locale. U
 **Notes :**
 - Seuls les points ayant du `content` dans leur charge utile Qdrant peuvent être récupérés. Les souvenirs pré-1.3 sans contenu dans Qdrant sont rapportés comme `skipped_no_content`.
 - Les souvenirs récupérés préservent leur `device_id` d'origine depuis la charge utile Qdrant. Si aucun `device_id` n'existe dans la charge utile, l'ID de l'appareil local est utilisé.
+- Fournir à la fois `device_id` et `all_devices: true` est rejeté comme entrée invalide.
 - Après la récupération, exécutez `npm run build` et redémarrez le serveur si nécessaire. Les souvenirs récupérés sont immédiatement disponibles pour la recherche et le rappel.
 
 ---
@@ -2339,6 +2344,13 @@ Ce qui se passe au premier démarrage après la mise à jour :
 ```
 
 **Rétrocompatible** : Les souvenirs pré-1.3 sans `device_id` ou sans contenu dans Qdrant continuent de fonctionner normalement. Ils ne peuvent simplement pas être récupérés via l'outil `repair`.
+
+**Améliorations post-1.3 (1.4.10)** : Un audit de la fonctionnalité multi-appareils a trouvé et corrigé une véritable lacune de migration ainsi que quelques dérives contractuelles :
+
+- L'index de charge utile Qdrant `device_id` est désormais garanti **inconditionnellement** à chaque appel de `ensureCollection`, pas seulement lors de la création d'une nouvelle collection — les collections créées avant le déploiement de cette fonctionnalité sont désormais également migrées.
+- `BHGBRAIN_DEVICE_ID` **a désormais la priorité** sur un `device.id` persisté, conformément au contrat « les variables d'environnement gagnent » utilisé ailleurs. Lorsqu'elle remplace une valeur persistée, la nouvelle valeur est re-persistée.
+- `config.json` n'est réécrit que lorsque l'id de l'appareil a été nouvellement généré ou modifié par un override d'environnement, et non à chaque démarrage.
+- L'outil `repair` a reçu un booléen explicite `all_devices`, mutuellement exclusif avec `device_id`, comme chemin documenté pour tous les appareils (le comportement implicite précédent « omettre `device_id` » fonctionne toujours sans changement).
 
 ---
 

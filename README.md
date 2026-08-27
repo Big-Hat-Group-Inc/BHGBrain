@@ -669,11 +669,11 @@ Every memory write stores the full content in both SQLite (local) and the Qdrant
 
 Each BHGBrain instance resolves a stable `device_id` on startup, using this priority order:
 
-1. **Explicit config**: `device.id` field in `config.json`
-2. **Environment variable**: `BHGBRAIN_DEVICE_ID`
+1. **Environment variable**: `BHGBRAIN_DEVICE_ID` — takes precedence over a persisted value, matching the "env vars win" contract used for every other `BHGBRAIN_*` override (see [Config vs. environment](#configuration)). When it overrides a previously persisted `device.id`, the new value is re-persisted.
+2. **Explicit/persisted config**: `device.id` field in `config.json`
 3. **Auto-generated**: Derived from `os.hostname()`, lowercased and sanitized to `[a-zA-Z0-9._-]`
 
-On first run, the resolved ID is persisted to `config.json` so it remains stable across restarts, even if the hostname changes later.
+On first run, the resolved ID is persisted to `config.json` so it remains stable across restarts, even if the hostname changes later. `config.json` is rewritten only when the device id was newly synthesized or changed by an env override — a steady-state boot with an already-persisted, unchanged id performs no write.
 
 ```jsonc
 // config.json — device section
@@ -2452,12 +2452,16 @@ Recover memories from Qdrant into the local SQLite database. Used for multi-devi
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `dry_run` | `boolean` | No | `false` | When `true`, reports what would be recovered without making changes. |
-| `device_id` | `string` | No | — | Filter recovery to memories created by a specific device. Omit to recover all. |
+| `device_id` | `string` | No | — | Filter recovery to memories created by a specific device. Mutually exclusive with `all_devices`. |
+| `all_devices` | `boolean` | No | `false` | Explicitly recover memories from every device. Mutually exclusive with `device_id`. This is also the default behavior when neither field is provided. |
 
 **Output:**
 
 ```json
 {
+  "dry_run": false,
+  "all_devices": true,
+  "device_id_filter": null,
   "collections_scanned": 2,
   "points_scanned": 47,
   "already_in_sqlite": 12,
@@ -2470,6 +2474,7 @@ Recover memories from Qdrant into the local SQLite database. Used for multi-devi
 **Notes:**
 - Only points with `content` in their Qdrant payload can be recovered. Pre-1.3 memories without content in Qdrant are reported as `skipped_no_content`.
 - Recovered memories preserve their original `device_id` from the Qdrant payload. If no `device_id` exists in the payload, the local device's ID is used.
+- Passing both `device_id` and `all_devices: true` is rejected as invalid input.
 - After recovery, run `npm run build` and restart the server if needed. The recovered memories are immediately available for search and recall.
 
 ---
@@ -2643,6 +2648,13 @@ What happens on first start after upgrade:
 ```
 
 **Backward compatible**: Pre-1.3 memories without `device_id` or content in Qdrant continue to work normally. They simply cannot be recovered via the `repair` tool.
+
+**Post-1.3 refinements (1.4.10)**: An audit of the multi-device feature found and fixed a real migration gap plus a couple of contract drifts:
+
+- The `device_id` Qdrant payload index is now ensured **unconditionally** on every `ensureCollection` call, not just when a collection is first created — collections created before this feature shipped now get migrated too.
+- `BHGBRAIN_DEVICE_ID` now **takes precedence** over a persisted `device.id`, matching the "env vars win" contract used elsewhere. When it overrides a persisted value, the new value is re-persisted.
+- `config.json` is rewritten only when the device id was newly synthesized or changed by an env override, not on every startup.
+- The `repair` tool gained an explicit `all_devices` boolean, mutually exclusive with `device_id`, as the documented all-devices path (the previous implicit "omit `device_id`" behavior still works unchanged).
 
 ---
 

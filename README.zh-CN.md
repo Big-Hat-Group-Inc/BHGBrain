@@ -614,11 +614,11 @@ graph TD
 
 每个 BHGBrain 实例在启动时按以下优先顺序解析一个稳定的 `device_id`：
 
-1. **显式配置**：`config.json` 中的 `device.id` 字段
-2. **环境变量**：`BHGBRAIN_DEVICE_ID`
+1. **环境变量**：`BHGBRAIN_DEVICE_ID` —— 优先于持久化的值，与其他所有 `BHGBRAIN_*` 覆盖项遵循的"环境变量优先"约定一致（参见[配置与环境](#配置)）。当它覆盖了之前持久化的 `device.id` 时，新值会被重新持久化。
+2. **显式/持久化配置**：`config.json` 中的 `device.id` 字段
 3. **自动生成**：从 `os.hostname()` 派生，转为小写并清理为 `[a-zA-Z0-9._-]`
 
-首次运行时，解析后的 ID 会持久化到 `config.json`，以确保在重启后保持稳定，即使主机名后来发生变化。
+首次运行时，解析后的 ID 会持久化到 `config.json`，以确保在重启后保持稳定，即使主机名后来发生变化。仅当设备 ID 是新生成的或被环境变量覆盖而发生变化时，才会重写 `config.json`——如果启动时 ID 已持久化且未变化，则不会写入。
 
 ```jsonc
 // config.json — device 部分
@@ -2284,12 +2284,16 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 | 参数 | 类型 | 是否必需 | 默认值 | 说明 |
 |---|---|---|---|---|
 | `dry_run` | `boolean` | 否 | `false` | 为 `true` 时，报告将恢复的内容但不做任何更改。 |
-| `device_id` | `string` | 否 | — | 过滤恢复范围到由特定设备创建的记忆。省略则恢复全部。 |
+| `device_id` | `string` | 否 | — | 过滤恢复范围到由特定设备创建的记忆。与 `all_devices` 互斥。 |
+| `all_devices` | `boolean` | 否 | `false` | 显式恢复所有设备的记忆。与 `device_id` 互斥。这也是两个字段都未提供时的默认行为。 |
 
 **输出：**
 
 ```json
 {
+  "dry_run": false,
+  "all_devices": true,
+  "device_id_filter": null,
   "collections_scanned": 2,
   "points_scanned": 47,
   "already_in_sqlite": 12,
@@ -2302,6 +2306,7 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 **注意事项：**
 - 只有 Qdrant payload 中包含 `content` 的点才能被恢复。1.3 之前不包含 Qdrant 内容的记忆会被报告为 `skipped_no_content`。
 - 恢复的记忆保留其 Qdrant payload 中的原始 `device_id`。如果 payload 中不存在 `device_id`，则使用本地设备的 ID。
+- 同时传入 `device_id` 和 `all_devices: true` 将被拒绝，视为无效输入。
 - 恢复后，如需要请运行 `npm run build` 并重启服务器。恢复的记忆可立即用于搜索和召回。
 
 ---
@@ -2332,6 +2337,13 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 ```
 
 **向后兼容**：不包含 `device_id` 或 Qdrant 内容的 1.3 之前的记忆继续正常工作。它们只是无法通过 `repair` 工具恢复。
+
+**1.3 之后的改进（1.4.10）**：对多设备功能的审计发现并修复了一个真实的迁移缺口以及几处契约偏差：
+
+- `device_id` 的 Qdrant payload 索引现在会在每次调用 `ensureCollection` 时**无条件**确保存在，而不仅仅是在集合首次创建时——在此功能上线之前创建的集合现在也会被迁移。
+- `BHGBRAIN_DEVICE_ID` 现在**优先**于持久化的 `device.id`，与其他地方使用的"环境变量优先"约定保持一致。当它覆盖了持久化的值时，新值会被重新持久化。
+- 仅当设备 ID 是新生成的或被环境变量覆盖而发生变化时，才会重写 `config.json`，而不是每次启动都重写。
+- `repair` 工具新增了显式的 `all_devices` 布尔字段，与 `device_id` 互斥，作为文档化的"所有设备"路径（此前隐式的"省略 `device_id`"行为保持不变）。
 
 ---
 

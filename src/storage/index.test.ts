@@ -134,6 +134,37 @@ describe('StorageManager cross-store consistency', () => {
     });
   });
 
+  describe('device_id provenance round-trip', () => {
+    it('tags both the SQLite insert and the Qdrant upsert payload with device_id', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory({ ...baseMem, device_id: 'device-a' }, [1, 2, 3]);
+
+      expect(sqlite.insertMemory).toHaveBeenCalledWith(expect.objectContaining({ device_id: 'device-a' }));
+      expect(qdrant.upsert).toHaveBeenCalledWith(
+        'global', 'general', 'mem-1', [1, 2, 3],
+        expect.objectContaining({ device_id: 'device-a' }),
+      );
+    });
+
+    it('persists a null device_id when the writer did not supply one', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory(baseMem, [1, 2, 3]);
+
+      expect(qdrant.upsert).toHaveBeenCalledWith(
+        'global', 'general', 'mem-1', [1, 2, 3],
+        expect.objectContaining({ device_id: null }),
+      );
+    });
+  });
+
   describe('updateMemory rollback', () => {
     it('rolls back SQLite update when Qdrant upsert fails', async () => {
       const sqlite = createMockSqlite();

@@ -105,6 +105,101 @@ describe('collections delete semantics', () => {
   });
 });
 
+type RepairResult = {
+  dry_run: boolean;
+  all_devices: boolean;
+  device_id_filter: string | null;
+  recovered: number;
+  skipped_device_filter?: number;
+};
+
+describe('repair device filtering', () => {
+  function createRepairCtx(points: Array<{ id: string; payload: Record<string, unknown> }>) {
+    const qdrant = {
+      listAllCollections: vi.fn(async () => ['bhgbrain_global_general']),
+      scrollAll: vi.fn(async () => points),
+    };
+    const sqlite = {
+      getMemoryById: vi.fn(() => null),
+      getCollection: vi.fn(() => ({ name: 'general' })),
+      createCollection: vi.fn(),
+      insertMemory: vi.fn(),
+      flushIfDirty: vi.fn(),
+      countMemories: vi.fn(() => 0),
+    };
+    const storage = { qdrant, sqlite } as unknown as StorageManager;
+    const ctx: ToolContext = {
+      config: { device: { id: 'local-device' } } as ToolContext['config'],
+      storage,
+      embedding: { model: 'm', dimensions: 1 } as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+    return { ctx, sqlite };
+  }
+
+  const twoDevicePoints = [
+    { id: 'p-a', payload: { content: 'from device a', device_id: 'device-a', namespace: 'global', collection: 'general' } },
+    { id: 'p-b', payload: { content: 'from device b', device_id: 'device-b', namespace: 'global', collection: 'general' } },
+  ];
+
+  it('recovers only the requested device when device_id is provided', async () => {
+    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+
+    const result = await handleTool(ctx, 'repair', { device_id: 'device-a' }, 'c1') as RepairResult;
+
+    expect(result.recovered).toBe(1);
+    expect(result.device_id_filter).toBe('device-a');
+    expect(result.all_devices).toBe(false);
+    expect(sqlite.insertMemory).toHaveBeenCalledTimes(1);
+    expect(sqlite.insertMemory).toHaveBeenCalledWith(expect.objectContaining({ id: 'p-a', device_id: 'device-a' }));
+  });
+
+  it('recovers points from every device when all_devices is explicitly true', async () => {
+    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+
+    const result = await handleTool(ctx, 'repair', { all_devices: true }, 'c1') as RepairResult;
+
+    expect(result.recovered).toBe(2);
+    expect(result.all_devices).toBe(true);
+    expect(result.device_id_filter).toBeNull();
+    expect(sqlite.insertMemory).toHaveBeenCalledTimes(2);
+  });
+
+  it('recovers points from every device when neither filter is provided (backward-compatible default)', async () => {
+    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+
+    const result = await handleTool(ctx, 'repair', {}, 'c1') as RepairResult;
+
+    expect(result.recovered).toBe(2);
+    expect(result.all_devices).toBe(true);
+    expect(sqlite.insertMemory).toHaveBeenCalledTimes(2);
+  });
+
+  it('sets the local device_id on a recovered record whose original payload has none', async () => {
+    const { ctx, sqlite } = createRepairCtx([
+      { id: 'p-legacy', payload: { content: 'pre-migration memory', namespace: 'global', collection: 'general' } },
+    ]);
+
+    const result = await handleTool(ctx, 'repair', {}, 'c1') as RepairResult;
+
+    expect(result.recovered).toBe(1);
+    expect(sqlite.insertMemory).toHaveBeenCalledWith(expect.objectContaining({ id: 'p-legacy', device_id: 'local-device' }));
+  });
+
+  it('rejects device_id and all_devices together as mutually exclusive', async () => {
+    const { ctx } = createRepairCtx(twoDevicePoints);
+
+    const result = await handleTool(ctx, 'repair', { device_id: 'device-a', all_devices: true }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+  });
+});
+
 describe('tool input contracts', () => {
   // Input validation happens (via strict Zod schemas) before any dependency is
   // touched, so a bare ctx with metrics + logger is enough to exercise rejection.

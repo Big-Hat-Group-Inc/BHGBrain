@@ -619,11 +619,11 @@ Cada escritura de memoria almacena el contenido completo tanto en SQLite (local)
 
 Cada instancia de BHGBrain resuelve un `device_id` estable al iniciar, usando este orden de prioridad:
 
-1. **Configuración explícita**: Campo `device.id` en `config.json`
-2. **Variable de entorno**: `BHGBRAIN_DEVICE_ID`
+1. **Variable de entorno**: `BHGBRAIN_DEVICE_ID` — tiene prioridad sobre un valor persistido, siguiendo el contrato de "las variables de entorno ganan" usado para cualquier otro override `BHGBRAIN_*` (ver [Configuración vs. entorno](#configuración)). Cuando anula un `device.id` previamente persistido, el nuevo valor se vuelve a persistir.
+2. **Configuración explícita/persistida**: Campo `device.id` en `config.json`
 3. **Auto-generado**: Derivado de `os.hostname()`, en minúsculas y sanitizado a `[a-zA-Z0-9._-]`
 
-En la primera ejecución, el ID resuelto se persiste en `config.json` para que permanezca estable entre reinicios, incluso si el hostname cambia posteriormente.
+En la primera ejecución, el ID resuelto se persiste en `config.json` para que permanezca estable entre reinicios, incluso si el hostname cambia posteriormente. `config.json` solo se reescribe cuando el device id fue recién generado o cambiado por un override de entorno — un arranque en estado estable con un id ya persistido y sin cambios no realiza ninguna escritura.
 
 ```jsonc
 // config.json — sección de dispositivo
@@ -2289,12 +2289,16 @@ Recuperar memorias desde Qdrant a la base de datos SQLite local. Se usa para con
 | Parámetro | Tipo | Requerido | Predeterminado | Descripción |
 |---|---|---|---|---|
 | `dry_run` | `boolean` | No | `false` | Cuando es `true`, reporta lo que se recuperaría sin hacer cambios. |
-| `device_id` | `string` | No | — | Filtrar la recuperación a memorias creadas por un dispositivo específico. Omitir para recuperar todas. |
+| `device_id` | `string` | No | — | Filtrar la recuperación a memorias creadas por un dispositivo específico. Mutuamente excluyente con `all_devices`. |
+| `all_devices` | `boolean` | No | `false` | Recuperar explícitamente memorias de todos los dispositivos. Mutuamente excluyente con `device_id`. Este es también el comportamiento predeterminado cuando no se proporciona ninguno de los dos campos. |
 
 **Salida:**
 
 ```json
 {
+  "dry_run": false,
+  "all_devices": true,
+  "device_id_filter": null,
   "collections_scanned": 2,
   "points_scanned": 47,
   "already_in_sqlite": 12,
@@ -2307,6 +2311,7 @@ Recuperar memorias desde Qdrant a la base de datos SQLite local. Se usa para con
 **Notas:**
 - Solo los puntos con `content` en su payload de Qdrant pueden recuperarse. Las memorias pre-1.3 sin contenido en Qdrant se reportan como `skipped_no_content`.
 - Las memorias recuperadas preservan su `device_id` original del payload de Qdrant. Si no existe `device_id` en el payload, se usa el ID del dispositivo local.
+- Pasar tanto `device_id` como `all_devices: true` se rechaza como entrada inválida.
 - Después de la recuperación, ejecuta `npm run build` y reinicia el servidor si es necesario. Las memorias recuperadas están inmediatamente disponibles para búsqueda y recall.
 
 ---
@@ -2337,6 +2342,13 @@ Lo que ocurre en el primer inicio después de la actualización:
 ```
 
 **Retrocompatible**: Las memorias pre-1.3 sin `device_id` o contenido en Qdrant continúan funcionando normalmente. Simplemente no pueden recuperarse vía la herramienta `repair`.
+
+**Refinamientos post-1.3 (1.4.10)**: Una auditoría de la función multi-dispositivo encontró y corrigió una brecha de migración real más un par de desviaciones de contrato:
+
+- El índice de payload de Qdrant `device_id` ahora se garantiza **incondicionalmente** en cada llamada a `ensureCollection`, no solo cuando se crea una colección por primera vez — las colecciones creadas antes de que esta función se lanzara ahora también se migran.
+- `BHGBRAIN_DEVICE_ID` ahora **tiene prioridad** sobre un `device.id` persistido, siguiendo el contrato de "las variables de entorno ganan" usado en otros lugares. Cuando anula un valor persistido, el nuevo valor se vuelve a persistir.
+- `config.json` se reescribe solo cuando el device id fue recién generado o cambiado por un override de entorno, no en cada arranque.
+- La herramienta `repair` obtuvo un booleano `all_devices` explícito, mutuamente excluyente con `device_id`, como la ruta documentada de todos los dispositivos (el comportamiento implícito anterior de "omitir `device_id`" sigue funcionando sin cambios).
 
 ---
 
