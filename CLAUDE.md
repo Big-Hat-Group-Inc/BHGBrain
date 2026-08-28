@@ -31,6 +31,25 @@ Changing either surface means updating the schema/handler *and* `README.md`
 the build, so model the types properly (see the `eliminate-any-type-casting` change).
 Run `npm run lint && npm test` before declaring work done.
 
+## Live Qdrant / Docker verification
+
+No Docker or live Qdrant here by default, which leaves proposal tasks like "verify
+against a live instance" or "docker compose up" stuck unchecked (hit repeatedly, e.g.
+`fix-qdrant-client-search-removal`, `fix-vector-store-health-fidelity`,
+`secure-container-default-binding`). Unblock by provisioning a disposable WSL2 Ubuntu
+sandbox: `wsl --install -d Ubuntu-24.04 --no-launch`, install Docker Engine + Node 20
+*and* 22 (nvm) inside it, `git clone` the **local working tree** (not GitHub) into the
+WSL native filesystem so unpushed commits carry over and npm/tsc stay fast.
+- `@qdrant/js-client-rest@1.19.0` needs Node **>=22** (`EBADENGINE` on 20) though
+  `package.json` still declares `>=20.0.0` — use Node 22 for anything touching the
+  Qdrant client directly.
+- From PowerShell/git-bash, set `MSYS_NO_PATHCONV=1` before any `wsl -d ... --` call,
+  and hardcode values instead of `$(...)` or exported variables inside nested
+  `wsl -- bash -c '...'` scripts — both silently break across that boundary.
+- A background process inside WSL needs the Bash tool's own `run_in_background: true`
+  on the `wsl` invocation itself; `nohup cmd &` inside `wsl -- bash -c` still dies when
+  that call returns.
+
 ## Docs to keep in sync when behavior changes
 
 - `README.md` — user-facing reference (tools, env vars, config).
@@ -93,6 +112,15 @@ other's edits.
 
 Note the `openspec` CLI is **not** on PATH here, so read task state from
 `openspec/changes/<change-id>/tasks.md` directly rather than via `openspec status`.
+
+A survey agent that fills a proposal's `blocked` field — even just to say "effectively
+already resolved" — gets that proposal filtered out of the build loop and skipped
+entirely; it never reaches Linear. Check the workflow's `skipped` list and finish those
+by hand (happened to `align-restore-response-docs`).
+
+The `Workflow` tool's `args` parameter did not reliably reach the script as an object
+in this environment (`args.changes` came back `undefined` twice in a row) — prefer
+hardcoding the target list as a literal in the script body over passing it via `args`.
 
 ## Repo layout notes
 
