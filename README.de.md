@@ -502,9 +502,12 @@ node dist/index.js --stdio --config=/path/to/config.json
 
 ### HTTP-Modus
 
-> Dieser Transport ist eine reine REST-API für Skripte, Health-Probes und die CLI. Er
-> implementiert **kein** MCP Streamable HTTP — MCP-Clients müssen stattdessen stdio
-> verwenden (siehe „MCP-Client-Konfiguration").
+> Dieser Transport spricht echtes MCP über HTTP — den **Streamable-HTTP**-Transport
+> unter `/mcp`, sodass mehrere MCP-Clients einen einzigen, dauerhaft laufenden
+> Serverprozess teilen können — zusätzlich zu einer schlichten REST-API
+> (`POST /tool/:name`, `GET /resource`) für Skripte, Health-Probes und die CLI. Siehe
+> „MCP-Client-Konfiguration", um einen Streamable-HTTP-fähigen Client auf `/mcp`
+> zeigen zu lassen.
 
 HTTP ist standardmäßig auf `127.0.0.1:3721` aktiviert. Setzen Sie `BHGBRAIN_TOKEN` vor dem Start, wenn Sie authentifizierten Zugriff wünschen:
 
@@ -519,9 +522,17 @@ Der Server hört standardmäßig auf `http://127.0.0.1:3721`. Verfügbare HTTP-E
 | Endpunkt | Authentifizierung erforderlich | Beschreibung |
 |---|---|---|
 | `GET /health` | Nein | Gesundheitsprüfung (unauthentifiziert für Probe-Kompatibilität) |
-| `POST /tool/:name` | Ja | Benanntes MCP-Tool aufrufen |
-| `GET /resource?uri=...` | Ja | MCP-Ressource per URI lesen |
+| `POST /mcp` | Ja | MCP Streamable HTTP: JSON-RPC-Anfragen; eine `initialize`-Anfrage eröffnet eine neue Sitzung |
+| `GET /mcp` | Ja | MCP Streamable HTTP: eigenständiger SSE-Kanal für eine bestehende Sitzung |
+| `DELETE /mcp` | Ja | MCP Streamable HTTP: beendet eine Sitzung |
+| `POST /tool/:name` | Ja | REST-Komfortschicht: benanntes MCP-Tool direkt aufrufen |
+| `GET /resource?uri=...` | Ja | REST-Komfortschicht: MCP-Ressource direkt per URI lesen |
 | `GET /metrics` | Ja | Metriken im Prometheus-Format (wenn `metrics_enabled: true`) |
+
+Jede `/mcp`-Sitzung ist ein frischer, In-Memory-MCP-Server, der denselben zugrunde
+liegenden Speicher wie jede andere Sitzung und die REST-Endpunkte nutzt — ein Neustart
+des Prozesses verwirft alle Sitzungen, und spezifikationskonforme Clients
+initialisieren sich automatisch neu.
 
 Beispiel Gesundheitsprüfung:
 
@@ -574,13 +585,38 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter (stdio-Transport)
+### OpenClaw / mcporter (Streamable-HTTP-Transport)
 
-BHGBrain spricht MCP **ausschließlich über stdio**. Der unter „HTTP-Modus"
-beschriebene HTTP-Server ist eine reine REST-API (`POST /tool/:name`,
-`GET /resource`) — er ist *kein* MCP-Streamable-HTTP-Endpunkt, MCP-Clients können sich
-also nicht damit verbinden. Verweisen Sie stattdessen auf die Binärdatei
-`bhgbrain-server`:
+Der HTTP-Server von BHGBrain spricht echtes MCP unter `/mcp` über den
+**Streamable-HTTP**-Transport (siehe „HTTP-Modus") — starten Sie den Server einmal und
+richten Sie jeden MCP-Client auf dieselbe URL, sodass sie sich einen dauerhaft
+laufenden Prozess und ein SQLite-/Qdrant-Backend teilen, statt dass jeder Client sein
+eigenes isoliertes `--stdio`-Kindprozess startet:
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "http",
+      "url": "http://127.0.0.1:3721/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    }
+  }
+}
+```
+
+Starten Sie zuerst den Server (`node dist/index.js` oder `bhgbrain server start`) mit
+`BHGBRAIN_TOKEN` auf denselben Wert gesetzt wie im obigen Header.
+
+#### stdio-Transport (Alternative: pro Client ein Prozess)
+
+Clients, die nur stdio unterstützen (oder die keinen laufenden Server teilen dürfen),
+können weiterhin ihr eigenes `bhgbrain-server --stdio`-Kindprozess starten. Das wird
+vollständig unterstützt, allerdings erhält jeder Client, der dies tut, einen eigenen,
+isolierten Prozess — kein Zustand wird mit anderen Clients geteilt, bis er nach
+SQLite/Qdrant durchgeschrieben wird.
 
 ```json
 {
@@ -616,12 +652,15 @@ Oder gegen ein Quellcode-Checkout statt der global installierten Binärdatei:
 }
 ```
 
-> **OpenClaw läuft in WSL oder einem Container?** BHGBrain muss in derselben Umgebung
-> installiert sein. stdio bedeutet, dass der Client den Server als Kindprozess startet
-> — der Server kann also nicht in einer separaten Distribution oder einem separaten
-> Container liegen. Um Speicher umgebungsübergreifend zu teilen, geben Sie jeder
-> Installation ihre eigene SQLite-Datenbank und richten Sie alle auf denselben
-> Qdrant-Cluster aus (siehe „Multi-Device-Speicher").
+> **OpenClaw läuft in WSL oder einem Container mit dem stdio-Transport?** BHGBrain
+> muss in derselben Umgebung installiert sein. stdio bedeutet, dass der Client den
+> Server als Kindprozess startet — der Server kann also nicht in einer separaten
+> Distribution oder einem separaten Container liegen. Der Streamable-HTTP-Transport
+> oben umgeht dieses Problem vollständig — richten Sie Clients in jeder Umgebung auf
+> dieselbe URL `http://host:3721/mcp`. Um Speicher stattdessen über getrennte
+> Serverinstanzen hinweg zu teilen, geben Sie jeder Installation ihre eigene
+> SQLite-Datenbank und richten Sie alle auf denselben Qdrant-Cluster aus (siehe
+> „Multi-Device-Speicher").
 
 ---
 

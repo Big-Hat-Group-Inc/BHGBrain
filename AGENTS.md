@@ -58,8 +58,15 @@ src/
 ## Key Design Patterns
 
 ### Dual Transport Support
-- **HTTP Transport**: Default mode, Express server with authentication
-- **Stdio Transport**: MCP stdio protocol for CLI integration
+- **HTTP Transport**: Default mode, Express server with authentication. Serves real
+  MCP via the Streamable HTTP transport at `POST/GET/DELETE /mcp` (per-session
+  `Server` + `StreamableHTTPServerTransport` pairs keyed by `Mcp-Session-Id`, built
+  through `src/transport/mcp-server.ts`'s `buildMcpServer` and managed by
+  `McpSessionManager` in `src/transport/mcp-http.ts`), alongside the REST convenience
+  endpoints (`POST /tool/:name`, `GET /resource`).
+- **Stdio Transport**: MCP stdio protocol for CLI integration — also builds its
+  `Server` via `buildMcpServer`, so both transports share identical tool/resource
+  handling.
 - Configured via `transport.http.enabled` and `--stdio` flag
 
 ### Storage Architecture

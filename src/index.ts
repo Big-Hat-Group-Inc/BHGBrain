@@ -1,14 +1,6 @@
 #!/usr/bin/env node
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  ListResourcesRequestSchema,
-  ListResourceTemplatesRequestSchema,
-  ReadResourceRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
 
 import { loadConfig, ensureDataDir } from './config/index.js';
 import { SqliteStore } from './storage/sqlite.js';
@@ -24,11 +16,10 @@ import { HealthService } from './health/index.js';
 import { MetricsCollector } from './health/metrics.js';
 import { createLogger } from './health/logger.js';
 import { CircuitBreaker } from './resilience/index.js';
-import { ResourceHandler, MCP_RESOURCE_DEFINITIONS, MCP_RESOURCE_TEMPLATES } from './resources/index.js';
-import { handleTool, type ToolContext } from './tools/index.js';
-import { MCP_TOOL_DEFINITIONS } from './tools/schemas.js';
+import { ResourceHandler } from './resources/index.js';
+import type { ToolContext } from './tools/index.js';
 import { createHttpServer } from './transport/http.js';
-import { buildToolCallResponse } from './transport/mcp-response.js';
+import { buildMcpServer } from './transport/mcp-server.js';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -125,63 +116,41 @@ async function main() {
 
   if (isStdio || !config.transport.http.enabled) {
     // MCP stdio transport
-    const server = new Server(
-      { name: 'bhgbrain', version: '1.4.0' },
-      { capabilities: { tools: {}, resources: {} } },
-    );
-
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: MCP_TOOL_DEFINITIONS,
-    }));
-
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: toolArgs } = request.params;
-      const result = await handleTool(ctx, name, toolArgs);
-      return buildToolCallResponse(result);
-    });
-
-    server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-      resources: MCP_RESOURCE_DEFINITIONS.map(r => ({
-        uri: r.uri,
-        name: r.name,
-        description: r.description,
-        mimeType: 'application/json',
-      })),
-    }));
-
-    server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
-      resourceTemplates: MCP_RESOURCE_TEMPLATES.map(r => ({
-        uriTemplate: r.uriTemplate,
-        name: r.name,
-        description: r.description,
-        mimeType: 'application/json',
-      })),
-    }));
-
-    server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      const { uri } = request.params;
-      const result = await resources.handle(uri);
-      return {
-        contents: [{
-          uri,
-          mimeType: 'application/json',
-          text: JSON.stringify(result, null, 2),
-        }],
-      };
-    });
-
+    const server = buildMcpServer(ctx, resources);
     const transport = new StdioServerTransport();
     await server.connect(transport);
     logger.info({ event: 'connected', transport: 'stdio' });
   } else {
-    // HTTP transport
-    const app = createHttpServer(config, ctx, resources, logger);
+    // HTTP transport — also serves real MCP (Streamable HTTP) at /mcp
+    // alongside the REST convenience endpoints.
+    const { app, mcpSessions } = createHttpServer(config, ctx, resources, logger);
     const { host, port } = config.transport.http;
 
-    app.listen(port, host, () => {
+    const httpServer = app.listen(port, host, () => {
       logger.info({ event: 'listening', transport: 'http', host, port });
       console.log(`BHGBrain server listening on http://${host}:${port}`);
     });
+
+    // Clean teardown on shutdown: close every live MCP session's transport,
+    // stop the scheduled-cleanup timer, then close the listener before
+    // exiting — mirrors the ordering the SDK expects (sessions closed while
+    // the process can still flush their final I/O).
+    let shuttingDown = false;
+    const shutdown = (signal: NodeJS.Signals) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      logger.info({ event: 'shutdown_start', signal });
+      void (async () => {
+        await mcpSessions.closeAll();
+        cleanupScheduler.stop();
+        httpServer.close(() => {
+          logger.info({ event: 'shutdown_complete', signal });
+          process.exit(0);
+        });
+      })();
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   }
 }
 

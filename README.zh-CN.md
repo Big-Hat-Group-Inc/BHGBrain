@@ -491,8 +491,10 @@ node dist/index.js --stdio --config=/path/to/config.json
 
 ### HTTP 模式
 
-> 该传输是供脚本、健康探针和 CLI 使用的普通 REST API，**未**实现 MCP Streamable HTTP。
-> MCP 客户端请改用 stdio（参见「MCP 客户端配置」）。
+> 该传输在 `/mcp` 上提供真正的 MCP over HTTP —— **Streamable HTTP** 传输，使多个 MCP
+> 客户端可以共享同一个长期运行的服务器进程 —— 同时也提供供脚本、健康探针和 CLI 使用的
+> 普通 REST 便捷 API（`POST /tool/:name`、`GET /resource`）。参见「MCP 客户端配置」，
+> 了解如何让支持 Streamable HTTP 的客户端连接 `/mcp`。
 
 HTTP 默认在 `127.0.0.1:3721` 上启用。如需认证访问，启动前请设置 `BHGBRAIN_TOKEN`：
 
@@ -507,9 +509,15 @@ node dist/index.js
 | 端点 | 是否需要认证 | 说明 |
 |---|---|---|
 | `GET /health` | 否 | 健康检查（不需认证，兼容探针） |
-| `POST /tool/:name` | 是 | 调用指定 MCP 工具 |
-| `GET /resource?uri=...` | 是 | 通过 URI 读取 MCP 资源 |
+| `POST /mcp` | 是 | MCP Streamable HTTP：JSON-RPC 请求；`initialize` 请求会创建新会话 |
+| `GET /mcp` | 是 | MCP Streamable HTTP：既有会话的独立 SSE 通道 |
+| `DELETE /mcp` | 是 | MCP Streamable HTTP：终止会话 |
+| `POST /tool/:name` | 是 | REST 便捷层：直接调用指定 MCP 工具 |
+| `GET /resource?uri=...` | 是 | REST 便捷层：直接通过 URI 读取 MCP 资源 |
 | `GET /metrics` | 是 | Prometheus 格式的指标（需 `metrics_enabled: true`） |
+
+每个 `/mcp` 会话都是一个全新的内存态 MCP 服务器，与其他会话及 REST 端点共享同一底层
+存储 —— 重启进程会丢弃所有会话，符合规范的客户端会自动重新初始化。
 
 健康检查示例：
 
@@ -562,11 +570,35 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter（stdio 传输）
+### OpenClaw / mcporter（Streamable HTTP 传输）
 
-BHGBrain **仅通过 stdio** 提供 MCP 服务。「HTTP 模式」一节描述的 HTTP 服务器是普通的
-REST API（`POST /tool/:name`、`GET /resource`），**不是** MCP Streamable HTTP 端点，
-因此 MCP 客户端无法连接它。请改为指向 `bhgbrain-server` 可执行文件：
+BHGBrain 的 HTTP 服务器通过 **Streamable HTTP** 传输在 `/mcp` 上提供真正的 MCP 服务
+（参见「HTTP 模式」）—— 启动服务器一次，让每个 MCP 客户端都连接同一个 URL，从而共享
+同一个长期运行的进程和同一个 SQLite/Qdrant 后端，而不是每个客户端各自启动一个孤立的
+`--stdio` 子进程：
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "http",
+      "url": "http://127.0.0.1:3721/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    }
+  }
+}
+```
+
+先启动服务器（`node dist/index.js` 或 `bhgbrain server start`），并将 `BHGBRAIN_TOKEN`
+设置为与上方请求头中相同的值。
+
+#### stdio 传输（每个客户端一个进程的替代方案）
+
+只支持 stdio（或不能共享正在运行的服务器）的客户端仍可以启动自己的
+`bhgbrain-server --stdio` 子进程。此方式完全受支持，但这样做的每个客户端都会得到
+各自独立的进程 —— 在状态被写入 SQLite/Qdrant 之前，不会与其他客户端共享。
 
 ```json
 {
@@ -602,9 +634,11 @@ REST API（`POST /tool/:name`、`GET /resource`），**不是** MCP Streamable H
 }
 ```
 
-> **在 WSL 或容器中运行 OpenClaw？** BHGBrain 必须安装在同一环境中。stdio 意味着客户端
-> 将服务器作为子进程启动，因此服务器不能位于另一个发行版或容器中。若要跨环境共享记忆，
-> 请让每个安装拥有各自的 SQLite，并将它们全部指向同一个 Qdrant 集群（参见「多设备记忆」）。
+> **在 WSL 或容器中以 stdio 传输运行 OpenClaw？** BHGBrain 必须安装在同一环境中。stdio
+> 意味着客户端将服务器作为子进程启动，因此服务器不能位于另一个发行版或容器中。上面的
+> Streamable HTTP 传输可以完全避免这个问题 —— 让任意环境中的客户端都连接同一个
+> `http://host:3721/mcp` URL。若要在多个独立的服务器实例之间共享记忆，请让每个安装
+> 拥有各自的 SQLite，并将它们全部指向同一个 Qdrant 集群（参见「多设备记忆」）。
 
 ---
 
