@@ -1,7 +1,7 @@
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
-import type { SearchMode, SearchResult, MemoryRecord, MemoryType, RetentionTier, RecallFilter } from '../domain/types.js';
+import type { SearchMode, SearchResult, MemoryRecord, MemoryType, RetentionTier, RecallFilter, ArchiveRecord } from '../domain/types.js';
 import type { AccessUpdate } from '../storage/sqlite.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
@@ -30,6 +30,31 @@ function isMemoryType(value: unknown): value is MemoryType {
 
 function isRetentionTier(value: unknown): value is RetentionTier {
   return typeof value === 'string' && (RETENTION_TIERS as readonly string[]).includes(value);
+}
+
+// Maps a retained archive row into the SearchResult shape so `include_archived`
+// callers get a uniform result list. `archived_memories` keeps summary/tags/tier
+// only — no content, no vector — so `content` here is the summary (the only text
+// retained) and `type`/`device_id` fall back to defaults rather than claiming
+// data the archive never had. `score` is a flat placeholder (not a relevance
+// score; archived matches are metadata-term hits, appended rather than ranked
+// alongside active results) — callers key off `archived: true`, not `score`.
+function archiveRecordToSearchResult(record: ArchiveRecord): SearchResult {
+  return {
+    id: record.memory_id,
+    content: record.summary,
+    summary: record.summary,
+    type: 'semantic',
+    tags: record.tags,
+    score: 0,
+    retention_tier: record.tier,
+    expires_at: null,
+    expiring_soon: false,
+    device_id: null,
+    created_at: record.created_at,
+    last_accessed: record.expired_at,
+    archived: true,
+  };
 }
 
 interface RankedItem {
@@ -70,19 +95,40 @@ export class SearchService {
     // unfiltered callers see identical behavior to before this parameter
     // existed.
     filter?: RecallFilter,
+    // Additive opt-in (add-review-and-archive-recall): archived matches are
+    // fetched separately and appended after active results rather than
+    // folded into ranking, so they never reduce how many active results
+    // `limit` allows. Defaults false so every pre-existing caller is
+    // unaffected.
+    includeArchived = false,
   ): Promise<SearchResult[]> {
     const start = Date.now();
     try {
+      let results: SearchResult[];
       switch (mode) {
         case 'semantic':
-          return await this.semanticSearch(query, namespace, collection, limit, filter);
+          results = await this.semanticSearch(query, namespace, collection, limit, filter);
+          break;
         case 'fulltext':
-          return this.fulltextSearch(query, namespace, collection, limit, filter);
+          results = this.fulltextSearch(query, namespace, collection, limit, filter);
+          break;
         case 'hybrid':
-          return await this.hybridSearch(query, namespace, collection, limit, signal, filter);
+          results = await this.hybridSearch(query, namespace, collection, limit, signal, filter);
+          break;
+        default: {
+          const unsupportedMode: never = mode;
+          throw new Error(`Unsupported search mode: ${unsupportedMode}`);
+        }
       }
-      const unsupportedMode: never = mode;
-      throw new Error(`Unsupported search mode: ${unsupportedMode}`);
+
+      if (includeArchived) {
+        const archivedMatches = this.storage.sqlite
+          .searchArchived(namespace, query, limit)
+          .map(archiveRecordToSearchResult);
+        results = [...results, ...archivedMatches];
+      }
+
+      return results;
     } finally {
       this.metrics?.recordHistogram('search_total_ms', Date.now() - start);
     }

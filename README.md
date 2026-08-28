@@ -1359,7 +1359,7 @@ The server runs a scheduled cleanup job (default: daily at 2:00 AM UTC, configur
 
 1. **Identify expired memories:** Query SQLite for all memories where `decay_eligible = true` AND `expires_at < now()`. Only `T2`/`T3` are eligible for direct archive-and-delete:
    - `T0` is always excluded (T0 is never decay eligible).
-   - `T1` is never directly deleted. Expired or `review_due`-past `T1` memories are surfaced as **review candidates** in the GC result instead, so an operator can decide whether to promote, re-save, or manually delete them.
+   - `T1` is never directly deleted. Expired or `review_due`-past `T1` memories are surfaced as **review candidates** in the GC result instead, so an operator can decide whether to promote, re-save, or manually delete them — or, via MCP, list and disposition them through the `review` tool (`action: "list"` / `"keep"` / `"archive"`; see [MCP Tools Reference](#mcp-tools-reference)).
 
 2. **Archive before delete (if enabled):** For each `T2`/`T3` candidate, write a summary record to the `memory_archive` table and log a distinct `ARCHIVE` audit event:
 
@@ -1422,7 +1422,8 @@ The `bhgbrain gc --consolidate` command (or `RetentionService.runConsolidation()
 
 #### Archive Search and Restore
 
-Deleted memories (when `archive_before_delete: true`) can be inspected and restored:
+Deleted memories (when `archive_before_delete: true`) can be inspected and restored
+from the CLI:
 
 ```bash
 bhgbrain archive list                 # List recently archived memories
@@ -1430,7 +1431,18 @@ bhgbrain archive search <query>       # Search archived summaries by text
 bhgbrain archive restore <memory_id>  # Restore an archived memory
 ```
 
-**Restore semantics:** A restored memory is re-created as a **new** `T2` memory from the archived summary text. The original content (if longer than the summary) cannot be recovered - the archive stores only the 120-character summary. The restored memory receives fresh timestamps and a new UUID, and is re-embedded in Qdrant.
+**Restore semantics:** A restored memory is re-created as a **new** memory (at its
+original tier) from the archived summary text. The original content (if longer than
+the summary) cannot be recovered - the archive stores only the 120-character summary.
+The restored memory receives fresh timestamps and a new UUID, and is re-embedded in
+Qdrant. The CLI's `archive restore` additionally deletes the archive row once restored.
+
+MCP clients have an equivalent path: the `search` tool's `include_archived` parameter
+finds archived memories by summary/tag term (marked `archived: true`, never
+access-recorded), and the `review` tool's `restore` action recreates an active memory
+from an archived record — tagged `restored-from-archive`, with the archive row
+**retained** (unlike the CLI path) so its origin stays inspectable. See
+[MCP Tools Reference](#mcp-tools-reference).
 
 ---
 
@@ -2265,7 +2277,7 @@ bhgbrain server token                 # Generate a new random bearer token
 
 ## MCP Tools Reference
 
-BHGBrain exposes 12 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
+BHGBrain exposes 13 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
 
 ```json
 {
@@ -2425,8 +2437,9 @@ Search memories using semantic, fulltext, or hybrid modes. Offers more control t
 | `collection` | `string` | No | - | Filter to a specific collection. |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | No | `"hybrid"` | Search algorithm. |
 | `limit` | `integer (1-50)` | No | `10` | Maximum number of results. |
+| `include_archived` | `boolean` | No | `false` | Also search archived memories (see [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving)) for a summary/tag term match. Matches are appended after active results, marked `archived: true`, and never reduce how many active results `limit` allows. Archived hits are not access-recorded. |
 
-**Output:** Same structure as `recall` - `{ "results": [...] }` - but without the `min_score` gate and supporting up to 50 results.
+**Output:** Same structure as `recall` - `{ "results": [...] }` - but without the `min_score` gate and supporting up to 50 results. Archived matches (when `include_archived: true`) carry `archived: true`, use the retained summary as `content`, and have no meaningful `score` (they're metadata-term matches, not ranked).
 
 ---
 
@@ -2719,6 +2732,101 @@ A memory with no content changes returns an empty `revisions` array, not an erro
 - A `REVISE` audit event records the source revision number, distinguishable from the generic REVISE the write pipeline logs on ordinary T0 content changes.
 - Reverting requires the embedding provider — if it is unavailable the revert fails with `EMBEDDING_UNAVAILABLE` and the memory is left completely unchanged (no partial write, no vector desync).
 - Reverting to a revision number that does not exist for the memory returns `NOT_FOUND`.
+
+---
+
+### `review` - Review Queue and Archive Recall
+
+Lists and dispositions the T1 review queue, and restores archived memories. Closes the
+read side of the tiered lifecycle: `review_due` (stamped on T1 memories, see
+[Tier Lifecycle](#tier-lifecycle---assignment-promotion-sliding-window)) and
+`archived_memories` (see [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving))
+both have write paths but previously had no MCP-facing read surface. Content revision
+is deliberately not duplicated here — use `remember`'s UPDATE path for that.
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `action` | `"list" \| "keep" \| "archive" \| "restore"` | **Yes** | - | Which operation to perform. |
+| `id` | `string (UUID)` | Required for `keep`/`archive`/`restore` | - | The memory ID. For `restore`, the original memory's ID, looked up in the archive. |
+| `days` | `integer (0-3650)` | No | `0` | (`list` only) Look-ahead window in days beyond "due now". `0` returns only memories already due. |
+| `namespace` | `string` | No | `"global"` | Namespace scope. |
+| `limit` | `integer (1-100)` | No | `20` | (`list` only) Page size. |
+| `cursor` | `string` | No | - | (`list` only) Pagination cursor returned by a prior `list` call. |
+
+**Output (`action: "list"`):**
+
+```json
+{
+  "items": [
+    {
+      "id": "3f4a1b2c-...",
+      "namespace": "global",
+      "collection": "general",
+      "summary": "Deployment runbook for the payments service",
+      "tags": ["deployment", "runbook"],
+      "retention_tier": "T1",
+      "review_due": "2026-03-01T00:00:00.000Z",
+      "expires_at": "2026-03-01T00:00:00.000Z"
+    }
+  ],
+  "cursor": "2026-03-01T00:00:00.000Z|3f4a1b2c-..."
+}
+```
+
+Items are non-archived T1 memories whose `review_due` is at or before "now + `days`",
+returned oldest-due-first. `cursor` is `null` once the last page is reached; pass it
+back as the `cursor` input to fetch the next page.
+
+**Output (`action: "keep"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "review_due": "2027-03-01T00:00:00.000Z",
+  "expires_at": "2027-03-01T00:00:00.000Z"
+}
+```
+
+Confirms the memory is still accurate: re-extends both `review_due` and `expires_at`
+per the memory's tier lifecycle policy (reusing the same computation `remember` and
+access-driven promotion use), regardless of `sliding_window_enabled` — an explicit
+human confirmation gets the full extension even when passive sliding-window renewal is
+disabled. Records a `REVISE` audit event noting a review confirmation. Returns
+`NOT_FOUND` if the memory does not exist.
+
+**Output (`action: "archive"`):**
+
+```json
+{ "id": "3f4a1b2c-...", "archived": true }
+```
+
+Routes the memory through the same archive transition GC uses: its vector is removed,
+its row is moved to `archived_memories` (summary, tags, tier, and access stats
+retained; content and vector are not), and an `ARCHIVE` audit event is recorded.
+Returns `NOT_FOUND` if the ID has never existed, and `CONFLICT` if it is already
+archived.
+
+**Output (`action: "restore"`):**
+
+```json
+{
+  "id": "9c2e5f10-...",
+  "restored_from": "3f4a1b2c-...",
+  "archive_id": 42,
+  "restored": true
+}
+```
+
+Re-creates an active memory from the archive record's retained summary and tags at the
+original tier — a provenance-carrying **stub**, not a resurrection: the original
+content and vector were never retained, so the restored memory's content is its
+archived summary, tagged with its original tags plus a `restored-from-archive` marker
+tag, and freshly embedded so it participates in search. The archive row is retained
+(not deleted), unlike the CLI's `archive restore` command. Records a `RESTORE` audit
+event linking the archive origin. Returns `NOT_FOUND` if no archive record exists for
+the given ID.
 
 ---
 

@@ -190,6 +190,225 @@ describe('revisions tool', () => {
   });
 });
 
+describe('search tool include_archived wiring', () => {
+  it('passes include_archived through to SearchService.search', async () => {
+    const search = vi.fn(async () => []);
+    const ctx: ToolContext = {
+      config: {} as ToolContext['config'],
+      storage: {} as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: { search } as unknown as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+
+    await handleTool(ctx, 'search', { query: 'hello', include_archived: true }, 'c1');
+
+    expect(search).toHaveBeenCalledWith(
+      'hello', 'global', undefined, 'hybrid', 10, expect.any(Object), undefined, true,
+    );
+  });
+
+  it('defaults include_archived to false', async () => {
+    const search = vi.fn(async () => []);
+    const ctx: ToolContext = {
+      config: {} as ToolContext['config'],
+      storage: {} as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: { search } as unknown as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+
+    await handleTool(ctx, 'search', { query: 'hello' }, 'c1');
+
+    expect(search).toHaveBeenCalledWith(
+      'hello', 'global', undefined, 'hybrid', 10, expect.any(Object), undefined, false,
+    );
+  });
+});
+
+describe('review tool', () => {
+  const UUID = '550e8400-e29b-41d4-a716-446655440010';
+  type ReviewStorage = StorageManager & {
+    deleteMemory: ReturnType<typeof vi.fn>;
+    writeMemory: ReturnType<typeof vi.fn>;
+    logAudit: ReturnType<typeof vi.fn>;
+  };
+  let ctx: ToolContext;
+  let storage: ReviewStorage;
+
+  beforeEach(() => {
+    storage = {
+      sqlite: {
+        listReviewDue: vi.fn(() => []),
+        getMemoryById: vi.fn(() => null),
+        updateMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+        archiveMemory: vi.fn(),
+        deleteArchive: vi.fn(),
+        getArchiveByMemoryId: vi.fn(() => null),
+        countMemories: vi.fn(() => 0),
+      },
+      deleteMemory: vi.fn(async () => true),
+      writeMemory: vi.fn(async () => {}),
+      logAudit: vi.fn(),
+    } as unknown as ReviewStorage;
+
+    ctx = {
+      config: { device: { id: 'local-device' } } as ToolContext['config'],
+      storage,
+      embedding: { embed: vi.fn(async () => [1, 2, 3]) } as unknown as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  });
+
+  it('list returns paginated due items oldest-first with a cursor when the page is full', async () => {
+    const due = [{
+      id: 'm1', namespace: 'global', collection: 'general', summary: 's1', tags: [],
+      retention_tier: 'T1', review_due: '2026-01-01T00:00:00.000Z', expires_at: null,
+    }];
+    (storage.sqlite.listReviewDue as ReturnType<typeof vi.fn>).mockReturnValue(due);
+
+    const result = await handleTool(ctx, 'review', { action: 'list', limit: 1 }, 'c1') as {
+      items: Array<{ id: string }>; cursor: string | null;
+    };
+
+    expect(storage.sqlite.listReviewDue).toHaveBeenCalledWith('global', expect.any(String), 1, undefined);
+    expect(result.items.map(i => i.id)).toEqual(['m1']);
+    expect(result.cursor).toBe('2026-01-01T00:00:00.000Z|m1');
+  });
+
+  it('list returns a null cursor when the page is not full', async () => {
+    (storage.sqlite.listReviewDue as ReturnType<typeof vi.fn>).mockReturnValue([]);
+    const result = await handleTool(ctx, 'review', { action: 'list' }, 'c1') as { cursor: string | null };
+    expect(result.cursor).toBeNull();
+  });
+
+  it('keep re-extends review_due and expires_at per tier policy and audits a REVISE confirmation', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: UUID, namespace: 'global', retention_tier: 'T1',
+    });
+
+    const result = await handleTool(ctx, 'review', { action: 'keep', id: UUID }, 'c1') as {
+      id: string; review_due: string | null; expires_at: string | null;
+    };
+
+    expect(storage.sqlite.updateMemory).toHaveBeenCalledWith(UUID, expect.objectContaining({
+      review_due: expect.any(String),
+      expires_at: expect.any(String),
+    }));
+    expect(storage.logAudit).toHaveBeenCalledWith('REVISE', UUID, 'global', 'c1', expect.objectContaining({
+      details: expect.objectContaining({ action: 'revise', prior_tier: 'T1', new_tier: 'T1' }),
+    }));
+    expect(result.id).toBe(UUID);
+    expect(result.review_due).toEqual(expect.any(String));
+  });
+
+  it('keep returns NOT_FOUND for a memory that does not exist', async () => {
+    const result = await handleTool(ctx, 'review', { action: 'keep', id: UUID }, 'c1') as BrainErrorEnvelope;
+    expect(result.error.code).toBe('NOT_FOUND');
+    expect(storage.sqlite.updateMemory).not.toHaveBeenCalled();
+  });
+
+  it('archive routes through the existing archive path and audits ARCHIVE', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: UUID, namespace: 'global', retention_tier: 'T1', summary: 'x', tags: [], access_count: 0, created_at: 'now',
+    });
+
+    const result = await handleTool(ctx, 'review', { action: 'archive', id: UUID }, 'c1') as { id: string; archived: boolean };
+
+    expect(storage.sqlite.archiveMemory).toHaveBeenCalled();
+    expect(storage.deleteMemory).toHaveBeenCalledWith(UUID);
+    expect(storage.logAudit).toHaveBeenCalledWith('ARCHIVE', UUID, 'global', 'c1', expect.objectContaining({
+      details: expect.objectContaining({ action: 'archive', prior_tier: 'T1', new_tier: null }),
+    }));
+    expect(result.archived).toBe(true);
+    expect(storage.sqlite.deleteArchive).not.toHaveBeenCalled();
+  });
+
+  it('rejects archiving an already-archived memory with CONFLICT', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue(null);
+    (storage.sqlite.getArchiveByMemoryId as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: 1, memory_id: UUID, summary: 's', tier: 'T1', namespace: 'global',
+      created_at: 'a', expired_at: 'b', access_count: 0, tags: [],
+    });
+
+    const result = await handleTool(ctx, 'review', { action: 'archive', id: UUID }, 'c1') as BrainErrorEnvelope;
+    expect(result.error.code).toBe('CONFLICT');
+    expect(storage.sqlite.archiveMemory).not.toHaveBeenCalled();
+  });
+
+  it('archiving a memory that never existed fails with NOT_FOUND, not CONFLICT', async () => {
+    const result = await handleTool(ctx, 'review', { action: 'archive', id: UUID }, 'c1') as BrainErrorEnvelope;
+    expect(result.error.code).toBe('NOT_FOUND');
+  });
+
+  it('rolls the archive row back if the vector/row delete fails, instead of leaving both states', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: UUID, namespace: 'global', retention_tier: 'T1', summary: 'x', tags: [], access_count: 0, created_at: 'now',
+    });
+    storage.deleteMemory = vi.fn(async () => { throw new Error('qdrant down'); });
+
+    await handleTool(ctx, 'review', { action: 'archive', id: UUID }, 'c1');
+
+    expect(storage.sqlite.archiveMemory).toHaveBeenCalled();
+    expect(storage.sqlite.deleteArchive).toHaveBeenCalledWith(UUID);
+    expect(storage.logAudit).not.toHaveBeenCalled();
+  });
+
+  it('restore creates an active stub from the archive record, embeds it, retains the archive row, and audits RESTORE', async () => {
+    (storage.sqlite.getArchiveByMemoryId as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: 7, memory_id: UUID, summary: 'archived summary', tier: 'T2',
+      namespace: 'global', created_at: '2025-01-01T00:00:00.000Z', expired_at: '2025-06-01T00:00:00.000Z',
+      access_count: 3, tags: ['ops'],
+    });
+
+    const result = await handleTool(ctx, 'review', { action: 'restore', id: UUID }, 'c1') as {
+      id: string; restored_from: string; restored: boolean;
+    };
+
+    expect(ctx.embedding.embed).toHaveBeenCalledWith('archived summary');
+    expect(storage.writeMemory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: 'archived summary',
+        summary: 'archived summary',
+        tags: expect.arrayContaining(['ops', 'restored-from-archive']),
+        retention_tier: 'T2',
+      }),
+      [1, 2, 3],
+    );
+    expect(storage.sqlite.deleteArchive).not.toHaveBeenCalled();
+    expect(storage.logAudit).toHaveBeenCalledWith('RESTORE', expect.any(String), 'global', 'c1', expect.objectContaining({
+      details: expect.objectContaining({ action: 'restore', prior_tier: null, new_tier: 'T2' }),
+    }));
+    expect(result.restored).toBe(true);
+    expect(result.restored_from).toBe(UUID);
+  });
+
+  it('restore returns NOT_FOUND when there is no archive record for the id', async () => {
+    const result = await handleTool(ctx, 'review', { action: 'restore', id: UUID }, 'c1') as BrainErrorEnvelope;
+    expect(result.error.code).toBe('NOT_FOUND');
+    expect(storage.writeMemory).not.toHaveBeenCalled();
+  });
+
+  it('rejects keep/archive/restore without an id', async () => {
+    const result = await handleTool(ctx, 'review', { action: 'keep' }, 'c1') as BrainErrorEnvelope;
+    expect(result.error.code).toBe('INVALID_INPUT');
+  });
+});
+
 type RepairResult = {
   dry_run: boolean;
   all_devices: boolean;

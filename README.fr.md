@@ -1326,7 +1326,7 @@ Le serveur exécute une tâche de nettoyage planifiée (par défaut : quotidienn
 
 1. **Identifier les souvenirs expirés :** Interroger SQLite pour tous les souvenirs où `decay_eligible = true` ET `expires_at < now()`. Seuls `T2`/`T3` sont éligibles à l'archivage-et-suppression direct :
    - `T0` est toujours exclu (T0 n'est jamais éligible au déclin).
-   - `T1` n'est jamais supprimé directement. Les souvenirs `T1` expirés ou dont `review_due` est dépassé sont présentés comme **candidats à révision** dans le résultat du GC, afin qu'un opérateur décide de les promouvoir, de les ré-enregistrer ou de les supprimer manuellement.
+   - `T1` n'est jamais supprimé directement. Les souvenirs `T1` expirés ou dont `review_due` est dépassé sont présentés comme **candidats à révision** dans le résultat du GC, afin qu'un opérateur décide de les promouvoir, de les ré-enregistrer ou de les supprimer manuellement — ou, via MCP, de les lister et de les dispositionner avec l'outil `review` (`action: "list"` / `"keep"` / `"archive"` ; voir [Référence des outils MCP](#référence-des-outils-mcp)).
 
 2. **Archiver avant suppression (si activé) :** Pour chaque candidat `T2`/`T3`, un enregistrement de résumé est écrit dans la table `memory_archive` et un événement d'audit `ARCHIVE` distinct est consigné :
 
@@ -1389,7 +1389,7 @@ La commande `bhgbrain gc --consolidate` (ou `RetentionService.runConsolidation()
 
 #### Recherche et restauration dans les archives
 
-Les souvenirs supprimés (lorsque `archive_before_delete: true`) peuvent être inspectés et restaurés :
+Les souvenirs supprimés (lorsque `archive_before_delete: true`) peuvent être inspectés et restaurés depuis la CLI :
 
 ```bash
 bhgbrain archive list                 # Lister les résumés de souvenirs récemment archivés
@@ -1397,7 +1397,9 @@ bhgbrain archive search <query>       # Rechercher dans les archives par texte
 bhgbrain archive restore <memory_id>  # Restaurer un souvenir archivé
 ```
 
-**Sémantique de restauration :** Un souvenir restauré est recréé en tant que **nouveau** souvenir `T2` à partir du texte de résumé archivé. Le contenu original (s'il est plus long que le résumé) ne peut pas être récupéré — l'archive ne stocke que le résumé de 120 caractères. Le souvenir restauré reçoit de nouveaux horodatages et un nouvel UUID, et est ré-intégré dans Qdrant.
+**Sémantique de restauration :** Un souvenir restauré est recréé en tant que **nouveau** souvenir (à son niveau d'origine) à partir du texte de résumé archivé. Le contenu original (s'il est plus long que le résumé) ne peut pas être récupéré — l'archive ne stocke que le résumé de 120 caractères. Le souvenir restauré reçoit de nouveaux horodatages et un nouvel UUID, et est ré-intégré dans Qdrant. La commande CLI `archive restore` supprime en plus la ligne d'archive une fois la restauration effectuée.
+
+Les clients MCP disposent d'un chemin équivalent : le paramètre `include_archived` de l'outil `search` trouve les souvenirs archivés par correspondance de termes sur le résumé/les tags (marqués `archived: true`, jamais enregistrés comme accès), et l'action `restore` de l'outil `review` recrée un souvenir actif à partir d'un enregistrement archivé — étiqueté `restored-from-archive`, avec la ligne d'archive **conservée** (contrairement au chemin CLI) afin que son origine reste inspectable. Voir [Référence des outils MCP](#référence-des-outils-mcp).
 
 ---
 
@@ -2203,7 +2205,7 @@ bhgbrain server token                 # Générer un nouveau token Bearer aléat
 
 ## Référence des outils MCP
 
-BHGBrain expose 10 outils MCP. Tous les outils valident les entrées avec des schémas Zod et renvoient du JSON structuré. Les erreurs utilisent une enveloppe cohérente :
+BHGBrain expose 11 outils MCP. Tous les outils valident les entrées avec des schémas Zod et renvoient du JSON structuré. Les erreurs utilisent une enveloppe cohérente :
 
 ```json
 {
@@ -2363,8 +2365,9 @@ Recherche des souvenirs en utilisant les modes sémantique, plein texte ou hybri
 | `collection` | `string` | Non | — | Filtrer sur une collection spécifique. |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | Non | `"hybrid"` | Algorithme de recherche. |
 | `limit` | `integer (1–50)` | Non | `10` | Nombre maximum de résultats. |
+| `include_archived` | `boolean` | Non | `false` | Recherche aussi dans les souvenirs archivés (voir [Déclin, nettoyage et archivage](#déclin-nettoyage-et-archivage)) par correspondance de termes sur le résumé/les tags. Les correspondances sont ajoutées après les résultats actifs, marquées `archived: true`, et ne réduisent jamais le nombre de résultats actifs autorisés par `limit`. Les correspondances archivées ne sont jamais enregistrées comme accès. |
 
-**Sortie :** Même structure que `recall` — `{ "results": [...] }` — mais sans le filtre `min_score` et supportant jusqu'à 50 résultats.
+**Sortie :** Même structure que `recall` — `{ "results": [...] }` — mais sans le filtre `min_score` et supportant jusqu'à 50 résultats. Les correspondances archivées (quand `include_archived: true`) portent `archived: true`, utilisent le résumé conservé comme `content`, et n'ont pas de `score` significatif (ce sont des correspondances de termes sur les métadonnées, pas des résultats classés).
 
 ---
 
@@ -2580,6 +2583,78 @@ Un souvenir sans changement de contenu renvoie un tableau `revisions` vide, pas 
 - Un événement d'audit `REVISE` enregistre le numéro de révision source, distinguable du REVISE générique que le pipeline d'écriture enregistre lors des changements de contenu T0 ordinaires.
 - La restauration nécessite le fournisseur d'embedding — s'il est indisponible, elle échoue avec `EMBEDDING_UNAVAILABLE` et le souvenir reste totalement inchangé (pas d'écriture partielle, pas de désynchronisation du vecteur).
 - Restaurer vers un numéro de révision qui n'existe pas pour le souvenir renvoie `NOT_FOUND`.
+
+---
+
+### `review` — File d'attente de révision et récupération d'archive
+
+Liste et dispositionne la file d'attente de révision T1, et restaure les souvenirs archivés. Ferme le côté lecture du cycle de vie par niveaux : `review_due` (estampillé sur les souvenirs T1, voir [Cycle de vie des niveaux](#cycle-de-vie-des-niveaux--attribution-promotion-fenêtre-glissante)) et `archived_memories` (voir [Déclin, nettoyage et archivage](#déclin-nettoyage-et-archivage)) avaient tous deux un chemin d'écriture mais aucune surface de lecture côté MCP jusqu'ici. La révision de contenu n'est délibérément pas dupliquée ici — utilisez le chemin UPDATE de `remember` pour cela.
+
+**Entrée :**
+
+| Paramètre | Type | Requis | Défaut | Description |
+|---|---|---|---|---|
+| `action` | `"list" \| "keep" \| "archive" \| "restore"` | **Oui** | - | Opération à effectuer. |
+| `id` | `string (UUID)` | Requis pour `keep`/`archive`/`restore` | - | L'ID du souvenir. Pour `restore`, l'ID du souvenir original, recherché dans l'archive. |
+| `days` | `integer (0–3650)` | Non | `0` | (`list` uniquement) Fenêtre d'anticipation en jours au-delà de « dû maintenant ». `0` renvoie uniquement les souvenirs déjà dus. |
+| `namespace` | `string` | Non | `"global"` | Portée de l'espace de noms. |
+| `limit` | `integer (1–100)` | Non | `20` | (`list` uniquement) Taille de page. |
+| `cursor` | `string` | Non | - | (`list` uniquement) Curseur de pagination renvoyé par un précédent appel `list`. |
+
+**Sortie (`action: "list"`) :**
+
+```json
+{
+  "items": [
+    {
+      "id": "3f4a1b2c-...",
+      "namespace": "global",
+      "collection": "general",
+      "summary": "Runbook de déploiement pour le service de paiement",
+      "tags": ["deployment", "runbook"],
+      "retention_tier": "T1",
+      "review_due": "2026-03-01T00:00:00.000Z",
+      "expires_at": "2026-03-01T00:00:00.000Z"
+    }
+  ],
+  "cursor": "2026-03-01T00:00:00.000Z|3f4a1b2c-..."
+}
+```
+
+Les éléments sont des souvenirs T1 non archivés dont `review_due` est à ou avant « maintenant + `days` », renvoyés du plus ancien dû au plus récent. `cursor` vaut `null` une fois la dernière page atteinte ; renvoyez-le en entrée `cursor` pour récupérer la page suivante.
+
+**Sortie (`action: "keep"`) :**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "review_due": "2027-03-01T00:00:00.000Z",
+  "expires_at": "2027-03-01T00:00:00.000Z"
+}
+```
+
+Confirme que le souvenir reste exact : prolonge à la fois `review_due` et `expires_at` selon la politique de cycle de vie du niveau du souvenir (en réutilisant le même calcul que `remember` et la promotion déclenchée par accès), indépendamment de `sliding_window_enabled` — une confirmation humaine explicite reçoit l'extension complète même lorsque le renouvellement passif par fenêtre glissante est désactivé. Enregistre un événement d'audit `REVISE` notant une confirmation de révision. Renvoie `NOT_FOUND` si le souvenir n'existe pas.
+
+**Sortie (`action: "archive"`) :**
+
+```json
+{ "id": "3f4a1b2c-...", "archived": true }
+```
+
+Fait transiter le souvenir par la même transition d'archivage que le GC : son vecteur est supprimé, sa ligne est déplacée vers `archived_memories` (résumé, tags, niveau et statistiques d'accès sont conservés ; le contenu et le vecteur non), et un événement d'audit `ARCHIVE` est enregistré. Renvoie `NOT_FOUND` si l'ID n'a jamais existé, et `CONFLICT` s'il est déjà archivé.
+
+**Sortie (`action: "restore"`) :**
+
+```json
+{
+  "id": "9c2e5f10-...",
+  "restored_from": "3f4a1b2c-...",
+  "archive_id": 42,
+  "restored": true
+}
+```
+
+Recrée un souvenir actif à partir du résumé et des tags conservés dans l'enregistrement d'archive, au niveau d'origine — un **stub porteur de provenance**, pas une résurrection : le contenu et le vecteur d'origine n'ont jamais été conservés, donc le contenu du souvenir restauré est son résumé archivé, étiqueté avec ses tags d'origine plus un tag marqueur `restored-from-archive`, et fraîchement ré-embeddé pour qu'il participe à la recherche. La ligne d'archive est conservée (non supprimée), contrairement à la commande CLI `archive restore`. Enregistre un événement d'audit `RESTORE` reliant l'origine de l'archive. Renvoie `NOT_FOUND` s'il n'existe aucun enregistrement d'archive pour l'ID donné.
 
 ---
 

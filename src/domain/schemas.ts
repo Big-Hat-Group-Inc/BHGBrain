@@ -55,6 +55,10 @@ export const SearchInputSchema = z.object({
   collection: NameSchema.optional(),
   mode: SearchModeSchema.default('hybrid'),
   limit: z.number().int().min(1).max(50).default(10),
+  // Additive opt-in (add-review-and-archive-recall): archived matches are
+  // appended after active results, marked `archived: true`, and never count
+  // against `limit`'s reduction of active results — see `search/index.ts`.
+  include_archived: z.boolean().optional().default(false),
 }).strict();
 
 export const TagInputSchema = z.object({
@@ -91,6 +95,22 @@ export const RevisionsInputSchema = z.object({
   { message: 'revision is required for revert', path: ['revision'] },
 );
 
+export const ReviewInputSchema = z.object({
+  action: z.enum(['list', 'keep', 'archive', 'restore']),
+  // Required for keep/archive/restore (the memory id being actioned on; for
+  // restore this is the original memory's id used to look up its archive
+  // record — enforced below since it's action-dependent). Unused by list.
+  id: z.string().uuid().optional(),
+  // list only: look-ahead window in days beyond "due now" (0 = due only).
+  days: z.number().int().min(0).max(3650).optional().default(0),
+  namespace: NamespaceSchema.default('global'),
+  limit: z.number().int().min(1).max(100).default(20),
+  cursor: z.string().optional(),
+}).strict().refine(
+  data => data.action === 'list' || data.id !== undefined,
+  { message: 'id is required for keep, archive, and restore', path: ['id'] },
+);
+
 export const RepairInputSchema = z.object({
   // 'from-qdrant' (default): the pre-existing behavior — recover memories
   // missing from SQLite by scrolling Qdrant payloads. 're-embed': the
@@ -124,3 +144,4 @@ export type CategoryInput = z.infer<typeof CategoryInputSchema>;
 export type BackupInput = z.infer<typeof BackupInputSchema>;
 export type RepairInput = z.infer<typeof RepairInputSchema>;
 export type RevisionsInput = z.infer<typeof RevisionsInputSchema>;
+export type ReviewInput = z.infer<typeof ReviewInputSchema>;

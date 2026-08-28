@@ -101,6 +101,10 @@ export interface SearchResult {
   // near-duplicate memories. Never populated by the public `search`/`recall`
   // tools, so it never appears in their JSON responses.
   vector?: number[];
+  // Set only on archived matches surfaced via `search`'s `include_archived`
+  // (add-review-and-archive-recall). Absent (not `false`) on every active
+  // result, so it never appears in default JSON responses.
+  archived?: boolean;
 }
 
 export interface WriteResult {

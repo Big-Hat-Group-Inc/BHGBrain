@@ -1320,7 +1320,7 @@ El servidor ejecuta un trabajo de limpieza programado (por defecto: diariamente 
 
 1. **Identificar memorias expiradas:** Consultar SQLite para todas las memorias donde `decay_eligible = true` Y `expires_at < now()`. Solo `T2`/`T3` son elegibles para archivar-y-eliminar directamente:
    - `T0` siempre se excluye (T0 nunca es elegible para decaimiento).
-   - `T1` nunca se elimina directamente. Las memorias `T1` expiradas o con `review_due` vencido se muestran como **candidatas de revisión** en el resultado de GC, para que un operador decida si promoverlas, volver a guardarlas o eliminarlas manualmente.
+   - `T1` nunca se elimina directamente. Las memorias `T1` expiradas o con `review_due` vencido se muestran como **candidatas de revisión** en el resultado de GC, para que un operador decida si promoverlas, volver a guardarlas o eliminarlas manualmente — o, vía MCP, listarlas y disposicionarlas con la herramienta `review` (`action: "list"` / `"keep"` / `"archive"`; ver [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)).
 
 2. **Archivar antes de eliminar (si está habilitado):** Para cada candidata `T2`/`T3`, se escribe un registro de resumen en la tabla `memory_archive` y se registra un evento de auditoría `ARCHIVE` distinto:
 
@@ -1383,7 +1383,7 @@ El comando `bhgbrain gc --consolidate` (o `RetentionService.runConsolidation()`)
 
 #### Búsqueda y Restauración de Archivo
 
-Las memorias eliminadas (cuando `archive_before_delete: true`) pueden inspeccionarse y restaurarse:
+Las memorias eliminadas (cuando `archive_before_delete: true`) pueden inspeccionarse y restaurarse desde la CLI:
 
 ```bash
 bhgbrain archive list                 # Listar resúmenes de memorias archivadas (eliminadas)
@@ -1391,7 +1391,9 @@ bhgbrain archive search <query>       # Buscar en el archivo por texto
 bhgbrain archive restore <memory_id>  # Restaurar una memoria archivada
 ```
 
-**Semántica de restauración:** Una memoria restaurada se recrea como una **nueva** memoria `T2` a partir del texto de resumen archivado. El contenido original (si es más largo que el resumen) no puede recuperarse — el archivo almacena solo el resumen de 120 caracteres. La memoria restaurada recibe marcas de tiempo nuevas y un nuevo UUID, y se re-embede en Qdrant.
+**Semántica de restauración:** Una memoria restaurada se recrea como una **nueva** memoria (en su nivel original) a partir del texto de resumen archivado. El contenido original (si es más largo que el resumen) no puede recuperarse — el archivo almacena solo el resumen de 120 caracteres. La memoria restaurada recibe marcas de tiempo nuevas y un nuevo UUID, y se re-embede en Qdrant. El `archive restore` de la CLI además elimina la fila de archivo tras restaurar.
+
+Los clientes MCP tienen una ruta equivalente: el parámetro `include_archived` de la herramienta `search` encuentra memorias archivadas por coincidencia de términos en resumen/etiquetas (marcadas con `archived: true`, nunca registradas como acceso), y la acción `restore` de la herramienta `review` recrea una memoria activa a partir de un registro archivado — etiquetada como `restored-from-archive`, con la fila de archivo **conservada** (a diferencia de la ruta de la CLI) para que su origen siga siendo inspeccionable. Vea [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp).
 
 ---
 
@@ -2198,7 +2200,7 @@ bhgbrain server token                 # Generar un nuevo bearer token aleatorio
 
 ## Referencia de Herramientas MCP
 
-BHGBrain expone 10 herramientas MCP. Todas las herramientas validan la entrada con esquemas Zod y devuelven JSON estructurado. Los errores usan un sobre consistente:
+BHGBrain expone 11 herramientas MCP. Todas las herramientas validan la entrada con esquemas Zod y devuelven JSON estructurado. Los errores usan un sobre consistente:
 
 ```json
 {
@@ -2358,8 +2360,9 @@ Busca memorias usando modos semántico, de texto completo o híbrido. Ofrece má
 | `collection` | `string` | No | — | Filtrar a una colección específica. |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | No | `"hybrid"` | Algoritmo de búsqueda. |
 | `limit` | `integer (1–50)` | No | `10` | Número máximo de resultados. |
+| `include_archived` | `boolean` | No | `false` | También busca en memorias archivadas (ver [Decaimiento, Limpieza y Archivado](#decaimiento-limpieza-y-archivado)) mediante coincidencia de términos en el resumen/etiquetas. Las coincidencias se añaden después de los resultados activos, marcadas con `archived: true`, y nunca reducen cuántos resultados activos permite `limit`. Las coincidencias archivadas no se registran como acceso. |
 
-**Salida:** Misma estructura que `recall` — `{ "results": [...] }` — pero sin la compuerta `min_score` y admitiendo hasta 50 resultados.
+**Salida:** Misma estructura que `recall` — `{ "results": [...] }` — pero sin la compuerta `min_score` y admitiendo hasta 50 resultados. Las coincidencias archivadas (cuando `include_archived: true`) llevan `archived: true`, usan el resumen conservado como `content` y no tienen un `score` significativo (son coincidencias de términos en metadatos, no resultados clasificados).
 
 ---
 
@@ -2575,6 +2578,78 @@ Una memoria sin cambios de contenido devuelve un array `revisions` vacío, no un
 - Un evento de auditoría `REVISE` registra el número de revisión de origen, distinguible del REVISE genérico que el pipeline de escritura registra en cambios de contenido T0 ordinarios.
 - El revert requiere el proveedor de embeddings — si no está disponible, el revert falla con `EMBEDDING_UNAVAILABLE` y la memoria queda completamente sin cambios (sin escritura parcial, sin desincronización del vector).
 - Revertir a un número de revisión que no existe para la memoria devuelve `NOT_FOUND`.
+
+---
+
+### `review` — Cola de Revisión y Recuperación de Archivo
+
+Lista y disposiciona la cola de revisión T1, y restaura memorias archivadas. Cierra el lado de lectura del ciclo de vida por niveles: `review_due` (marcado en memorias T1, ver [Ciclo de Vida por Nivel](#ciclo-de-vida-por-nivel--asignación-promoción-ventana-deslizante)) y `archived_memories` (ver [Decaimiento, Limpieza y Archivado](#decaimiento-limpieza-y-archivado)) tenían ambos una ruta de escritura pero antes no tenían superficie de lectura desde MCP. La revisión de contenido deliberadamente no se duplica aquí — usa la ruta UPDATE de `remember` para eso.
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Predeterminado | Descripción |
+|---|---|---|---|---|
+| `action` | `"list" \| "keep" \| "archive" \| "restore"` | **Sí** | - | Operación a realizar. |
+| `id` | `string (UUID)` | Requerido para `keep`/`archive`/`restore` | - | El ID de la memoria. Para `restore`, el ID de la memoria original, buscado en el archivo. |
+| `days` | `integer (0–3650)` | No | `0` | (solo `list`) Ventana de anticipación en días más allá de "vencido ahora". `0` devuelve solo memorias ya vencidas. |
+| `namespace` | `string` | No | `"global"` | Ámbito de namespace. |
+| `limit` | `integer (1–100)` | No | `20` | (solo `list`) Tamaño de página. |
+| `cursor` | `string` | No | - | (solo `list`) Cursor de paginación devuelto por una llamada `list` anterior. |
+
+**Salida (`action: "list"`):**
+
+```json
+{
+  "items": [
+    {
+      "id": "3f4a1b2c-...",
+      "namespace": "global",
+      "collection": "general",
+      "summary": "Runbook de despliegue para el servicio de pagos",
+      "tags": ["deployment", "runbook"],
+      "retention_tier": "T1",
+      "review_due": "2026-03-01T00:00:00.000Z",
+      "expires_at": "2026-03-01T00:00:00.000Z"
+    }
+  ],
+  "cursor": "2026-03-01T00:00:00.000Z|3f4a1b2c-..."
+}
+```
+
+Los elementos son memorias T1 no archivadas cuyo `review_due` es en o antes de "ahora + `days`", devueltas en orden de vencimiento más antiguo primero. `cursor` es `null` una vez alcanzada la última página; pásalo de vuelta como entrada `cursor` para obtener la siguiente página.
+
+**Salida (`action: "keep"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "review_due": "2027-03-01T00:00:00.000Z",
+  "expires_at": "2027-03-01T00:00:00.000Z"
+}
+```
+
+Confirma que la memoria sigue siendo precisa: extiende tanto `review_due` como `expires_at` según la política de ciclo de vida del nivel de la memoria (reutilizando el mismo cálculo que usan `remember` y la promoción por acceso), sin importar `sliding_window_enabled` — una confirmación humana explícita recibe la extensión completa incluso cuando la renovación pasiva por ventana deslizante está deshabilitada. Registra un evento de auditoría `REVISE` que anota una confirmación de revisión. Devuelve `NOT_FOUND` si la memoria no existe.
+
+**Salida (`action: "archive"`):**
+
+```json
+{ "id": "3f4a1b2c-...", "archived": true }
+```
+
+Enruta la memoria por la misma transición de archivado que usa el GC: su vector se elimina, su fila se mueve a `archived_memories` (se conservan resumen, etiquetas, nivel y estadísticas de acceso; el contenido y el vector no), y se registra un evento de auditoría `ARCHIVE`. Devuelve `NOT_FOUND` si el ID nunca existió, y `CONFLICT` si ya está archivado.
+
+**Salida (`action: "restore"`):**
+
+```json
+{
+  "id": "9c2e5f10-...",
+  "restored_from": "3f4a1b2c-...",
+  "archive_id": 42,
+  "restored": true
+}
+```
+
+Recrea una memoria activa a partir del resumen y las etiquetas conservados en el registro de archivo, en el nivel original — un **stub con procedencia**, no una resurrección: el contenido y el vector originales nunca se conservaron, así que el contenido de la memoria restaurada es su resumen archivado, etiquetado con sus etiquetas originales más una etiqueta marcadora `restored-from-archive`, y re-embebido para que participe en la búsqueda. La fila de archivo se conserva (no se elimina), a diferencia del comando `archive restore` de la CLI. Registra un evento de auditoría `RESTORE` que enlaza el origen del archivo. Devuelve `NOT_FOUND` si no existe un registro de archivo para el ID dado.
 
 ---
 

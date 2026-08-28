@@ -105,6 +105,7 @@ export interface SqliteStorage {
   recordAccessBatch(updates: AccessUpdate[]): void;
   listExpiredMemories(nowIso: string, tier?: RetentionTier): MemoryRecordWithoutEmbedding[];
   listReviewCandidates(nowIso: string, limit?: number): MemoryRecordWithoutEmbedding[];
+  listReviewDue(namespace: string, before: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
   listExpiringMemories(nowIso: string, untilIso: string, limit: number): MemoryRecordWithoutEmbedding[];
   countExpiringMemories(nowIso: string, untilIso: string): number;
   countByTier(): Record<RetentionTier, number>;
@@ -125,6 +126,7 @@ export interface SqliteStorage {
   archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void;
   listArchive(limit: number): ArchiveRecord[];
   searchArchive(query: string, limit: number): ArchiveRecord[];
+  searchArchived(namespace: string, query: string, limit: number): ArchiveRecord[];
   getArchiveByMemoryId(memoryId: string): ArchiveRecord | null;
   deleteArchive(memoryId: string): void;
   insertRevision(memoryId: string, revision: number, content: string, updatedAt: string, updatedBy?: string): void;
@@ -989,6 +991,32 @@ export class SqliteStore implements SqliteStorage {
     );
   }
 
+  /**
+   * Namespace-scoped, paginated companion to `listReviewCandidates`: the
+   * review queue surfaced through the `review` MCP tool needs a bound (`due
+   * now` or `due within N days`, via `before`) and cursor pagination rather
+   * than the GC-oriented top-N-globally shape `listReviewCandidates` has.
+   * Only T1 memories carry a `review_due`, so the tier filter mirrors that
+   * invariant; ordering is oldest-due-first per the review queue contract.
+   */
+  listReviewDue(namespace: string, before: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
+    let sql = `SELECT * FROM memories WHERE archived = 0 AND namespace = ? AND retention_tier = 'T1'
+       AND review_due IS NOT NULL AND review_due <= ?`;
+    const params: SqlParams = [namespace, before];
+    if (cursor) {
+      const sepIdx = cursor.indexOf('|');
+      if (sepIdx !== -1) {
+        const cursorDue = cursor.substring(0, sepIdx);
+        const cursorId = cursor.substring(sepIdx + 1);
+        sql += ` AND (review_due > ? OR (review_due = ? AND id > ?))`;
+        params.push(cursorDue, cursorDue, cursorId);
+      }
+    }
+    sql += ` ORDER BY review_due ASC, id ASC LIMIT ?`;
+    params.push(limit);
+    return this.queryMemories(sql, params);
+  }
+
   listExpiringMemories(nowIso: string, untilIso: string, limit: number): MemoryRecordWithoutEmbedding[] {
     return this.queryMemories(
       `SELECT * FROM memories WHERE archived = 0 AND expires_at IS NOT NULL AND expires_at >= ? AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?`,
@@ -1228,6 +1256,28 @@ export class SqliteStore implements SqliteStorage {
       `SELECT * FROM memory_archive WHERE LOWER(summary) LIKE ? OR LOWER(tags) LIKE ? ORDER BY expired_at DESC LIMIT ?`,
     );
     stmt.bind([like, like, limit]);
+    const rows: ArchiveRecord[] = [];
+    while (stmt.step()) {
+      rows.push(this.rowToArchive(stmt.getAsObject()));
+    }
+    stmt.free();
+    return rows;
+  }
+
+  /**
+   * Namespace-scoped companion to `searchArchive` (which is deliberately
+   * namespace-agnostic for the CLI/operator surface): the `search` tool's
+   * `include_archived` results must not leak archived memories across
+   * namespace boundaries the way an unscoped LIKE query would. Matches on
+   * retained summary/tags only — content and vectors are not kept for
+   * archived rows, so this is metadata-term search, not semantic search.
+   */
+  searchArchived(namespace: string, query: string, limit: number): ArchiveRecord[] {
+    const like = `%${query.toLowerCase()}%`;
+    const stmt = this.db.prepare(
+      `SELECT * FROM memory_archive WHERE namespace = ? AND (LOWER(summary) LIKE ? OR LOWER(tags) LIKE ?) ORDER BY expired_at DESC LIMIT ?`,
+    );
+    stmt.bind([namespace, like, like, limit]);
     const rows: ArchiveRecord[] = [];
     while (stmt.step()) {
       rows.push(this.rowToArchive(stmt.getAsObject()));

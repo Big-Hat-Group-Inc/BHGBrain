@@ -1321,7 +1321,7 @@ Der Server führt einen geplanten Bereinigungsauftrag aus (Standard: täglich um
 
 1. **Abgelaufene Erinnerungen identifizieren:** SQLite nach allen Erinnerungen abfragen, bei denen `decay_eligible = true` UND `expires_at < now()`. Nur `T2`/`T3` sind für direktes Archivieren-und-Löschen berechtigt:
    - `T0` ist immer ausgeschlossen (T0 ist nie verfallsberechtigt).
-   - `T1` wird nie direkt gelöscht. Abgelaufene oder `review_due`-überfällige `T1`-Erinnerungen werden stattdessen im GC-Ergebnis als **Review-Kandidaten** ausgewiesen, damit ein Operator entscheiden kann, ob sie befördert, neu gespeichert oder manuell gelöscht werden.
+   - `T1` wird nie direkt gelöscht. Abgelaufene oder `review_due`-überfällige `T1`-Erinnerungen werden stattdessen im GC-Ergebnis als **Review-Kandidaten** ausgewiesen, damit ein Operator entscheiden kann, ob sie befördert, neu gespeichert oder manuell gelöscht werden — oder sie über MCP mit dem Tool `review` (`action: "list"` / `"keep"` / `"archive"`; siehe [MCP-Tools-Referenz](#mcp-tools-referenz)) auflisten und disponieren.
 
 2. **Vor dem Löschen archivieren (wenn aktiviert):** Für jeden `T2`/`T3`-Kandidaten wird ein Zusammenfassungsdatensatz in die Tabelle `memory_archive` geschrieben und ein eigenständiges `ARCHIVE`-Audit-Ereignis protokolliert:
 
@@ -1384,7 +1384,7 @@ Der Befehl `bhgbrain gc --consolidate` (oder `RetentionService.runConsolidation(
 
 #### Archivsuche und Wiederherstellung
 
-Gelöschte Erinnerungen (wenn `archive_before_delete: true`) können eingesehen und wiederhergestellt werden:
+Gelöschte Erinnerungen (wenn `archive_before_delete: true`) können über die CLI eingesehen und wiederhergestellt werden:
 
 ```bash
 bhgbrain archive list                 # Kürzlich archivierte Erinnerungen auflisten
@@ -1392,7 +1392,9 @@ bhgbrain archive search <query>       # Archiv per Text durchsuchen
 bhgbrain archive restore <memory_id>  # Eine archivierte Erinnerung wiederherstellen
 ```
 
-**Wiederherstellungssemantik:** Eine wiederhergestellte Erinnerung wird als **neue** `T2`-Erinnerung aus dem archivierten Zusammenfassungstext neu erstellt. Der ursprüngliche Inhalt (wenn er länger als die Zusammenfassung war) kann nicht wiederhergestellt werden – das Archiv speichert nur die 120-Zeichen-Zusammenfassung. Die wiederhergestellte Erinnerung erhält neue Zeitstempel und eine neue UUID und wird in Qdrant neu eingebettet.
+**Wiederherstellungssemantik:** Eine wiederhergestellte Erinnerung wird als **neue** Erinnerung (auf ihrer ursprünglichen Stufe) aus dem archivierten Zusammenfassungstext neu erstellt. Der ursprüngliche Inhalt (wenn er länger als die Zusammenfassung war) kann nicht wiederhergestellt werden – das Archiv speichert nur die 120-Zeichen-Zusammenfassung. Die wiederhergestellte Erinnerung erhält neue Zeitstempel und eine neue UUID und wird in Qdrant neu eingebettet. Das CLI-`archive restore` löscht zusätzlich die Archivzeile nach der Wiederherstellung.
+
+MCP-Clients haben einen entsprechenden Pfad: Der Parameter `include_archived` des `search`-Tools findet archivierte Erinnerungen per Zusammenfassungs-/Tag-Textabgleich (markiert mit `archived: true`, nie als Zugriff protokolliert), und die `restore`-Aktion des `review`-Tools erstellt eine aktive Erinnerung aus einem Archiveintrag neu — markiert mit `restored-from-archive`, wobei die Archivzeile (anders als beim CLI-Pfad) **beibehalten** wird, sodass ihr Ursprung nachvollziehbar bleibt. Siehe [MCP-Tools-Referenz](#mcp-tools-referenz).
 
 ---
 
@@ -2197,7 +2199,7 @@ bhgbrain server token                 # Neues zufälliges Bearer-Token generiere
 
 ## MCP-Tools-Referenz
 
-BHGBrain stellt 10 MCP-Tools bereit. Alle Tools validieren Eingaben mit Zod-Schemas und geben strukturiertes JSON zurück. Fehler verwenden einen konsistenten Umschlag:
+BHGBrain stellt 11 MCP-Tools bereit. Alle Tools validieren Eingaben mit Zod-Schemas und geben strukturiertes JSON zurück. Fehler verwenden einen konsistenten Umschlag:
 
 ```json
 {
@@ -2357,8 +2359,9 @@ Erinnerungen mithilfe semantischer, Volltext- oder Hybrid-Modi durchsuchen. Biet
 | `collection` | `string` | Nein | — | Auf eine bestimmte Sammlung beschränken. |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | Nein | `"hybrid"` | Suchalgorithmus. |
 | `limit` | `integer (1–50)` | Nein | `10` | Maximale Anzahl der Ergebnisse. |
+| `include_archived` | `boolean` | Nein | `false` | Durchsucht zusätzlich archivierte Erinnerungen (siehe [Verfall, Bereinigung und Archivierung](#verfall-bereinigung-und-archivierung)) per Zusammenfassungs-/Tag-Textabgleich. Treffer werden nach den aktiven Ergebnissen angehängt, mit `archived: true` markiert und reduzieren nie, wie viele aktive Ergebnisse `limit` zulässt. Archivtreffer werden nicht als Zugriff protokolliert. |
 
-**Ausgabe:** Gleiche Struktur wie `recall` — `{ "results": [...] }` — aber ohne den `min_score`-Filter und mit Unterstützung von bis zu 50 Ergebnissen.
+**Ausgabe:** Gleiche Struktur wie `recall` — `{ "results": [...] }` — aber ohne den `min_score`-Filter und mit Unterstützung von bis zu 50 Ergebnissen. Archivtreffer (bei `include_archived: true`) tragen `archived: true`, verwenden die gespeicherte Zusammenfassung als `content` und haben keinen aussagekräftigen `score` (es sind Metadaten-Texttreffer, keine gerankten Ergebnisse).
 
 ---
 
@@ -2574,6 +2577,78 @@ Eine Erinnerung ohne Inhaltsänderungen liefert ein leeres `revisions`-Array, ke
 - Ein `REVISE`-Audit-Ereignis protokolliert die Quellrevisionsnummer, unterscheidbar vom generischen REVISE, das die Schreib-Pipeline bei gewöhnlichen T0-Inhaltsänderungen protokolliert.
 - Der Revert benötigt den Embedding-Provider — ist dieser nicht verfügbar, schlägt der Revert mit `EMBEDDING_UNAVAILABLE` fehl und die Erinnerung bleibt vollständig unverändert (kein Teil-Schreibvorgang, keine Vektor-Desynchronisierung).
 - Ein Revert auf eine nicht existierende Revisionsnummer liefert `NOT_FOUND`.
+
+---
+
+### `review` — Review-Warteschlange und Archiv-Wiederherstellung
+
+Listet die T1-Review-Warteschlange auf und disponiert sie, und stellt archivierte Erinnerungen wieder her. Schließt die Leseseite des gestuften Lebenszyklus: `review_due` (auf T1-Erinnerungen gestempelt, siehe [Stufenlebenszyklus](#stufenlebenszyklus--zuweisung-beförderung-gleitendes-fenster)) und `archived_memories` (siehe [Verfall, Bereinigung und Archivierung](#verfall-bereinigung-und-archivierung)) hatten bisher zwar einen Schreibpfad, aber keine MCP-seitige Leseoberfläche. Die Inhaltsrevision wird hier bewusst nicht dupliziert — dafür den UPDATE-Pfad von `remember` verwenden.
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `action` | `"list" \| "keep" \| "archive" \| "restore"` | **Ja** | - | Auszuführende Operation. |
+| `id` | `string (UUID)` | Erforderlich für `keep`/`archive`/`restore` | - | Die Erinnerungs-ID. Bei `restore` die ursprüngliche Erinnerungs-ID, die im Archiv nachgeschlagen wird. |
+| `days` | `integer (0–3650)` | Nein | `0` | (nur `list`) Vorlauffenster in Tagen über „jetzt fällig" hinaus. `0` liefert nur bereits fällige Erinnerungen. |
+| `namespace` | `string` | Nein | `"global"` | Namensraum-Bereich. |
+| `limit` | `integer (1–100)` | Nein | `20` | (nur `list`) Seitengröße. |
+| `cursor` | `string` | Nein | - | (nur `list`) Paginierungs-Cursor eines vorherigen `list`-Aufrufs. |
+
+**Ausgabe (`action: "list"`):**
+
+```json
+{
+  "items": [
+    {
+      "id": "3f4a1b2c-...",
+      "namespace": "global",
+      "collection": "general",
+      "summary": "Deployment-Runbook für den Payments-Service",
+      "tags": ["deployment", "runbook"],
+      "retention_tier": "T1",
+      "review_due": "2026-03-01T00:00:00.000Z",
+      "expires_at": "2026-03-01T00:00:00.000Z"
+    }
+  ],
+  "cursor": "2026-03-01T00:00:00.000Z|3f4a1b2c-..."
+}
+```
+
+Die Einträge sind nicht archivierte T1-Erinnerungen, deren `review_due` bei oder vor „jetzt + `days`" liegt, zurückgegeben mit dem am längsten fälligen zuerst. `cursor` ist `null`, sobald die letzte Seite erreicht ist; für die nächste Seite als `cursor`-Eingabe zurückgeben.
+
+**Ausgabe (`action: "keep"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "review_due": "2027-03-01T00:00:00.000Z",
+  "expires_at": "2027-03-01T00:00:00.000Z"
+}
+```
+
+Bestätigt, dass die Erinnerung weiterhin zutrifft: verlängert sowohl `review_due` als auch `expires_at` gemäß der Lebenszyklusrichtlinie der Stufe der Erinnerung (unter Wiederverwendung derselben Berechnung, die `remember` und zugriffsgesteuerte Promotion nutzen), unabhängig von `sliding_window_enabled` — eine explizite menschliche Bestätigung erhält die volle Verlängerung, selbst wenn die passive Gleitfenster-Erneuerung deaktiviert ist. Protokolliert ein `REVISE`-Audit-Ereignis, das eine Review-Bestätigung vermerkt. Liefert `NOT_FOUND`, falls die Erinnerung nicht existiert.
+
+**Ausgabe (`action: "archive"`):**
+
+```json
+{ "id": "3f4a1b2c-...", "archived": true }
+```
+
+Leitet die Erinnerung über denselben Archivierungsübergang, den auch GC nutzt: ihr Vektor wird entfernt, ihre Zeile wird nach `archived_memories` verschoben (Zusammenfassung, Tags, Stufe und Zugriffsstatistiken werden beibehalten; Inhalt und Vektor nicht), und ein `ARCHIVE`-Audit-Ereignis wird protokolliert. Liefert `NOT_FOUND`, falls die ID nie existiert hat, und `CONFLICT`, falls sie bereits archiviert ist.
+
+**Ausgabe (`action: "restore"`):**
+
+```json
+{
+  "id": "9c2e5f10-...",
+  "restored_from": "3f4a1b2c-...",
+  "archive_id": 42,
+  "restored": true
+}
+```
+
+Erstellt eine aktive Erinnerung aus der gespeicherten Zusammenfassung und den Tags des Archiveintrags neu, auf der ursprünglichen Stufe — ein **Stub mit Herkunftsnachweis**, keine Wiederbelebung: der ursprüngliche Inhalt und Vektor wurden nie aufbewahrt, daher ist der Inhalt der wiederhergestellten Erinnerung ihre archivierte Zusammenfassung, versehen mit ihren ursprünglichen Tags plus einem `restored-from-archive`-Markierungs-Tag, und frisch eingebettet, damit sie an der Suche teilnimmt. Die Archivzeile wird beibehalten (nicht gelöscht), anders als beim CLI-Befehl `archive restore`. Protokolliert ein `RESTORE`-Audit-Ereignis, das den Archivursprung verknüpft. Liefert `NOT_FOUND`, falls für die angegebene ID kein Archiveintrag existiert.
 
 ---
 

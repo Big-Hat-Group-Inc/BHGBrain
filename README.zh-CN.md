@@ -1292,7 +1292,7 @@ checksum = SHA-256(normalizeContent(content))
 
 1. **识别过期记忆：** 查询 SQLite 中所有满足 `decay_eligible = true` 且 `expires_at < now()` 的记忆。只有 `T2`/`T3` 有资格被直接归档并删除：
    - `T0` 始终被排除（T0 永远不具备衰减资格）。
-   - `T1` 永远不会被直接删除。已过期或 `review_due` 已超期的 `T1` 记忆会在 GC 结果中作为**待审核候选项**列出，由操作者决定是晋升、重新保存还是手动删除。
+   - `T1` 永远不会被直接删除。已过期或 `review_due` 已超期的 `T1` 记忆会在 GC 结果中作为**待审核候选项**列出，由操作者决定是晋升、重新保存还是手动删除——或者通过 MCP 使用 `review` 工具（`action: "list"` / `"keep"` / `"archive"`；参见 [MCP 工具参考](#mcp-工具参考)）列出并处置它们。
 
 2. **删除前归档（若已启用）：** 对每条 `T2`/`T3` 候选记忆，将摘要记录写入 `memory_archive` 表，并记录一条独立的 `ARCHIVE` 审计事件：
 
@@ -1355,7 +1355,7 @@ memory_revisions {
 
 #### 归档搜索与恢复
 
-已删除的记忆（当 `archive_before_delete: true` 时）可以被检查和恢复：
+已删除的记忆（当 `archive_before_delete: true` 时）可以通过 CLI 检查和恢复：
 
 ```bash
 bhgbrain archive list                 # 列出最近归档的记忆
@@ -1363,7 +1363,9 @@ bhgbrain archive search <query>       # 按文本搜索归档摘要
 bhgbrain archive restore <memory_id>  # 恢复已归档的记忆
 ```
 
-**恢复语义：** 恢复的记忆从归档摘要文本作为**新的** `T2` 记忆重新创建。原始内容（如果比摘要更长）无法恢复——归档仅存储 120 字符的摘要。恢复的记忆获得全新的时间戳和新 UUID，并在 Qdrant 中重新嵌入。
+**恢复语义：** 恢复的记忆从归档摘要文本重新创建为一条**新的**记忆（沿用其原始层级）。原始内容（如果比摘要更长）无法恢复——归档仅存储 120 字符的摘要。恢复的记忆获得全新的时间戳和新 UUID，并在 Qdrant 中重新嵌入。CLI 的 `archive restore` 在恢复后还会删除该归档记录行。
+
+MCP 客户端也有对应的路径：`search` 工具的 `include_archived` 参数可按摘要/标签词条匹配找到已归档的记忆（标记为 `archived: true`，从不记录访问），而 `review` 工具的 `restore` 动作可根据归档记录重新创建一条活跃记忆——标记为 `restored-from-archive`，且归档记录行会被**保留**（这与 CLI 路径不同），以便其来源始终可追溯。参见 [MCP 工具参考](#mcp-工具参考)。
 
 ---
 
@@ -2155,7 +2157,7 @@ bhgbrain server token                 # 生成新的随机 Bearer token
 
 ## MCP 工具参考
 
-BHGBrain 暴露 10 个 MCP 工具。所有工具使用 Zod schema 验证输入并返回结构化 JSON。错误使用统一的信封格式：
+BHGBrain 暴露 11 个 MCP 工具。所有工具使用 Zod schema 验证输入并返回结构化 JSON。错误使用统一的信封格式：
 
 ```json
 {
@@ -2315,8 +2317,9 @@ BHGBrain 暴露 10 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `collection` | `string` | 否 | — | 过滤到特定集合。 |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | 否 | `"hybrid"` | 搜索算法。 |
 | `limit` | `integer (1–50)` | 否 | `10` | 最大结果数量。 |
+| `include_archived` | `boolean` | 否 | `false` | 同时搜索已归档的记忆（参见[衰减、清理与归档](#衰减清理与归档)），按摘要/标签进行词条匹配。归档命中会追加在活跃结果之后，标记为 `archived: true`，且从不减少 `limit` 允许的活跃结果数量。归档命中不会记录访问。 |
 
-**输出：** 与 `recall` 相同的结构——`{ "results": [...] }`——但没有 `min_score` 关卡，支持最多 50 条结果。
+**输出：** 与 `recall` 相同的结构——`{ "results": [...] }`——但没有 `min_score` 关卡，支持最多 50 条结果。归档命中（当 `include_archived: true` 时）带有 `archived: true`，使用保留的摘要作为 `content`，且没有有意义的 `score`（它们是元数据词条匹配，而非排序结果）。
 
 ---
 
@@ -2532,6 +2535,78 @@ BHGBrain 暴露 10 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 - `REVISE` 审计事件会记录来源版本号，与写入管道在普通 T0 内容变更时记录的通用 REVISE 事件相区分。
 - 回退需要嵌入提供方可用——如果不可用，回退会以 `EMBEDDING_UNAVAILABLE` 失败，且记忆保持完全不变（不会发生部分写入，也不会造成向量不同步）。
 - 回退到该记忆不存在的版本号会返回 `NOT_FOUND`。
+
+---
+
+### `review`——审阅队列与归档找回
+
+列出并处置 T1 审阅队列，并恢复已归档的记忆。补上分层生命周期的读取侧：`review_due`（写在 T1 记忆上，参见[层级生命周期](#层级生命周期分配晋升与滑动窗口)）和 `archived_memories`（参见[衰减、清理与归档](#衰减清理与归档)）此前都只有写入路径，没有面向 MCP 的读取接口。内容修订功能有意不在此处重复实现——请使用 `remember` 的 UPDATE 路径。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `action` | `"list" \| "keep" \| "archive" \| "restore"` | **是** | - | 要执行的操作。 |
+| `id` | `string (UUID)` | `keep`/`archive`/`restore` 时必需 | - | 记忆 ID。对 `restore` 而言，是用于在归档中查找的原始记忆 ID。 |
+| `days` | `integer (0–3650)` | 否 | `0` | （仅 `list`）超出"现在到期"之外的提前提醒天数窗口。`0` 表示仅返回已到期的记忆。 |
+| `namespace` | `string` | 否 | `"global"` | 命名空间范围。 |
+| `limit` | `integer (1–100)` | 否 | `20` | （仅 `list`）分页大小。 |
+| `cursor` | `string` | 否 | - | （仅 `list`）上一次 `list` 调用返回的分页游标。 |
+
+**输出（`action: "list"`）：**
+
+```json
+{
+  "items": [
+    {
+      "id": "3f4a1b2c-...",
+      "namespace": "global",
+      "collection": "general",
+      "summary": "支付服务的部署手册",
+      "tags": ["deployment", "runbook"],
+      "retention_tier": "T1",
+      "review_due": "2026-03-01T00:00:00.000Z",
+      "expires_at": "2026-03-01T00:00:00.000Z"
+    }
+  ],
+  "cursor": "2026-03-01T00:00:00.000Z|3f4a1b2c-..."
+}
+```
+
+返回的是 `review_due` 在"现在 + `days`"或之前的未归档 T1 记忆，按到期时间从早到晚排列。到达最后一页时 `cursor` 为 `null`；将其作为 `cursor` 输入传回可获取下一页。
+
+**输出（`action: "keep"`）：**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "review_due": "2027-03-01T00:00:00.000Z",
+  "expires_at": "2027-03-01T00:00:00.000Z"
+}
+```
+
+确认该记忆仍然准确：按该记忆所在层级的生命周期策略（复用 `remember` 与访问驱动晋升所用的同一套计算）同时延长 `review_due` 和 `expires_at`，无论 `sliding_window_enabled` 如何设置——显式的人工确认会获得完整的延长，即便被动的滑动窗口续期已被禁用。记录一条注明"审阅确认"的 `REVISE` 审计事件。若记忆不存在则返回 `NOT_FOUND`。
+
+**输出（`action: "archive"`）：**
+
+```json
+{ "id": "3f4a1b2c-...", "archived": true }
+```
+
+让该记忆经过与 GC 相同的归档转换：删除其向量，将其记录行移入 `archived_memories`（保留摘要、标签、层级和访问统计；不保留内容和向量），并记录一条 `ARCHIVE` 审计事件。若该 ID 从未存在过则返回 `NOT_FOUND`，若已被归档则返回 `CONFLICT`。
+
+**输出（`action: "restore"`）：**
+
+```json
+{
+  "id": "9c2e5f10-...",
+  "restored_from": "3f4a1b2c-...",
+  "archive_id": 42,
+  "restored": true
+}
+```
+
+根据归档记录中保留的摘要和标签，在原始层级重新创建一条活跃记忆——这是一个**带溯源信息的存根**，而非原样复活：原始内容和向量从未被保留，因此恢复后记忆的内容就是其归档摘要，标签为原始标签加上一个 `restored-from-archive` 标记标签，并重新生成嵌入以便参与搜索。归档记录行会被保留（不会删除），这与 CLI 的 `archive restore` 不同。记录一条关联归档来源的 `RESTORE` 审计事件。若给定 ID 没有对应的归档记录则返回 `NOT_FOUND`。
 
 ---
 

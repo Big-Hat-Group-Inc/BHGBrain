@@ -1,3 +1,4 @@
+import { v4 as uuidv4 } from 'uuid';
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
@@ -11,12 +12,13 @@ import {
   RememberInputSchema, RecallInputSchema, ForgetInputSchema,
   SearchInputSchema, TagInputSchema, CollectionsInputSchema,
   CategoryInputSchema, BackupInputSchema, RepairInputSchema,
-  RevisionsInputSchema,
+  RevisionsInputSchema, ReviewInputSchema,
   type RepairInput,
 } from '../domain/schemas.js';
 import type { WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter } from '../domain/types.js';
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
 import { computeChecksum } from '../domain/normalize.js';
+import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { handleImport } from './import.js';
 import { handleBootstrap } from './bootstrap.js';
 import { ZodError } from 'zod';
@@ -121,6 +123,7 @@ async function dispatch(
     case 'bootstrap': return handleBootstrap(ctx, args, logCtx);
     case 'import': return handleImport(ctx, args, logCtx);
     case 'revisions': return handleRevisions(ctx, args, clientId, logCtx);
+    case 'review': return handleReview(ctx, args, clientId, logCtx);
     case 'repair': return handleRepair(ctx, args);
     default:
       throw invalidInput(`Unknown tool: ${toolName}`);
@@ -226,6 +229,7 @@ async function handleSearch(
   const signal: { degraded?: boolean } = {};
   const results = await ctx.search.search(
     input.query, input.namespace, input.collection, input.mode, input.limit, signal,
+    undefined, input.include_archived,
   );
   // `degraded` is true when hybrid mode fell back to fulltext-only (embedding /
   // vector store unavailable), so callers can tell it from a healthy result.
@@ -273,6 +277,181 @@ async function handleRevisions(
   // 'revert' — schema's refine already guarantees `revision` is present here.
   const updated = await ctx.storage.revertMemory(input.id, input.revision!, clientId);
   return { id: input.id, revision: input.revision!, content: updated.content };
+}
+
+// Closes the read side of the tiered lifecycle (add-review-and-archive-recall):
+// `list` surfaces T1 memories whose `review_due` has lapsed (or falls within a
+// look-ahead window); `keep`/`archive`/`restore` disposition them. Content
+// revision is deliberately not duplicated here — that stays `remember`'s
+// UPDATE flow (design.md "one write path for content").
+async function handleReview(
+  ctx: ToolContext, args: unknown, clientId: string, logCtx: ToolLogContext,
+): Promise<unknown> {
+  const input = parseInput(ReviewInputSchema, args);
+  logCtx.namespace = input.namespace;
+
+  if (input.action === 'list') {
+    const now = new Date();
+    const before = new Date(now.getTime() + input.days * 24 * 60 * 60 * 1000).toISOString();
+    const due = ctx.storage.sqlite.listReviewDue(input.namespace, before, input.limit, input.cursor);
+    const last = due[due.length - 1];
+    const cursor = due.length === input.limit && last?.review_due
+      ? `${last.review_due}|${last.id}`
+      : null;
+
+    return {
+      items: due.map(m => ({
+        id: m.id,
+        namespace: m.namespace,
+        collection: m.collection,
+        summary: m.summary,
+        tags: m.tags,
+        retention_tier: m.retention_tier,
+        review_due: m.review_due,
+        expires_at: m.expires_at,
+      })),
+      cursor,
+    };
+  }
+
+  // Schema refine guarantees `id` is present for keep/archive/restore.
+  const id = input.id!;
+  const lifecycle = new MemoryLifecycleService(ctx.config);
+
+  if (input.action === 'keep') {
+    const mem = ctx.storage.sqlite.getMemoryById(id);
+    if (!mem) throw notFound(`Memory ${id} not found`);
+    logCtx.namespace = mem.namespace;
+
+    const now = new Date();
+    const nowIso = now.toISOString();
+    // A human confirmation is at least as strong a signal as an automated
+    // access, so `keep` re-applies the tier's full lifecycle policy
+    // (review_due + expires_at) regardless of sliding-window configuration —
+    // design.md: "explicit curation beats passive policy".
+    const nextReviewDue = lifecycle.buildMetadata(mem.retention_tier, now).review_due;
+    const nextExpiry = lifecycle.computeExpiry(mem.retention_tier, now);
+
+    ctx.storage.sqlite.updateMemory(id, {
+      review_due: nextReviewDue,
+      expires_at: nextExpiry,
+      updated_at: nowIso,
+    });
+    ctx.storage.sqlite.flushIfDirty();
+
+    ctx.storage.logAudit('REVISE', id, mem.namespace, clientId, {
+      details: {
+        memory_id: id,
+        prior_tier: mem.retention_tier,
+        new_tier: mem.retention_tier,
+        actor: clientId,
+        timestamp: nowIso,
+        action: 'revise',
+      },
+    });
+
+    return { id, review_due: nextReviewDue, expires_at: nextExpiry };
+  }
+
+  if (input.action === 'archive') {
+    const mem = ctx.storage.sqlite.getMemoryById(id);
+    if (!mem) {
+      // Already archived (row moved to memory_archive, gone from `memories`)
+      // is a conflict, not a not-found — distinguishable from "never existed".
+      if (ctx.storage.sqlite.getArchiveByMemoryId(id)) {
+        throw conflict(`Memory ${id} is already archived`);
+      }
+      throw notFound(`Memory ${id} not found`);
+    }
+    logCtx.namespace = mem.namespace;
+
+    const nowIso = new Date().toISOString();
+    ctx.storage.sqlite.archiveMemory(mem, nowIso);
+    try {
+      await ctx.storage.deleteMemory(id);
+    } catch (err) {
+      // Vector/SQLite removal failed: undo the archive row so the memory
+      // isn't left both live and archived.
+      ctx.storage.sqlite.deleteArchive(id);
+      ctx.storage.sqlite.flushIfDirty();
+      throw err;
+    }
+
+    ctx.storage.logAudit('ARCHIVE', id, mem.namespace, clientId, {
+      details: {
+        memory_id: id,
+        prior_tier: mem.retention_tier,
+        new_tier: null,
+        actor: clientId,
+        timestamp: nowIso,
+        action: 'archive',
+      },
+    });
+    ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
+    return { id, archived: true };
+  }
+
+  // 'restore'
+  const archived = ctx.storage.sqlite.getArchiveByMemoryId(id);
+  if (!archived) throw notFound(`Archived memory ${id} not found`);
+  logCtx.namespace = archived.namespace;
+
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const metadata = lifecycle.buildMetadata(archived.tier, now);
+  // Provenance-carrying stub: content is the retained summary (archive rows
+  // keep no content/vector), tagged so it's identifiable as a restore rather
+  // than implying the original memory survived intact.
+  const tags = [...new Set([...archived.tags, 'restored-from-archive'])];
+  const content = archived.summary;
+  const restoredId = uuidv4();
+
+  const memory: Omit<MemoryRecord, 'embedding'> = {
+    id: restoredId,
+    namespace: archived.namespace,
+    collection: 'general',
+    type: 'semantic',
+    category: null,
+    content,
+    summary: archived.summary,
+    tags,
+    source: 'cli',
+    checksum: computeChecksum(content),
+    importance: 0.5,
+    retention_tier: archived.tier,
+    expires_at: metadata.expires_at,
+    decay_eligible: metadata.decay_eligible,
+    review_due: metadata.review_due,
+    access_count: 0,
+    last_operation: 'ADD',
+    merged_from: null,
+    archived: false,
+    vector_synced: true,
+    device_id: ctx.config.device.id ?? null,
+    created_at: nowIso,
+    updated_at: nowIso,
+    last_accessed: nowIso,
+  };
+
+  const vector = await ctx.embedding.embed(content);
+  await ctx.storage.writeMemory(memory, vector);
+
+  // Archive row is retained (not deleted) so the origin stays inspectable —
+  // this deliberately differs from the CLI's `archive restore` path, which
+  // deletes the archive row after restoring.
+  ctx.storage.logAudit('RESTORE', restoredId, archived.namespace, clientId, {
+    details: {
+      memory_id: restoredId,
+      prior_tier: null,
+      new_tier: archived.tier,
+      actor: clientId,
+      timestamp: nowIso,
+      action: 'restore',
+    },
+  });
+
+  ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
+  return { id: restoredId, restored_from: archived.memory_id, archive_id: archived.id, restored: true };
 }
 
 async function handleCollections(

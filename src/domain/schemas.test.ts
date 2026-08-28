@@ -101,6 +101,16 @@ describe('SearchInputSchema', () => {
   it('rejects limit > 50', () => {
     expect(() => SearchInputSchema.parse({ query: 'test', limit: 51 })).toThrow();
   });
+
+  it('defaults include_archived to false', () => {
+    const result = SearchInputSchema.parse({ query: 'test' });
+    expect(result.include_archived).toBe(false);
+  });
+
+  it('accepts an explicit include_archived: true', () => {
+    const result = SearchInputSchema.parse({ query: 'test', include_archived: true });
+    expect(result.include_archived).toBe(true);
+  });
 });
 
 describe('TagInputSchema', () => {

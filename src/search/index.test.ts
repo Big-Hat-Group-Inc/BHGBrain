@@ -164,6 +164,45 @@ describe('SearchService', () => {
     expect(results.map(r => r.id)).toEqual(['mem-3', 'mem-1', 'mem-2']);
   });
 
+  // add-review-and-archive-recall
+  it('appends archived matches marked archived: true without reducing the active-results limit', async () => {
+    const { service, storage } = createSearchService();
+    (storage.sqlite as unknown as { searchArchived: ReturnType<typeof vi.fn> }).searchArchived = vi.fn(
+      (_ns: string, _q: string, _limit: number) => [
+        {
+          id: 99, memory_id: 'archived-1', summary: 'an archived summary', tier: 'T2',
+          namespace: 'global', created_at: '2025-01-01T00:00:00Z', expired_at: '2025-06-01T00:00:00Z',
+          access_count: 2, tags: ['old'],
+        },
+      ],
+    );
+
+    const results = await service.search(
+      'hello', 'global', undefined, 'fulltext', 10, undefined, undefined, true,
+    );
+
+    expect(results).toHaveLength(2);
+    expect(results[0]!.id).toBe('mem-1');
+    expect(results[0]!.archived).toBeUndefined();
+    const archivedResult = results[1]!;
+    expect(archivedResult.id).toBe('archived-1');
+    expect(archivedResult.archived).toBe(true);
+    expect(archivedResult.summary).toBe('an archived summary');
+    expect(archivedResult.tags).toEqual(['old']);
+    expect(storage.sqlite.recordAccessBatch).toHaveBeenCalledWith([expect.objectContaining({ id: 'mem-1' })]);
+  });
+
+  it('excludes archived matches by default', async () => {
+    const { service, storage } = createSearchService();
+    const searchArchived = vi.fn(() => []);
+    (storage.sqlite as unknown as { searchArchived: typeof searchArchived }).searchArchived = searchArchived;
+
+    const results = await service.search('hello', 'global', undefined, 'fulltext', 10);
+
+    expect(results.every(r => r.archived === undefined)).toBe(true);
+    expect(searchArchived).not.toHaveBeenCalled();
+  });
+
   it('reconstructs a search result from the Qdrant payload when the ranked id misses local storage', async () => {
     const { service, storage } = createSearchService({ memories: new Map() });
     storage.qdrant.search.mockResolvedValue([

@@ -603,6 +603,67 @@ describe('SqliteStore', () => {
     expect(work.map(m => m.id)).toEqual(['00000000-0000-0000-0000-0000000000c1']);
   });
 
+  // -- Review queue (add-review-and-archive-recall) --
+
+  it('listReviewDue returns only due, non-archived T1 memories in the namespace, oldest first, paginated', () => {
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000d1', checksum: 'd1',
+      retention_tier: 'T1', review_due: '2026-01-01T00:00:00.000Z',
+    });
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000d2', checksum: 'd2',
+      retention_tier: 'T1', review_due: '2026-02-01T00:00:00.000Z',
+    });
+    // Not due yet (review_due after the bound) -- excluded.
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000d3', checksum: 'd3',
+      retention_tier: 'T1', review_due: '2027-01-01T00:00:00.000Z',
+    });
+    // Wrong tier -- review_due is set but T1-only listing excludes it.
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000d4', checksum: 'd4',
+      retention_tier: 'T2', review_due: '2026-01-15T00:00:00.000Z',
+    });
+    // Different namespace -- excluded.
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000d5', checksum: 'd5', namespace: 'other',
+      retention_tier: 'T1', review_due: '2026-01-01T00:00:00.000Z',
+    });
+
+    const before = '2026-06-01T00:00:00.000Z';
+    const page1 = store.listReviewDue('global', before, 1);
+    expect(page1.map(m => m.id)).toEqual(['00000000-0000-0000-0000-0000000000d1']);
+
+    const cursor = `${page1[0]!.review_due}|${page1[0]!.id}`;
+    const page2 = store.listReviewDue('global', before, 1, cursor);
+    expect(page2.map(m => m.id)).toEqual(['00000000-0000-0000-0000-0000000000d2']);
+
+    const page3 = store.listReviewDue('global', before, 10);
+    expect(page3.map(m => m.id)).toEqual([
+      '00000000-0000-0000-0000-0000000000d1',
+      '00000000-0000-0000-0000-0000000000d2',
+    ]);
+  });
+
+  it('searchArchived matches retained summary/tags and scopes to the given namespace', () => {
+    const mem = { ...sampleMemory(), namespace: 'global', retention_tier: 'T2' as const };
+    store.archiveMemory({ ...mem, summary: 'a note about kubernetes', tags: ['ops'] }, '2026-01-01T00:00:00.000Z');
+    store.archiveMemory(
+      { ...mem, id: '00000000-0000-0000-0000-0000000000a2', summary: 'unrelated content', tags: ['kubernetes-tag'] },
+      '2026-01-02T00:00:00.000Z',
+    );
+    store.archiveMemory(
+      { ...mem, id: '00000000-0000-0000-0000-0000000000a3', namespace: 'other', summary: 'kubernetes in another namespace', tags: [] },
+      '2026-01-03T00:00:00.000Z',
+    );
+
+    const bySummary = store.searchArchived('global', 'kubernetes', 10);
+    expect(bySummary.map(r => r.memory_id).sort()).toEqual([mem.id, '00000000-0000-0000-0000-0000000000a2'].sort());
+
+    const noMatch = store.searchArchived('global', 'nonexistent-term', 10);
+    expect(noMatch).toEqual([]);
+  });
+
   // -- Health --
 
   it('passes health check', () => {
