@@ -55,15 +55,16 @@
 
 ## 6. Validation
 
-- [ ] 6.1 Run `npm run lint`, `npm test`, and `npm run build`; build the image and
-  verify a default `docker compose up` starts securely. _(2026-06-06: lint clean, 259 tests
-  pass, build OK; **entrypoint shell + compose validated by syntax check, but the image build /
-  `docker compose up` could NOT be run — Docker is unavailable in this environment.** Remaining:
-  build-verify before release. 2026-08-27 re-check: still holds — `docker`/`docker compose` are
-  not installed in this environment (`docker --version` → command not found), so the `FROM
-  node:20-slim@sha256:...` digest pin, `qdrant/qdrant:v1.12.4` pin, and the full image
-  build/`docker compose up` path remain unverified end-to-end. Re-ran `npm run lint` (tsc +
-  eslint, clean), `npm test` (29 files / 415 tests pass), and `npm run build` (tsc, clean) —
-  all green. Digest was resolved live against the Docker Hub registry API (not guessed) and is
-  syntactically valid, but pulling/building with it has not been confirmed. Remaining:
-  build-verify before release.)_
+- [x] 6.1 Run `npm run lint`, `npm test`, and `npm run build`; build the image and
+  verify a default `docker compose up` starts securely. _(2026-08-28: build-verified live in a
+  fresh WSL2 Ubuntu 24.04 instance with real Docker Engine 29.7.2 + Compose v5.5.0 (this repo
+  ships no Docker in its native environment, so a disposable sandbox was provisioned for this
+  check). `docker compose build bhgbrain` succeeded on the digest-pinned `node:20-slim` base
+  (both stages). `docker compose up -d bhgbrain` with no `.env` present (first-run scenario) came
+  up `Up (healthy)` with no crash-loop: auto-provisioned a `BHGBRAIN_TOKEN`, printed it once,
+  persisted it to `/data/bhgbrain-token`, and bound only to `127.0.0.1:3721` (confirmed via `ss
+  -tlnp`, not `0.0.0.0`). With Qdrant/embedding credentials both absent it degraded gracefully
+  (`status: degraded`, no crash) rather than failing closed destructively. `curl -H "Authorization:
+  Bearer <token>"` against `/health` returned 200 with the expected component breakdown. Prior
+  `npm run lint`/`npm test`/`npm run build` results (all green) reconfirmed on both Node 20 and
+  Node 22 in the same sandbox. Nothing remains unverified for this change.)_
