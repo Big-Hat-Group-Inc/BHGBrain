@@ -213,6 +213,15 @@ const ConfigSchema = z.object({
     extraction_model: z.string().default('gpt-4o-mini'),
     extraction_model_env: z.string().default('BHGBRAIN_EXTRACTION_API_KEY'),
     fallback_to_threshold_dedup: z.boolean().default(true),
+    // Opt-in LLM entailment check for UPDATE-band writes that don't already
+    // trip the regex-based `detectsInvalidation` fast path (see
+    // `add-contradiction-detection`). Reuses `extraction_model` /
+    // `extraction_model_env` above for the model name and API key env var —
+    // deliberately no parallel model/credential fields here.
+    contradiction_detection: z.object({
+      enabled: z.boolean().default(false),
+      timeout_ms: z.number().int().positive().default(5000),
+    }).default({}),
   }).default({}),
   auto_summarize: z.boolean().default(true),
 });

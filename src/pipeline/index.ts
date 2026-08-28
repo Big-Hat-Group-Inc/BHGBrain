@@ -6,6 +6,7 @@ import type { MemoryType, MemorySource, WriteOperation, MemoryRecord, WriteResul
 import { normalizeContent, computeChecksum, generateSummary, containsSecret, detectsInvalidation } from '../domain/normalize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { invalidInput, internal } from '../errors/index.js';
+import { checkEntailment } from './entailment.js';
 
 interface MemoryCandidate {
   content: string;
@@ -140,7 +141,7 @@ export class WritePipeline {
       10,
     );
 
-    const operation = this.classifyOperation(candidate.content, similar, tier);
+    const operation = await this.classifyOperation(candidate.content, similar, tier, input.namespace, input.collection);
     const resolvedType = candidate.type ?? 'semantic';
     const summary = generateSummary(candidate.content);
     const importance = candidate.importance ?? 0.5;
@@ -288,11 +289,13 @@ export class WritePipeline {
     };
   }
 
-  private classifyOperation(
+  private async classifyOperation(
     candidateContent: string,
     similar: Array<{ id: string; score: number }>,
     tier: RetentionTier,
-  ): { op: WriteOperation; targetId?: string } {
+    namespace: string,
+    collection: string,
+  ): Promise<{ op: WriteOperation; targetId?: string }> {
     if (similar.length === 0) return { op: 'ADD' };
 
     const top = similar[0]!;
@@ -301,6 +304,9 @@ export class WritePipeline {
     // An explicit invalidation ("no longer true", "correction:", ...) tied to
     // a sufficiently similar prior memory takes DELETE over NOOP/UPDATE — see
     // "Candidate invalidation results in DELETE" in write-decision-pipeline/spec.md.
+    // This regex fast path is checked first and always short-circuits: it is
+    // free/instant/zero-dependency, and the LLM entailment check below never
+    // runs (and never overrides) when it already matched.
     if (top.score >= thresholds.update && detectsInvalidation(candidateContent)) {
       return { op: 'DELETE', targetId: top.id };
     }
@@ -308,9 +314,50 @@ export class WritePipeline {
       return { op: 'NOOP', targetId: top.id };
     }
     if (top.score >= thresholds.update) {
+      if (this.config.pipeline.contradiction_detection.enabled) {
+        const contradicted = await this.checkContradiction(candidateContent, top.id, namespace, collection);
+        if (contradicted) {
+          return { op: 'DELETE', targetId: top.id };
+        }
+      }
       return { op: 'UPDATE', targetId: top.id };
     }
     return { op: 'ADD' };
+  }
+
+  /**
+   * Opt-in LLM entailment check for UPDATE-band candidates that didn't
+   * already trip `detectsInvalidation`. Fails open on any error: logs a
+   * degraded-path warning (mirroring the `fallback_to_threshold_dedup`
+   * pattern above) and returns `false` so the caller proceeds with the
+   * existing UPDATE merge, exactly as if `contradiction_detection` were
+   * disabled for this write. Never throws.
+   */
+  private async checkContradiction(
+    candidateContent: string,
+    targetId: string,
+    namespace: string,
+    collection: string,
+  ): Promise<boolean> {
+    const existing = this.storage.sqlite.getMemoryById(targetId);
+    if (!existing) {
+      // Nothing to compare against (drifted store) — let the caller's
+      // existing UPDATE-target-not-found handling deal with it downstream.
+      return false;
+    }
+
+    try {
+      const label = await checkEntailment(existing.content, candidateContent, this.config);
+      return label === 'contradict';
+    } catch (err) {
+      this.logger?.warn({
+        event: 'contradiction_check_degraded',
+        namespace,
+        collection,
+        error: (err as Error).message,
+      });
+      return false;
+    }
   }
 
   /**

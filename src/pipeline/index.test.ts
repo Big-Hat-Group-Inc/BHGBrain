@@ -3,17 +3,33 @@ import { WritePipeline } from './index.js';
 import type { BrainConfig } from '../config/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { StorageManager } from '../storage/index.js';
+import { checkEntailment } from './entailment.js';
+
+vi.mock('./entailment.js', () => ({
+  checkEntailment: vi.fn(),
+}));
 
 describe('WritePipeline NOOP handling', () => {
   const config = {
     deduplication: { similarity_threshold: 0.92 },
-    pipeline: { extraction_enabled: true, fallback_to_threshold_dedup: true },
+    pipeline: {
+      extraction_enabled: true,
+      fallback_to_threshold_dedup: true,
+      extraction_model: 'gpt-4o-mini',
+      extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
+      // contradiction_detection defaults to disabled — every test in this
+      // describe block confirms zero behavior change while it's off (task
+      // 4.6); the dedicated "WritePipeline contradiction detection" block
+      // below opts it in per test.
+      contradiction_detection: { enabled: false, timeout_ms: 5000 },
+    },
   } as unknown as BrainConfig;
 
   let embedding: EmbeddingProvider;
   let storage: StorageManager;
 
   beforeEach(() => {
+    vi.mocked(checkEntailment).mockReset();
     // Fresh per test: several tests reassign `embedding.embed` /
     // `storage.qdrant.searchSimilar` to simulate failures, and those
     // overrides must not leak into later tests.
@@ -158,6 +174,9 @@ describe('WritePipeline NOOP handling', () => {
     expect(storage.updateMemory).toHaveBeenCalledTimes(1);
     expect(storage.writeMemory).not.toHaveBeenCalled();
     expect(storage.logAudit).toHaveBeenCalledWith('UPDATE', 'existing-id', 'global', undefined);
+    // contradiction_detection.enabled is false (the default) in this
+    // describe block's shared config — the entailment check must never run.
+    expect(checkEntailment).not.toHaveBeenCalled();
   });
 
   it('fails when UPDATE target is missing instead of silently duplicating as ADD', async () => {
@@ -295,5 +314,181 @@ describe('WritePipeline NOOP handling', () => {
     expect(storage.writeMemory).not.toHaveBeenCalled();
     expect(storage.writeMemoryWithoutVector).not.toHaveBeenCalled();
     expect(storage.updateMemory).not.toHaveBeenCalled();
+  });
+});
+
+describe('WritePipeline contradiction detection', () => {
+  const enabledConfig = {
+    deduplication: { similarity_threshold: 0.92 },
+    pipeline: {
+      extraction_enabled: true,
+      fallback_to_threshold_dedup: true,
+      extraction_model: 'gpt-4o-mini',
+      extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
+      contradiction_detection: { enabled: true, timeout_ms: 5000 },
+    },
+  } as unknown as BrainConfig;
+
+  let embedding: EmbeddingProvider;
+  let storage: StorageManager;
+
+  beforeEach(() => {
+    vi.mocked(checkEntailment).mockReset();
+    embedding = {
+      model: 'test-model',
+      dimensions: 2,
+      embed: vi.fn(async () => [0.1, 0.2]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
+      healthCheck: vi.fn(async () => true),
+    };
+    storage = {
+      sqlite: {
+        getMemoryByChecksum: vi.fn(() => null),
+        getMemoryById: vi.fn(() => ({
+          id: 'existing-id',
+          summary: 'existing summary',
+          type: 'semantic',
+          content: 'we use MySQL for the primary database',
+          created_at: '2026-01-01T00:00:00.000Z',
+          importance: 0.5,
+          tags: [],
+        })),
+        insertMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+        fullTextSearch: vi.fn(() => []),
+      },
+      qdrant: {
+        // UPDATE band: at/above `update` threshold (0.92) but below `noop` (0.98).
+        searchSimilar: vi.fn(async () => [{ id: 'existing-id', score: 0.95 }]),
+      },
+      updateMemory: vi.fn(),
+      writeMemory: vi.fn(),
+      writeMemoryWithoutVector: vi.fn(),
+      deleteMemory: vi.fn(async () => true),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+  });
+
+  it('routes to DELETE when the entailment check classifies the candidate as contradict', async () => {
+    vi.mocked(checkEntailment).mockResolvedValue('contradict');
+    const pipeline = new WritePipeline(enabledConfig, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'We migrated to Postgres',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(checkEntailment).toHaveBeenCalledTimes(1);
+    expect(result[0]!.operation).toBe('DELETE');
+    expect(result[0]!.merged_with_id).toBe('existing-id');
+    expect(storage.deleteMemory).toHaveBeenCalledWith('existing-id');
+    expect(storage.writeMemory).toHaveBeenCalledTimes(1);
+    expect(storage.updateMemory).not.toHaveBeenCalled();
+  });
+
+  it('proceeds with UPDATE when the entailment check classifies the candidate as agree', async () => {
+    vi.mocked(checkEntailment).mockResolvedValue('agree');
+    const pipeline = new WritePipeline(enabledConfig, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'We use MySQL as our primary database',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(checkEntailment).toHaveBeenCalledTimes(1);
+    expect(result[0]!.operation).toBe('UPDATE');
+    expect(result[0]!.merged_with_id).toBe('existing-id');
+    expect(storage.updateMemory).toHaveBeenCalledTimes(1);
+    expect(storage.deleteMemory).not.toHaveBeenCalled();
+  });
+
+  it('proceeds with UPDATE when the entailment check classifies the candidate as refine', async () => {
+    vi.mocked(checkEntailment).mockResolvedValue('refine');
+    const pipeline = new WritePipeline(enabledConfig, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'We use MySQL 8 as our primary database',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(checkEntailment).toHaveBeenCalledTimes(1);
+    expect(result[0]!.operation).toBe('UPDATE');
+    expect(storage.deleteMemory).not.toHaveBeenCalled();
+  });
+
+  it('does not invoke the entailment check when the regex fast path already matched', async () => {
+    vi.mocked(checkEntailment).mockResolvedValue('agree');
+    const pipeline = new WritePipeline(enabledConfig, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'That is no longer true, we use Postgres now.',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(checkEntailment).not.toHaveBeenCalled();
+    expect(result[0]!.operation).toBe('DELETE');
+    expect(storage.deleteMemory).toHaveBeenCalledWith('existing-id');
+  });
+
+  it('does not invoke the entailment check when contradiction_detection is disabled', async () => {
+    const disabledConfig = {
+      deduplication: { similarity_threshold: 0.92 },
+      pipeline: {
+        extraction_enabled: true,
+        fallback_to_threshold_dedup: true,
+        extraction_model: 'gpt-4o-mini',
+        extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
+        contradiction_detection: { enabled: false, timeout_ms: 5000 },
+      },
+    } as unknown as BrainConfig;
+    const pipeline = new WritePipeline(disabledConfig, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'We migrated to Postgres',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(checkEntailment).not.toHaveBeenCalled();
+    expect(result[0]!.operation).toBe('UPDATE');
+    expect(storage.deleteMemory).not.toHaveBeenCalled();
+  });
+
+  it('fails open to UPDATE and logs a degraded-path warning when the entailment check throws', async () => {
+    vi.mocked(checkEntailment).mockRejectedValue(new Error('entailment check timed out after 5000ms'));
+    const logger = { warn: vi.fn() };
+    const pipeline = new WritePipeline(enabledConfig, storage, embedding, logger);
+
+    const result = await pipeline.process({
+      content: 'We migrated to Postgres',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('UPDATE');
+    expect(storage.updateMemory).toHaveBeenCalledTimes(1);
+    expect(storage.deleteMemory).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'contradiction_check_degraded',
+      namespace: 'global',
+      collection: 'general',
+      error: 'entailment check timed out after 5000ms',
+    }));
   });
 });

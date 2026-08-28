@@ -1186,10 +1186,20 @@ checksum = SHA-256(normalizeContent(content))
 |---|---|---|
 | `NOOP` | 得分 ≥ noop 阈值 | 内容被视为重复；返回现有记忆的 ID 而不写入 |
 | `DELETE` | 得分 ≥ update 阈值**且**内容明确使匹配项失效（例如"不再正确"、"更正："、"忘记那个"） | 删除现有记忆，候选内容作为新记忆存储，并通过 `merged_from` 引用被删除的记忆 |
+| `DELETE`（可选启用） | 得分处于 update 区间内，上述短语启发式规则**未**触发，`pipeline.contradiction_detection.enabled` 为 `true`，且 LLM 蕴含检查将候选内容相对于匹配记忆分类为 `contradict` | 与上方短语触发的 `DELETE` 效果相同——删除现有记忆，候选内容作为新记忆存储，并通过 `merged_from` 引用被删除的记忆 |
 | `UPDATE` | 得分 ≥ update 阈值 | 内容是对现有内容的更新；合并标签、更新内容和校验和，保留 ID |
 | `ADD` | 得分 < update 阈值 | 全新记忆；使用新 UUID 创建 |
 
-上图展示的是 NOOP/UPDATE/ADD 路径；DELETE 是 UPDATE 路径的一个变体，仅在失效启发式规则触发时才会走这条路径。
+上图展示的是 NOOP/UPDATE/ADD 路径；DELETE 是 UPDATE 路径的一个变体，当基于短语的失效启发式规则触发时，或者（可选启用，见下文）当 LLM 蕴含检查将 update 区间内的候选内容分类为与现有记忆矛盾时，都会走这条路径。
+
+**矛盾检测（可选启用，默认关闭）：** 上述短语启发式规则仅能识别明确表明自己是更正的候选内容（"不再正确"、"更正："等）。如果同一话题的候选内容在不使用这些短语的情况下产生冲突——例如存储中已有"我们使用 MySQL"，此时到达"我们已迁移到 Postgres"——就会悄悄落入 `UPDATE`，两条事实并存。将 `pipeline.contradiction_detection.enabled` 设为 `true` 可以弥补这一缺口：对于落在 update 区间内、且尚未触发短语启发式规则的候选内容，管道会发起一次 LLM 调用（复用 `pipeline.extraction_model` / `pipeline.extraction_model_env` 的凭据——无需单独配置模型或 API 密钥），将候选内容相对于匹配记忆分类为 `agree`、`refine` 或 `contradict`。只有 `contradict` 会改变行为，走向与短语启发式规则相同的删除并替换路径；`agree`/`refine` 都会落入现有的 `UPDATE` 合并逻辑，与当前行为完全一致。短语启发式规则始终优先检查，一旦匹配就会短路，不发起 LLM 调用，因此明确的更正仍然是免费且即时的。
+
+| `pipeline.contradiction_detection.*` 字段 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `false` | 为 update 区间内的写入开启 LLM 蕴含检查。默认关闭：在运维人员主动启用之前，行为零变化、延迟/成本零增加。 |
+| `timeout_ms` | `5000` | 蕴含检查调用的上限。遇到超时、网络错误、非 2xx 响应，或无法解析/不在列表内的分类结果时，管道会优雅降级——效果与该次写入禁用此功能完全一致——并记录 `contradiction_check_degraded` 警告，而不是阻塞或拒绝写入。 |
+
+**启用前需权衡的取舍：** 目前的缺口是一种假*阴性*（真实的矛盾未被检测到；两条记忆都会保留，后续明确的更正仍能修复它）。而 LLM 将 `refine` 误判为 `contradict` 则是假*阳性*，会悄悄删除一条仍然正确的记忆——由于删除并替换不会在修订历史中保留被删除记忆的内容，这种损失并非轻易可恢复。该检查采用保守的提示词设计（温度为 0，"不确定则不判为 contradict"），并因此默认关闭；启用时请充分考虑这一取舍。
 
 **各层级的去重阈值：**
 

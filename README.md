@@ -1255,10 +1255,20 @@ If no exact match is found, the content is embedded and the top 10 most similar 
 |---|---|---|
 | `NOOP` | Score ≥ noop threshold | Content is considered a duplicate; return the existing memory's ID without writing |
 | `DELETE` | Score ≥ update threshold **and** the content explicitly invalidates the match (e.g. "no longer true", "correction:", "forget that") | The existing memory is deleted and the candidate is stored as a new memory referencing it via `merged_from` |
+| `DELETE` (opt-in) | Score is in the update band, the phrase heuristic above did **not** fire, `pipeline.contradiction_detection.enabled` is `true`, and an LLM entailment check classifies the candidate as `contradict` relative to the matched memory | Same effect as the phrase-triggered `DELETE` above — the existing memory is deleted and the candidate is stored as a new memory referencing it via `merged_from` |
 | `UPDATE` | Score ≥ update threshold | Content is an update of existing; merge tags, update content and checksum, preserve ID |
 | `ADD` | Score < update threshold | Genuinely new memory; create with a new UUID |
 
-The diagram above shows the NOOP/UPDATE/ADD paths; DELETE is a variant of the UPDATE path taken only when the invalidation heuristic fires.
+The diagram above shows the NOOP/UPDATE/ADD paths; DELETE is a variant of the UPDATE path taken when either the phrase-based invalidation heuristic fires, or (opt-in, see below) an LLM entailment check classifies an update-band candidate as contradicting the existing memory.
+
+**Contradiction detection (opt-in, default off):** the phrase heuristic above only catches candidates that explicitly say they're a correction ("no longer true", "correction:", ...). A same-topic candidate that conflicts without using one of those phrases — e.g. "We migrated to Postgres" arriving when the store already has "we use MySQL" — silently falls through to `UPDATE` and both facts coexist. Setting `pipeline.contradiction_detection.enabled: true` closes that gap: for candidates that land in the update band *and* don't already trip the phrase heuristic, the pipeline makes one LLM call (reusing the `pipeline.extraction_model` / `pipeline.extraction_model_env` credentials — no separate model or API key configuration) that classifies the candidate against the matched memory as `agree`, `refine`, or `contradict`. Only `contradict` changes behavior, routing to the same delete-and-replace path as the phrase heuristic; `agree`/`refine` fall through to the existing `UPDATE` merge, identical to today's behavior. The phrase heuristic is always checked first and short-circuits without an LLM call whenever it matches, so explicit corrections stay free and instant.
+
+| `pipeline.contradiction_detection.*` field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Turns the LLM entailment check on for update-band writes. Off by default: zero behavior change, zero extra latency/cost, until an operator opts in. |
+| `timeout_ms` | `5000` | Upper bound on the entailment call. On timeout, network error, non-2xx response, or an unparseable/off-list classification, the pipeline fails open — proceeds exactly as if the feature were disabled for that write — and logs a `contradiction_check_degraded` warning rather than blocking or rejecting the write. |
+
+**Trade-off to weigh before enabling:** today's gap is a false *negative* (a real contradiction goes undetected; both memories persist, and a later explicit correction still fixes it). An LLM misclassifying `refine` as `contradict` is a false *positive* that silently deletes a memory that was still true — and because delete-and-replace does not preserve the deleted memory's content in memory revision history, that loss is not trivially recoverable. The check is prompted conservatively (temperature 0, "not confident → not contradict") and ships default-off for this reason; enable it with that trade-off in mind.
 
 **Tier-specific deduplication thresholds:**
 

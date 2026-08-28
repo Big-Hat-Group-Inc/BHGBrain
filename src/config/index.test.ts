@@ -155,6 +155,62 @@ describe('loadConfig Azure embedding validation', () => {
   });
 });
 
+describe('pipeline.contradiction_detection config', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to disabled with a 5000ms timeout when omitted', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.contradiction_detection.enabled).toBe(false);
+    expect(config.pipeline.contradiction_detection.timeout_ms).toBe(5000);
+  });
+
+  it('accepts enabled: true with a missing/invalid extraction_model_env — reachability is a runtime concern, not a config-shape one', () => {
+    const configPath = writeConfig({
+      pipeline: {
+        contradiction_detection: { enabled: true },
+        extraction_model_env: '',
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.contradiction_detection.enabled).toBe(true);
+    expect(config.pipeline.extraction_model_env).toBe('');
+  });
+
+  it('honors an explicit timeout_ms override', () => {
+    const configPath = writeConfig({
+      pipeline: {
+        contradiction_detection: { enabled: true, timeout_ms: 2500 },
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.contradiction_detection.timeout_ms).toBe(2500);
+  });
+});
+
 const ENV_KEYS = [
   'BHGBRAIN_DATA_DIR',
   'BHGBRAIN_HTTP_HOST',
