@@ -82,13 +82,13 @@ export class HealthService {
       }
       // openspec/changes/upgrade-fulltext-to-fts5, task 3.3 (visibility half):
       // when the SQLite build lacks the fts5 module, fulltext search runs on the
-      // legacy LIKE-based matcher instead of the (not yet implemented) FTS5/BM25
-      // path. Surface that here rather than silently — the "Missing FTS5 support
-      // SHALL degrade gracefully and visibly" spec requirement — while keeping the
-      // component healthy. Since migrate-sqlite-to-native-engine, the `node:sqlite`
-      // build ships fts5, so `isFts5Available()` is `true` in normal operation and
-      // this branch is not the expected steady state anymore; it stays as a visible
-      // fallback for any future build that lacks the module.
+      // legacy LIKE-based matcher instead of the FTS5/BM25 path. Surface that here
+      // rather than silently — the "Missing FTS5 support SHALL degrade gracefully
+      // and visibly" spec requirement — while keeping the component healthy. Since
+      // migrate-sqlite-to-native-engine, the `node:sqlite` build ships fts5, so
+      // `isFts5Available()` is `true` in normal operation and this branch is not
+      // the expected steady state anymore; it stays as a visible fallback for any
+      // future build that lacks the module.
       if (!this.storage.sqlite.isFts5Available()) {
         return {
           status: 'healthy',

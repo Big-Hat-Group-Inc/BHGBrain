@@ -733,6 +733,123 @@ describe('SqliteStore', () => {
     expect(results[0]!.rank).toBeGreaterThan(results[1]!.rank);
   });
 
+  // openspec/changes/upgrade-fulltext-to-fts5, task 4.1: porter stemming means
+  // a query term matches a differently-inflected form of the same word. Both
+  // "runs" and "running" stem to "run" under SQLite's porter tokenizer
+  // (verified directly against an fts5vocab table), but neither is a
+  // substring of the other, so this only passes via real stemming — never by
+  // accident of substring matching (unlike e.g. "deploy"/"deployed", which
+  // would pass under plain LIKE too).
+  it('fullTextSearch stemming: "runs" matches a memory containing only "running" (task 4.1)', () => {
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000401', checksum: 'stem-running',
+      content: 'The background job keeps running until the queue is drained.',
+      summary: 'background job note', tags: [],
+    });
+    const results = store.fullTextSearch('global', 'runs', 10);
+    expect(results.some(r => r.id === '00000000-0000-0000-0000-000000000401')).toBe(true);
+  });
+
+  // openspec/changes/upgrade-fulltext-to-fts5, task 4.2: BM25 column weights
+  // (1.0 content / 2.0 summary / 2.0 tags) mean a single match in the
+  // (higher-weighted) summary outranks a single match in the (1x-weighted)
+  // content, holding field length equal so length normalization doesn't
+  // confound the comparison.
+  it('fullTextSearch BM25 ranks a summary match above a content-only match, honoring column weights (task 4.2)', () => {
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000402', checksum: 'bm25-summary-hit',
+      content: 'filler filler filler filler', summary: 'onboarding', tags: [],
+    });
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000403', checksum: 'bm25-content-hit',
+      content: 'onboarding filler filler filler', summary: 'unrelated summary text', tags: [],
+    });
+    const results = store.fullTextSearch('global', 'onboarding', 10);
+    expect(results.map(r => r.id)).toEqual([
+      '00000000-0000-0000-0000-000000000402',
+      '00000000-0000-0000-0000-000000000403',
+    ]);
+  });
+
+  // openspec/changes/upgrade-fulltext-to-fts5, task 4.4: queries containing
+  // FTS5 query-syntax tokens must not error and must be treated as literal
+  // search text (buildFts5MatchExpression double-quotes every term).
+  it('fullTextSearch treats FTS5 operator syntax in the query as literal text without erroring (task 4.4)', () => {
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000404', checksum: 'match-safety',
+      content: 'a message about near neighbors and a wildcard star test with parens',
+      summary: 'operator safety fixture', tags: [],
+    });
+    const dangerousQueries = ['NEAR', '"quoted"', 'foo*', '(parens)', 'foo AND bar', 'a"b', 'col:content'];
+    for (const query of dangerousQueries) {
+      expect(() => store.fullTextSearch('global', query, 10)).not.toThrow();
+    }
+  });
+
+  // openspec/changes/upgrade-fulltext-to-fts5, task 3.3: with the FTS5
+  // capability probe forced false (and the schema rebuilt to match, exactly
+  // as `ensureFtsSchema` would after a real probe failure), fulltext search
+  // still works correctly via the legacy LIKE-based path — the routing
+  // branch, not just the health/log visibility half, is exercised for real.
+  it('fullTextSearch routes to the legacy LIKE-based path when FTS5 is unavailable (task 3.3)', () => {
+    const internal = store as unknown as { ftsAvailable: boolean; ensureFtsSchema: () => void };
+    internal.ftsAvailable = false;
+    internal.ensureFtsSchema();
+
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000405', checksum: 'legacy-path',
+      content: 'a passing mention of vector search here', summary: 'misc note', tags: [],
+    });
+    expect(store.isFts5Available()).toBe(false);
+    const results = store.fullTextSearch('global', 'vector', 10);
+    expect(results.some(r => r.id === '00000000-0000-0000-0000-000000000405')).toBe(true);
+  });
+
+  // openspec/changes/upgrade-fulltext-to-fts5, task 4.3: a store whose
+  // on-disk `memories_fts` is still the legacy plain table (simulating an
+  // upgrade from a pre-FTS5 build) migrates to the FTS5 table on the next
+  // open, backfilling from `memories` — the source of truth, not the stale
+  // legacy FTS rows — and the migration is idempotent across repeated opens.
+  it('migrates a legacy plain-table memories_fts to FTS5 on reopen, backfilling from memories (task 4.3)', async () => {
+    const mem = {
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000406', checksum: 'migrate-me',
+      content: 'notes about deployment automation and pipelines', summary: 'automation summary', tags: ['ops'],
+    };
+    store.insertMemory(mem);
+
+    // Downgrade the on-disk memories_fts to the pre-migration legacy shape,
+    // deliberately with stale/wrong data, so a correct migration must ignore
+    // it and rebuild from `memories` instead.
+    const internal = store as unknown as { db: DatabaseSync };
+    internal.db.exec('DROP TABLE IF EXISTS memories_fts');
+    internal.db.exec(`
+      CREATE TABLE memories_fts (
+        id TEXT PRIMARY KEY, namespace TEXT NOT NULL,
+        content TEXT NOT NULL, summary TEXT NOT NULL, tags TEXT NOT NULL
+      )
+    `);
+    internal.db.prepare(
+      `INSERT INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
+    ).run(mem.id, mem.namespace, 'stale wrong content', 'stale wrong summary', 'stale');
+
+    await store.reloadFromDisk();
+
+    const table = internal.db.prepare(
+      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memories_fts'`,
+    ).get() as { sql: string } | undefined;
+    expect(table?.sql).toMatch(/CREATE VIRTUAL TABLE/i);
+
+    // Backfilled from `memories` (real content), not the stale legacy row,
+    // and stemmed ("automate" -> "automation").
+    const results = store.fullTextSearch('global', 'automate', 10);
+    expect(results.some(r => r.id === mem.id)).toBe(true);
+
+    // Idempotent: a second reopen is a no-op, not an error, and results hold.
+    await store.reloadFromDisk();
+    const resultsAgain = store.fullTextSearch('global', 'automate', 10);
+    expect(resultsAgain.some(r => r.id === mem.id)).toBe(true);
+  });
+
   it('fullTextSearch type filter returns up to limit matching rows instead of starving on higher-ranked non-matches', () => {
     // push-down-recall-filters regression: three higher-relevance 'episodic'
     // rows outrank three lower-relevance 'procedural' rows. A limit of 3 with

@@ -1888,15 +1888,17 @@ La búsqueda semántica usa embeddings de OpenAI y similitud vectorial de Qdrant
 
 ### Búsqueda de Texto Completo
 
-La búsqueda de texto completo usa la coincidencia de texto interno de SQLite para encontrar memorias que contienen palabras o frases específicas.
+La búsqueda de texto completo usa un índice FTS5 real de SQLite para encontrar memorias que contienen palabras o frases específicas, con lematización (stemming) en inglés y ranking de relevancia BM25.
 
 **Cómo funciona:**
 1. La consulta se divide en términos en minúsculas.
-2. Cada término se compara con la tabla shadow `memories_fts` usando `LIKE %term%` en las columnas `content`, `summary` y `tags`.
-3. Los resultados se ordenan por el número de términos coincidentes (más coincidencias = mayor rango).
-4. El rango se normaliza a una puntuación de 0.0–1.0: `min(1.0, term_count / 10)`.
+2. Cada término se compara como una frase literal con la tabla virtual FTS5 `memories_fts` (columnas `content`/`summary`/`tags`, tokenizador `porter unicode61`), unidos con `AND` — cada término debe coincidir, y la sintaxis de FTS5 incrustada en un término (`NEAR`, `*`, paréntesis, `AND`/`OR`, filtros de columna) se trata como texto literal inerte en lugar de interpretarse como un operador.
+3. El tokenizador `porter` aplica lematización tanto al índice como a la consulta, de modo que un término de consulta coincide con otras formas flexionadas de la misma palabra (p. ej., "runs" coincide con "running"; "deploy" coincide con "deployed") — no solo subcadenas exactas.
+4. Los resultados se ordenan con `bm25()`, ponderando las coincidencias en `summary` y `tags` 2x por encima de las coincidencias en `content` (reflejando la ponderación por frecuencia de términos previa a FTS5).
 5. Las memorias archivadas se excluyen (la tabla FTS se mantiene sincronizada con la tabla principal de memorias — las filas archivadas se eliminan de FTS).
 6. Los metadatos de acceso se actualizan para los resultados devueltos.
+
+**Alternativa (fallback):** si la compilación de SQLite en ejecución no tiene el módulo `fts5` compilado (verificado mediante una prueba de capacidad al inicio, no asumido), la búsqueda de texto completo recurre a un comparador `LIKE '%term%'` heredado con un rango de frecuencia de términos hecho a mano en lugar de fallar. Esto es visible, no silencioso: el componente `sqlite` de `health://status` lleva un `message`, y se registra una advertencia `fts5_unavailable` una vez al inicio. Ver [Endpoint de Salud](#endpoint-de-salud).
 
 **Cuándo usar:** Búsquedas exactas de palabras clave, búsqueda de identificadores específicos (IDs de memoria, nombres de proyectos, nombres de sistemas), cuando conoces la terminología exacta utilizada.
 
@@ -1926,8 +1928,8 @@ flowchart TD
     end
 
     subgraph Fulltext["Fulltext Search"]
-        P2["Tokenize Query"] --> FTS["SQLite FTS<br/>LIKE matching"]
-        FTS --> FR["Ranked Results<br/><i>by term count</i>"]
+        P2["Tokenize Query"] --> FTS["SQLite FTS5<br/>MATCH + porter stemming"]
+        FTS --> FR["Ranked Results<br/><i>by BM25</i>"]
     end
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
@@ -2083,7 +2085,7 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 
 **Fusión:** los candidatos de cada variante buscada se fusionan por id de memoria, conservando el score **máximo** por id (no sumado ni promediado — una memoria encontrada por dos variantes no se infla respecto a una encontrada solo por su mejor variante), y luego se trunca al `limit` del llamador antes de que continúen el scoring/ranking. Esto significa que `semantic_score` en un resultado ahora representa "el mejor score entre todas las variantes buscadas", en lugar de "el score contra la consulta literal" — un cambio en lo que representa el campo, aunque su rango numérico y su calibración frente a `min_score`/ranking compuesto permanecen sin cambios.
 
-**No se aplica a texto completo:** el `mode: "fulltext"` independiente y la rama de texto completo de hybrid siempre buscan la única consulta original — la coincidencia de términos conjuntiva basada en `LIKE` tiene una debilidad relacionada, pero separada, con las palabras vacías, que se rastrea de forma independiente (migración de texto completo a un índice BM25 real).
+**No se aplica a texto completo:** el `mode: "fulltext"` independiente y la rama de texto completo de hybrid siempre buscan la única consulta original — el índice FTS5/BM25 (ver [Búsqueda de Texto Completo](#búsqueda-de-texto-completo)) aplica lematización a cada término, lo que cierra la mayor parte de la brecha de flexión para la que existe la expansión de consultas, pero no elimina las palabras vacías, por lo que una consulta compuesta solo por palabras vacías sigue sin devolver nada por la rama de texto completo.
 
 **Configuración** (`search.query_expansion` en `config.json`, ver [Configuración](#configuración)):
 

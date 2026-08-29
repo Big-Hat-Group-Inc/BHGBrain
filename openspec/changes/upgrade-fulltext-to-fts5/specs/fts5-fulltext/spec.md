@@ -6,9 +6,15 @@ by BM25 with summary and tags weighted above body content, preserving the orderi
 contract consumed by hybrid fusion.
 
 #### Scenario: Morphological variant query
-- **WHEN** a memory contains "deployment pipeline"
-- **AND** a fulltext search queries "deployed"
+- **WHEN** a memory contains "the job keeps running"
+- **AND** a fulltext search queries "runs"
 - **THEN** the memory SHALL be returned
+- **NOTE**: "runs"/"running" (both stem to "run") is used here rather than
+  "deploy"/"deployed"/"deployment" — verified empirically against SQLite's porter
+  tokenizer that "deployment" stems to "deploi" while "deployed" stems to "deploy",
+  so that pair does NOT demonstrate a match. "runs"/"running" both stem to "run" and
+  neither is a substring of the other, so it is a real (not substring-coincidental)
+  stemming example.
 
 #### Scenario: Ranking respects field weights and length normalization
 - **WHEN** one memory matches the query in its summary and another matches only deep

@@ -1900,15 +1900,17 @@ Semantic search uses OpenAI embeddings and Qdrant vector similarity (cosine dist
 
 ### Fulltext Search
 
-Fulltext search uses SQLite's internal text matching to find memories containing specific words or phrases.
+Fulltext search uses a real SQLite FTS5 index to find memories containing specific words or phrases, with English stemming and BM25 relevance ranking.
 
 **How it works:**
 1. The query is split into lowercase terms.
-2. Each term is matched against the `memories_fts` shadow table using `LIKE %term%` on `content`, `summary`, and `tags` columns.
-3. Results are ranked by the number of matching terms (more matches = higher rank).
-4. The rank is normalized to a 0.0-1.0 score: `min(1.0, term_count / 10)`.
+2. Each term is matched against the `memories_fts` FTS5 virtual table (`content`/`summary`/`tags` columns, `porter unicode61` tokenizer) as a literal phrase, joined with `AND` — every term must match, and FTS5 query syntax embedded in a term (`NEAR`, `*`, parens, `AND`/`OR`, column filters) is treated as inert literal text rather than parsed as an operator.
+3. The `porter` tokenizer stems both the index and the query, so a query term matches other inflected forms of the same word (e.g. "runs" matches "running"; "deploy" matches "deployed") - not just exact substrings.
+4. Results are ranked with `bm25()`, weighting `summary` and `tags` matches 2x above `content` matches (mirroring the pre-FTS5 term-frequency weighting).
 5. Archived memories are excluded (the FTS table is kept in sync with the main memories table - archived rows are removed from FTS).
 6. Access metadata is updated for returned results.
+
+**Fallback:** if the running SQLite build has no `fts5` module compiled in (verified via a startup capability probe, not assumed), fulltext search degrades to a legacy `LIKE '%term%'` matcher with a hand-rolled term-frequency rank instead of erroring. This is visible, not silent: `health://status`'s `sqlite` component carries a `message`, and a `fts5_unavailable` warning is logged once at startup. See [Health Endpoint](#health-endpoint).
 
 **When to use:** Exact keyword searches, searching for specific identifiers (memory IDs, project names, system names), when you know the exact terminology used.
 
@@ -1938,8 +1940,8 @@ flowchart TD
     end
 
     subgraph Fulltext["Fulltext Search"]
-        P2["Tokenize Query"] --> FTS["SQLite FTS<br/>LIKE matching"]
-        FTS --> FR["Ranked Results<br/><i>by term count</i>"]
+        P2["Tokenize Query"] --> FTS["SQLite FTS5<br/>MATCH + porter stemming"]
+        FTS --> FR["Ranked Results<br/><i>by BM25</i>"]
     end
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
@@ -2095,7 +2097,7 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 
 **Merging:** candidates from every searched variant are merged by memory id, keeping the **max** score per id (not summed or averaged - a memory matched by two variants isn't inflated relative to one matched by only its best variant), then truncated back to the caller's `limit` before scoring/ranking continue. This means `semantic_score` on a result now means "best score across every variant searched," rather than "score against the literal query" - a change in what the field represents, though its numeric range and calibration against `min_score`/composite ranking are unchanged.
 
-**Not applied to fulltext:** standalone `mode: "fulltext"` and hybrid's fulltext leg always search the single original query string - conjunctive `LIKE`-based term matching has a related but separate stopword weakness, tracked independently (upgrading fulltext to a real BM25 index).
+**Not applied to fulltext:** standalone `mode: "fulltext"` and hybrid's fulltext leg always search the single original query string - the FTS5/BM25 index (see [Fulltext Search](#fulltext-search)) applies porter stemming to every term, which closes most of the inflection gap query expansion exists for, but it does not strip stopwords, so an all-stopword query still returns nothing via the fulltext leg.
 
 **Configuration** (`search.query_expansion` in `config.json`, see [Configuration](#configuration)):
 

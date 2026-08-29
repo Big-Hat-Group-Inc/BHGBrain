@@ -1780,15 +1780,17 @@ BHGBrain 支持三种搜索模式，可以独立使用或组合使用。
 
 ### 全文搜索
 
-全文搜索使用 SQLite 内部文本匹配来查找包含特定词语或短语的记忆。
+全文搜索使用真正的 SQLite FTS5 索引来查找包含特定词语或短语的记忆，具备英文词干提取（stemming）和 BM25 相关性排名。
 
 **工作原理：**
 1. 将查询拆分为小写词语。
-2. 每个词语通过 `LIKE %term%` 在 `memories_fts` 影子表的 `content`、`summary` 和 `tags` 列中进行匹配。
-3. 结果按匹配词语数量排序（匹配越多 = 排名越高）。
-4. 排名归一化为 0.0–1.0 的得分：`min(1.0, term_count / 10)`。
+2. 每个词语作为字面短语与 FTS5 虚拟表 `memories_fts`（`content`/`summary`/`tags` 列，`porter unicode61` 分词器）匹配，词语之间以 `AND` 连接——每个词语都必须匹配，且词语中嵌入的 FTS5 语法（`NEAR`、`*`、括号、`AND`/`OR`、列过滤器）会被当作惰性字面文本处理，而不会被解析为操作符。
+3. `porter` 分词器同时对索引和查询进行词干提取，因此查询词语可以匹配同一单词的其他变形形式（例如 "runs" 匹配 "running"；"deploy" 匹配 "deployed"）——不仅仅是精确子串。
+4. 结果通过 `bm25()` 排名，`summary` 和 `tags` 中的匹配权重是 `content` 匹配的 2 倍（沿用 FTS5 之前基于词频的权重）。
 5. 已归档记忆被排除（FTS 表与主记忆表保持同步——已归档行从 FTS 中移除）。
 6. 更新返回结果的访问元数据。
+
+**回退：** 如果正在运行的 SQLite 版本未编译 `fts5` 模块（通过启动时的能力探测验证，而非假定），全文搜索会回退到旧版 `LIKE '%term%'` 匹配器，使用手写的词频排名，而不是报错。这一过程是可见的，而非静默的：`health://status` 的 `sqlite` 组件会携带一条 `message`，并在启动时记录一次 `fts5_unavailable` 警告。参见[健康端点](#健康端点)。
 
 **适用场景：** 精确关键词搜索、搜索特定标识符（记忆 ID、项目名称、系统名称）、知道确切术语时。
 
@@ -1818,8 +1820,8 @@ flowchart TD
     end
 
     subgraph Fulltext["Fulltext Search"]
-        P2["Tokenize Query"] --> FTS["SQLite FTS<br/>LIKE matching"]
-        FTS --> FR["Ranked Results<br/><i>by term count</i>"]
+        P2["Tokenize Query"] --> FTS["SQLite FTS5<br/>MATCH + porter stemming"]
+        FTS --> FR["Ranked Results<br/><i>by BM25</i>"]
     end
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
@@ -1975,7 +1977,7 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 
 **合并方式：** 每个被搜索变体返回的候选项按记忆 id 合并，同一 id 保留**最高**分（而不是求和或平均——被两个变体同时匹配到的记忆不会相对于仅被其最佳变体匹配到的记忆被夸大），随后截断到调用方的 `limit`，再继续后续的评分/排名。这意味着结果上的 `semantic_score` 现在表示"所有被搜索变体中的最高分"，而不再是"针对字面查询的分数"——这是该字段含义上的变化，尽管其数值范围以及相对于 `min_score`/复合排名的校准都保持不变。
 
-**不应用于全文搜索：** 独立的 `mode: "fulltext"` 以及 hybrid 模式的全文检索分支，始终只搜索唯一的原始查询字符串——基于 `LIKE` 的连接式词项匹配存在一个相关但不同的停用词弱点，已单独跟踪（将全文检索迁移到真正的 BM25 索引）。
+**不应用于全文搜索：** 独立的 `mode: "fulltext"` 以及 hybrid 模式的全文检索分支，始终只搜索唯一的原始查询字符串——FTS5/BM25 索引（参见[全文搜索](#全文搜索)）会对每个词语进行词干提取，这消除了查询扩展所针对的大部分词形变化差距，但它不会去除停用词，因此纯停用词查询在全文检索分支中仍然不会返回任何结果。
 
 **配置**（`config.json` 中的 `search.query_expansion`，参见[配置](#配置)）：
 

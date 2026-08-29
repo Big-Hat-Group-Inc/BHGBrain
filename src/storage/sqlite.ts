@@ -239,13 +239,13 @@ CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(archived);
 CREATE INDEX IF NOT EXISTS idx_memories_vector_synced ON memories(vector_synced);
 CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(namespace, pinned);
 
-CREATE TABLE IF NOT EXISTS memories_fts (
-  id TEXT PRIMARY KEY,
-  namespace TEXT NOT NULL,
-  content TEXT NOT NULL,
-  summary TEXT NOT NULL,
-  tags TEXT NOT NULL
-);
+-- memories_fts is intentionally NOT created here. It is derived data
+-- (rebuildable from memories at any time) whose *shape* depends on runtime
+-- FTS5 capability: an FTS5 virtual table (porter/unicode61 tokenizer, BM25
+-- ranking) when this SQLite build supports it, or the legacy plain LIKE-
+-- matched table otherwise. ensureFtsSchema() (called from openDatabase(),
+-- after the FTS5 capability probe) creates/migrates it to the right shape on
+-- every startup, idempotently. See openspec/changes/upgrade-fulltext-to-fts5.
 
 CREATE TABLE IF NOT EXISTS categories (
   name TEXT NOT NULL,
@@ -424,9 +424,11 @@ export class SqliteStore implements SqliteStorage {
   // (rather than assumes) availability and is expected to report `true` here —
   // the probe itself stays engine-agnostic and authoritative, per design.md, so
   // it also correctly reports `false` again if ever run against a build that
-  // omits fts5. Consumed by HealthService to surface a legacy-fulltext fallback
-  // condition visibly rather than silently, per the "Missing FTS5 support SHALL
-  // degrade gracefully and visibly" requirement.
+  // omits fts5. Drives `ensureFtsSchema()`'s choice of table shape and
+  // `fullTextSearch`'s choice of query strategy, and is consumed by
+  // HealthService to surface a legacy-fulltext fallback condition visibly
+  // rather than silently, per the "Missing FTS5 support SHALL degrade
+  // gracefully and visibly" requirement.
   private ftsAvailable = false;
 
   constructor(private dataDir: string) {
@@ -476,6 +478,7 @@ export class SqliteStore implements SqliteStorage {
     this.ensureMemoryColumns();
     this.db.exec(SCHEMA_SQL);
     this.ftsAvailable = this.probeFts5Support();
+    this.ensureFtsSchema();
   }
 
   async init(): Promise<void> {
@@ -533,11 +536,10 @@ export class SqliteStore implements SqliteStorage {
   /**
    * Attempts to create (and immediately drop) a scratch FTS5 virtual table in the
    * temp schema, so its result never touches the persisted database image.
-   * openspec/changes/upgrade-fulltext-to-fts5 task 1.1 — the engine-level FTS5
-   * fulltext path (table DDL, migration, BM25 query) is not implemented yet (see
-   * `ftsAvailable`'s comment above); this only probes capability. The probe
-   * itself is real and generic: it reports `true` on any SQLite build (this
-   * engine's included) that compiles fts5 in, and `false` otherwise.
+   * openspec/changes/upgrade-fulltext-to-fts5 task 1.1. The probe is real and
+   * generic: it reports `true` on any SQLite build (this engine's included)
+   * that compiles fts5 in, and `false` otherwise — `ensureFtsSchema()` and
+   * `fullTextSearch` both key off the result rather than assuming it.
    */
   private probeFts5Support(): boolean {
     try {
@@ -547,6 +549,147 @@ export class SqliteStore implements SqliteStorage {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Idempotently ensures `memories_fts` matches the current `ftsAvailable`
+   * capability (openspec/changes/upgrade-fulltext-to-fts5, tasks 1.2/2.1/3.3):
+   * an FTS5 virtual table (porter/unicode61 tokenizer) when FTS5 is available,
+   * migrating from the legacy plain table if one is found, or the legacy plain
+   * table otherwise — rebuilding it from `memories` if a persisted FTS5 table
+   * turns out to be unreadable on a build that no longer compiles fts5 in. FTS
+   * data is always derived from `memories` (the source of truth), never
+   * authoritative, so both branches are safe to (re)run on every startup and
+   * safe to interrupt: a crash mid-migration leaves the previous, still-valid
+   * table in place (see `migrateToFts5`'s transaction).
+   */
+  private ensureFtsSchema(): void {
+    const existing = this.queryOne(
+      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memories_fts'`,
+    );
+    const existingIsFts5 = existing !== null && /CREATE VIRTUAL TABLE/i.test(this.getString(existing, 'sql'));
+
+    if (this.ftsAvailable) {
+      if (existingIsFts5) {
+        return; // Already migrated; idempotent no-op.
+      }
+      this.migrateToFts5();
+      return;
+    }
+
+    // FTS5 unavailable: ensure the legacy plain table exists. If a
+    // previously-migrated FTS5 table is sitting there instead (this build no
+    // longer compiles fts5, an unlikely downgrade), it is unreadable by this
+    // engine — drop it and rebuild the plain table from `memories` rather than
+    // failing closed.
+    if (existingIsFts5) {
+      this.db.exec('DROP TABLE IF EXISTS memories_fts');
+    }
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memories_fts (
+        id TEXT PRIMARY KEY,
+        namespace TEXT NOT NULL,
+        collection TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        tags TEXT NOT NULL
+      );
+    `);
+    // Upgrade path: a legacy table created before `collection` was added to
+    // this schema (pre-upgrade-fulltext-to-fts5) predates the column.
+    const columns = new Set(this.queryAll(`PRAGMA table_info(memories_fts)`).map(row => this.getString(row, 'name')));
+    if (!columns.has('collection')) {
+      this.db.exec(`ALTER TABLE memories_fts ADD COLUMN collection TEXT NOT NULL DEFAULT ''`);
+    }
+    if (existingIsFts5) {
+      this.backfillFtsFromMemories('memories_fts');
+    }
+  }
+
+  /**
+   * Builds a fresh FTS5 `memories_fts` table and atomically swaps it in for
+   * whatever `memories_fts` currently is (absent, or the legacy plain table),
+   * backfilling from `memories` — the source of truth — inside one
+   * transaction so a crash mid-migration rolls back to the pre-migration
+   * state rather than leaving a half-swapped schema (task 2.1).
+   */
+  private migrateToFts5(): void {
+    this.execSql('BEGIN TRANSACTION');
+    try {
+      this.execSql('DROP TABLE IF EXISTS memories_fts5_migrating');
+      this.db.exec(`
+        CREATE VIRTUAL TABLE memories_fts5_migrating USING fts5(
+          id UNINDEXED, namespace UNINDEXED, collection UNINDEXED,
+          content, summary, tags,
+          tokenize = 'porter unicode61'
+        );
+      `);
+      this.backfillFtsFromMemories('memories_fts5_migrating');
+      this.execSql('DROP TABLE IF EXISTS memories_fts');
+      this.db.exec('ALTER TABLE memories_fts5_migrating RENAME TO memories_fts');
+      this.execSql('COMMIT');
+    } catch (err) {
+      this.execSql('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /**
+   * Batch-copies non-archived rows from `memories` into `tableName`'s
+   * (id, namespace, collection, content, summary, tags) columns, 500 rows per
+   * JS-side batch (keyset-paginated by id, not OFFSET, so no batch re-scans
+   * rows already copied), translating the JSON-encoded `tags` column into the
+   * space-joined plain text both fulltext table shapes index. Shared by
+   * `migrateToFts5` (populating the new table before the atomic swap) and
+   * `ensureFtsSchema`'s downgrade branch (rebuilding the legacy table
+   * directly) — task 2.1.
+   */
+  private backfillFtsFromMemories(tableName: string): void {
+    const memoriesExists = this.queryOne(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memories'`);
+    if (!memoriesExists) return;
+    const insertStmt = this.db.prepare(
+      `INSERT INTO ${tableName} (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    const BATCH = 500;
+    let cursorId = '';
+    for (;;) {
+      const rows = this.queryAll(
+        `SELECT id, namespace, collection, content, summary, tags FROM memories
+         WHERE archived = 0 AND id > ? ORDER BY id LIMIT ?`,
+        [cursorId, BATCH],
+      );
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        insertStmt.run(
+          this.getString(row, 'id'),
+          this.getString(row, 'namespace'),
+          this.getString(row, 'collection'),
+          this.getString(row, 'content'),
+          this.getString(row, 'summary'),
+          SqliteStore.tagsJsonToText(this.getString(row, 'tags')),
+        );
+      }
+      cursorId = this.getString(rows[rows.length - 1], 'id');
+      if (rows.length < BATCH) break;
+    }
+  }
+
+  /**
+   * Parses the JSON-encoded `memories.tags` column into the space-joined
+   * plain text `memories_fts.tags` indexes (mirroring the write-path hooks in
+   * `insertMemory`/`updateMemory`). Malformed JSON indexes as empty tags text
+   * rather than failing the whole migration over one bad row.
+   */
+  private static tagsJsonToText(tagsJson: string): string {
+    try {
+      const parsed: unknown = JSON.parse(tagsJson);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((t): t is string => typeof t === 'string').join(' ');
+      }
+    } catch {
+      // Malformed tags JSON: index with no tags text rather than fail.
+    }
+    return '';
   }
 
   /**
@@ -649,8 +792,8 @@ export class SqliteStore implements SqliteStorage {
       ],
     );
     this.execSql(
-      `INSERT INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
-      [mem.id, mem.namespace, mem.content, mem.summary, mem.tags.join(' ')],
+      `INSERT INTO memories_fts (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
+      [mem.id, mem.namespace, mem.collection, mem.content, mem.summary, mem.tags.join(' ')],
     );
   }
 
@@ -727,8 +870,8 @@ export class SqliteStore implements SqliteStorage {
         ],
       );
       this.execSql(
-        `INSERT OR IGNORE INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
-        [id, namespace, content, summary, tags.join(' ')],
+        `INSERT OR IGNORE INTO memories_fts (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
+        [id, namespace, collection, content, summary, tags.join(' ')],
       );
       this.execSql('COMMIT');
     } catch (err) {
@@ -776,8 +919,8 @@ export class SqliteStore implements SqliteStorage {
       const mem = this.getMemoryById(id, true);
       if (mem && !mem.archived) {
         this.execSql(
-          `INSERT INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
-          [mem.id, mem.namespace, mem.content, mem.summary, mem.tags.join(' ')],
+          `INSERT INTO memories_fts (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
+          [mem.id, mem.namespace, mem.collection, mem.content, mem.summary, mem.tags.join(' ')],
         );
       }
     }
@@ -896,10 +1039,103 @@ export class SqliteStore implements SqliteStorage {
     return row ? this.getNumber(row, 'cnt') : 0;
   }
 
+  /**
+   * Tokenizes `query` and dispatches to the FTS5/BM25 path when this SQLite
+   * build supports it, or the legacy LIKE-based path otherwise (task 3.3).
+   * Both paths return `Array<{ id, rank }>` ordered by descending relevance
+   * with a deterministic id tie-break — the contract hybrid RRF consumes
+   * (task 3.2) — so callers never need to know which path ran.
+   */
   fullTextSearch(namespace: string, query: string, limit: number, collection?: string, filter?: RecallFilter): Array<{ id: string; rank: number }> {
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
     if (terms.length === 0) return [];
 
+    return this.ftsAvailable
+      ? this.fullTextSearchFts5(namespace, terms, limit, collection, filter)
+      : this.fullTextSearchLike(namespace, terms, limit, collection, filter);
+  }
+
+  /**
+   * FTS5/BM25 fulltext search (task 3.1): `terms` are sanitized into a safe
+   * MATCH expression (`buildFts5MatchExpression`) so FTS5 query syntax
+   * embedded in user input can never be interpreted as an operator (task
+   * 4.4), matched against the porter/unicode61-tokenized `content`/
+   * `summary`/`tags` columns (stemmed, so e.g. "deploy" matches "deployed" —
+   * task 4.1), and ranked with `bm25(memories_fts, 1.0, 2.0, 2.0)` — column
+   * weights mirroring the 1×/2×/2× content/summary/tags intent the legacy
+   * term-frequency ranker used (task 4.2). `bm25()` returns *lower is
+   * better*; negate it so the existing "higher rank first" contract keeps
+   * working (task 3.2).
+   */
+  private fullTextSearchFts5(
+    namespace: string, terms: string[], limit: number, collection?: string, filter?: RecallFilter,
+  ): Array<{ id: string; rank: number }> {
+    const matchExpr = SqliteStore.buildFts5MatchExpression(terms);
+    const conditions = ['t.namespace = ?', 'memories_fts MATCH ?'];
+    const params: SqlParams = [namespace, matchExpr];
+
+    if (collection) {
+      conditions.push('t.collection = ?');
+      params.push(collection);
+    }
+    // Push type/tags/date predicates down so `limit` counts matching memories
+    // (see `push-down-recall-filters`), mirroring the LIKE path below.
+    if (filter?.type) {
+      conditions.push('m.type = ?');
+      params.push(filter.type);
+    }
+    if (filter?.tags && filter.tags.length > 0) {
+      conditions.push(`(${filter.tags.map(() => 'm.tags LIKE ?').join(' OR ')})`);
+      for (const tag of filter.tags) {
+        params.push(`%"${tag}"%`);
+      }
+    }
+    if (filter?.after !== undefined) {
+      conditions.push('m.created_at >= ?');
+      params.push(filter.after);
+    }
+    if (filter?.before !== undefined) {
+      conditions.push('m.created_at <= ?');
+      params.push(filter.before);
+    }
+    params.push(limit);
+
+    const sql = `
+      SELECT t.id AS id, bm25(memories_fts, 1.0, 2.0, 2.0) AS score
+      FROM memories_fts t JOIN memories m ON m.id = t.id AND m.archived = 0
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY score ASC, t.id ASC
+      LIMIT ?
+    `;
+    const rows = this.queryAll(sql, params);
+    return rows.map(row => ({ id: this.getString(row, 'id'), rank: -this.getNumber(row, 'score') }));
+  }
+
+  /**
+   * Builds a safe FTS5 MATCH expression from already-lowercased, whitespace-
+   * split `terms`: each term is wrapped as a literal phrase (an embedded `"`
+   * doubled, per SQL string-escaping rules) and phrases are joined with an
+   * explicit `AND`, so FTS5 operators embedded in user input — `NEAR`, `*`,
+   * parens, column filters (`col:`), boolean keywords — can never be parsed
+   * as syntax; they end up as inert phrase text instead (task 3.1/4.4). This
+   * also implements the desired "all terms must match" semantics explicitly,
+   * rather than relying on FTS5's own (different) default for adjacent
+   * bareword tokens.
+   */
+  private static buildFts5MatchExpression(terms: string[]): string {
+    return terms.map(term => `"${term.replace(/"/g, '""')}"`).join(' AND ');
+  }
+
+  /**
+   * Legacy fulltext search (task 3.3's fallback path): ANDed non-sargable
+   * `LIKE '%term%'` predicates over a capped candidate pool, ranked in JS by
+   * a hand-rolled term-frequency count weighting summary/tags matches above
+   * body matches. Unchanged from the pre-FTS5 implementation — this is what
+   * runs when `ftsAvailable` is `false`.
+   */
+  private fullTextSearchLike(
+    namespace: string, terms: string[], limit: number, collection?: string, filter?: RecallFilter,
+  ): Array<{ id: string; rank: number }> {
     const conditions = terms.map(() => `(LOWER(f.content) LIKE ? OR LOWER(f.summary) LIKE ? OR LOWER(f.tags) LIKE ?)`);
     const params: SqlParams = [namespace];
 
@@ -948,12 +1184,13 @@ export class SqliteStore implements SqliteStorage {
     const candidateLimit = Math.min(Math.max(limit * 5, 50), 500);
     params.push(candidateLimit);
 
-    // `memories_fts` is a plain table (not an FTS5 virtual table), so there is no
-    // bm25()/rank available. Compute a deterministic term-frequency relevance score
-    // per row — weighting matches in the curated summary/tags above the body — and
-    // return rows ordered by descending relevance. Ordering is what feeds hybrid RRF
-    // (which ranks by array position), so this replaces the previous constant rank
-    // that made the fulltext RRF component degenerate.
+    // `memories_fts` is a plain table here (not an FTS5 virtual table — this
+    // is the fallback path), so there is no bm25()/rank available. Compute a
+    // deterministic term-frequency relevance score per row — weighting
+    // matches in the curated summary/tags above the body — and return rows
+    // ordered by descending relevance. Ordering is what feeds hybrid RRF
+    // (which ranks by array position), so this replaces the previous constant
+    // rank that made the fulltext RRF component degenerate.
     const sql = `SELECT f.id, f.content, f.summary, f.tags FROM memories_fts f${collectionJoin} WHERE f.namespace = ? AND ${conditions.join(' AND ')} LIMIT ?`;
     const rows = this.queryAll(sql, params);
     const scored: Array<{ id: string; rank: number }> = [];

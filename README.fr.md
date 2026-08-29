@@ -1899,15 +1899,17 @@ La recherche sémantique utilise les embeddings OpenAI et la similarité vectori
 
 ### Recherche plein texte
 
-La recherche plein texte utilise la correspondance de texte interne de SQLite pour trouver des souvenirs contenant des mots ou des expressions spécifiques.
+La recherche plein texte utilise un véritable index FTS5 de SQLite pour trouver des souvenirs contenant des mots ou des expressions spécifiques, avec une racinisation (stemming) en anglais et un classement de pertinence BM25.
 
 **Comment ça fonctionne :**
 1. La requête est divisée en termes en minuscules.
-2. Chaque terme est mis en correspondance avec la table fantôme `memories_fts` en utilisant `LIKE %terme%` sur les colonnes `content`, `summary` et `tags`.
-3. Les résultats sont classés par le nombre de termes correspondants (plus de correspondances = rang plus élevé).
-4. Le rang est normalisé en score de 0,0 à 1,0 : `min(1,0, nombre_termes / 10)`.
+2. Chaque terme est mis en correspondance en tant que phrase littérale avec la table virtuelle FTS5 `memories_fts` (colonnes `content`/`summary`/`tags`, tokenizer `porter unicode61`), reliés par `AND` — chaque terme doit correspondre, et la syntaxe FTS5 intégrée dans un terme (`NEAR`, `*`, parenthèses, `AND`/`OR`, filtres de colonne) est traitée comme du texte littéral inerte plutôt qu'interprétée comme un opérateur.
+3. Le tokenizer `porter` applique la racinisation à la fois à l'index et à la requête, de sorte qu'un terme de requête correspond à d'autres formes fléchies du même mot (par ex. "runs" correspond à "running" ; "deploy" correspond à "deployed") — pas seulement des sous-chaînes exactes.
+4. Les résultats sont classés avec `bm25()`, pondérant les correspondances dans `summary` et `tags` 2x plus que les correspondances dans `content` (reflétant la pondération par fréquence de termes d'avant FTS5).
 5. Les souvenirs archivés sont exclus (la table FTS est maintenue synchronisée avec la table principale des souvenirs — les lignes archivées sont supprimées de FTS).
 6. Les métadonnées d'accès sont mises à jour pour les résultats renvoyés.
+
+**Repli (fallback) :** si le build SQLite en cours d'exécution n'a pas le module `fts5` compilé (vérifié via une sonde de capacité au démarrage, non supposé), la recherche plein texte se replie sur un comparateur `LIKE '%terme%'` hérité avec un rang de fréquence de termes fait main, plutôt que d'échouer. C'est visible, pas silencieux : le composant `sqlite` de `health://status` porte un `message`, et un avertissement `fts5_unavailable` est journalisé une fois au démarrage. Voir [Point de terminaison de santé](#point-de-terminaison-de-santé).
 
 **Quand l'utiliser :** Recherches exactes par mots-clés, recherche d'identifiants spécifiques (IDs de souvenirs, noms de projets, noms de systèmes), lorsque vous connaissez la terminologie exacte utilisée.
 
@@ -1937,8 +1939,8 @@ flowchart TD
     end
 
     subgraph Fulltext["Fulltext Search"]
-        P2["Tokenize Query"] --> FTS["SQLite FTS<br/>LIKE matching"]
-        FTS --> FR["Ranked Results<br/><i>by term count</i>"]
+        P2["Tokenize Query"] --> FTS["SQLite FTS5<br/>MATCH + porter stemming"]
+        FTS --> FR["Ranked Results<br/><i>by BM25</i>"]
     end
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
@@ -2094,7 +2096,7 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 
 **Fusion :** les candidats de chaque variante recherchée sont fusionnés par id de mémoire, en conservant le score **maximal** par id (ni somme ni moyenne — une mémoire trouvée par deux variantes n'est pas gonflée par rapport à une mémoire trouvée seulement par sa meilleure variante), puis tronqués au `limit` de l'appelant avant que le scoring/classement ne se poursuive. Cela signifie que `semantic_score` sur un résultat représente désormais « le meilleur score parmi toutes les variantes recherchées », plutôt que « le score contre la requête littérale » — un changement de ce que représente ce champ, même si sa plage numérique et son calibrage vis-à-vis de `min_score`/du classement composite restent inchangés.
 
-**Non appliqué au texte intégral :** le `mode: "fulltext"` autonome et la branche texte intégral du mode hybride recherchent toujours uniquement la requête originale — l'appariement conjonctif de termes basé sur `LIKE` a une faiblesse liée mais distincte vis-à-vis des mots vides, suivie séparément (migration du texte intégral vers un véritable index BM25).
+**Non appliqué au texte intégral :** le `mode: "fulltext"` autonome et la branche texte intégral du mode hybride recherchent toujours uniquement la requête originale — l'index FTS5/BM25 (voir [Recherche plein texte](#recherche-plein-texte)) applique une racinisation à chaque terme, ce qui comble la majeure partie de l'écart d'inflexion pour lequel l'expansion de requête existe, mais il ne supprime pas les mots vides, donc une requête entièrement composée de mots vides ne renvoie toujours rien via la branche texte intégral.
 
 **Configuration** (`search.query_expansion` dans `config.json`, voir [Configuration](#configuration)) :
 

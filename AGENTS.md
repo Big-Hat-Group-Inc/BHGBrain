@@ -228,14 +228,22 @@ openspec list --json
 5. **Memory Types**: Use correct type (`episodic`/`semantic`/`procedural`)
 6. **Embedding Dimensions**: Must match Qdrant configuration
 7. **Zod Validation**: All config must pass Zod schema validation
-8. **FTS5 is available but unused for queries**: `node:sqlite`'s bundled SQLite build
-   compiles in the `fts5` virtual-table module (`migrate-sqlite-to-native-engine`
-   replaced the old `sql.js` engine, which did not), so `SqliteStore.isFts5Available()`
-   now probes `true` and the `sqlite` health component no longer surfaces the legacy-
-   fulltext fallback message. Fulltext search (`fullTextSearch` in
-   `src/storage/sqlite.ts`) still runs the legacy `LIKE`-based matcher unconditionally,
-   though — the engine-level FTS5/BM25 query path itself is not implemented yet. See
-   `openspec/changes/upgrade-fulltext-to-fts5`, now unblocked by this change.
+8. **Fulltext search runs on FTS5/BM25, with a probed LIKE fallback**:
+   `node:sqlite`'s bundled SQLite build compiles in the `fts5` virtual-table module
+   (`migrate-sqlite-to-native-engine` replaced the old `sql.js` engine, which did not),
+   so `SqliteStore.isFts5Available()` probes `true` in normal operation.
+   `fullTextSearch` (`src/storage/sqlite.ts`) branches on that probe: when `true` it
+   queries the `memories_fts` FTS5 virtual table (`porter unicode61` tokenizer,
+   `bm25(memories_fts, 1.0, 2.0, 2.0)` ranking negated so higher rank still means more
+   relevant) via `fullTextSearchFts5`; when `false` it falls back unchanged to the
+   legacy `LIKE`-based term-frequency matcher via `fullTextSearchLike`, and the
+   `sqlite` health component/startup log surface the fallback. `ensureFtsSchema()`
+   (called from `openDatabase()`) idempotently migrates a legacy plain `memories_fts`
+   table to FTS5 on startup, backfilling from `memories` — the source of truth — inside
+   one transaction. User query terms are sanitized into a safe MATCH expression
+   (`buildFts5MatchExpression`, double-quoted phrases joined with `AND`) so FTS5
+   operator syntax embedded in a query can never be parsed as an operator. See
+   `openspec/changes/upgrade-fulltext-to-fts5`.
 
 ## Quick Start for New Features
 

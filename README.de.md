@@ -1884,15 +1884,17 @@ Die semantische Suche verwendet OpenAI-Einbettungen und Qdrant-Vektorähnlichkei
 
 ### Volltextsuche
 
-Die Volltextsuche verwendet SQLites interne Textübereinstimmung, um Erinnerungen zu finden, die bestimmte Wörter oder Phrasen enthalten.
+Die Volltextsuche verwendet einen echten SQLite-FTS5-Index, um Erinnerungen zu finden, die bestimmte Wörter oder Phrasen enthalten, mit englischem Stemming und BM25-Relevanzranking.
 
 **Funktionsweise:**
 1. Die Abfrage wird in Kleinbuchstaben-Terme aufgeteilt.
-2. Jeder Term wird gegen die Schattentabelle `memories_fts` mit `LIKE %term%` auf den Spalten `content`, `summary` und `tags` abgeglichen.
-3. Ergebnisse werden nach der Anzahl übereinstimmender Terme sortiert (mehr Übereinstimmungen = höherer Rang).
-4. Der Rang wird auf einen Score von 0.0–1.0 normalisiert: `min(1.0, Termanzahl / 10)`.
+2. Jeder Term wird als literale Phrase gegen die FTS5-Tabelle `memories_fts` (Spalten `content`/`summary`/`tags`, Tokenizer `porter unicode61`) abgeglichen und mit `AND` verknüpft – jeder Term muss übereinstimmen, und FTS5-Syntax innerhalb eines Terms (`NEAR`, `*`, Klammern, `AND`/`OR`, Spaltenfilter) wird als reglose Literaltext behandelt statt als Operator interpretiert.
+3. Der `porter`-Tokenizer wendet Stemming sowohl auf den Index als auch auf die Abfrage an, sodass ein Abfrageterm andere Flexionsformen desselben Wortes trifft (z. B. passt "runs" auf "running"; "deploy" auf "deployed") – nicht nur exakte Teilstrings.
+4. Ergebnisse werden mit `bm25()` gerankt, wobei Treffer in `summary` und `tags` 2x höher gewichtet werden als Treffer in `content` (entspricht der Gewichtung vor FTS5).
 5. Archivierte Erinnerungen sind ausgeschlossen (die FTS-Tabelle wird mit der Haupterinnerungstabelle synchron gehalten – archivierte Zeilen werden aus FTS entfernt).
 6. Zugriffsmetadaten werden für zurückgegebene Ergebnisse aktualisiert.
+
+**Fallback:** Wenn der laufende SQLite-Build kein `fts5`-Modul kompiliert hat (per Startup-Fähigkeitsprüfung verifiziert, nicht angenommen), fällt die Volltextsuche auf einen alten `LIKE '%term%'`-Matcher mit handgestricktem Termhäufigkeits-Rang zurück, statt einen Fehler zu werfen. Das ist sichtbar, nicht still: Die `sqlite`-Komponente von `health://status` trägt eine `message`, und beim Start wird einmalig eine `fts5_unavailable`-Warnung geloggt. Siehe [Health-Endpunkt](#health-endpunkt).
 
 **Wann zu verwenden:** Exakte Schlüsselwortsuchen, Suche nach spezifischen Bezeichnern (Speicher-IDs, Projektnamen, Systemnamen), wenn Sie die genaue verwendete Terminologie kennen.
 
@@ -1922,8 +1924,8 @@ flowchart TD
     end
 
     subgraph Fulltext["Fulltext Search"]
-        P2["Tokenize Query"] --> FTS["SQLite FTS<br/>LIKE matching"]
-        FTS --> FR["Ranked Results<br/><i>by term count</i>"]
+        P2["Tokenize Query"] --> FTS["SQLite FTS5<br/>MATCH + porter stemming"]
+        FTS --> FR["Ranked Results<br/><i>by BM25</i>"]
     end
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
@@ -2079,7 +2081,7 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 
 **Merging:** Kandidaten aus jeder durchsuchten Variante werden anhand der Speicher-ID zusammengeführt, wobei der **höchste** Score pro ID erhalten bleibt (nicht summiert oder gemittelt – eine von zwei Varianten getroffene Erinnerung wird nicht gegenüber einer nur von ihrer besten Variante getroffenen Erinnerung überhöht), bevor auf das `limit` des Aufrufers gekürzt wird und Scoring/Ranking fortgesetzt werden. Das bedeutet, `semantic_score` eines Ergebnisses bedeutet jetzt "bester Score über alle durchsuchten Varianten hinweg" statt "Score gegen die wörtliche Anfrage" – eine Änderung dessen, was das Feld repräsentiert, auch wenn sein Wertebereich und seine Kalibrierung gegenüber `min_score`/Composite Ranking unverändert bleiben.
 
-**Nicht auf Volltext angewendet:** Der eigenständige `mode: "fulltext"` und der Volltext-Zweig von Hybrid durchsuchen immer nur die einzelne Originalanfrage – die konjunktive `LIKE`-basierte Term-Übereinstimmung hat eine verwandte, aber separate Stoppwort-Schwäche, die unabhängig verfolgt wird (Umstellung von Volltext auf einen echten BM25-Index).
+**Nicht auf Volltext angewendet:** Der eigenständige `mode: "fulltext"` und der Volltext-Zweig von Hybrid durchsuchen immer nur die einzelne Originalanfrage – der FTS5/BM25-Index (siehe [Volltextsuche](#volltextsuche)) wendet Stemming auf jeden Term an, was die meiste Flexionslücke schließt, für die die Query-Erweiterung existiert, entfernt aber keine Stoppwörter, sodass eine reine Stoppwort-Anfrage über den Volltext-Zweig weiterhin nichts liefert.
 
 **Konfiguration** (`search.query_expansion` in `config.json`, siehe [Konfiguration](#konfiguration)):
 
