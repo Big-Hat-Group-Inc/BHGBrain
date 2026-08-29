@@ -337,7 +337,10 @@ The file is created automatically on first run with all defaults applied. Edit i
     // Max memories included in auto-inject payload
     "auto_inject_limit": 10,
     // Maximum characters in tool response payloads
-    "max_response_chars": 50000
+    "max_response_chars": 50000,
+    // Per-namespace cap on memories with pinned: true (see remember/tag and
+    // memory://inject docs)
+    "pin_limit_per_namespace": 20
   },
 
   // Memory retention and lifecycle settings
@@ -540,8 +543,14 @@ The file is created automatically on first run with all defaults applied. Edit i
     "budget_unit": "chars",
     // Greedy near-duplicate suppression within the hint-selected memory
     // section: a candidate exceeding deduplication.similarity_threshold
-    // similarity to an already-selected memory is skipped.
-    "dedup_suppression": true
+    // similarity to an already-selected memory is skipped. Pinned memories
+    // are exempt in both directions.
+    "dedup_suppression": true,
+    // Whether pinned memories are always included in the memory section
+    // (see defaults.pin_limit_per_namespace, and remember/tag's `pinned`
+    // parameter). false disables the step entirely; the pin cap is still
+    // enforced at write time regardless.
+    "pinned_enabled": true
   },
 
   // Observability settings
@@ -1057,6 +1066,7 @@ Every memory stored in BHGBrain is a `MemoryRecord` with the following fields:
 | `merged_from` | `string \| null` | ID of the memory this was merged from (dedup UPDATE path) |
 | `archived` | `boolean` | Whether this memory is soft-archived (excluded from search/recall) |
 | `vector_synced` | `boolean` | Whether the Qdrant vector is in sync with SQLite state |
+| `pinned` | `boolean` | Whether this memory is always included in [`memory://inject`](#memoryinject---session-context-injection) payloads, bounded by `defaults.pin_limit_per_namespace`; has no effect on `search`/`recall` |
 | `device_id` | `string \| null` | Identifier of the BHGBrain instance that created this memory (see [Multi-Device Memory](#multi-device-memory)) |
 | `created_at` | `string (ISO 8601)` | Creation timestamp |
 | `updated_at` | `string (ISO 8601)` | Last update timestamp |
@@ -1077,6 +1087,7 @@ CREATE INDEX idx_memories_expiry      ON memories(decay_eligible, expires_at);
 CREATE INDEX idx_memories_review_due  ON memories(retention_tier, review_due);
 CREATE INDEX idx_memories_archived    ON memories(archived);
 CREATE INDEX idx_memories_vector_sync ON memories(vector_synced);
+CREATE INDEX idx_memories_pinned      ON memories(namespace, pinned);
 ```
 
 #### Qdrant Payload Indexes
@@ -2334,15 +2345,24 @@ The inject resource builds a budgeted text payload for injecting into an LLM con
 1. Category content is prepended first (full content, in order), capped to its
    reserved share of the budget: `(1 - auto_inject.memory_budget_fraction) × budget`.
    Whatever categories leave unused rolls into the memory section below (no waste).
-2. Memories are appended (content or summary depending on space) into the remaining
+2. **Pinned memories are always included next**, ahead of recency/relevance
+   selection, regardless of where they would otherwise rank (see [Pinning Memories
+   for Guaranteed Inject](#pinning-memories-for-guaranteed-inject) below).
+3. Memories are appended (content or summary depending on space) into the remaining
    budget — always at least `auto_inject.memory_budget_fraction × budget` when
    memories exist, so category content can no longer starve the memory section.
    - `memory://inject` (no hint): top memories by **recency**, unchanged from before
      this option existed.
    - `memory://inject/{hint}`: top memories by **hybrid relevance** to the hint (see
      below).
-3. The payload is truncated at `auto_inject.max_chars`, interpreted per
-   `auto_inject.budget_unit` (default 30,000 characters).
+   - A memory that is both pinned and independently selected here is excluded from
+     this step (matched by ID) so it appears exactly once, not twice, and doesn't
+     consume an extra slot of `auto_inject_limit`.
+4. The payload is truncated at `auto_inject.max_chars`, interpreted per
+   `auto_inject.budget_unit` (default 30,000 characters). This applies to pinned
+   content too: if a namespace's pinned memories alone exceed the memory section's
+   reserved share, they truncate per-item like any other content and `truncated`
+   is `true`.
 
 Query parameters:
 - `namespace` - namespace to inject from (default: `global`)
@@ -2380,12 +2400,51 @@ instead of recency:
 - **Near-duplicate suppression**: when `auto_inject.dedup_suppression` is `true`
   (default), a candidate whose vector similarity to an already-selected memory
   exceeds `deduplication.similarity_threshold` is skipped, and the freed budget goes
-  to the next distinct candidate.
+  to the next distinct candidate. **Pinned memories are exempt from this in both
+  directions**: two near-duplicate pinned memories are both injected (never
+  suppressed against each other), and a pinned memory never suppresses — and is
+  never suppressed by — a relevance-selected candidate that happens to be a
+  near-duplicate of it.
 
 Example: `memory://inject/deploy%20to%20production` conditions selection on
 "deploy to production".
 
 The response shape is identical to `memory://inject`.
+
+### Pinning Memories for Guaranteed Inject
+
+Both `memory://inject` and `memory://inject/{hint}` normally select their memory
+section by recency or relevance, which means a specific fact only makes it into the
+injected context if it happens to rank well — a critical operating rule ("always use
+pnpm, never npm") can silently drop out if nothing referenced it recently and it
+doesn't match the current hint. **Pinning** closes that gap: a pinned memory is
+always included in the memory section, regardless of recency or relevance rank.
+
+- **Set via `remember`** at write time (`pinned: true`/`false`) — on a dedup
+  **UPDATE**, omitting `pinned` preserves the existing memory's pin state, so a
+  content correction doesn't silently unpin a critical fact; pass it explicitly to
+  change it.
+- **Set via `tag`** as a dedicated, lightweight toggle (`pinned: true`/`false`) that
+  doesn't touch content or require re-submitting it.
+- **Bounded per namespace**: `defaults.pin_limit_per_namespace` (default `20`) caps
+  how many memories can be pinned at once, enforced at write time. Pinning beyond
+  the cap returns `INVALID_INPUT`; unpin one first to make room.
+- **Draws from the existing memory-section budget** (`auto_inject.memory_budget_fraction`
+  share) — there is no separate carve-out. If pinned content alone exceeds that
+  share, it truncates per-item like any other content and the payload's `truncated`
+  flag is set.
+- **Exempt from near-duplicate suppression** in both directions (see above).
+- **No effect on `search`/`recall`**: `pinned` never appears in `SearchResult` and
+  never influences ranking or ordering — this is deliberately distinct from the `T0`
+  retention tier, which only affects retention/ranking and has no inject-inclusion
+  guarantee of its own. A memory can be `T0` and pinned, `T0` and unpinned, or any
+  tier and pinned — the two are orthogonal.
+- **Kill switch**: `auto_inject.pinned_enabled: false` (default `true`) disables the
+  pinned-inclusion step entirely — both inject templates behave exactly as if no
+  memory were pinned. The per-namespace cap is still enforced at write time
+  regardless of this switch.
+- **Durable**: pin state is persisted to the Qdrant payload and restored by
+  `repair --mode from-qdrant` and cross-device sync, so it survives a SQLite rebuild.
 
 ### `memory://{id}/revisions` - Revision History
 
@@ -2616,6 +2675,7 @@ Store content in BHGBrain with automatic deduplication, normalization, embedding
 | `importance` | `number (0-1)` | No | `0.5` | Importance score. Higher values are prioritized in stale cleanup. |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | No | `"cli"` | Source of the memory. Affects default tier (e.g., agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | No | auto-assigned | Explicit tier override. Takes precedence over all heuristics. |
+| `pinned` | `boolean` | No | `false` on ADD; preserved on UPDATE | Pin this memory so it is always included in `memory://inject` payloads (see [Session Inject](#memoryinject---session-context-injection)), bounded by `defaults.pin_limit_per_namespace` (default 20). On a dedup **UPDATE**, omitting `pinned` preserves the existing memory's pin state — pass it explicitly to change it. Exceeding the per-namespace cap when newly pinning returns `INVALID_INPUT`. |
 
 **Long content is rejected, not silently mush-embedded:** content longer than
 `pipeline.long_content_threshold_chars` (config, default `8,000` characters ≈ 1–2
@@ -2819,7 +2879,7 @@ Search memories using semantic, fulltext, or hybrid modes. Offers more control t
 
 ### `tag` - Manage Tags
 
-Add or remove tags from a memory. Tags are merged/filtered atomically; the memory content and embedding are not affected.
+Add or remove tags from a memory, and/or pin/unpin it. Tags and pin state are updated atomically; the memory content and embedding are not affected.
 
 **Input:**
 
@@ -2828,6 +2888,7 @@ Add or remove tags from a memory. Tags are merged/filtered atomically; the memor
 | `id` | `string (UUID)` | **Yes** | - | Memory to tag. |
 | `add` | `string[]` | No | `[]` | Tags to add. Max 20 tags total after merge. |
 | `remove` | `string[]` | No | `[]` | Tags to remove. |
+| `pinned` | `boolean` | No | unchanged | Pin (`true`) or unpin (`false`) this memory, independent of tags — a dedicated toggle for [inject pinning](#memoryinject---session-context-injection) that doesn't require re-submitting content. Omit to leave pin state unchanged. Pinning a not-yet-pinned memory when the namespace is already at `defaults.pin_limit_per_namespace` returns `INVALID_INPUT`. |
 
 **Output:**
 
@@ -2838,7 +2899,7 @@ Add or remove tags from a memory. Tags are merged/filtered atomically; the memor
 }
 ```
 
-Returns `INVALID_INPUT` if adding tags would exceed the 20-tag limit.
+Returns `INVALID_INPUT` if adding tags would exceed the 20-tag limit, or if pinning would exceed `defaults.pin_limit_per_namespace`.
 
 ---
 

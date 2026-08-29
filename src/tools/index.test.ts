@@ -1895,3 +1895,143 @@ describe('handleRecall follow_links (add-memory-links)', () => {
     expect(result.results.every(r => !r.linked_from)).toBe(true);
   });
 });
+
+describe('remember tool pin cap enforcement (add-inject-pinning)', () => {
+  function makeCtx(process: ReturnType<typeof vi.fn>, pinnedCount: number, limit = 20): ToolContext {
+    return {
+      config: {
+        device: { id: 'local-device' },
+        pipeline: { long_content_threshold_chars: 8000 },
+        defaults: { pin_limit_per_namespace: limit },
+      } as unknown as ToolContext['config'],
+      storage: {
+        sqlite: {
+          countMemories: vi.fn(() => 3),
+          countPinnedMemories: vi.fn(() => pinnedCount),
+        },
+      } as unknown as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: { process } as unknown as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('rejects pinned: true with INVALID_INPUT when the namespace is already at the cap', async () => {
+    const process = vi.fn(async () => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
+    const ctx = makeCtx(process, 20, 20);
+
+    const result = await handleTool(ctx, 'remember', { content: 'a new pinned fact', pinned: true }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(process).not.toHaveBeenCalled();
+  });
+
+  it('allows pinned: true and passes it to the pipeline when under the cap', async () => {
+    const process = vi.fn(async () => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
+    const ctx = makeCtx(process, 19, 20);
+
+    await handleTool(ctx, 'remember', { content: 'a new pinned fact', pinned: true }, 'c1');
+
+    expect(process).toHaveBeenCalledWith(expect.objectContaining({ pinned: true }));
+  });
+
+  it('never checks the cap when pinned is omitted', async () => {
+    const process = vi.fn(async () => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
+    const ctx = makeCtx(process, 20, 20);
+
+    const result = await handleTool(ctx, 'remember', { content: 'ordinary content' }, 'c1') as { id: string };
+
+    expect(result.id).toBe('a');
+    expect(process).toHaveBeenCalledTimes(1);
+    const call = process.mock.calls[0]![0] as { pinned?: boolean };
+    expect(call.pinned).toBeUndefined();
+  });
+});
+
+describe('tag tool pinned toggle (add-inject-pinning)', () => {
+  function makeCtx(mem: { id: string; namespace: string; tags: string[]; pinned: boolean }, pinnedCount = 0, limit = 20) {
+    const updateMemory = vi.fn();
+    const ctx = {
+      config: {
+        defaults: { pin_limit_per_namespace: limit },
+      } as unknown as ToolContext['config'],
+      storage: {
+        sqlite: {
+          getMemoryById: vi.fn(() => mem),
+          updateMemory,
+          flushIfDirty: vi.fn(),
+          countPinnedMemories: vi.fn(() => pinnedCount),
+        },
+      } as unknown as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    } as ToolContext;
+    return { ctx, updateMemory };
+  }
+
+  it('pins a memory without touching content, via updateMemory', async () => {
+    const mem = { id: '550e8400-e29b-41d4-a716-446655440099', namespace: 'global', tags: ['a'], pinned: false };
+    const { ctx, updateMemory } = makeCtx(mem, 0, 20);
+
+    await handleTool(ctx, 'tag', { id: '550e8400-e29b-41d4-a716-446655440099', pinned: true }, 'c1');
+
+    expect(updateMemory).toHaveBeenCalledWith('550e8400-e29b-41d4-a716-446655440099', expect.objectContaining({ pinned: true, tags: ['a'] }));
+  });
+
+  it('unpins a memory via updateMemory', async () => {
+    const mem = { id: '550e8400-e29b-41d4-a716-446655440099', namespace: 'global', tags: ['a'], pinned: true };
+    const { ctx, updateMemory } = makeCtx(mem, 1, 20);
+
+    await handleTool(ctx, 'tag', { id: '550e8400-e29b-41d4-a716-446655440099', pinned: false }, 'c1');
+
+    expect(updateMemory).toHaveBeenCalledWith('550e8400-e29b-41d4-a716-446655440099', expect.objectContaining({ pinned: false }));
+  });
+
+  it('omitting pinned leaves the pin field untouched in the update call', async () => {
+    const mem = { id: '550e8400-e29b-41d4-a716-446655440099', namespace: 'global', tags: ['a'], pinned: true };
+    const { ctx, updateMemory } = makeCtx(mem, 1, 20);
+
+    await handleTool(ctx, 'tag', { id: '550e8400-e29b-41d4-a716-446655440099', add: ['b'] }, 'c1');
+
+    expect(updateMemory).toHaveBeenCalledTimes(1);
+    const fields = updateMemory.mock.calls[0]![1] as Record<string, unknown>;
+    expect('pinned' in fields).toBe(false);
+  });
+
+  it('rejects pinning a not-yet-pinned memory with INVALID_INPUT when the namespace is at the cap', async () => {
+    const mem = { id: '550e8400-e29b-41d4-a716-446655440099', namespace: 'global', tags: [], pinned: false };
+    const { ctx, updateMemory } = makeCtx(mem, 20, 20);
+
+    const result = await handleTool(ctx, 'tag', { id: '550e8400-e29b-41d4-a716-446655440099', pinned: true }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(updateMemory).not.toHaveBeenCalled();
+  });
+
+  it('allows re-pinning an already-pinned memory even at the cap', async () => {
+    const mem = { id: '550e8400-e29b-41d4-a716-446655440099', namespace: 'global', tags: [], pinned: true };
+    const { ctx, updateMemory } = makeCtx(mem, 20, 20);
+
+    await handleTool(ctx, 'tag', { id: '550e8400-e29b-41d4-a716-446655440099', pinned: true }, 'c1');
+
+    expect(updateMemory).toHaveBeenCalledWith('550e8400-e29b-41d4-a716-446655440099', expect.objectContaining({ pinned: true }));
+  });
+
+  it('allows unpinning even when the namespace is at the cap', async () => {
+    const mem = { id: '550e8400-e29b-41d4-a716-446655440099', namespace: 'global', tags: [], pinned: true };
+    const { ctx, updateMemory } = makeCtx(mem, 20, 20);
+
+    await handleTool(ctx, 'tag', { id: '550e8400-e29b-41d4-a716-446655440099', pinned: false }, 'c1');
+
+    expect(updateMemory).toHaveBeenCalledWith('550e8400-e29b-41d4-a716-446655440099', expect.objectContaining({ pinned: false }));
+  });
+});

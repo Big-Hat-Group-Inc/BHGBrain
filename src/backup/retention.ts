@@ -373,6 +373,9 @@ export class RetentionService {
       merged_from: null,
       archived: false,
       vector_synced: true,
+      // Archive rows carry no pin state (ArchiveRecord has no `pinned`
+      // field), so a restore never resurrects a memory as pinned.
+      pinned: false,
       created_at: now,
       updated_at: now,
       last_accessed: now,

@@ -163,6 +163,22 @@ async function handleRemember(
     );
   }
 
+  // Pin cap enforced at write time (add-inject-pinning): whether this call
+  // resolves to an ADD or an UPDATE of an as-yet-unpinned memory is only
+  // known deep inside the dedup pipeline, so this is a conservative
+  // namespace-wide check against an explicit `pinned: true` rather than a
+  // precise "would this newly pin a memory" check — the same simplification
+  // `tag`'s dedicated toggle (which does know the exact target) doesn't need.
+  if (input.pinned === true) {
+    const limit = ctx.config.defaults.pin_limit_per_namespace;
+    if (ctx.storage.sqlite.countPinnedMemories(input.namespace) >= limit) {
+      throw invalidInput(
+        `Namespace "${input.namespace}" already has ${limit} pinned memories ` +
+        `(defaults.pin_limit_per_namespace). Unpin one before pinning another.`,
+      );
+    }
+  }
+
   const results = await ctx.pipeline.process({
     content: input.content,
     namespace: input.namespace,
@@ -174,6 +190,7 @@ async function handleRemember(
     source: input.source,
     retention_tier: input.retention_tier,
     device_id: ctx.config.device.id ?? null,
+    pinned: input.pinned,
     clientId,
   });
 
@@ -413,7 +430,24 @@ async function handleTag(
     throw invalidInput('Maximum 20 tags per memory');
   }
 
-  ctx.storage.sqlite.updateMemory(input.id, { tags, updated_at: new Date().toISOString() });
+  // Pin cap enforced at write time (add-inject-pinning): only checked when
+  // this call would newly pin a memory not already pinned — re-pinning an
+  // already-pinned memory, or unpinning, never trips it.
+  if (input.pinned === true && !mem.pinned) {
+    const limit = ctx.config.defaults.pin_limit_per_namespace;
+    if (ctx.storage.sqlite.countPinnedMemories(mem.namespace) >= limit) {
+      throw invalidInput(
+        `Namespace "${mem.namespace}" already has ${limit} pinned memories ` +
+        `(defaults.pin_limit_per_namespace). Unpin one before pinning another.`,
+      );
+    }
+  }
+
+  ctx.storage.sqlite.updateMemory(input.id, {
+    tags,
+    updated_at: new Date().toISOString(),
+    ...(input.pinned !== undefined ? { pinned: input.pinned } : {}),
+  });
   ctx.storage.sqlite.flushIfDirty();
 
   return { id: input.id, tags };
@@ -584,6 +618,9 @@ async function handleReview(
     merged_from: null,
     archived: false,
     vector_synced: true,
+    // Archive rows carry no pin state, so a `review restore` never
+    // resurrects a memory as pinned.
+    pinned: false,
     device_id: ctx.config.device.id ?? null,
     created_at: nowIso,
     updated_at: nowIso,
@@ -1107,6 +1144,10 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
         merged_from: null,
         archived: false,
         vector_synced: true,
+        // Restore pin state from the recovered Qdrant payload rather than
+        // defaulting it to false, so `repair --mode from-qdrant` preserves
+        // it. See add-inject-pinning.
+        pinned: typeof payload.pinned === 'boolean' ? payload.pinned : false,
         device_id: recoveredDeviceId,
         // Carry forward whatever identity the recovered vector was already
         // stamped with — this reconstructs a SQLite row from an existing

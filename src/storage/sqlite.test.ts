@@ -963,3 +963,119 @@ describe('SqliteStore embedding provenance', () => {
     });
   });
 });
+
+describe('SqliteStore pinned memories (add-inject-pinning)', () => {
+  let store: SqliteStore;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-'));
+    store = new SqliteStore(tempDir);
+    await store.init();
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function baseMemory() {
+    return {
+      id: '550e8400-e29b-41d4-a716-446655440000',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic' as const,
+      category: null,
+      content: 'test content',
+      summary: 'test content',
+      tags: [] as string[],
+      source: 'cli' as const,
+      checksum: 'abc123',
+      importance: 0.5,
+      access_count: 0,
+      last_operation: 'ADD' as const,
+      merged_from: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      last_accessed: new Date().toISOString(),
+    };
+  }
+  const sampleMemory = (overrides: Partial<ReturnType<typeof baseMemory>> = {}) => ({ ...baseMemory(), ...overrides });
+
+  it('defaults pinned to false when omitted on insert', () => {
+    store.insertMemory(sampleMemory());
+    expect(store.getMemoryById('550e8400-e29b-41d4-a716-446655440000')!.pinned).toBe(false);
+  });
+
+  it('persists an explicit pinned: true on insert', () => {
+    store.insertMemory({ ...sampleMemory(), pinned: true });
+    expect(store.getMemoryById('550e8400-e29b-41d4-a716-446655440000')!.pinned).toBe(true);
+  });
+
+  it('updateMemory sets and clears pinned via the boolean-coercion branch', () => {
+    store.insertMemory(sampleMemory());
+    store.updateMemory('550e8400-e29b-41d4-a716-446655440000', { pinned: true });
+    expect(store.getMemoryById('550e8400-e29b-41d4-a716-446655440000')!.pinned).toBe(true);
+    store.updateMemory('550e8400-e29b-41d4-a716-446655440000', { pinned: false });
+    expect(store.getMemoryById('550e8400-e29b-41d4-a716-446655440000')!.pinned).toBe(false);
+  });
+
+  it('listPinnedMemories returns only pinned, non-archived memories for the namespace, newest-updated first', () => {
+    store.insertMemory(sampleMemory({ id: '00000000-0000-0000-0000-000000000001', checksum: 'a' }));
+    store.insertMemory(sampleMemory({ id: '00000000-0000-0000-0000-000000000002', checksum: 'b' }));
+    store.insertMemory(sampleMemory({
+      id: '00000000-0000-0000-0000-000000000003', checksum: 'c', namespace: 'other',
+    }));
+    store.updateMemory('00000000-0000-0000-0000-000000000001', { pinned: true, updated_at: '2026-01-01T00:00:00Z' });
+    store.updateMemory('00000000-0000-0000-0000-000000000002', { pinned: true, updated_at: '2026-01-02T00:00:00Z' });
+    store.updateMemory('00000000-0000-0000-0000-000000000003', { pinned: true });
+
+    const pinned = store.listPinnedMemories('global');
+    expect(pinned.map(m => m.id)).toEqual([
+      '00000000-0000-0000-0000-000000000002',
+      '00000000-0000-0000-0000-000000000001',
+    ]);
+  });
+
+  it('listPinnedMemories excludes archived memories', () => {
+    store.insertMemory(sampleMemory());
+    store.updateMemory('550e8400-e29b-41d4-a716-446655440000', { pinned: true, archived: true });
+    expect(store.listPinnedMemories('global')).toEqual([]);
+  });
+
+  it('countPinnedMemories is scoped per namespace', () => {
+    store.insertMemory(sampleMemory({ id: '00000000-0000-0000-0000-000000000001', checksum: 'a' }));
+    store.insertMemory(sampleMemory({
+      id: '00000000-0000-0000-0000-000000000002', checksum: 'b', namespace: 'other',
+    }));
+    store.updateMemory('00000000-0000-0000-0000-000000000001', { pinned: true });
+    store.updateMemory('00000000-0000-0000-0000-000000000002', { pinned: true });
+
+    expect(store.countPinnedMemories('global')).toBe(1);
+    expect(store.countPinnedMemories('other')).toBe(1);
+    expect(store.countPinnedMemories('nonexistent')).toBe(0);
+  });
+
+  it('upsertMemoryFromPayload restores pinned: true from the payload (repair --mode from-qdrant durability)', () => {
+    store.upsertMemoryFromPayload('550e8400-e29b-41d4-a716-446655440099', {
+      content: 'restored content',
+      summary: 'restored',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic',
+      pinned: true,
+    });
+    expect(store.getMemoryById('550e8400-e29b-41d4-a716-446655440099')!.pinned).toBe(true);
+  });
+
+  it('upsertMemoryFromPayload defaults pinned to false when absent from the payload', () => {
+    store.upsertMemoryFromPayload('550e8400-e29b-41d4-a716-446655440098', {
+      content: 'restored content',
+      summary: 'restored',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic',
+    });
+    expect(store.getMemoryById('550e8400-e29b-41d4-a716-446655440098')!.pinned).toBe(false);
+  });
+});

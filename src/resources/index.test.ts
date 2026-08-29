@@ -496,6 +496,189 @@ describe('relevance-conditioned inject (memory://inject/{hint})', () => {
   });
 });
 
+describe('inject pinning (add-inject-pinning)', () => {
+  const baseConfig = {
+    defaults: { namespace: 'global', auto_inject_limit: 5 },
+    auto_inject: {
+      max_chars: 500, memory_budget_fraction: 0.4, budget_unit: 'chars',
+      dedup_suppression: true, pinned_enabled: true,
+    },
+    deduplication: { similarity_threshold: 0.9 },
+  } as unknown as BrainConfig;
+
+  const healthy = { check: async () => ({ status: 'healthy' }) } as HealthService;
+
+  function makeStorage(overrides: Record<string, unknown> = {}) {
+    return {
+      sqlite: {
+        listCategoryHeaders: () => [],
+        getCategoryContentSlice: () => ({ content: '', length: 0 }),
+        listMemories: () => [],
+        listPinnedMemories: () => [],
+        countMemories: () => 0,
+        getMemoryById: () => null,
+        touchMemory: () => undefined,
+        scheduleDeferredFlush: () => undefined,
+        listCategories: () => [],
+        listCollections: () => [],
+        getCategory: () => null,
+        ...overrides,
+      },
+    } as unknown as StorageManager;
+  }
+
+  const mkPinned = (id: string, content: string) => ({
+    id, type: 'semantic', content, summary: id, updated_at: '2026-01-01T00:00:00Z',
+  });
+
+  const mkResult = (id: string, content: string, vector?: number[]): SearchResult => ({
+    id, content, summary: id, type: 'semantic', tags: [], score: 0.9,
+    retention_tier: 'T2', created_at: '2026-01-01T00:00:00Z', last_accessed: '2026-01-01T00:00:00Z',
+    vector,
+  });
+
+  it('hintless inject includes pinned memories ahead of recency (5.5)', async () => {
+    const storage = makeStorage({
+      listPinnedMemories: () => [mkPinned('p1', 'critical pinned fact')],
+      listMemories: () => [{ type: 'semantic', content: 'recent unrelated memory', summary: 'recent' }],
+    });
+    const handler = new ResourceHandler(baseConfig, storage, {} as SearchService, healthy);
+
+    const result = await handler.handle('memory://inject') as InjectResult;
+
+    expect(result.content).toContain('critical pinned fact');
+    expect(result.content).toContain('recent unrelated memory');
+    expect(result.memories_count).toBe(2);
+    // Pinned content appears first in the assembled block.
+    expect(result.content.indexOf('critical pinned fact')).toBeLessThan(result.content.indexOf('recent unrelated memory'));
+  });
+
+  it('hinted inject includes pinned memories ahead of relevance, even when unmatched (5.6)', async () => {
+    const searchForInject = vi.fn(async () => [mkResult('r1', 'relevant to hint')]);
+    const search = { searchForInject } as unknown as SearchService;
+    const storage = makeStorage({
+      listPinnedMemories: () => [mkPinned('p1', 'pinned unrelated to hint')],
+    });
+    const handler = new ResourceHandler(baseConfig, storage, search, healthy);
+
+    const result = await handler.handle('memory://inject/some%20hint') as InjectResult;
+
+    expect(result.content).toContain('pinned unrelated to hint');
+    expect(result.content).toContain('relevant to hint');
+    expect(result.memories_count).toBe(2);
+  });
+
+  it('a memory that is both pinned and independently top-ranked appears exactly once (5.7)', async () => {
+    const searchForInject = vi.fn(async () => [mkResult('shared', 'shared content'), mkResult('other', 'other content')]);
+    const search = { searchForInject } as unknown as SearchService;
+    const storage = makeStorage({
+      listPinnedMemories: () => [mkPinned('shared', 'shared content')],
+    });
+    const handler = new ResourceHandler(baseConfig, storage, search, healthy);
+
+    const result = await handler.handle('memory://inject/hint') as InjectResult;
+
+    expect(result.memories_count).toBe(2);
+    expect(result.content.match(/shared content/g)).toHaveLength(1);
+  });
+
+  it('pinned_enabled: false restores byte-for-byte pre-pinning behavior (5.9)', async () => {
+    const listMemories = () => [{ type: 'semantic', content: 'recent memory', summary: 'recent' }];
+    const listPinnedMemories = vi.fn(() => [mkPinned('p1', 'should never appear')]);
+    const disabledConfig = {
+      ...baseConfig,
+      auto_inject: { ...baseConfig.auto_inject, pinned_enabled: false },
+    } as unknown as BrainConfig;
+    const storageDisabled = makeStorage({ listMemories, listPinnedMemories });
+    const storageEnabledNoPins = makeStorage({ listMemories, listPinnedMemories: () => [] });
+
+    const disabledResult = await new ResourceHandler(disabledConfig, storageDisabled, {} as SearchService, healthy)
+      .handle('memory://inject') as InjectResult;
+    const enabledNoPinsResult = await new ResourceHandler(baseConfig, storageEnabledNoPins, {} as SearchService, healthy)
+      .handle('memory://inject') as InjectResult;
+
+    expect(listPinnedMemories).not.toHaveBeenCalled();
+    expect(disabledResult.content).not.toContain('should never appear');
+    expect(disabledResult.content).toBe(enabledNoPinsResult.content);
+    expect(disabledResult.memories_count).toBe(enabledNoPinsResult.memories_count);
+  });
+
+  it('two near-duplicate pinned memories are both injected, not suppressed against each other (5.8)', async () => {
+    const storage = makeStorage({
+      listPinnedMemories: () => [mkPinned('p1', 'near duplicate content A'), mkPinned('p2', 'near duplicate content B')],
+    });
+    const handler = new ResourceHandler(baseConfig, storage, {} as SearchService, healthy);
+
+    const result = await handler.handle('memory://inject') as InjectResult;
+
+    expect(result.content).toContain('near duplicate content A');
+    expect(result.content).toContain('near duplicate content B');
+    expect(result.memories_count).toBe(2);
+  });
+
+  it('a pinned memory and a near-duplicate relevance candidate are both injected (5.8)', async () => {
+    const pinnedVectorLike = mkResult('rel', 'near duplicate relevance candidate', [0.999, Math.sqrt(1 - 0.999 ** 2), 0]);
+    const searchForInject = vi.fn(async () => [pinnedVectorLike]);
+    const search = { searchForInject } as unknown as SearchService;
+    const storage = makeStorage({
+      listPinnedMemories: () => [mkPinned('pin', 'near duplicate pinned content')],
+    });
+    const handler = new ResourceHandler(baseConfig, storage, search, healthy);
+
+    const result = await handler.handle('memory://inject/hint') as InjectResult;
+
+    expect(result.content).toContain('near duplicate pinned content');
+    expect(result.content).toContain('near duplicate relevance candidate');
+    expect(result.memories_count).toBe(2);
+  });
+
+  it('a shared pinned/top-ranked id is excluded before suppression, so it never suppresses a distinct near-duplicate candidate (4.3)', async () => {
+    // 'shared' is both pinned and independently top-ranked by relevance, and
+    // is a near-duplicate (by vector) of a distinct candidate 'other'. If
+    // exclusion ran after suppression, greedy suppression would select
+    // 'shared' first and drop 'other' as its near-duplicate — even though
+    // 'shared' itself is excluded from the candidate list moments later.
+    // Excluding first means suppression never sees 'shared' at all, so
+    // 'other' must survive.
+    const shared = mkResult('shared', 'shared content', [1, 0, 0]);
+    const other = mkResult('other', 'distinct near-duplicate content', [0.999, Math.sqrt(1 - 0.999 ** 2), 0]);
+    const searchForInject = vi.fn(async () => [shared, other]);
+    const search = { searchForInject } as unknown as SearchService;
+    const storage = makeStorage({
+      listPinnedMemories: () => [mkPinned('shared', 'shared content')],
+    });
+    const handler = new ResourceHandler(baseConfig, storage, search, healthy);
+
+    const result = await handler.handle('memory://inject/hint') as InjectResult;
+
+    expect(result.content).toContain('shared content');
+    expect(result.content).toContain('distinct near-duplicate content');
+    expect(result.memories_count).toBe(2);
+  });
+
+  it('oversized pinned content truncates per-item and sets truncated: true (5.10)', async () => {
+    const config = {
+      ...baseConfig,
+      auto_inject: { ...baseConfig.auto_inject, max_chars: 10 },
+    } as unknown as BrainConfig;
+    // Both content and summary exceed the budget so neither the full-content nor
+    // the summary-fallback block fits, forcing appendBlock's slice-and-truncate path.
+    const storage = makeStorage({
+      listPinnedMemories: () => [{
+        id: 'p1', type: 'semantic', content: 'x'.repeat(100), summary: 'y'.repeat(100),
+        updated_at: '2026-01-01T00:00:00Z',
+      }],
+    });
+    const handler = new ResourceHandler(config, storage, {} as SearchService, healthy);
+
+    const result = await handler.handle('memory://inject') as InjectResult;
+
+    expect(result.truncated).toBe(true);
+    expect(result.content.length).toBeLessThanOrEqual(10);
+    expect(result.memories_count).toBe(0);
+  });
+});
+
 describe('MCP resource template discovery', () => {
   it('concrete resources do not include parameterized URIs', () => {
     for (const r of MCP_RESOURCE_DEFINITIONS) {

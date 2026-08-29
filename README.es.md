@@ -303,7 +303,10 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     // Número máximo de memorias incluidas en el payload de auto-inject
     "auto_inject_limit": 10,
     // Número máximo de caracteres en los payloads de respuesta de herramientas
-    "max_response_chars": 50000
+    "max_response_chars": 50000,
+    // Límite por namespace de memorias con pinned: true (ver la
+    // documentación de remember/tag y memory://inject)
+    "pin_limit_per_namespace": 20
   },
 
   // Configuración de retención y ciclo de vida de memorias
@@ -504,7 +507,13 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     // Supresión voraz de casi-duplicados dentro de la sección de memorias
     // seleccionada por hint: se omite un candidato cuya similitud con una
     // memoria ya seleccionada supere deduplication.similarity_threshold.
-    "dedup_suppression": true
+    // Las memorias fijadas (pinned) están exentas en ambas direcciones.
+    "dedup_suppression": true,
+    // Si las memorias fijadas se incluyen siempre en la sección de memorias
+    // (ver defaults.pin_limit_per_namespace y el parámetro `pinned` de
+    // remember/tag). false desactiva este paso por completo; el límite de
+    // fijado se sigue aplicando al escribir independientemente de esto.
+    "pinned_enabled": true
   },
 
   // Configuración de observabilidad
@@ -1031,6 +1040,7 @@ Cada memoria almacenada en BHGBrain es un `MemoryRecord` con los siguientes camp
 | `merged_from` | `string \| null` | ID de la memoria desde la que se fusionó esta (ruta UPDATE de dedup) |
 | `archived` | `boolean` | Si esta memoria está archivada de forma flexible (excluida de búsqueda/recall) |
 | `vector_synced` | `boolean` | Si el vector de Qdrant está sincronizado con el estado de SQLite |
+| `pinned` | `boolean` | Si esta memoria se incluye siempre en los payloads de `memory://inject`, limitado por `defaults.pin_limit_per_namespace`; no afecta a `search`/`recall` |
 | `device_id` | `string \| null` | Identificador de la instancia de BHGBrain que creó esta memoria (ver [Memoria Multi-Dispositivo](#memoria-multi-dispositivo)) |
 | `created_at` | `string (ISO 8601)` | Marca de tiempo de creación |
 | `updated_at` | `string (ISO 8601)` | Marca de tiempo de la última actualización |
@@ -1051,6 +1061,7 @@ CREATE INDEX idx_memories_expiry      ON memories(decay_eligible, expires_at);
 CREATE INDEX idx_memories_review_due  ON memories(retention_tier, review_due);
 CREATE INDEX idx_memories_archived    ON memories(archived);
 CREATE INDEX idx_memories_vector_sync ON memories(vector_synced);
+CREATE INDEX idx_memories_pinned      ON memories(namespace, pinned);
 ```
 
 #### Índices de Payload de Qdrant
@@ -2298,7 +2309,11 @@ El recurso inject construye un payload de texto con presupuesto para inyectar en
    limitado a su parte reservada del presupuesto:
    `(1 - auto_inject.memory_budget_fraction) × presupuesto`. Lo que las categorías
    dejen sin usar pasa a la sección de memorias siguiente (sin desperdicio).
-2. Las memorias se añaden dentro del presupuesto restante (contenido o resumen
+2. **Las memorias fijadas (pinned) se incluyen siempre a continuación**, antes de
+   la selección por recencia/relevancia, sin importar en qué posición quedarían de
+   otro modo (ver [Fijar Memorias para Inyección Garantizada](#fijar-memorias-para-inyección-garantizada)
+   más abajo).
+3. Las memorias se añaden dentro del presupuesto restante (contenido o resumen
    según el espacio) — siempre al menos `auto_inject.memory_budget_fraction ×
    presupuesto` cuando existen memorias, de modo que el contenido de categorías ya
    no puede dejar sin espacio a la sección de memorias.
@@ -2306,8 +2321,14 @@ El recurso inject construye un payload de texto con presupuesto para inyectar en
      cambios respecto a antes de esta opción.
    - `memory://inject/{hint}`: memorias principales por **relevancia híbrida** a la
      pista (ver más abajo).
-3. El payload se trunca en `auto_inject.max_chars`, interpretado según
-   `auto_inject.budget_unit` (predeterminado 30.000 caracteres).
+   - Una memoria que está fijada y además sería seleccionada aquí se excluye de
+     este paso (por ID), de modo que aparece exactamente una vez y no consume un
+     puesto adicional de `auto_inject_limit`.
+4. El payload se trunca en `auto_inject.max_chars`, interpretado según
+   `auto_inject.budget_unit` (predeterminado 30.000 caracteres). Esto también se
+   aplica al contenido fijado: si las memorias fijadas de un namespace por sí solas
+   superan la parte reservada de la sección de memorias, se truncan por elemento
+   como cualquier otro contenido y `truncated` es `true`.
 
 Parámetros de consulta:
 - `namespace` — namespace desde el que inyectar (predeterminado: `global`)
@@ -2347,12 +2368,55 @@ frase de tarea, nombre de repo o tema) en lugar de por recencia:
 - **Supresión de casi-duplicados**: cuando `auto_inject.dedup_suppression` es
   `true` (predeterminado), se omite un candidato cuya similitud vectorial con una
   memoria ya seleccionada supere `deduplication.similarity_threshold`, y el
-  presupuesto liberado pasa al siguiente candidato distinto.
+  presupuesto liberado pasa al siguiente candidato distinto. **Las memorias
+  fijadas están exentas de esto en ambas direcciones**: dos memorias fijadas
+  casi-duplicadas se inyectan ambas (nunca se suprimen entre sí), y una memoria
+  fijada nunca suprime — ni es suprimida por — un candidato seleccionado por
+  relevancia que resulte ser casi-duplicado de ella.
 
 Ejemplo: `memory://inject/deploy%20to%20production` condiciona la selección a
 "deploy to production".
 
 La forma de la respuesta es idéntica a `memory://inject`.
+
+### Fijar Memorias para Inyección Garantizada
+
+Tanto `memory://inject` como `memory://inject/{hint}` seleccionan normalmente su
+sección de memorias por recencia o relevancia, lo que significa que un hecho
+concreto solo llega al contexto inyectado si resulta bien clasificado — una regla
+operativa crítica ("usa siempre pnpm, nunca npm") puede desaparecer silenciosamente
+si nada la ha referenciado recientemente y no coincide con la pista actual. **Fijar
+(pin)** cierra esa brecha: una memoria fijada se incluye siempre en la sección de
+memorias, sin importar su posición por recencia o relevancia.
+
+- **Se establece vía `remember`** en el momento de escribir (`pinned: true`/`false`)
+  — en un `UPDATE` de dedup, omitir `pinned` conserva el estado de fijado existente
+  de la memoria, de modo que una corrección de contenido no la desfija
+  silenciosamente; pásalo explícitamente para cambiarlo.
+- **Se establece vía `tag`** como un interruptor dedicado y ligero
+  (`pinned: true`/`false`) que no toca el contenido ni requiere volver a enviarlo.
+- **Limitado por namespace**: `defaults.pin_limit_per_namespace` (predeterminado
+  `20`) limita cuántas memorias pueden fijarse a la vez, aplicado al escribir.
+  Fijar más allá del límite devuelve `INVALID_INPUT`; desfija una primero para
+  hacer sitio.
+- **Usa el presupuesto de memorias existente** (la parte
+  `auto_inject.memory_budget_fraction`) — no hay una partición aparte. Si el
+  contenido fijado por sí solo supera esa parte, se trunca por elemento como
+  cualquier otro contenido y se establece el flag `truncated` del payload.
+- **Exenta de la supresión de casi-duplicados** en ambas direcciones (ver arriba).
+- **Sin efecto en `search`/`recall`**: `pinned` nunca aparece en `SearchResult` ni
+  influye en el ranking u orden — esto es deliberadamente distinto del nivel de
+  retención `T0`, que solo afecta a la retención/ranking y no ofrece ninguna
+  garantía de inclusión en inject por sí mismo. Una memoria puede ser `T0` y
+  fijada, `T0` y no fijada, o cualquier nivel y fijada — ambos son ortogonales.
+- **Interruptor de apagado**: `auto_inject.pinned_enabled: false` (predeterminado
+  `true`) desactiva por completo el paso de inclusión de fijadas — ambas
+  plantillas de inject se comportan como si ninguna memoria estuviera fijada. El
+  límite por namespace se sigue aplicando al escribir independientemente de este
+  interruptor.
+- **Duradera**: el estado de fijado se persiste en el payload de Qdrant y se
+  restaura mediante `repair --mode from-qdrant` y la sincronización entre
+  dispositivos, de modo que sobrevive a una reconstrucción de SQLite.
 
 ### `memory://{id}/revisions` — Historial de Revisiones
 
@@ -2557,6 +2621,7 @@ Almacena contenido en BHGBrain con deduplicación automática, normalización, e
 | `importance` | `number (0–1)` | No | `0.5` | Puntuación de importancia. Los valores más altos se priorizan en la limpieza de obsolescencia. |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | No | `"cli"` | Fuente de la memoria. Afecta al nivel predeterminado (p.ej., agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | No | auto-asignado | Anulación explícita del nivel. Tiene precedencia sobre todas las heurísticas. |
+| `pinned` | `boolean` | No | `false` en ADD; se conserva en UPDATE | Fija esta memoria para que siempre se incluya en los payloads de `memory://inject`, limitado por `defaults.pin_limit_per_namespace` (predeterminado 20). En un `UPDATE` de dedup, omitir `pinned` conserva el estado de fijado existente de la memoria — pásalo explícitamente para cambiarlo. Superar el límite por namespace al fijar una memoria nueva devuelve `INVALID_INPUT`. |
 
 **El contenido largo se rechaza, no se convierte silenciosamente en un "vector mush":** el contenido más largo que `pipeline.long_content_threshold_chars` (configuración, predeterminado `8.000` caracteres ≈ 1–2 páginas) se rechaza con un error `INVALID_INPUT` que indica el recuento de caracteres, el umbral y la solución: llame a `import` con `format: "freeform"` en su lugar, o divida el contenido en llamadas `remember` más pequeñas. Esto es intencional: incrustar varios miles de palabras como un solo vector produce un "vector mush" de baja calidad que coincide débilmente con muchas consultas no relacionadas en lugar de coincidir fuertemente con una sola. El límite absoluto de 100.000 caracteres de la tabla anterior sigue aplicándose como techo absoluto, pero `long_content_threshold_chars` es el límite que los llamantes alcanzarán primero.
 
@@ -2755,7 +2820,7 @@ Busca memorias usando modos semántico, de texto completo o híbrido. Ofrece má
 
 ### `tag` — Gestionar Etiquetas
 
-Añade o elimina etiquetas de una memoria. Las etiquetas se fusionan/filtran atómicamente; el contenido y el embedding de la memoria no se ven afectados.
+Añade o elimina etiquetas de una memoria, y/o la fija o desfija. Las etiquetas y el estado de fijado se actualizan atómicamente; el contenido y el embedding de la memoria no se ven afectados.
 
 **Entrada:**
 
@@ -2764,6 +2829,7 @@ Añade o elimina etiquetas de una memoria. Las etiquetas se fusionan/filtran at�
 | `id` | `string (UUID)` | **Sí** | — | Memoria a etiquetar. |
 | `add` | `string[]` | No | `[]` | Etiquetas a añadir. Máx. 20 etiquetas totales tras la fusión. |
 | `remove` | `string[]` | No | `[]` | Etiquetas a eliminar. |
+| `pinned` | `boolean` | No | sin cambios | Fija (`true`) o desfija (`false`) esta memoria, independientemente de las etiquetas — un interruptor dedicado para el fijado de inyección que no requiere volver a enviar el contenido. Omítelo para dejar el estado de fijado sin cambios. Fijar una memoria aún no fijada cuando el namespace ya está en `defaults.pin_limit_per_namespace` devuelve `INVALID_INPUT`. |
 
 **Salida:**
 
@@ -2774,7 +2840,7 @@ Añade o elimina etiquetas de una memoria. Las etiquetas se fusionan/filtran at�
 }
 ```
 
-Devuelve `INVALID_INPUT` si añadir etiquetas excedería el límite de 20 etiquetas.
+Devuelve `INVALID_INPUT` si añadir etiquetas excedería el límite de 20 etiquetas, o si fijar excedería `defaults.pin_limit_per_namespace`.
 
 ---
 

@@ -304,7 +304,10 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     // Nombre maximum de souvenirs inclus dans la charge utile d'injection automatique
     "auto_inject_limit": 10,
     // Nombre maximum de caractères dans les charges utiles de réponse des outils
-    "max_response_chars": 50000
+    "max_response_chars": 50000,
+    // Limite par namespace des souvenirs avec pinned: true (voir la
+    // documentation de remember/tag et de memory://inject)
+    "pin_limit_per_namespace": 20
   },
 
   // Paramètres de rétention et du cycle de vie de la mémoire
@@ -506,8 +509,14 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     // Suppression gloutonne des quasi-doublons dans la section des
     // souvenirs sélectionnée par indice : un candidat dont la similarité
     // dépasse deduplication.similarity_threshold par rapport à un
-    // souvenir déjà sélectionné est ignoré.
-    "dedup_suppression": true
+    // souvenir déjà sélectionné est ignoré. Les souvenirs épinglés en sont
+    // exemptés dans les deux sens.
+    "dedup_suppression": true,
+    // Si les souvenirs épinglés sont toujours inclus dans la section des
+    // souvenirs (voir defaults.pin_limit_per_namespace et le paramètre
+    // `pinned` de remember/tag). false désactive complètement cette étape ;
+    // la limite d'épinglage reste appliquée à l'écriture quoi qu'il arrive.
+    "pinned_enabled": true
   },
 
   // Paramètres d'observabilité
@@ -1036,6 +1045,7 @@ Chaque souvenir stocké dans BHGBrain est un `MemoryRecord` avec les champs suiv
 | `merged_from` | `string \| null` | ID du souvenir dont celui-ci a été fusionné (chemin UPDATE de déduplication) |
 | `archived` | `boolean` | Si ce souvenir est archivé de façon logicielle (exclu de la recherche/du rappel) |
 | `vector_synced` | `boolean` | Si le vecteur Qdrant est synchronisé avec l'état SQLite |
+| `pinned` | `boolean` | Si ce souvenir est toujours inclus dans les charges utiles `memory://inject`, limité par `defaults.pin_limit_per_namespace` ; sans effet sur `search`/`recall` |
 | `device_id` | `string \| null` | Identifiant de l'instance BHGBrain qui a créé ce souvenir (voir [Mémoire multi-appareils](#mémoire-multi-appareils)) |
 | `created_at` | `string (ISO 8601)` | Horodatage de création |
 | `updated_at` | `string (ISO 8601)` | Horodatage de la dernière mise à jour |
@@ -1056,6 +1066,7 @@ CREATE INDEX idx_memories_expiry      ON memories(decay_eligible, expires_at);
 CREATE INDEX idx_memories_review_due  ON memories(retention_tier, review_due);
 CREATE INDEX idx_memories_archived    ON memories(archived);
 CREATE INDEX idx_memories_vector_sync ON memories(vector_synced);
+CREATE INDEX idx_memories_pinned      ON memories(namespace, pinned);
 ```
 
 #### Index de charge utile Qdrant
@@ -2303,7 +2314,11 @@ La ressource d'injection construit une charge utile textuelle budgétée pour l'
    plafonné à sa part réservée du budget :
    `(1 - auto_inject.memory_budget_fraction) × budget`. Ce que les catégories
    laissent inutilisé passe à la section des souvenirs ci-dessous (aucun gaspillage).
-2. Les souvenirs sont ajoutés dans le budget restant (contenu ou résumé selon
+2. **Les souvenirs épinglés sont toujours inclus ensuite**, avant la sélection par
+   récence/pertinence, quel que soit le rang qu'ils auraient autrement (voir
+   [Épingler des souvenirs pour une injection garantie](#épingler-des-souvenirs-pour-une-injection-garantie)
+   ci-dessous).
+3. Les souvenirs sont ajoutés dans le budget restant (contenu ou résumé selon
    l'espace disponible) — toujours au moins `auto_inject.memory_budget_fraction ×
    budget` lorsque des souvenirs existent, afin que le contenu des catégories ne
    puisse plus affamer la section des souvenirs.
@@ -2311,8 +2326,14 @@ La ressource d'injection construit une charge utile textuelle budgétée pour l'
      inchangé par rapport à avant cette option.
    - `memory://inject/{hint}` : meilleurs souvenirs par **pertinence hybride** à
      l'indice (voir ci-dessous).
-3. La charge utile est tronquée à `auto_inject.max_chars`, interprété selon
-   `auto_inject.budget_unit` (par défaut 30 000 caractères).
+   - Un souvenir à la fois épinglé et sélectionné ici indépendamment est exclu de
+     cette étape (par ID), afin qu'il apparaisse exactement une fois et ne
+     consomme pas une place supplémentaire de `auto_inject_limit`.
+4. La charge utile est tronquée à `auto_inject.max_chars`, interprété selon
+   `auto_inject.budget_unit` (par défaut 30 000 caractères). Cela s'applique aussi
+   au contenu épinglé : si les souvenirs épinglés d'un namespace dépassent à eux
+   seuls la part réservée de la section des souvenirs, ils sont tronqués par
+   élément comme tout autre contenu et `truncated` vaut `true`.
 
 Paramètres de requête :
 - `namespace` — espace de noms depuis lequel injecter (par défaut : `global`)
@@ -2352,12 +2373,57 @@ de tâche, un nom de dépôt ou un sujet) plutôt que par récence :
 - **Suppression des quasi-doublons** : lorsque `auto_inject.dedup_suppression` est
   `true` (par défaut), un candidat dont la similarité vectorielle avec un souvenir
   déjà sélectionné dépasse `deduplication.similarity_threshold` est ignoré, et le
-  budget libéré revient au candidat distinct suivant.
+  budget libéré revient au candidat distinct suivant. **Les souvenirs épinglés en
+  sont exemptés dans les deux sens** : deux souvenirs épinglés quasi-doublons sont
+  tous deux injectés (jamais supprimés l'un par rapport à l'autre), et un souvenir
+  épinglé ne supprime jamais — et n'est jamais supprimé par — un candidat
+  sélectionné par pertinence qui s'avère être un quasi-doublon de celui-ci.
 
 Exemple : `memory://inject/deploy%20to%20production` conditionne la sélection sur
 "deploy to production".
 
 La forme de la réponse est identique à `memory://inject`.
+
+### Épingler des souvenirs pour une injection garantie
+
+`memory://inject` et `memory://inject/{hint}` sélectionnent normalement leur
+section de souvenirs par récence ou pertinence, ce qui signifie qu'un fait précis
+n'atteint le contexte injecté que s'il se classe bien — une règle opérationnelle
+critique (« toujours utiliser pnpm, jamais npm ») peut disparaître silencieusement
+si rien ne l'a référencée récemment et qu'elle ne correspond pas à l'indice actuel.
+**L'épinglage** comble cette lacune : un souvenir épinglé est toujours inclus dans
+la section des souvenirs, quel que soit son rang par récence ou pertinence.
+
+- **Défini via `remember`** au moment de l'écriture (`pinned: true`/`false`) — lors
+  d'un `UPDATE` de déduplication, omettre `pinned` conserve l'état d'épinglage
+  existant du souvenir, de sorte qu'une correction de contenu ne le désépingle pas
+  silencieusement ; passez-le explicitement pour le modifier.
+- **Défini via `tag`** comme un interrupteur dédié et léger (`pinned: true`/`false`)
+  qui ne touche pas au contenu ni ne nécessite de le renvoyer.
+- **Limité par namespace** : `defaults.pin_limit_per_namespace` (par défaut `20`)
+  plafonne le nombre de souvenirs pouvant être épinglés à la fois, appliqué à
+  l'écriture. Épingler au-delà de la limite renvoie `INVALID_INPUT` ; désépinglez-en
+  un d'abord pour faire de la place.
+- **Puise dans le budget existant de la section des souvenirs** (la part
+  `auto_inject.memory_budget_fraction`) — il n'y a pas de réservation séparée. Si le
+  contenu épinglé dépasse à lui seul cette part, il est tronqué par élément comme
+  tout autre contenu et le drapeau `truncated` de la charge utile est activé.
+- **Exempté de la suppression des quasi-doublons** dans les deux sens (voir
+  ci-dessus).
+- **Aucun effet sur `search`/`recall`** : `pinned` n'apparaît jamais dans
+  `SearchResult` et n'influence jamais le classement ou l'ordre — ceci est
+  délibérément distinct du niveau de rétention `T0`, qui n'affecte que la
+  rétention/le classement et n'offre aucune garantie d'inclusion dans l'injection.
+  Un souvenir peut être `T0` et épinglé, `T0` et non épinglé, ou n'importe quel
+  niveau et épinglé — les deux sont orthogonaux.
+- **Interrupteur d'arrêt** : `auto_inject.pinned_enabled: false` (par défaut
+  `true`) désactive entièrement l'étape d'inclusion des souvenirs épinglés — les
+  deux modèles d'injection se comportent alors comme si aucun souvenir n'était
+  épinglé. La limite par namespace reste appliquée à l'écriture quel que soit cet
+  interrupteur.
+- **Durable** : l'état d'épinglage est persisté dans la charge utile Qdrant et
+  restauré par `repair --mode from-qdrant` et la synchronisation multi-appareils,
+  de sorte qu'il survit à une reconstruction de SQLite.
 
 ### `memory://{id}/revisions` — Historique des révisions
 
@@ -2561,6 +2627,7 @@ Stocke du contenu dans BHGBrain avec déduplication automatique, normalisation, 
 | `importance` | `number (0–1)` | Non | `0,5` | Score d'importance. Les valeurs plus élevées sont prioritaires lors du nettoyage des périmés. |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | Non | `"cli"` | Source du souvenir. Affecte le niveau par défaut (ex. agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | Non | auto-attribué | Remplacement de niveau explicite. Prend le dessus sur toutes les heuristiques. |
+| `pinned` | `boolean` | Non | `false` en ADD ; conservé en UPDATE | Épingle ce souvenir pour qu'il soit toujours inclus dans les charges utiles `memory://inject`, limité par `defaults.pin_limit_per_namespace` (par défaut 20). Lors d'un `UPDATE` de déduplication, omettre `pinned` conserve l'état d'épinglage existant du souvenir — passez-le explicitement pour le modifier. Dépasser la limite par namespace en épinglant un nouveau souvenir renvoie `INVALID_INPUT`. |
 
 **Le contenu long est rejeté, pas transformé silencieusement en « vecteur bouillie » :** le contenu plus long que `pipeline.long_content_threshold_chars` (configuration, valeur par défaut `8 000` caractères ≈ 1–2 pages) est rejeté avec une erreur `INVALID_INPUT` indiquant le nombre de caractères, le seuil, et la solution : appelez `import` avec `format: "freeform"` à la place, ou divisez le contenu en plusieurs appels `remember` plus petits. Ceci est intentionnel : intégrer plusieurs milliers de mots en un seul vecteur produit un « vecteur bouillie » de mauvaise qualité qui correspond faiblement à de nombreuses requêtes non liées plutôt que fortement à une seule. Le plafond absolu de 100 000 caractères du tableau ci-dessus s'applique toujours, mais `long_content_threshold_chars` est la limite que les appelants atteindront en premier.
 
@@ -2757,7 +2824,7 @@ Recherche des souvenirs en utilisant les modes sémantique, plein texte ou hybri
 
 ### `tag` — Gérer les tags
 
-Ajouter ou supprimer des tags d'un souvenir. Les tags sont fusionnés/filtrés de façon atomique ; le contenu et l'embedding du souvenir ne sont pas affectés.
+Ajouter ou supprimer des tags d'un souvenir, et/ou l'épingler ou le désépingler. Les tags et l'état d'épinglage sont mis à jour de façon atomique ; le contenu et l'embedding du souvenir ne sont pas affectés.
 
 **Entrée :**
 
@@ -2766,6 +2833,7 @@ Ajouter ou supprimer des tags d'un souvenir. Les tags sont fusionnés/filtrés d
 | `id` | `string (UUID)` | **Oui** | — | Souvenir à tagger. |
 | `add` | `string[]` | Non | `[]` | Tags à ajouter. Max 20 tags au total après fusion. |
 | `remove` | `string[]` | Non | `[]` | Tags à supprimer. |
+| `pinned` | `boolean` | Non | inchangé | Épingle (`true`) ou désépingle (`false`) ce souvenir, indépendamment des tags — un interrupteur dédié pour l'épinglage d'injection qui ne nécessite pas de renvoyer le contenu. Omettez-le pour laisser l'état d'épinglage inchangé. Épingler un souvenir pas encore épinglé alors que le namespace est déjà à `defaults.pin_limit_per_namespace` renvoie `INVALID_INPUT`. |
 
 **Sortie :**
 
@@ -2776,7 +2844,7 @@ Ajouter ou supprimer des tags d'un souvenir. Les tags sont fusionnés/filtrés d
 }
 ```
 
-Renvoie `INVALID_INPUT` si l'ajout de tags dépasserait la limite de 20 tags.
+Renvoie `INVALID_INPUT` si l'ajout de tags dépasserait la limite de 20 tags, ou si l'épinglage dépasserait `defaults.pin_limit_per_namespace`.
 
 ---
 

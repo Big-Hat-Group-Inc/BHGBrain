@@ -62,6 +62,12 @@ export interface MemoryRecord {
   merged_from: string | null;
   archived: boolean;
   vector_synced: boolean;
+  // Always included in `memory://inject` and `memory://inject/{hint}`
+  // regardless of recency/relevance rank, bounded by
+  // `defaults.pin_limit_per_namespace` and the memory section's budget. Has
+  // no effect on search/recall ordering or ranking — deliberately distinct
+  // from T0 retention. See add-inject-pinning.
+  pinned: boolean;
   device_id?: string | null;
   // Provider-qualified embedding identity (`<provider>/<model>@<dimensions>`)
   // that produced this row's current vector. Null for legacy rows written

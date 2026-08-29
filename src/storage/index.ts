@@ -810,7 +810,7 @@ function toQdrantPayload(
   mem: Pick<
     MemoryRecordWithoutEmbedding,
     'type' | 'tags' | 'collection' | 'content' | 'summary' | 'category' | 'source' |
-    'importance' | 'retention_tier' | 'decay_eligible' | 'expires_at' | 'created_at' | 'checksum'
+    'importance' | 'retention_tier' | 'decay_eligible' | 'expires_at' | 'created_at' | 'checksum' | 'pinned'
   > & { device_id?: string | null; embedding_model?: string | null },
 ): Record<string, unknown> {
   return {
@@ -834,5 +834,9 @@ function toQdrantPayload(
     // embedding-provenance). Null for legacy vectors written before
     // provenance stamping.
     embedding_model: mem.embedding_model ?? null,
+    // Whether this memory is pinned for guaranteed inject inclusion (see
+    // add-inject-pinning). Persisted so `repair --mode from-qdrant` and the
+    // cross-device fallback path restore pin state instead of resetting it.
+    pinned: mem.pinned,
   };
 }

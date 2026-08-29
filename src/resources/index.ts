@@ -251,20 +251,63 @@ export class ResourceHandler {
       categoriesCount++;
     }
 
-    // 2. Memory section: hybrid-relevance selection when a hint is given
-    // (access recorded and expiry-filtered identically to a normal search,
-    // near-duplicate suppressed), recency fallback otherwise — unchanged
-    // from what `memory://inject` always did.
+    // 2. Memory section: a namespace's pinned memories are always included
+    // first (regardless of recency/relevance rank), drawing from the same
+    // remaining budget the recency/relevance candidates below use — no
+    // separate carve-out. This runs identically for `memory://inject` and
+    // `memory://inject/{hint}` (before the `trimmedHint` branch below
+    // decides which algorithm fills the rest of the section), and is
+    // deliberately never passed through `suppressNearDuplicates`: pinned
+    // memories are exempt from near-duplicate suppression in both
+    // directions (see design's near-duplicate-exemption decision). Ids
+    // included here are excluded from the recency/relevance candidate list
+    // below via a plain Set check, so a memory that is both pinned and
+    // independently top-ranked appears exactly once and doesn't consume an
+    // extra slot of `auto_inject_limit`. See add-inject-pinning.
+    const pinnedIds = new Set<string>();
+    let pinnedAppended = 0;
+    let pinnedTotal = 0;
+    if (this.config.auto_inject.pinned_enabled) {
+      const pinnedMemories = this.storage.sqlite.listPinnedMemories(namespace);
+      pinnedTotal = pinnedMemories.length;
+      for (const mem of pinnedMemories) {
+        if (totalChars >= budgetChars) break;
+
+        const remaining = budgetChars - totalChars;
+        const contentBlock = mem.content.length + 50 <= remaining
+          ? `- [${mem.type}] ${mem.content}\n`
+          : `- [${mem.type}] ${mem.summary}\n`;
+        if (appendBlock(contentBlock, budgetChars)) {
+          pinnedIds.add(mem.id);
+          pinnedAppended++;
+        } else {
+          break;
+        }
+      }
+    }
+
+    // 3. Recency/relevance selection, unchanged from what `memory://inject`
+    // always did except for excluding already-pinned ids: hybrid-relevance
+    // selection when a hint is given (access recorded and expiry-filtered
+    // identically to a normal search, near-duplicate suppressed), recency
+    // fallback otherwise.
     const topK = this.config.defaults.auto_inject_limit;
     const trimmedHint = hint?.trim();
-    let memories: Array<Pick<MemoryRecord | SearchResult, 'type' | 'content' | 'summary'>>;
+    let memories: Array<Pick<MemoryRecord | SearchResult, 'id' | 'type' | 'content' | 'summary'>>;
     if (trimmedHint) {
       const candidates = await this.search.searchForInject(trimmedHint, namespace, topK);
-      memories = dedup_suppression ? this.suppressNearDuplicates(candidates) : candidates;
+      // Exclude already-pinned ids BEFORE suppression, not after: a memory
+      // that is both pinned and independently top-ranked must never act as
+      // the suppressing (or suppressed) party against a *different*
+      // candidate on account of its now-to-be-excluded presence here — see
+      // the near-duplicate-exemption decision. Suppression therefore only
+      // ever runs over genuinely non-pinned candidates.
+      const nonPinned = candidates.filter(mem => !pinnedIds.has(mem.id));
+      memories = dedup_suppression ? this.suppressNearDuplicates(nonPinned) : nonPinned;
     } else {
-      memories = this.storage.sqlite.listMemories(namespace, topK);
+      memories = this.storage.sqlite.listMemories(namespace, topK).filter(mem => !pinnedIds.has(mem.id));
     }
-    let memoriesCount = 0;
+    let candidatesAppended = 0;
 
     for (const mem of memories) {
       if (totalChars >= budgetChars) break;
@@ -274,14 +317,15 @@ export class ResourceHandler {
         ? `- [${mem.type}] ${mem.content}\n`
         : `- [${mem.type}] ${mem.summary}\n`;
       if (appendBlock(contentBlock, budgetChars)) {
-        memoriesCount++;
+        candidatesAppended++;
       } else {
         break;
       }
     }
 
+    const memoriesCount = pinnedAppended + candidatesAppended;
     const content = parts.join('');
-    truncated = truncated || memories.length > memoriesCount;
+    truncated = truncated || pinnedTotal > pinnedAppended || memories.length > candidatesAppended;
 
     return {
       content,

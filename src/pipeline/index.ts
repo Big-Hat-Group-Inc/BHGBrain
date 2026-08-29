@@ -48,6 +48,9 @@ export class WritePipeline {
     clientId?: string;
     retention_tier?: RetentionTier;
     device_id?: string | null;
+    // Explicit-set-wins on UPDATE (preserves existing pin state when
+    // omitted); defaults to false on ADD when omitted. See add-inject-pinning.
+    pinned?: boolean;
   }): Promise<WriteResult[]> {
     const normalized = normalizeContent(input.content);
 
@@ -138,6 +141,7 @@ export class WritePipeline {
       clientId?: string;
       retention_tier?: RetentionTier;
       device_id?: string | null;
+      pinned?: boolean;
     },
   ): Promise<WriteResult> {
     const checksum = computeChecksum(candidate.content);
@@ -243,6 +247,9 @@ export class WritePipeline {
         decay_eligible: lifecycleMetadata.decay_eligible,
         review_due: lifecycleMetadata.review_due,
         last_operation: 'UPDATE',
+        // Explicit-set-wins: an explicit `pinned` on this remember call
+        // overrides; omitted preserves the existing memory's pin state.
+        pinned: input.pinned !== undefined ? input.pinned : existing.pinned,
         updated_at: now,
       }, vector);
 
@@ -292,6 +299,7 @@ export class WritePipeline {
         merged_from: operation.targetId,
         archived: false,
         vector_synced: true,
+        pinned: input.pinned ?? false,
         device_id: input.device_id ?? null,
         created_at: now,
         updated_at: now,
@@ -334,6 +342,7 @@ export class WritePipeline {
       merged_from: null,
       archived: false,
       vector_synced: true,
+      pinned: input.pinned ?? false,
       device_id: input.device_id ?? null,
       created_at: now,
       updated_at: now,
@@ -476,6 +485,7 @@ export class WritePipeline {
       clientId?: string;
       retention_tier?: RetentionTier;
       device_id?: string | null;
+      pinned?: boolean;
     },
     checksum: string,
     now: string,
@@ -533,6 +543,9 @@ export class WritePipeline {
         review_due: lifecycleMetadata.review_due,
         last_operation: 'UPDATE',
         vector_synced: false,
+        // Explicit-set-wins: an explicit `pinned` on this remember call
+        // overrides; omitted preserves the existing memory's pin state.
+        pinned: input.pinned !== undefined ? input.pinned : existing.pinned,
         updated_at: now,
       });
 
@@ -571,6 +584,7 @@ export class WritePipeline {
       merged_from: null,
       archived: false,
       vector_synced: false,
+      pinned: input.pinned ?? false,
       device_id: input.device_id ?? null,
       created_at: now,
       updated_at: now,

@@ -300,7 +300,10 @@ BHGBrain 从以下位置加载配置文件：
     // 自动注入载荷中包含的最大记忆数量
     "auto_inject_limit": 10,
     // 工具响应载荷的最大字符数
-    "max_response_chars": 50000
+    "max_response_chars": 50000,
+    // 每个命名空间中 pinned: true 记忆数量的上限
+    // （参见 remember/tag 与 memory://inject 文档）
+    "pin_limit_per_namespace": 20
   },
 
   // 记忆保留与生命周期设置
@@ -480,7 +483,13 @@ BHGBrain 从以下位置加载配置文件：
     "budget_unit": "chars",
     // 在按提示选出的记忆部分内进行贪心近重复抑制：若某候选与已选记忆的
     // 相似度超过 deduplication.similarity_threshold，则跳过该候选。
-    "dedup_suppression": true
+    // 已固定（pinned）的记忆在两个方向上都不受此影响。
+    "dedup_suppression": true,
+    // 是否始终在记忆部分中包含已固定的记忆（参见
+    // defaults.pin_limit_per_namespace 以及 remember/tag 的 `pinned`
+    // 参数）。设为 false 会完全禁用此步骤；无论此开关如何，固定数量上限
+    // 仍会在写入时强制执行。
+    "pinned_enabled": true
   },
 
   // 可观测性设置
@@ -975,6 +984,7 @@ BHGBrain 中存储的每条记忆都是一个 `MemoryRecord`，包含以下字�
 | `merged_from` | `string \| null` | 该记忆合并自的来源记忆 ID（去重 UPDATE 路径） |
 | `archived` | `boolean` | 该记忆是否已软归档（从搜索/召回中排除） |
 | `vector_synced` | `boolean` | Qdrant 向量是否与 SQLite 状态同步 |
+| `pinned` | `boolean` | 该记忆是否始终包含在 `memory://inject` 载荷中，受 `defaults.pin_limit_per_namespace` 限制；对 `search`/`recall` 没有影响 |
 | `device_id` | `string \| null` | 创建此记忆的 BHGBrain 实例标识符（参见[多设备记忆](#多设备记忆)） |
 | `created_at` | `string (ISO 8601)` | 创建时间戳 |
 | `updated_at` | `string (ISO 8601)` | 最后更新时间戳 |
@@ -995,6 +1005,7 @@ CREATE INDEX idx_memories_expiry      ON memories(decay_eligible, expires_at);
 CREATE INDEX idx_memories_review_due  ON memories(retention_tier, review_due);
 CREATE INDEX idx_memories_archived    ON memories(archived);
 CREATE INDEX idx_memories_vector_sync ON memories(vector_synced);
+CREATE INDEX idx_memories_pinned      ON memories(namespace, pinned);
 ```
 
 #### Qdrant Payload 索引
@@ -2235,13 +2246,20 @@ stdio 传输发送（每个 stdio 连接对应一个长期存活的 `Server`）�
 1. 类别内容优先插入（完整内容，按顺序），并限制在其保留的预算份额内：
    `(1 - auto_inject.memory_budget_fraction) × 预算`。类别未用完的部分会滚入
    下方的记忆部分（不浪费）。
-2. 记忆在剩余预算内附加（根据空间决定使用内容或摘要）——只要存在记忆，
+2. **已固定的记忆接下来始终会被包含**，排在按最近程度/相关性选取之前，
+   无论它们本应排在什么位置（详见下文的
+   [固定记忆以确保注入](#固定记忆以确保注入)）。
+3. 记忆在剩余预算内附加（根据空间决定使用内容或摘要）——只要存在记忆，
    记忆部分始终至少能获得 `auto_inject.memory_budget_fraction × 预算`，
    使类别内容不再能耗尽记忆部分的空间。
    - `memory://inject`（无提示）：按**最近程度**选取顶部记忆，与引入此选项前一致。
    - `memory://inject/{hint}`：按与提示的**混合相关性**选取顶部记忆（见下文）。
-3. 载荷在 `auto_inject.max_chars` 处截断，依据 `auto_inject.budget_unit` 解释
-   （默认 30,000 字符）。
+   - 既已固定又会被此步骤独立选中的记忆会（按 ID）从此步骤中排除，因此它
+     只会出现一次，也不会额外占用 `auto_inject_limit` 的名额。
+4. 载荷在 `auto_inject.max_chars` 处截断，依据 `auto_inject.budget_unit` 解释
+   （默认 30,000 字符）。这同样适用于固定内容：若某命名空间的固定记忆
+   本身就超过了记忆部分的保留份额，会像其他内容一样按条目截断，
+   且 `truncated` 为 `true`。
 
 查询参数：
 - `namespace`——要注入的命名空间（默认：`global`）
@@ -2275,12 +2293,46 @@ stdio 传输发送（每个 stdio 连接对应一个长期存活的 `Server`）�
 - 空提示（去除首尾空白后为空）会回退到上述最近程度行为。
 - **近重复抑制**：当 `auto_inject.dedup_suppression` 为 `true`（默认）时，
   若某候选与已选记忆的向量相似度超过 `deduplication.similarity_threshold`，
-  则跳过该候选，释放出的预算用于下一个不同的候选。
+  则跳过该候选，释放出的预算用于下一个不同的候选。**已固定的记忆在两个
+  方向上都不受此影响**：两条互为近重复的固定记忆会同时被注入（彼此之间
+  不会被抑制），且固定记忆既不会抑制、也不会被恰好与其近重复的按相关性
+  选出的候选所抑制。
 
 示例：`memory://inject/deploy%20to%20production` 将选取条件设为
 "deploy to production"。
 
 响应结构与 `memory://inject` 相同。
+
+### 固定记忆以确保注入
+
+`memory://inject` 与 `memory://inject/{hint}` 通常按最近程度或相关性选取
+记忆部分，这意味着某个具体事实只有在排名靠前时才会进入被注入的上下文——
+一条关键的运行规则（例如"始终使用 pnpm，绝不使用 npm"）如果近期没有被
+引用过，且与当前提示不匹配，就可能悄无声息地被排除在外。**固定（pin）**
+弥补了这一缺口：被固定的记忆始终会包含在记忆部分中，无论其按最近程度或
+相关性本应排在何处。
+
+- **通过 `remember` 设置**，在写入时指定（`pinned: true`/`false`）——在去重
+  `UPDATE` 时，省略 `pinned` 会保留该记忆现有的固定状态，因此一次内容修正
+  不会悄悄取消固定；需显式传入才能更改。
+- **通过 `tag` 设置**，作为一个专用的轻量开关（`pinned: true`/`false`），
+  不涉及内容，也无需重新提交内容。
+- **按命名空间限量**：`defaults.pin_limit_per_namespace`（默认 `20`）限制了
+  单个命名空间可同时固定的记忆数量，在写入时强制执行。超过上限进行固定会
+  返回 `INVALID_INPUT`；先取消固定一条以腾出空间。
+- **使用现有的记忆部分预算**（`auto_inject.memory_budget_fraction` 份额）——
+  没有单独的预留空间。若固定内容本身就超过该份额，会像其他内容一样按
+  条目截断，并设置载荷的 `truncated` 标志。
+- **在两个方向上都不受近重复抑制影响**（见上文）。
+- **对 `search`/`recall` 没有影响**：`pinned` 从不出现在 `SearchResult` 中，
+  也不影响排序或顺序——这与 `T0` 保留层级刻意区分开来：`T0` 只影响
+  保留/排序，本身并不提供注入包含的保证。一条记忆可以是 `T0` 且固定、
+  `T0` 且未固定，或任意层级且固定——二者相互正交。
+- **总开关**：`auto_inject.pinned_enabled: false`（默认 `true`）会完全禁用
+  固定记忆的包含步骤——两种注入模板都会表现得就像没有任何记忆被固定一样。
+  无论此开关如何，每命名空间的固定上限仍会在写入时强制执行。
+- **持久化**：固定状态会持久化到 Qdrant 载荷中，并由 `repair --mode
+  from-qdrant` 和跨设备同步恢复，因此能在 SQLite 重建后依然保留。
 
 ### `memory://{id}/revisions`——版本历史
 
@@ -2478,6 +2530,7 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `importance` | `number (0–1)` | 否 | `0.5` | 重要性评分。较高值在过期清理中优先保留。 |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | 否 | `"cli"` | 记忆来源。影响默认层级（例如 agent+procedural → T1）。 |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | 否 | 自动分配 | 显式层级覆盖。优先于所有启发式规则。 |
+| `pinned` | `boolean` | 否 | ADD 时为 `false`；UPDATE 时保留 | 固定该记忆，使其始终包含在 `memory://inject` 载荷中，受 `defaults.pin_limit_per_namespace`（默认 20）限制。在去重 `UPDATE` 时，省略 `pinned` 会保留该记忆现有的固定状态——需显式传入才能更改。新固定记忆时超过每命名空间上限会返回 `INVALID_INPUT`。 |
 
 **超长内容会被拒绝，而不是被静默嵌入为低质量的"糊状向量"：** 超过 `pipeline.long_content_threshold_chars`（配置项，默认 `8,000` 字符，约 1–2 页）的内容会被拒绝，并返回 `INVALID_INPUT` 错误，其中说明了实际字符数、配置的阈值以及解决方法：改用 `format: "freeform"` 调用 `import` 工具，或将内容拆分为多次较小的 `remember` 调用。这是有意为之：将数千字的文本嵌入为单个向量会产生低质量的"糊状向量"，它会与许多不相关的查询产生弱匹配，而不是与某一个查询产生强匹配。上表中 100,000 字符的硬性上限仍然适用，作为绝对上限，但调用者实际会先触及 `long_content_threshold_chars` 这一限制。
 
@@ -2667,7 +2720,7 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 
 ### `tag`——管理标签
 
-向记忆添加或移除标签。标签原子性地合并/过滤；记忆内容和嵌入不受影响。
+向记忆添加或移除标签，和/或对其进行固定/取消固定。标签与固定状态会原子性地更新；记忆内容和嵌入不受影响。
 
 **输入：**
 
@@ -2676,6 +2729,7 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `id` | `string (UUID)` | **是** | — | 要打标签的记忆。 |
 | `add` | `string[]` | 否 | `[]` | 要添加的标签。合并后总计最多 20 个标签。 |
 | `remove` | `string[]` | 否 | `[]` | 要移除的标签。 |
+| `pinned` | `boolean` | 否 | 保持不变 | 固定（`true`）或取消固定（`false`）该记忆，与标签无关——为注入固定提供的专用轻量开关，无需重新提交内容。省略该参数则固定状态保持不变。在命名空间已达到 `defaults.pin_limit_per_namespace` 时固定一个尚未固定的记忆会返回 `INVALID_INPUT`。 |
 
 **输出：**
 
@@ -2686,7 +2740,7 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 }
 ```
 
-如果添加标签会超过 20 个标签的限制，返回 `INVALID_INPUT`。
+如果添加标签会超过 20 个标签的限制，或固定操作会超过 `defaults.pin_limit_per_namespace`，则返回 `INVALID_INPUT`。
 
 ---
 

@@ -302,7 +302,10 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Maximale Anzahl automatisch eingebetteter Erinnerungen
     "auto_inject_limit": 10,
     // Maximale Zeichenanzahl in Tool-Antwort-Payloads
-    "max_response_chars": 50000
+    "max_response_chars": 50000,
+    // Obergrenze pro Namespace für Erinnerungen mit pinned: true (siehe
+    // remember/tag und die memory://inject-Dokumentation)
+    "pin_limit_per_namespace": 20
   },
 
   // Einstellungen für Aufbewahrung und Lebenszyklus von Erinnerungen
@@ -503,7 +506,13 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Gierige Near-Duplicate-Unterdrückung innerhalb des hint-basierten
     // Erinnerungsabschnitts: Ein Kandidat, der deduplication.similarity_threshold
     // gegenüber einer bereits ausgewählten Erinnerung überschreitet, wird übersprungen.
-    "dedup_suppression": true
+    // Angepinnte Erinnerungen sind in beide Richtungen davon ausgenommen.
+    "dedup_suppression": true,
+    // Ob angepinnte Erinnerungen immer im Erinnerungsabschnitt enthalten sind
+    // (siehe defaults.pin_limit_per_namespace sowie den Parameter `pinned`
+    // von remember/tag). false deaktiviert diesen Schritt vollständig; die
+    // Pin-Obergrenze wird unabhängig davon weiterhin beim Schreiben durchgesetzt.
+    "pinned_enabled": true
   },
 
   // Observability-Einstellungen
@@ -1030,6 +1039,7 @@ Jede in BHGBrain gespeicherte Erinnerung ist ein `MemoryRecord` mit folgenden Fe
 | `merged_from` | `string \| null` | ID der Erinnerung, aus der diese zusammengeführt wurde (Deduplizierungs-UPDATE-Pfad) |
 | `archived` | `boolean` | Ob diese Erinnerung soft-archiviert ist (von Suche/Recall ausgeschlossen) |
 | `vector_synced` | `boolean` | Ob der Qdrant-Vektor mit dem SQLite-Zustand synchron ist |
+| `pinned` | `boolean` | Ob diese Erinnerung immer in `memory://inject`-Payloads enthalten ist, begrenzt durch `defaults.pin_limit_per_namespace`; hat keine Auswirkung auf `search`/`recall` |
 | `device_id` | `string \| null` | Bezeichner der BHGBrain-Instanz, die diese Erinnerung erstellt hat (siehe [Multi-Device-Speicher](#multi-device-speicher)) |
 | `created_at` | `string (ISO 8601)` | Erstellungszeitstempel |
 | `updated_at` | `string (ISO 8601)` | Letzter Aktualisierungszeitstempel |
@@ -1050,6 +1060,7 @@ CREATE INDEX idx_memories_expiry      ON memories(decay_eligible, expires_at);
 CREATE INDEX idx_memories_review_due  ON memories(retention_tier, review_due);
 CREATE INDEX idx_memories_archived    ON memories(archived);
 CREATE INDEX idx_memories_vector_sync ON memories(vector_synced);
+CREATE INDEX idx_memories_pinned      ON memories(namespace, pinned);
 ```
 
 #### Qdrant-Payload-Indizes
@@ -2296,7 +2307,11 @@ Die Inject-Ressource erstellt einen budgetierten Text-Payload für die Einbettun
    begrenzt auf ihren reservierten Budgetanteil:
    `(1 - auto_inject.memory_budget_fraction) × Budget`. Was Kategorien ungenutzt
    lassen, fließt in den Erinnerungsabschnitt unten (keine Verschwendung).
-2. Erinnerungen werden in das verbleibende Budget angehängt (Inhalt oder
+2. **Angepinnte Erinnerungen werden als Nächstes immer eingeschlossen**, vor der
+   Auswahl nach Aktualität/Relevanz, unabhängig davon, wo sie sonst eingestuft
+   würden (siehe [Erinnerungen für garantierte Injektion anpinnen](#erinnerungen-für-garantierte-injektion-anpinnen)
+   unten).
+3. Erinnerungen werden in das verbleibende Budget angehängt (Inhalt oder
    Zusammenfassung je nach verfügbarem Platz) — immer mindestens
    `auto_inject.memory_budget_fraction × Budget`, sofern Erinnerungen existieren,
    sodass Kategorieninhalt den Erinnerungsabschnitt nicht mehr aushungern kann.
@@ -2304,8 +2319,15 @@ Die Inject-Ressource erstellt einen budgetierten Text-Payload für die Einbettun
      unverändert gegenüber vor dieser Option.
    - `memory://inject/{hint}`: oberste Erinnerungen nach **hybrider Relevanz** zum
      Hinweis (siehe unten).
-3. Der Payload wird bei `auto_inject.max_chars` abgeschnitten, interpretiert gemäß
-   `auto_inject.budget_unit` (Standard 30.000 Zeichen).
+   - Eine Erinnerung, die sowohl angepinnt ist als auch hier unabhängig ausgewählt
+     würde, wird (per ID) aus diesem Schritt ausgeschlossen, sodass sie genau
+     einmal erscheint und keinen zusätzlichen Platz von `auto_inject_limit`
+     verbraucht.
+4. Der Payload wird bei `auto_inject.max_chars` abgeschnitten, interpretiert gemäß
+   `auto_inject.budget_unit` (Standard 30.000 Zeichen). Dies gilt auch für
+   angepinnten Inhalt: Übersteigen die angepinnten Erinnerungen eines Namespace
+   allein den reservierten Anteil des Erinnerungsabschnitts, werden sie wie jeder
+   andere Inhalt pro Eintrag abgeschnitten, und `truncated` ist `true`.
 
 Abfrageparameter:
 - `namespace` — Namensraum für den Inject (Standard: `global`)
@@ -2345,11 +2367,62 @@ Thema) statt nach Aktualität auswählt:
   (Standard), wird ein Kandidat übersprungen, dessen Vektorähnlichkeit zu einer
   bereits ausgewählten Erinnerung `deduplication.similarity_threshold` überschreitet;
   das freigewordene Budget geht an den nächsten unterschiedlichen Kandidaten.
+  **Angepinnte Erinnerungen sind davon in beide Richtungen ausgenommen**: Zwei
+  einander stark ähnliche angepinnte Erinnerungen werden beide injiziert (nie
+  gegenseitig unterdrückt), und eine angepinnte Erinnerung unterdrückt niemals
+  einen nach Relevanz ausgewählten Kandidaten, der ihr zufällig stark ähnelt —
+  und wird auch nicht durch ihn unterdrückt.
 
 Beispiel: `memory://inject/deploy%20to%20production` bedingt die Auswahl auf
 "deploy to production".
 
 Die Antwortstruktur ist identisch zu `memory://inject`.
+
+### Erinnerungen für garantierte Injektion anpinnen
+
+`memory://inject` und `memory://inject/{hint}` wählen ihren Erinnerungsabschnitt
+normalerweise nach Aktualität oder Relevanz aus, was bedeutet, dass eine
+bestimmte Tatsache nur dann in den injizierten Kontext gelangt, wenn sie gut
+genug eingestuft wird — eine kritische Betriebsregel („immer pnpm verwenden,
+niemals npm") kann stillschweigend herausfallen, wenn nichts kürzlich darauf
+verwiesen hat und sie nicht zum aktuellen Hinweis passt. **Anpinnen** schließt
+diese Lücke: Eine angepinnte Erinnerung wird immer in den Erinnerungsabschnitt
+aufgenommen, unabhängig von ihrer Einstufung nach Aktualität oder Relevanz.
+
+- **Setzbar über `remember`** beim Schreiben (`pinned: true`/`false`) — bei
+  einem Dedup-`UPDATE` bleibt der bestehende Pin-Status der Erinnerung erhalten,
+  wenn `pinned` weggelassen wird, sodass eine Inhaltskorrektur eine kritische
+  Tatsache nicht stillschweigend entpinnt; zum Ändern explizit angeben.
+- **Setzbar über `tag`** als dedizierter, leichtgewichtiger Umschalter
+  (`pinned: true`/`false`), der weder den Inhalt berührt noch dessen erneute
+  Übermittlung erfordert.
+- **Pro Namespace begrenzt**: `defaults.pin_limit_per_namespace` (Standard `20`)
+  begrenzt, wie viele Erinnerungen gleichzeitig angepinnt sein können,
+  durchgesetzt beim Schreiben. Wird die Obergrenze beim Anpinnen überschritten,
+  wird `INVALID_INPUT` zurückgegeben — zuerst eine andere Erinnerung entpinnen,
+  um Platz zu schaffen.
+- **Nutzt das vorhandene Budget des Erinnerungsabschnitts**
+  (`auto_inject.memory_budget_fraction`-Anteil) — es gibt kein separates
+  Kontingent. Übersteigt angepinnter Inhalt allein diesen Anteil, wird er wie
+  jeder andere Inhalt pro Eintrag abgeschnitten, und das `truncated`-Flag des
+  Payloads wird gesetzt.
+- **Von der Near-Duplicate-Unterdrückung ausgenommen** in beide Richtungen
+  (siehe oben).
+- **Keine Auswirkung auf `search`/`recall`**: `pinned` erscheint nie in
+  `SearchResult` und beeinflusst weder Ranking noch Reihenfolge — dies
+  unterscheidet sich bewusst von der Aufbewahrungsstufe `T0`, die nur
+  Aufbewahrung/Ranking beeinflusst und selbst keine Garantie für die
+  Injektions-Aufnahme bietet. Eine Erinnerung kann `T0` und angepinnt sein,
+  `T0` und nicht angepinnt, oder jede beliebige Stufe und angepinnt — beide sind
+  orthogonal.
+- **Abschaltbar**: `auto_inject.pinned_enabled: false` (Standard `true`)
+  deaktiviert den Schritt zur Aufnahme angepinnter Erinnerungen vollständig —
+  beide Inject-Vorlagen verhalten sich dann, als wäre keine Erinnerung
+  angepinnt. Die Obergrenze pro Namespace wird unabhängig von diesem Schalter
+  weiterhin beim Schreiben durchgesetzt.
+- **Dauerhaft**: Der Pin-Status wird im Qdrant-Payload persistiert und durch
+  `repair --mode from-qdrant` sowie die geräteübergreifende Synchronisation
+  wiederhergestellt, sodass er einen SQLite-Wiederaufbau übersteht.
 
 ### `memory://{id}/revisions` — Revisionsverlauf
 
@@ -2552,6 +2625,7 @@ Inhalt in BHGBrain mit automatischer Deduplizierung, Normalisierung, Einbettung 
 | `importance` | `number (0–1)` | Nein | `0.5` | Wichtigkeitsbewertung. Höhere Werte werden bei der Stale-Bereinigung priorisiert. |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | Nein | `"cli"` | Quelle der Erinnerung. Beeinflusst die Standard-Stufe (z. B. agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | Nein | automatisch zugewiesen | Explizite Stufenüberschreibung. Hat Vorrang vor allen Heuristiken. |
+| `pinned` | `boolean` | Nein | `false` bei ADD; bei UPDATE beibehalten | Pinnt diese Erinnerung, sodass sie immer in `memory://inject`-Payloads enthalten ist, begrenzt durch `defaults.pin_limit_per_namespace` (Standard 20). Bei einem Dedup-`UPDATE` bleibt der bestehende Pin-Status der Erinnerung erhalten, wenn `pinned` weggelassen wird — zum Ändern explizit angeben. Wird beim Neu-Pinnen die Obergrenze pro Namespace überschritten, wird `INVALID_INPUT` zurückgegeben. |
 
 **Lange Inhalte werden abgelehnt, nicht stillschweigend zu einem „Mush-Vektor" verarbeitet:** Inhalte, die länger sind als `pipeline.long_content_threshold_chars` (Konfiguration, Standard `8.000` Zeichen ≈ 1–2 Seiten), werden mit einem `INVALID_INPUT`-Fehler abgelehnt, der die Zeichenanzahl, den Schwellenwert und die Lösung nennt: Verwenden Sie stattdessen das `import`-Tool mit `format: "freeform"`, oder teilen Sie den Inhalt in mehrere `remember`-Aufrufe auf. Dies ist beabsichtigt: Die Einbettung mehrerer tausend Wörter als einzelner Vektor erzeugt einen minderwertigen „Mush-Vektor", der viele unterschiedliche Anfragen schwach statt einer Anfrage präzise trifft. Die Obergrenze von 100.000 Zeichen aus der Tabelle oben gilt weiterhin als absolutes Maximum, aber `long_content_threshold_chars` ist die Grenze, auf die Aufrufer zuerst stoßen.
 
@@ -2749,7 +2823,7 @@ Erinnerungen mithilfe semantischer, Volltext- oder Hybrid-Modi durchsuchen. Biet
 
 ### `tag` — Tags verwalten
 
-Tags zu einer Erinnerung hinzufügen oder entfernen. Tags werden atomar zusammengeführt/gefiltert; Inhalt und Einbettung der Erinnerung sind nicht betroffen.
+Tags zu einer Erinnerung hinzufügen oder entfernen und/oder sie pinnen oder entpinnen. Tags und Pin-Status werden atomar aktualisiert; Inhalt und Einbettung der Erinnerung sind nicht betroffen.
 
 **Eingabe:**
 
@@ -2758,6 +2832,7 @@ Tags zu einer Erinnerung hinzufügen oder entfernen. Tags werden atomar zusammen
 | `id` | `string (UUID)` | **Ja** | — | Zu tagende Erinnerung. |
 | `add` | `string[]` | Nein | `[]` | Hinzuzufügende Tags. Max. 20 Tags insgesamt nach der Zusammenführung. |
 | `remove` | `string[]` | Nein | `[]` | Zu entfernende Tags. |
+| `pinned` | `boolean` | Nein | unverändert | Pinnt (`true`) oder entpinnt (`false`) diese Erinnerung, unabhängig von Tags — ein dedizierter Umschalter fürs Inject-Pinning, der keine erneute Übermittlung des Inhalts erfordert. Weglassen, um den Pin-Status unverändert zu lassen. Wird eine noch nicht angepinnte Erinnerung angepinnt, während der Namespace bereits an der Obergrenze `defaults.pin_limit_per_namespace` liegt, wird `INVALID_INPUT` zurückgegeben. |
 
 **Ausgabe:**
 
@@ -2768,7 +2843,7 @@ Tags zu einer Erinnerung hinzufügen oder entfernen. Tags werden atomar zusammen
 }
 ```
 
-Gibt `INVALID_INPUT` zurück, wenn das Hinzufügen von Tags das Limit von 20 Tags überschreiten würde.
+Gibt `INVALID_INPUT` zurück, wenn das Hinzufügen von Tags das Limit von 20 Tags überschreiten würde, oder wenn das Pinnen `defaults.pin_limit_per_namespace` überschreiten würde.
 
 ---
 

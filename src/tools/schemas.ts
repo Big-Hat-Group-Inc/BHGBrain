@@ -58,6 +58,7 @@ export const MCP_TOOL_DEFINITIONS = [
         importance: { type: 'number', minimum: 0, maximum: 1, description: 'Importance score 0-1' },
         source: { type: 'string', enum: ['cli', 'api', 'agent', 'import'], description: 'Memory source' },
         retention_tier: { type: 'string', enum: ['T0', 'T1', 'T2', 'T3'], description: 'Optional explicit retention tier' },
+        pinned: { type: 'boolean', description: 'Pin this memory so it is always included in memory://inject payloads, bounded by defaults.pin_limit_per_namespace. On ADD, defaults to false when omitted; on UPDATE (dedup merge), omitting preserves the existing memory\'s pin state — pass explicitly to change it.' },
       },
       required: ['content'],
       additionalProperties: false,
@@ -161,11 +162,12 @@ export const MCP_TOOL_DEFINITIONS = [
         id: { type: 'string', format: 'uuid' },
         add: { type: 'array', items: { type: 'string', pattern: '^[a-zA-Z0-9-]+$', maxLength: 100 }, maxItems: 20 },
         remove: { type: 'array', items: { type: 'string', pattern: '^[a-zA-Z0-9-]+$', maxLength: 100 }, maxItems: 20 },
+        pinned: { type: 'boolean', description: 'Pin or unpin this memory without touching its content or tags, bounded by defaults.pin_limit_per_namespace. Omit to leave pin state unchanged.' },
       },
       required: ['id'],
       additionalProperties: false,
     },
-    // Reversible metadata edit: tags can always be added/removed back.
+    // Reversible metadata edit: tags/pin state can always be added/removed back.
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {

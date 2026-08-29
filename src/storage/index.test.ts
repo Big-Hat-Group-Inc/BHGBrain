@@ -178,6 +178,51 @@ describe('StorageManager cross-store consistency', () => {
     });
   });
 
+  describe('pinned durability (add-inject-pinning)', () => {
+    it('includes pinned: true in the Qdrant payload on writeMemory', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory({ ...baseMem, pinned: true }, [1, 2, 3]);
+
+      expect(qdrant.upsert).toHaveBeenCalledWith(
+        'global', 'general', 'mem-1', [1, 2, 3],
+        expect.objectContaining({ pinned: true }),
+      );
+    });
+
+    it('includes pinned: false in the Qdrant payload when unpinned', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory({ ...baseMem, pinned: false }, [1, 2, 3]);
+
+      expect(qdrant.upsert).toHaveBeenCalledWith(
+        'global', 'general', 'mem-1', [1, 2, 3],
+        expect.objectContaining({ pinned: false }),
+      );
+    });
+
+    it('carries the existing pinned state into the Qdrant payload on a metadata-only updateMemory', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory({ ...baseMem, pinned: true }, [1, 2, 3]);
+      await storage.updateMemory('mem-1', { importance: 0.9 }, [4, 5, 6]);
+
+      expect(qdrant.upsert).toHaveBeenLastCalledWith(
+        'global', 'general', 'mem-1', [4, 5, 6],
+        expect.objectContaining({ pinned: true }),
+      );
+    });
+  });
+
   describe('updateMemory rollback', () => {
     it('rolls back SQLite update when Qdrant upsert fails', async () => {
       const sqlite = createMockSqlite();

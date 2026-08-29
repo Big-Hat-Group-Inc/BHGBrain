@@ -33,6 +33,9 @@ export const RememberInputSchema = z.object({
   importance: z.number().min(0).max(1).optional(),
   source: MemorySourceSchema.optional().default('cli'),
   retention_tier: RetentionTierSchema.optional(),
+  // Explicit-set-wins on UPDATE (preserves existing state when omitted);
+  // defaults to false on ADD when omitted. See add-inject-pinning.
+  pinned: z.boolean().optional(),
 }).strict();
 
 export const RecallInputSchema = z.object({
@@ -81,6 +84,8 @@ export const TagInputSchema = z.object({
   id: z.string().uuid(),
   add: TagsSchema.optional().default([]),
   remove: TagsSchema.optional().default([]),
+  // Dedicated pin/unpin toggle, applied only when present. See add-inject-pinning.
+  pinned: z.boolean().optional(),
 }).strict();
 
 export const CollectionsInputSchema = z.object({

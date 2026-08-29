@@ -154,6 +154,34 @@ describe('SearchService', () => {
     expect(storage.sqlite.getMemoriesByIds).toHaveBeenCalledWith(['mem-1']);
   });
 
+  it('a pinned memory is unaffected by pinned state: no pinned field, ordering unchanged (add-inject-pinning 5.12)', async () => {
+    const pinnedMem: StoredMemory = {
+      id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic',
+      content: 'hello world', summary: 'hello', tags: [], source: 'cli',
+      checksum: 'mem-1',
+      importance: 0.9,
+      retention_tier: 'T2',
+      expires_at: '2026-12-31T00:00:00Z',
+      decay_eligible: true,
+      review_due: null,
+      access_count: 0,
+      last_operation: 'ADD',
+      merged_from: null,
+      archived: false,
+      vector_synced: true,
+      pinned: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+    };
+    const { service } = createSearchService({ memories: new Map([['mem-1', pinnedMem]]) });
+    const results = await service.search('hello', 'global', undefined, 'fulltext', 10);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.id).toBe('mem-1');
+    expect('pinned' in results[0]!).toBe(false);
+  });
+
   it('preserves ranked order even when the store returns rows in a different order', async () => {
     // Regression: an `IN (...)` bulk lookup does not guarantee row order matches
     // the ranked input. The service-layer memoryMap must re-order results to the

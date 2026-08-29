@@ -83,6 +83,8 @@ export interface SqliteStorage {
   getMemoryByChecksum(namespace: string, checksum: string, collection?: string): MemoryRecordWithoutEmbedding | null;
   listMemories(namespace: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
   listMemoriesInCollection(namespace: string, collection: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
+  listPinnedMemories(namespace: string): MemoryRecordWithoutEmbedding[];
+  countPinnedMemories(namespace: string): number;
   countMemories(namespace?: string): number;
   countMemoriesInCollection(namespace: string, collection: string): number;
   fullTextSearch(namespace: string, query: string, limit: number, collection?: string, filter?: RecallFilter): Array<{ id: string; rank: number }>;
@@ -202,6 +204,7 @@ CREATE TABLE IF NOT EXISTS memories (
   stale INTEGER NOT NULL DEFAULT 0,
   archived INTEGER NOT NULL DEFAULT 0,
   vector_synced INTEGER NOT NULL DEFAULT 1,
+  pinned INTEGER NOT NULL DEFAULT 0,
   device_id TEXT,
   embedding_model TEXT,
   created_at TEXT NOT NULL,
@@ -221,6 +224,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_expiry ON memories(decay_eligible, expir
 CREATE INDEX IF NOT EXISTS idx_memories_review_due ON memories(retention_tier, review_due);
 CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(archived);
 CREATE INDEX IF NOT EXISTS idx_memories_vector_synced ON memories(vector_synced);
+CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(namespace, pinned);
 
 CREATE TABLE IF NOT EXISTS memories_fts (
   id TEXT PRIMARY KEY,
@@ -487,14 +491,15 @@ export class SqliteStore implements SqliteStorage {
     const reviewDue = mem.review_due ?? null;
     const archived = mem.archived ?? false;
     const vectorSynced = mem.vector_synced ?? true;
+    const pinned = mem.pinned ?? false;
     const deviceId = mem.device_id ?? null;
     const embeddingModel = mem.embedding_model ?? null;
     this.db.run(
       `INSERT INTO memories (
         id, namespace, collection, type, category, content, summary, tags, source, checksum,
         importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
-        last_operation, merged_from, stale, archived, vector_synced, device_id, embedding_model, created_at, updated_at, last_accessed
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        last_operation, merged_from, stale, archived, vector_synced, pinned, device_id, embedding_model, created_at, updated_at, last_accessed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         mem.id,
         mem.namespace,
@@ -517,6 +522,7 @@ export class SqliteStore implements SqliteStorage {
         0,
         archived ? 1 : 0,
         vectorSynced ? 1 : 0,
+        pinned ? 1 : 0,
         deviceId,
         embeddingModel,
         mem.created_at,
@@ -558,6 +564,10 @@ export class SqliteStore implements SqliteStorage {
     const category = typeof payload.category === 'string' ? payload.category : null;
     const decayEligible = typeof payload.decay_eligible === 'boolean' ? payload.decay_eligible : true;
     const checksum = typeof payload.checksum === 'string' ? payload.checksum : '';
+    // Restore pin state from the payload rather than defaulting it to false,
+    // so a `repair --mode from-qdrant` rebuild (or the cross-device fallback
+    // path) preserves it. See add-inject-pinning.
+    const pinned = typeof payload.pinned === 'boolean' ? payload.pinned : false;
 
     // Handle expires_at which may be stored as epoch seconds in Qdrant
     let expiresAt: string | null = null;
@@ -583,13 +593,13 @@ export class SqliteStore implements SqliteStorage {
         `INSERT INTO memories (
           id, namespace, collection, type, category, content, summary, tags, source, checksum,
           importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
-          last_operation, merged_from, stale, archived, vector_synced, device_id, embedding_model, created_at, updated_at, last_accessed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          last_operation, merged_from, stale, archived, vector_synced, pinned, device_id, embedding_model, created_at, updated_at, last_accessed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id, namespace, collection, type, category, content, summary,
           JSON.stringify(tags), source, checksum, importance, retentionTier,
           expiresAt, decayEligible ? 1 : 0, null, 0,
-          'ADD', null, 0, 0, 1, deviceId, embeddingModel, createdAt, now, now,
+          'ADD', null, 0, 0, 1, pinned ? 1 : 0, deviceId, embeddingModel, createdAt, now, now,
         ],
       );
       this.db.run(
@@ -617,7 +627,7 @@ export class SqliteStore implements SqliteStorage {
       if (key === 'tags') {
         sets.push('tags = ?');
         vals.push(JSON.stringify(val));
-      } else if (key === 'decay_eligible' || key === 'archived' || key === 'vector_synced') {
+      } else if (key === 'decay_eligible' || key === 'archived' || key === 'vector_synced' || key === 'pinned') {
         sets.push(`${key} = ?`);
         vals.push(val ? 1 : 0);
       } else {
@@ -731,6 +741,29 @@ export class SqliteStore implements SqliteStorage {
     sql += ` ORDER BY created_at DESC, id DESC LIMIT ?`;
     params.push(limit);
     return this.queryMemories(sql, params);
+  }
+
+  /**
+   * A namespace's pinned, non-archived memories, ordered `updated_at DESC`
+   * ("most recently affirmed first") — the always-included candidate set for
+   * `buildInjectPayload`'s pinned step. See add-inject-pinning.
+   */
+  listPinnedMemories(namespace: string): MemoryRecordWithoutEmbedding[] {
+    return this.queryMemories(
+      `SELECT * FROM memories WHERE namespace = ? AND archived = 0 AND pinned = 1 ORDER BY updated_at DESC`,
+      [namespace],
+    );
+  }
+
+  countPinnedMemories(namespace: string): number {
+    const stmt = this.db.prepare(
+      `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND archived = 0 AND pinned = 1`,
+    );
+    stmt.bind([namespace]);
+    stmt.step();
+    const row = stmt.getAsObject() as { cnt: number };
+    stmt.free();
+    return row.cnt;
   }
 
   countMemories(namespace?: string): number {
@@ -1805,6 +1838,7 @@ export class SqliteStore implements SqliteStorage {
       merged_from: this.getNullableString(row, 'merged_from'),
       archived: this.getBoolean(row, 'archived'),
       vector_synced: row.vector_synced === undefined ? true : this.getBoolean(row, 'vector_synced'),
+      pinned: row.pinned === undefined ? false : this.getBoolean(row, 'pinned'),
       device_id: this.getNullableString(row, 'device_id'),
       embedding_model: this.getNullableString(row, 'embedding_model'),
       created_at: this.getString(row, 'created_at'),
@@ -1949,6 +1983,7 @@ export class SqliteStore implements SqliteStorage {
       { name: 'vector_synced', sql: `ALTER TABLE memories ADD COLUMN vector_synced INTEGER NOT NULL DEFAULT 1` },
       { name: 'device_id', sql: `ALTER TABLE memories ADD COLUMN device_id TEXT` },
       { name: 'embedding_model', sql: `ALTER TABLE memories ADD COLUMN embedding_model TEXT` },
+      { name: 'pinned', sql: `ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0` },
     ];
 
     for (const column of requiredColumns) {

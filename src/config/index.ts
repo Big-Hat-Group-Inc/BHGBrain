@@ -117,6 +117,10 @@ const ConfigSchema = z.object({
     min_score: z.number().min(0).max(1).default(0.6),
     auto_inject_limit: z.number().int().min(1).default(10),
     max_response_chars: z.number().int().positive().default(50000),
+    // Per-namespace cap on the number of memories with `pinned: true`, so
+    // pinning stays a small, deliberate set rather than a second unbounded
+    // inject path. See add-inject-pinning.
+    pin_limit_per_namespace: z.number().int().min(1).max(200).default(20),
   }).default({}),
   retention: z.object({
     decay_after_days: z.number().int().positive().default(180),
@@ -289,6 +293,11 @@ const ConfigSchema = z.object({
     // Greedy near-duplicate suppression within the hint-selected memory
     // section, reusing `deduplication.similarity_threshold`.
     dedup_suppression: z.boolean().default(true),
+    // Kill switch for the pinned-memory inject step (add-inject-pinning):
+    // `false` skips it entirely, leaving both inject templates behaving as
+    // if no memory were pinned. The pin cap is still enforced at write time
+    // regardless of this switch.
+    pinned_enabled: z.boolean().default(true),
   }).default({}),
   observability: z.object({
     metrics_enabled: z.boolean().default(false),

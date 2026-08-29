@@ -319,6 +319,120 @@ describe('WritePipeline NOOP handling', () => {
   });
 });
 
+describe('WritePipeline pinned (add-inject-pinning)', () => {
+  const config = {
+    deduplication: { similarity_threshold: 0.92 },
+    pipeline: {
+      extraction_enabled: true,
+      fallback_to_threshold_dedup: true,
+      extraction_model: 'gpt-4o-mini',
+      extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
+      contradiction_detection: { enabled: false, timeout_ms: 5000 },
+    },
+  } as unknown as BrainConfig;
+
+  let embedding: EmbeddingProvider;
+  let storage: StorageManager;
+  let existingMemory: { pinned: boolean } & Record<string, unknown>;
+
+  beforeEach(() => {
+    embedding = {
+      model: 'test-model',
+      dimensions: 2,
+      embed: vi.fn(async () => [0.1, 0.2]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
+      healthCheck: vi.fn(async () => true),
+    };
+    existingMemory = {
+      id: 'existing-id',
+      summary: 'existing summary',
+      type: 'semantic',
+      content: 'existing content',
+      created_at: '2026-01-01T00:00:00.000Z',
+      importance: 0.5,
+      tags: [],
+      pinned: true,
+    };
+    storage = {
+      sqlite: {
+        getMemoryByChecksum: vi.fn(() => null),
+        getMemoryById: vi.fn(() => existingMemory),
+        insertMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+        fullTextSearch: vi.fn(() => []),
+      },
+      qdrant: {
+        searchSimilar: vi.fn(async () => []),
+      },
+      updateMemory: vi.fn(),
+      writeMemory: vi.fn(),
+      writeMemoryWithoutVector: vi.fn(),
+      deleteMemory: vi.fn(async () => true),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+  });
+
+  it('ADD defaults pinned to false when omitted (5.1)', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+    await pipeline.process({
+      content: 'brand new content', namespace: 'global', collection: 'general', tags: [], source: 'cli',
+    });
+    expect(storage.writeMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ pinned: false }), expect.anything(),
+    );
+  });
+
+  it('ADD sets pinned: true when explicitly requested (5.1)', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+    await pipeline.process({
+      content: 'brand new pinned content', namespace: 'global', collection: 'general', tags: [], source: 'cli', pinned: true,
+    });
+    expect(storage.writeMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ pinned: true }), expect.anything(),
+    );
+  });
+
+  it('UPDATE omitting pinned preserves the existing memory\'s pin state (5.2)', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'existing-id', score: 0.95 }]);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await pipeline.process({
+      content: 'a refinement of the existing pinned memory', namespace: 'global', collection: 'general', tags: [], source: 'cli',
+    });
+
+    expect(storage.updateMemory).toHaveBeenCalledWith(
+      'existing-id', expect.objectContaining({ pinned: true }), expect.anything(),
+    );
+  });
+
+  it('UPDATE with an explicit pinned: false overrides an existing pinned memory (5.3)', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'existing-id', score: 0.95 }]);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await pipeline.process({
+      content: 'a refinement that unpins', namespace: 'global', collection: 'general', tags: [], source: 'cli', pinned: false,
+    });
+
+    expect(storage.updateMemory).toHaveBeenCalledWith(
+      'existing-id', expect.objectContaining({ pinned: false }), expect.anything(),
+    );
+  });
+
+  it('UPDATE with an explicit pinned: true pins a previously-unpinned memory', async () => {
+    existingMemory.pinned = false;
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'existing-id', score: 0.95 }]);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await pipeline.process({
+      content: 'a refinement that pins', namespace: 'global', collection: 'general', tags: [], source: 'cli', pinned: true,
+    });
+
+    expect(storage.updateMemory).toHaveBeenCalledWith(
+      'existing-id', expect.objectContaining({ pinned: true }), expect.anything(),
+    );
+  });
+});
+
 describe('WritePipeline dedup candidate window corroboration', () => {
   // Tier T2 (source: 'cli') resolves thresholds to { noop: 0.98, update: 0.92 }
   // via dedupThresholdFor with similarity_threshold: 0.92 (see
