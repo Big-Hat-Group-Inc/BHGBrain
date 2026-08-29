@@ -458,6 +458,32 @@ The file is created automatically on first run with all defaults applied. Edit i
       "lambda": 0.7,
       "candidate_pool_multiplier": 3,
       "candidate_pool_cap": 50
+    },
+    // Multi-query expansion: semantic search/recall embed and search more than
+    // one representation of the query, merging candidates by id (max score
+    // wins) before ranking (see "Multi-Query Expansion" below).
+    "query_expansion": {
+      "enabled": true,
+      // Upper bound on total variants searched (original + keyword-stripped +
+      // LLM-generated), regardless of llm_paraphrase.variant_count.
+      "max_variants": 2,
+      // Deterministic, no-model variant: the query with English stopwords
+      // removed, searched alongside the original whenever it differs and is
+      // non-empty.
+      "keyword_stripped": true,
+      // Opt-in, model-backed variant generation. Off by default: this is the
+      // first live-path LLM chat dependency and adds latency/cost per call.
+      "llm_paraphrase": {
+        "enabled": false,
+        // "paraphrase": reword the query. "hyde": generate a hypothetical
+        // answer passage and embed that instead (can improve recall, at the
+        // cost of possible hallucinated specifics - see README below).
+        "mode": "paraphrase",
+        "variant_count": 2,
+        // Chat-completion request timeout; any failure (timeout, non-2xx,
+        // missing key) degrades silently to the no-model variants above.
+        "timeout_ms": 3000
+      }
     }
   },
 
@@ -573,7 +599,7 @@ The file is created automatically on first run with all defaults applied. Edit i
 | `BHGBRAIN_TOKEN` | Required for non-loopback HTTP | — | Bearer token for HTTP authentication. Server **refuses to start** if the host is non-loopback and this is unset (unless `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Required for Qdrant Cloud | — | Set `qdrant.api_key_env` in config to the name of this variable. The default config field name is `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generated from hostname | Override the device identifier for multi-device setups. See [Device Identity Resolution](#device-identity-resolution). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model, used when `pipeline.extraction_enabled` is `true`. Also the default value of `pipeline.summarization_model_env` (used when `pipeline.summarization_enabled` is `true`) — point that field at a different variable if you want a separate key for summarization. |
+| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model, used when `pipeline.extraction_enabled` is `true`. Also the default value of `pipeline.summarization_model_env` (used when `pipeline.summarization_enabled` is `true`) — point that field at a different variable if you want a separate key for summarization. Also read by multi-query expansion's LLM paraphrase/HyDE phase (`search.query_expansion.llm_paraphrase.enabled`, see [Multi-Query Expansion](#multi-query-expansion)), which resolves the key from `pipeline.extraction_model_env` the same way, falling back to `OPENAI_API_KEY` when unset. |
 
 Generate a secure bearer token:
 
@@ -1777,6 +1803,35 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `candidate_pool_cap` | `50` | Upper bound on the widened pool size, regardless of `limit * candidate_pool_multiplier`. |
 
 **Not the same as `memory://inject/{hint}`'s near-duplicate suppression:** that resource template (see [MCP Resources Reference](#mcp-resources-reference)) already has its own, separate near-duplicate mechanism - a hard threshold drop (reusing `deduplication.similarity_threshold`, default `0.92`) rather than MMR's continuous relevance/diversity trade-off. The two are intentionally independent: `search.mmr` configuration has no effect on `memory://inject/{hint}`, and vice versa.
+
+---
+
+### Multi-Query Expansion
+
+`recall` and `search` (in `semantic` and `hybrid` modes) embed and search more than one representation of the query, not just the literal string. A conversational query like "how do we deploy" can embed far enough from a memory phrased "deployment runs via `docker-compose up -d`" that cosine similarity lands below `min_score`, even though the memory plainly answers the question. Query expansion widens the candidate pool searched for a single call so a memory like that still surfaces.
+
+**Ranking pipeline order:** query expansion (variant embed/search + merge) → relevance (cosine / FTS rank / RRF) → composite prior → MMR diversity reorder → downstream `min_score` / type / tags filtering and truncation to the caller's `limit`. Expansion only changes which candidates enter the pipeline; every stage after it is unaffected in mechanism.
+
+**Two independently gated phases:**
+
+1. **Keyword-stripped variant (default on, no model).** Alongside the original query, a deterministic variant with a small fixed set of English stopwords removed (e.g. "how do we deploy" → "deploy") is embedded and searched too, whenever it differs from the original and is non-empty. An all-stopword query ("is it") or an already-content-word-only query ("deploy production") produces no extra variant. Both embeds go through one batched `embedBatch` call, so this phase costs one extra Qdrant round trip, not an extra embedding API call.
+2. **LLM paraphrase / HyDE (default off, model-gated).** When `search.query_expansion.llm_paraphrase.enabled` is `true` *and* an API key resolves (from `pipeline.extraction_model_env`, falling back to `OPENAI_API_KEY`), a chat-completion call generates 1-3 additional variants - either reworded paraphrases of the query (`mode: "paraphrase"`, the default) or a hypothetical answer passage to embed instead (`mode: "hyde"`). HyDE can improve recall but risks pulling the embedding toward hallucinated specifics (tool names, numbers) the query never mentioned, so it is opt-in rather than the default. Any failure - missing key, non-2xx response, timeout - degrades silently to the phase-1 variants; a search call never fails because paraphrase generation failed.
+
+**Merging:** candidates from every searched variant are merged by memory id, keeping the **max** score per id (not summed or averaged - a memory matched by two variants isn't inflated relative to one matched by only its best variant), then truncated back to the caller's `limit` before scoring/ranking continue. This means `semantic_score` on a result now means "best score across every variant searched," rather than "score against the literal query" - a change in what the field represents, though its numeric range and calibration against `min_score`/composite ranking are unchanged.
+
+**Not applied to fulltext:** standalone `mode: "fulltext"` and hybrid's fulltext leg always search the single original query string - conjunctive `LIKE`-based term matching has a related but separate stopword weakness, tracked independently (upgrading fulltext to a real BM25 index).
+
+**Configuration** (`search.query_expansion` in `config.json`, see [Configuration](#configuration)):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Kill switch for the whole feature. `false` restores the pre-expansion, single-embed-per-query cost profile exactly. |
+| `max_variants` | `2` | Upper bound on the total variant count (original + keyword-stripped + LLM), independent of `llm_paraphrase.variant_count`. Variants beyond the cap are dropped, not queued. |
+| `keyword_stripped` | `true` | Enables phase 1 (the deterministic no-model variant). |
+| `llm_paraphrase.enabled` | `false` | Enables phase 2. Requires a resolvable API key or LLM expansion is silently skipped (logged once at startup, not per call). |
+| `llm_paraphrase.mode` | `"paraphrase"` | `"paraphrase"` rewords the query; `"hyde"` generates a hypothetical answer passage to embed. |
+| `llm_paraphrase.variant_count` | `2` | How many paraphrase/HyDE variants to request per call (1-3). |
+| `llm_paraphrase.timeout_ms` | `3000` | Chat-completion request timeout; a timeout counts as a failure and degrades to phase 1. |
 
 ---
 

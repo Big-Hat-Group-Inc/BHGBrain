@@ -412,6 +412,37 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
       "lambda": 0.7,
       "candidate_pool_multiplier": 3,
       "candidate_pool_cap": 50
+    },
+    // Multi-Query-Expansion: semantische Suche/Recall embedden und durchsuchen
+    // mehr als eine Repräsentation der Anfrage und mergen Kandidaten anhand
+    // der ID (der höhere Score gewinnt), bevor das Ranking greift (siehe
+    // "Multi-Query-Expansion" unten).
+    "query_expansion": {
+      "enabled": true,
+      // Obergrenze der insgesamt durchsuchten Varianten (Original +
+      // Stoppwort-bereinigt + LLM-generiert), unabhängig von
+      // llm_paraphrase.variant_count.
+      "max_variants": 2,
+      // Deterministische, modellfreie Variante: die Anfrage ohne englische
+      // Stoppwörter, zusätzlich zum Original durchsucht, sofern sie sich
+      // unterscheidet und nicht leer ist.
+      "keyword_stripped": true,
+      // Optionale, modellgestützte Variantengenerierung. Standardmäßig aus:
+      // dies ist die erste Live-Pfad-LLM-Chat-Abhängigkeit und fügt pro
+      // Aufruf Latenz/Kosten hinzu.
+      "llm_paraphrase": {
+        "enabled": false,
+        // "paraphrase": formuliert die Anfrage um. "hyde": generiert eine
+        // hypothetische Antwort-Passage und embedded diese stattdessen
+        // (kann Recall verbessern, auf Kosten möglicher halluzinierter
+        // Details — siehe README unten).
+        "mode": "paraphrase",
+        "variant_count": 2,
+        // Timeout für die Chat-Completion-Anfrage; jeder Fehlschlag
+        // (Timeout, Nicht-2xx, fehlender Key) degradiert stillschweigend
+        // zu den modellfreien Varianten oben.
+        "timeout_ms": 3000
+      }
     }
   },
 
@@ -530,7 +561,7 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
 | `BHGBRAIN_TOKEN` | Erforderlich für nicht-Loopback-HTTP | — | Bearer-Token für HTTP-Authentifizierung. Der Server **verweigert den Start**, wenn der Host nicht Loopback ist und dieser Wert nicht gesetzt ist (außer `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Erforderlich für Qdrant Cloud | — | Setzen Sie `qdrant.api_key_env` in der Konfiguration auf den Namen dieser Variable. Der Standard-Konfigurationsfeldname ist `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | Nein | Automatisch aus dem Hostnamen generiert | Überschreibt den Gerätebezeichner für Multi-Device-Setups. Siehe [Geräteidentitätsauflösung](#geräteidentitätsauflösung). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | Nein | Fällt auf `OPENAI_API_KEY` zurück | API-Schlüssel für das LLM-Extraktionsmodell, verwendet wenn `pipeline.extraction_enabled` auf `true` steht. Auch der Standardwert von `pipeline.summarization_model_env` (verwendet wenn `pipeline.summarization_enabled` auf `true` steht) — auf eine andere Variable verweisen, wenn ein separater Schlüssel für die Zusammenfassung gewünscht ist. |
+| `BHGBRAIN_EXTRACTION_API_KEY` | Nein | Fällt auf `OPENAI_API_KEY` zurück | API-Schlüssel für das LLM-Extraktionsmodell, verwendet wenn `pipeline.extraction_enabled` auf `true` steht. Auch der Standardwert von `pipeline.summarization_model_env` (verwendet wenn `pipeline.summarization_enabled` auf `true` steht) — auf eine andere Variable verweisen, wenn ein separater Schlüssel für die Zusammenfassung gewünscht ist. Wird auch von der LLM-Paraphrase/HyDE-Phase der Multi-Query-Expansion gelesen (`search.query_expansion.llm_paraphrase.enabled`, siehe [Multi-Query-Expansion](#multi-query-expansion)), die den Schlüssel auf dieselbe Weise aus `pipeline.extraction_model_env` auflöst und bei fehlender Variable auf `OPENAI_API_KEY` zurückfällt. |
 
 Sicheres Bearer-Token generieren:
 
@@ -1734,6 +1765,35 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `candidate_pool_cap` | `50` | Obergrenze für die Größe des erweiterten Pools, unabhängig von `limit * candidate_pool_multiplier`. |
 
 **Nicht dasselbe wie die Nahdublikat-Unterdrückung von `memory://inject/{hint}`:** Diese Resource-Vorlage (siehe [MCP-Ressourcen](#mcp-ressourcen)) verfügt bereits über einen eigenen, separaten Nahdublikat-Mechanismus – eine harte Schwellenwert-Verwerfung (die `deduplication.similarity_threshold`, Standard `0.92`, wiederverwendet) statt des kontinuierlichen Relevanz-/Diversitäts-Kompromisses von MMR. Beide sind absichtlich unabhängig: Die `search.mmr`-Konfiguration hat keine Auswirkung auf `memory://inject/{hint}` und umgekehrt.
+
+---
+
+### Multi-Query-Expansion
+
+`recall` und `search` (in den Modi `semantic` und `hybrid`) embedden und durchsuchen mehr als eine Repräsentation der Anfrage, nicht nur den wörtlichen String. Eine umgangssprachliche Anfrage wie "wie deployen wir" kann so weit von einer Erinnerung entfernt embeddet werden, die als "Deployment läuft über `docker-compose up -d`" formuliert ist, dass die Kosinus-Ähnlichkeit unter `min_score` fällt – obwohl die Erinnerung die Frage eindeutig beantwortet. Multi-Query-Expansion erweitert den für einen einzelnen Aufruf durchsuchten Kandidatenpool, sodass eine solche Erinnerung trotzdem auftaucht.
+
+**Reihenfolge der Ranking-Pipeline:** Query-Expansion (Varianten-Embed/-Suche + Merge) → Relevanz (Kosinus / FTS-Rang / RRF) → Composite-Prior → MMR-Diversitäts-Neuordnung → nachgelagerte `min_score`-/Typ-/Tag-Filterung und Kürzung auf das `limit` des Aufrufers. Query-Expansion verändert nur, welche Kandidaten in die Pipeline eintreten; jede nachfolgende Stufe bleibt im Mechanismus unverändert.
+
+**Zwei unabhängig aktivierbare Phasen:**
+
+1. **Stoppwort-bereinigte Variante (standardmäßig an, kein Modell).** Zusätzlich zur Originalanfrage wird eine deterministische Variante mit einer kleinen, festen Menge englischer Stoppwörter embeddet und durchsucht (z. B. "how do we deploy" → "deploy"), sofern sie sich vom Original unterscheidet und nicht leer ist. Eine reine Stoppwort-Anfrage ("is it") oder eine bereits nur aus Inhaltswörtern bestehende Anfrage ("deploy production") erzeugt keine zusätzliche Variante. Beide Embeddings laufen über einen gebündelten `embedBatch`-Aufruf, sodass diese Phase nur eine zusätzliche Qdrant-Anfrage kostet, nicht einen zusätzlichen Embedding-API-Aufruf.
+2. **LLM-Paraphrase / HyDE (standardmäßig aus, modellabhängig).** Wenn `search.query_expansion.llm_paraphrase.enabled` auf `true` steht *und* sich ein API-Schlüssel auflösen lässt (aus `pipeline.extraction_model_env`, mit Fallback auf `OPENAI_API_KEY`), erzeugt ein Chat-Completion-Aufruf 1–3 zusätzliche Varianten – entweder umformulierte Paraphrasen der Anfrage (`mode: "paraphrase"`, Standard) oder eine hypothetische Antwort-Passage, die stattdessen embeddet wird (`mode: "hyde"`). HyDE kann den Recall verbessern, riskiert aber, das Embedding in Richtung halluzinierter Details (Tool-Namen, Zahlen) zu ziehen, die in der Anfrage nie erwähnt wurden – daher ist es optional statt Standard. Jeder Fehlschlag – fehlender Schlüssel, Nicht-2xx-Antwort, Timeout – degradiert stillschweigend zu den Phase-1-Varianten; ein Suchaufruf schlägt nie fehl, nur weil die Paraphrasen-Generierung fehlschlug.
+
+**Merging:** Kandidaten aus jeder durchsuchten Variante werden anhand der Speicher-ID zusammengeführt, wobei der **höchste** Score pro ID erhalten bleibt (nicht summiert oder gemittelt – eine von zwei Varianten getroffene Erinnerung wird nicht gegenüber einer nur von ihrer besten Variante getroffenen Erinnerung überhöht), bevor auf das `limit` des Aufrufers gekürzt wird und Scoring/Ranking fortgesetzt werden. Das bedeutet, `semantic_score` eines Ergebnisses bedeutet jetzt "bester Score über alle durchsuchten Varianten hinweg" statt "Score gegen die wörtliche Anfrage" – eine Änderung dessen, was das Feld repräsentiert, auch wenn sein Wertebereich und seine Kalibrierung gegenüber `min_score`/Composite Ranking unverändert bleiben.
+
+**Nicht auf Volltext angewendet:** Der eigenständige `mode: "fulltext"` und der Volltext-Zweig von Hybrid durchsuchen immer nur die einzelne Originalanfrage – die konjunktive `LIKE`-basierte Term-Übereinstimmung hat eine verwandte, aber separate Stoppwort-Schwäche, die unabhängig verfolgt wird (Umstellung von Volltext auf einen echten BM25-Index).
+
+**Konfiguration** (`search.query_expansion` in `config.json`, siehe [Konfiguration](#konfiguration)):
+
+| Feld | Standard | Bedeutung |
+|---|---|---|
+| `enabled` | `true` | Abschalter für das gesamte Feature. `false` stellt exakt das Kostenprofil vor der Query-Expansion wieder her (ein Embedding pro Anfrage). |
+| `max_variants` | `2` | Obergrenze der insgesamt durchsuchten Varianten (Original + Stoppwort-bereinigt + LLM), unabhängig von `llm_paraphrase.variant_count`. Varianten über der Grenze werden verworfen, nicht aufgeschoben. |
+| `keyword_stripped` | `true` | Aktiviert Phase 1 (die deterministische, modellfreie Variante). |
+| `llm_paraphrase.enabled` | `false` | Aktiviert Phase 2. Erfordert einen auflösbaren API-Schlüssel, sonst wird die LLM-Expansion stillschweigend übersprungen (einmal beim Start protokolliert, nicht pro Aufruf). |
+| `llm_paraphrase.mode` | `"paraphrase"` | `"paraphrase"` formuliert die Anfrage um; `"hyde"` generiert eine hypothetische Antwort-Passage zum Embedden. |
+| `llm_paraphrase.variant_count` | `2` | Wie viele Paraphrase-/HyDE-Varianten pro Aufruf angefordert werden (1–3). |
+| `llm_paraphrase.timeout_ms` | `3000` | Timeout für die Chat-Completion-Anfrage; ein Timeout zählt als Fehlschlag und degradiert zu Phase 1. |
 
 ---
 

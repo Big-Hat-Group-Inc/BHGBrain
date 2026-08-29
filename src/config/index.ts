@@ -221,6 +221,31 @@ const ConfigSchema = z.object({
       candidate_pool_multiplier: z.number().positive().default(3),
       candidate_pool_cap: z.number().int().positive().default(50),
     }).default({}),
+    // Multi-query expansion (add-multi-query-expansion): `semanticSearch` and
+    // the semantic leg of `hybridSearch` embed/search more than one
+    // representation of the query and merge candidates by id, keeping the
+    // max score per id, before scoring/ranking continues. Phase 1 (no
+    // model) is default-on: a deterministic keyword-stripped variant is
+    // added whenever it differs from the original and is non-empty. Phase 2
+    // (LLM paraphrase/HyDE) is opt-in and gated on `llm_paraphrase.enabled`
+    // *and* a resolvable extraction API key; any failure degrades silently
+    // to the phase-1 variants.
+    query_expansion: z.object({
+      enabled: z.boolean().default(true),
+      // Upper bound on the combined variant count (original + keyword +
+      // LLM), independent of `llm_paraphrase.variant_count` — extra LLM
+      // variants beyond this cap are dropped, not queued.
+      max_variants: z.number().int().min(1).max(5).default(2),
+      keyword_stripped: z.boolean().default(true),
+      llm_paraphrase: z.object({
+        enabled: z.boolean().default(false),
+        mode: z.enum(['paraphrase', 'hyde']).default('paraphrase'),
+        variant_count: z.number().int().min(1).max(3).default(2),
+        // Enforced via AbortController on the chat-completions fetch,
+        // mirroring `pipeline.extraction_timeout_ms`.
+        timeout_ms: z.number().int().positive().default(3000),
+      }).default({}),
+    }).default({}),
   }).default({}),
   security: z.object({
     require_loopback_http: z.boolean().default(true),

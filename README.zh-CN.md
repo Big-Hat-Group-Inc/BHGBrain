@@ -406,6 +406,30 @@ BHGBrain 从以下位置加载配置文件：
       "lambda": 0.7,
       "candidate_pool_multiplier": 3,
       "candidate_pool_cap": 50
+    },
+    // 多查询扩展：语义搜索/recall 对查询的多种表示形式进行嵌入和搜索，
+    // 在排名之前按 id 合并候选项（取最高分）（详见下方"多查询扩展"）。
+    "query_expansion": {
+      "enabled": true,
+      // 搜索的变体总数上限（原始 + 去停用词 + LLM 生成），
+      // 与 llm_paraphrase.variant_count 相互独立。
+      "max_variants": 2,
+      // 确定性、无需模型的变体：去除英文停用词后的查询，只要与原始
+      // 查询不同且非空，就与原始查询一起被搜索。
+      "keyword_stripped": true,
+      // 可选的、基于模型的变体生成。默认关闭：这是首个实时路径上的
+      // LLM 对话依赖，每次调用都会增加延迟/成本。
+      "llm_paraphrase": {
+        "enabled": false,
+        // "paraphrase"：改写查询。"hyde"：生成一段假设性答案并改为
+        // 嵌入该段落（可能提升召回率，但代价是可能产生幻觉细节——
+        // 详见下方 README 说明）。
+        "mode": "paraphrase",
+        "variant_count": 2,
+        // 对话补全请求的超时时间；任何失败（超时、非 2xx 响应、
+        // 缺少 key）都会静默降级为上面的无模型变体。
+        "timeout_ms": 3000
+      }
     }
   },
 
@@ -508,7 +532,7 @@ BHGBrain 从以下位置加载配置文件：
 | `BHGBRAIN_TOKEN` | 非回环 HTTP 时必需 | — | HTTP 认证的 Bearer token。若主机地址为非回环且此变量未设置，服务器**拒绝启动**（除非 `allow_unauthenticated_http: true`）。 |
 | `QDRANT_API_KEY` | Qdrant Cloud 时必需 | — | 在配置中将 `qdrant.api_key_env` 设置为此变量名称。默认配置字段名为 `QDRANT_API_KEY`。 |
 | `BHGBRAIN_DEVICE_ID` | 否 | 从主机名自动生成 | 覆盖多设备设置的设备标识符。参见[设备身份解析](#设备身份解析)。 |
-| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key，在 `pipeline.extraction_enabled` 为 `true` 时使用。也是 `pipeline.summarization_model_env` 的默认值（在 `pipeline.summarization_enabled` 为 `true` 时使用）——如需为摘要使用独立的 key，可将该字段指向其他变量。 |
+| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key，在 `pipeline.extraction_enabled` 为 `true` 时使用。也是 `pipeline.summarization_model_env` 的默认值（在 `pipeline.summarization_enabled` 为 `true` 时使用）——如需为摘要使用独立的 key，可将该字段指向其他变量。多查询扩展的 LLM 改写/HyDE 阶段（`search.query_expansion.llm_paraphrase.enabled`，详见[多查询扩展](#多查询扩展)）也会读取此变量，其解析方式与此相同：先读取 `pipeline.extraction_model_env`，未设置时回退到 `OPENAI_API_KEY`。 |
 
 生成安全的 Bearer token：
 
@@ -1689,6 +1713,35 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `candidate_pool_cap` | `50` | 无论 `limit * candidate_pool_multiplier` 结果如何，扩大后的候选池大小的上限。 |
 
 **与 `memory://inject/{hint}` 的近似重复抑制并不相同：** 该资源模板（参见 [MCP 资源参考](#mcp-资源)）已经拥有自己独立的近似重复机制——一种硬阈值丢弃规则（复用 `deduplication.similarity_threshold`，默认值 `0.92`），而不是 MMR 那种连续的相关性/多样性权衡。二者刻意保持独立：`search.mmr` 配置对 `memory://inject/{hint}` 没有任何影响，反之亦然。
+
+---
+
+### 多查询扩展
+
+`recall` 和 `search`（在 `semantic` 和 `hybrid` 模式下）会对查询的多种表示形式进行嵌入和搜索，而不仅仅是字面字符串。像"我们怎么部署"这样的口语化查询，其嵌入可能与表述为"部署通过 `docker-compose up -d` 运行"的记忆相距甚远，以至于余弦相似度落在 `min_score` 之下——尽管这条记忆明明回答了这个问题。多查询扩展扩大了单次调用所搜索的候选池，使这样的记忆仍能浮现出来。
+
+**排名流水线顺序：** 查询扩展（变体嵌入/搜索 + 合并）→ 相关性（余弦相似度 / FTS 排名 / RRF）→ 复合先验 → MMR 多样性重排序 → 下游的 `min_score` / 类型 / 标签过滤以及截断到调用方的 `limit`。查询扩展只改变哪些候选项进入流水线；之后的每个阶段在机制上都不受影响。
+
+**两个可独立开关的阶段：**
+
+1. **去停用词变体（默认开启，无需模型）。** 除原始查询外，还会嵌入并搜索一个确定性变体——去除一小组固定的英文停用词后的查询（例如 "how do we deploy" → "deploy"），前提是该变体与原始查询不同且非空。全是停用词的查询（"is it"）或本身就只含实词的查询（"deploy production"）不会产生额外变体。两次嵌入都通过一次批量的 `embedBatch` 调用完成，因此这一阶段只多耗费一次额外的 Qdrant 往返，而不是额外的嵌入 API 调用。
+2. **LLM 改写 / HyDE（默认关闭，依赖模型）。** 当 `search.query_expansion.llm_paraphrase.enabled` 为 `true` 且能解析出 API key（来自 `pipeline.extraction_model_env`，未设置时回退到 `OPENAI_API_KEY`）时，会发起一次对话补全调用，生成 1-3 个额外变体——可以是查询的改写版本（`mode: "paraphrase"`，默认），也可以是一段假设性答案文本、改为嵌入该文本（`mode: "hyde"`）。HyDE 可能提升召回率，但也有可能把嵌入拉向查询中从未提及的幻觉细节（工具名、数字等），因此它是可选项而非默认项。任何失败——缺少 key、非 2xx 响应、超时——都会静默降级为第一阶段的变体；搜索调用绝不会因为改写生成失败而失败。
+
+**合并方式：** 每个被搜索变体返回的候选项按记忆 id 合并，同一 id 保留**最高**分（而不是求和或平均——被两个变体同时匹配到的记忆不会相对于仅被其最佳变体匹配到的记忆被夸大），随后截断到调用方的 `limit`，再继续后续的评分/排名。这意味着结果上的 `semantic_score` 现在表示"所有被搜索变体中的最高分"，而不再是"针对字面查询的分数"——这是该字段含义上的变化，尽管其数值范围以及相对于 `min_score`/复合排名的校准都保持不变。
+
+**不应用于全文搜索：** 独立的 `mode: "fulltext"` 以及 hybrid 模式的全文检索分支，始终只搜索唯一的原始查询字符串——基于 `LIKE` 的连接式词项匹配存在一个相关但不同的停用词弱点，已单独跟踪（将全文检索迁移到真正的 BM25 索引）。
+
+**配置**（`config.json` 中的 `search.query_expansion`，参见[配置](#配置)）：
+
+| 字段 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `true` | 整个功能的总开关。设为 `false` 可精确恢复扩展之前的成本配置（每次查询一次嵌入）。 |
+| `max_variants` | `2` | 搜索的变体总数上限（原始 + 去停用词 + LLM），与 `llm_paraphrase.variant_count` 相互独立。超出上限的变体会被丢弃，而不是排队等待。 |
+| `keyword_stripped` | `true` | 启用第一阶段（确定性、无需模型的变体）。 |
+| `llm_paraphrase.enabled` | `false` | 启用第二阶段。需要能解析出 API key，否则 LLM 扩展会被静默跳过（仅在启动时记录一次日志，不会针对每次调用记录）。 |
+| `llm_paraphrase.mode` | `"paraphrase"` | `"paraphrase"` 改写查询；`"hyde"` 生成一段假设性答案文本用于嵌入。 |
+| `llm_paraphrase.variant_count` | `2` | 每次调用请求多少个改写/HyDE 变体（1-3）。 |
+| `llm_paraphrase.timeout_ms` | `3000` | 对话补全请求的超时时间；超时视为失败，降级为第一阶段。 |
 
 ---
 

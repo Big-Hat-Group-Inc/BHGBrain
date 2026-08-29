@@ -7,6 +7,7 @@ import type { MetricsCollector } from '../health/metrics.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { embeddingUnavailable, internal } from '../errors/index.js';
 import { cosineSimilarity } from './similarity.js';
+import { buildVariants, type QueryExpansionProvider } from './query-expansion.js';
 
 const RRF_K = 60;
 
@@ -76,8 +77,80 @@ export class SearchService {
     private embedding: EmbeddingProvider,
     private metrics?: MetricsCollector,
     private logger?: { warn: (obj: Record<string, unknown>) => void },
+    // Optional phase-2 (LLM paraphrase/HyDE) variant generator
+    // (add-multi-query-expansion). Undefined for every caller that predates
+    // this parameter, in which case query expansion runs phase-1-only
+    // (deterministic keyword-stripped variant) exactly as if
+    // `llm_paraphrase.enabled` were false.
+    private queryExpansion?: QueryExpansionProvider,
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
+  }
+
+  // Generates LLM paraphrase/HyDE variant strings for `query`, or `[]` when
+  // phase 2 is disabled, unconfigured, or generation fails — this method
+  // itself never throws (add-multi-query-expansion design.md "Phase 2 ...
+  // degrade to phase 1 on any failure"). `QueryExpansionProvider.
+  // generateVariants` already returns `[]` on internal failure; the try/catch
+  // here is defense in depth so a caller-supplied provider that violates that
+  // contract still can't fail a search call.
+  private async generateLlmVariants(query: string): Promise<string[]> {
+    const qe = this.config.search.query_expansion;
+    if (!qe.enabled || !qe.llm_paraphrase.enabled) return [];
+    if (!this.queryExpansion?.configured) return [];
+    try {
+      return await this.queryExpansion.generateVariants(
+        query,
+        qe.llm_paraphrase.mode,
+        qe.llm_paraphrase.variant_count,
+        qe.llm_paraphrase.timeout_ms,
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  // Builds the embedding vectors to search for `query`: when query expansion
+  // is disabled, behaves exactly as before this feature existed (a single
+  // `embed` call on the literal query). When enabled, batches the original
+  // query plus any deterministic/LLM variants through one `embedBatch` call
+  // (add-multi-query-expansion design.md "Batching"). Returns the vector list
+  // alongside the variant count actually used, for the
+  // `search_query_expansion_variant_count` histogram.
+  private async embedQueryVariants(query: string): Promise<{ vectors: number[][]; variantCount: number }> {
+    const qe = this.config.search.query_expansion;
+    if (!qe.enabled) {
+      return { vectors: [await this.embedding.embed(query)], variantCount: 1 };
+    }
+    const llmVariants = await this.generateLlmVariants(query);
+    const variants = buildVariants(query, qe, llmVariants);
+    const vectors = await this.embedding.embedBatch(variants);
+    return { vectors, variantCount: variants.length };
+  }
+
+  // Merges per-variant candidate arrays by `id`, keeping the max score per id
+  // (add-multi-query-expansion design.md "Merge key and score fusion"), then
+  // sorts descending and truncates to `limit` so query expansion widens
+  // candidate *membership* without changing the per-call result-count bound.
+  // Generic over the candidate shape so both `semanticSearch`'s
+  // Qdrant-result-with-payload items and `hybridSearch`'s lighter
+  // `{id, score, vector}` semantic-leg items reuse the same merge logic.
+  private mergeVariantResults<T extends { id: string; score: number }>(
+    perVariant: T[][],
+    limit: number,
+  ): T[] {
+    const merged = new Map<string, T>();
+    for (const variantResults of perVariant) {
+      for (const item of variantResults) {
+        const existing = merged.get(item.id);
+        if (!existing || item.score > existing.score) {
+          merged.set(item.id, item);
+        }
+      }
+    }
+    return Array.from(merged.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
   }
 
   async search(
@@ -171,27 +244,33 @@ export class SearchService {
     // the pool. Default false so every pre-existing caller is unaffected.
     withVectors = false,
   ): Promise<SearchResult[]> {
-    let vector: number[];
+    let vectors: number[][];
+    let variantCount: number;
     try {
-      vector = await this.embedding.embed(query);
+      ({ vectors, variantCount } = await this.embedQueryVariants(query));
     } catch {
       throw embeddingUnavailable('Cannot perform semantic search: embedding provider unavailable');
     }
 
-    let results: Array<{ id: string; score: number; payload: Record<string, unknown>; vector?: number[] }>;
+    this.metrics?.recordHistogram('search_query_expansion_variant_count', variantCount);
+
+    let merged: Array<{ id: string; score: number; payload: Record<string, unknown>; vector?: number[] }>;
     try {
       const qdrantFilter: (RecallFilter & { withVector?: boolean }) | undefined = withVectors
         ? { ...(filter ?? {}), withVector: true }
         : filter;
-      results = qdrantFilter
-        ? await this.storage.qdrant.search(namespace, collection, vector, limit, qdrantFilter)
-        : await this.storage.qdrant.search(namespace, collection, vector, limit);
+      const perVariant = await Promise.all(vectors.map(vector =>
+        qdrantFilter
+          ? this.storage.qdrant.search(namespace, collection, vector, limit, qdrantFilter)
+          : this.storage.qdrant.search(namespace, collection, vector, limit),
+      ));
+      merged = this.mergeVariantResults(perVariant, limit);
     } catch (err) {
       throw internal(`Semantic search failed: vector store unavailable — ${(err as Error).message}`);
     }
 
     return this.buildSearchResults(
-      results.map(r => ({
+      merged.map(r => ({
         id: r.id,
         score: r.score,
         semantic_score: r.score,
@@ -245,7 +324,8 @@ export class SearchService {
       : this.storage.sqlite.fullTextSearch(namespace, query, limit * 2, collection);
 
     try {
-      const vector = await this.embedding.embed(query);
+      const { vectors, variantCount } = await this.embedQueryVariants(query);
+      this.metrics?.recordHistogram('search_query_expansion_variant_count', variantCount);
       // Preserve exact call arity for every pre-existing caller: `filter` is
       // passed through untouched (same reference, no `withVector` key added)
       // unless vectors were actually requested, and the options argument is
@@ -253,10 +333,15 @@ export class SearchService {
       const qdrantFilter: (RecallFilter & { withVector?: boolean }) | undefined = withVectors
         ? { ...(filter ?? {}), withVector: true }
         : filter;
-      const qdrantResults = qdrantFilter
-        ? await this.storage.qdrant.search(namespace, collection, vector, limit * 2, qdrantFilter)
-        : await this.storage.qdrant.search(namespace, collection, vector, limit * 2);
-      semanticItems = qdrantResults.map(r => ({ id: r.id, score: r.score, vector: r.vector }));
+      const perVariant = await Promise.all(vectors.map(vector =>
+        qdrantFilter
+          ? this.storage.qdrant.search(namespace, collection, vector, limit * 2, qdrantFilter)
+          : this.storage.qdrant.search(namespace, collection, vector, limit * 2),
+      ));
+      semanticItems = this.mergeVariantResults(
+        perVariant.map(results => results.map(r => ({ id: r.id, score: r.score, vector: r.vector }))),
+        limit * 2,
+      );
     } catch (err) {
       // Embedding/vector store unavailable: degrade to fulltext-only, but make the
       // degradation observable instead of silent (dependency outages are signal in

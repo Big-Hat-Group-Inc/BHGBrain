@@ -142,7 +142,11 @@ Most settings (including **embedding provider/model/dimensions**) live **only** 
    - `embedding.api_key_env` → defaults to `OPENAI_API_KEY`
    - `embedding.azure.api_key_env` → defaults to `AZURE_FOUNDRY_API_KEY`
    - `qdrant.api_key_env` → null by default; set to `"QDRANT_API_KEY"` for Qdrant Cloud
-   - `pipeline.extraction_model_env` → defaults to `BHGBRAIN_EXTRACTION_API_KEY`
+   - `pipeline.extraction_model_env` → defaults to `BHGBRAIN_EXTRACTION_API_KEY`. Also
+     the credential source for multi-query expansion's LLM paraphrase/HyDE phase
+     (`search.query_expansion.llm_paraphrase`, see `add-multi-query-expansion`) —
+     `LLMQueryExpansionProvider` resolves the same env var, falling back to
+     `OPENAI_API_KEY` when it's unset (`src/search/query-expansion.ts`).
 2. **Runtime overrides** applied by `applyEnvOverrides()` — a fixed set only:
    `BHGBRAIN_DATA_DIR`, `BHGBRAIN_HTTP_HOST`, `BHGBRAIN_HTTP_PORT`,
    `BHGBRAIN_QDRANT_MODE`, `BHGBRAIN_QDRANT_URL`, `BHGBRAIN_REQUIRE_LOOPBACK`,

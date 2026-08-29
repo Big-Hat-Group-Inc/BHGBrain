@@ -11,6 +11,7 @@ import { WritePipeline } from './pipeline/index.js';
 import { createExtractionProvider, warnIfExtractionDegraded } from './pipeline/extraction.js';
 import { createSummarizationProvider, warnIfSummarizationDegraded } from './summarization/index.js';
 import { SearchService } from './search/index.js';
+import { createQueryExpansionProvider, warnIfQueryExpansionDegraded } from './search/query-expansion.js';
 import { BackupService } from './backup/index.js';
 import { RetentionService } from './backup/retention.js';
 import { CleanupScheduler } from './backup/scheduler.js';
@@ -62,6 +63,13 @@ async function main() {
   // breaker should not degrade the server's aggregate health status. It
   // still gets `logger` so state transitions are visible in structured logs.
   const extractionBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
+  // Independent breaker instance (own failure/half-open state) sharing the
+  // `extraction` label with `extractionBreaker`: both wrap chat-completion
+  // calls against the same `pipeline.extraction_model`/`extraction_model_env`
+  // credential (add-multi-query-expansion design.md "Phase 2 client shape"),
+  // but a failing paraphrase/HyDE call must not trip the breaker guarding the
+  // write-pipeline's extraction call, or vice versa.
+  const queryExpansionBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
   const metrics = new MetricsCollector(config);
   const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
@@ -77,6 +85,13 @@ async function main() {
     : undefined;
   const summarization = createSummarizationProvider(config, { breaker: summarizationBreaker, metrics });
   warnIfSummarizationDegraded(summarization, config, logger);
+  // Not included in HealthService's `breakers` record below, same rationale as
+  // `extractionBreaker`/`summarizationBreaker`: query expansion phase 2 is a
+  // best-effort enhancement — search degrades to phase-1 variants on any
+  // failure — so an open breaker here should not degrade the server's
+  // aggregate health status.
+  const queryExpansion = createQueryExpansionProvider(config, { breaker: queryExpansionBreaker, metrics, logger });
+  warnIfQueryExpansionDegraded(queryExpansion, config, logger);
   const storage = new StorageManager(sqlite, qdrant, embedding, metrics, config, summarization);
 
   // Bootstrap: hydrate SQLite from Qdrant if this is a new device
@@ -111,7 +126,7 @@ async function main() {
 
   // Initialize services
   const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics, summarization);
-  const searchService = new SearchService(config, storage, embedding, metrics, logger);
+  const searchService = new SearchService(config, storage, embedding, metrics, logger, queryExpansion);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {
     [embeddingBreakerKey]: embeddingBreaker,

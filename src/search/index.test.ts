@@ -15,6 +15,8 @@ describe('SearchService', () => {
     slidingWindowEnabled?: boolean;
     ranking?: BrainConfig['search']['ranking'];
     mmr?: BrainConfig['search']['mmr'];
+    queryExpansion?: BrainConfig['search']['query_expansion'];
+    queryExpansionProvider?: import('./query-expansion.js').QueryExpansionProvider;
   } = {}) {
     const memories = opts.memories ?? new Map([
       ['mem-1', {
@@ -73,6 +75,18 @@ describe('SearchService', () => {
           candidate_pool_multiplier: 3,
           candidate_pool_cap: 50,
         },
+        // Mirrors the production default (add-multi-query-expansion) so
+        // pre-existing tests exercise the real default behavior; every query
+        // used elsewhere in this file ('hello', 'deployment task') has no
+        // stopwords to strip, so `buildVariants` still yields exactly one
+        // variant and every pre-existing store-call assertion is unaffected.
+        // Tests exercising expansion itself pass `queryExpansion` explicitly.
+        query_expansion: opts.queryExpansion ?? {
+          enabled: true,
+          max_variants: 2,
+          keyword_stripped: true,
+          llm_paraphrase: { enabled: false, mode: 'paraphrase', variant_count: 2, timeout_ms: 3000 },
+        },
       },
       ...(opts.slidingWindowEnabled === undefined ? {} : {
         retention: {
@@ -84,11 +98,19 @@ describe('SearchService', () => {
       }),
     } as unknown as BrainConfig;
 
+    // `embedBatch` delegates to the same underlying `embed` mock (one call per
+    // text) rather than an independent stub, so tests that simulate an outage
+    // via `embedding.embed.mockRejectedValue(...)` still see that failure
+    // whether the code path under test calls `embed` (query expansion
+    // disabled) or `embedBatch` (query expansion enabled, the default here) —
+    // mirroring how the real `OpenAIEmbeddingProvider.embed` is itself
+    // implemented as `embedBatch([text])[0]`.
+    const embedMock = vi.fn(async () => [1, 2, 3]);
     const embedding = {
       model: 'test-model',
       dimensions: 3,
-      embed: vi.fn(async () => [1, 2, 3]),
-      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [1, 2, 3])),
+      embed: embedMock,
+      embedBatch: vi.fn(async (texts: string[]) => Promise.all(texts.map(() => embedMock()))),
       healthCheck: vi.fn(async () => true),
     } as EmbeddingProvider;
 
@@ -96,7 +118,7 @@ describe('SearchService', () => {
     const logger = { warn: vi.fn() };
 
     return {
-      service: new SearchService(config, storage, embedding, metrics, logger),
+      service: new SearchService(config, storage, embedding, metrics, logger, opts.queryExpansionProvider),
       storage,
       embedding,
       metrics,
@@ -849,6 +871,199 @@ describe('SearchService', () => {
       // searchForInject's existing vector-carrying contract is unaffected.
       const injectResults = await enabledService.searchForInject('hello', 'global', 5);
       expect(injectResults.some(r => r.vector !== undefined)).toBe(true);
+    });
+  });
+
+  describe('multi-query expansion (add-multi-query-expansion)', () => {
+    const expansionMakeMem = (id: string): StoredMemory => ({
+      id, namespace: 'global', collection: 'general', type: 'semantic',
+      content: `content-${id}`, summary: `summary-${id}`, tags: [], source: 'cli',
+      checksum: id,
+      importance: 0.5,
+      retention_tier: 'T2',
+      expires_at: null,
+      decay_eligible: true,
+      review_due: null,
+      access_count: 0,
+      last_operation: 'ADD',
+      merged_from: null,
+      archived: false,
+      vector_synced: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+    });
+
+    // No composite-ranking distortion in this describe block: every test
+    // here asserts on raw merge/limit/routing behavior, so ranking is
+    // disabled to make `score`/`semantic_score` directly comparable to the
+    // scores the qdrant.search mocks hand back.
+    const noRanking = {
+      enabled: false, w_importance: 0, w_access: 0, access_norm: 1,
+      decay_per_day: { T0: 0, T1: 0, T2: 0, T3: 0 },
+    } as unknown as BrainConfig['search']['ranking'];
+
+    it('surfaces a memory the literal query alone would miss via the keyword-stripped variant', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['mem-literal', expansionMakeMem('mem-literal')],
+        ['mem-keyword-only', expansionMakeMem('mem-keyword-only')],
+      ]);
+      const { service, storage, embedding } = createSearchService({ memories, ranking: noRanking });
+      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+        texts.map(t => (t === 'deploy' ? [9, 9, 9] : [1, 2, 3])));
+      storage.qdrant.search.mockImplementation(async (_ns: string, _col: string | undefined, vector: number[]) =>
+        vector[0] === 9
+          ? [{ id: 'mem-keyword-only', score: 0.95, payload: {} }]
+          : [{ id: 'mem-literal', score: 0.5, payload: {} }]);
+
+      const results = await service.search('how do we deploy', 'global', undefined, 'semantic', 10);
+
+      expect(results.map(r => r.id).sort()).toEqual(['mem-keyword-only', 'mem-literal']);
+    });
+
+    it('keeps the max score, not a sum, when a memory id is matched by more than one variant', async () => {
+      const memories = new Map<string, StoredMemory>([['mem-1', expansionMakeMem('mem-1')]]);
+      const { service, storage, embedding } = createSearchService({ memories, ranking: noRanking });
+      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+        texts.map(t => (t === 'deploy' ? [9, 9, 9] : [1, 2, 3])));
+      storage.qdrant.search.mockImplementation(async (_ns: string, _col: string | undefined, vector: number[]) =>
+        vector[0] === 9
+          ? [{ id: 'mem-1', score: 0.9, payload: {} }]
+          : [{ id: 'mem-1', score: 0.4, payload: {} }]);
+
+      const results = await service.search('how do we deploy', 'global', undefined, 'semantic', 10);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]!.semantic_score).toBe(0.9);
+      expect(results[0]!.score).toBe(0.9);
+    });
+
+    it('still bounds the result count by limit when expansion widens the candidate pool', async () => {
+      const memories = new Map<string, StoredMemory>(
+        ['a1', 'a2', 'a3', 'b1', 'b2', 'b3'].map(id => [id, expansionMakeMem(id)]),
+      );
+      const { service, storage, embedding } = createSearchService({ memories, ranking: noRanking });
+      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+        texts.map(t => (t === 'deploy' ? [9, 9, 9] : [1, 2, 3])));
+      storage.qdrant.search.mockImplementation(async (_ns: string, _col: string | undefined, vector: number[]) =>
+        vector[0] === 9
+          ? [{ id: 'b1', score: 0.9, payload: {} }, { id: 'b2', score: 0.8, payload: {} }, { id: 'b3', score: 0.7, payload: {} }]
+          : [{ id: 'a1', score: 0.6, payload: {} }, { id: 'a2', score: 0.5, payload: {} }, { id: 'a3', score: 0.4, payload: {} }]);
+
+      const results = await service.search('how do we deploy', 'global', undefined, 'semantic', 3);
+
+      expect(results).toHaveLength(3);
+      // Highest-scoring 3 across both variants' 6 distinct candidates.
+      expect(results.map(r => r.id)).toEqual(['b1', 'b2', 'b3']);
+    });
+
+    it('kill switch: query_expansion.enabled=false embeds the literal query only, via embed not embedBatch', async () => {
+      const { service, embedding } = createSearchService({
+        queryExpansion: {
+          enabled: false, max_variants: 2, keyword_stripped: true,
+          llm_paraphrase: { enabled: false, mode: 'paraphrase', variant_count: 2, timeout_ms: 3000 },
+        },
+      });
+
+      await service.search('how do we deploy', 'global', undefined, 'semantic', 10);
+
+      expect(embedding.embed).toHaveBeenCalledWith('how do we deploy');
+      expect(embedding.embedBatch).not.toHaveBeenCalled();
+    });
+
+    it('hybridSearch: semantic-leg expansion merges into RRF while the fulltext leg is queried once with the original query', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['mem-literal', expansionMakeMem('mem-literal')],
+        ['mem-keyword-only', expansionMakeMem('mem-keyword-only')],
+      ]);
+      const { service, storage, embedding } = createSearchService({
+        memories, ranking: noRanking, fulltextResults: [],
+      });
+      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+        texts.map(t => (t === 'deploy' ? [9, 9, 9] : [1, 2, 3])));
+      storage.qdrant.search.mockImplementation(async (_ns: string, _col: string | undefined, vector: number[]) =>
+        vector[0] === 9
+          ? [{ id: 'mem-keyword-only', score: 0.95 }]
+          : [{ id: 'mem-literal', score: 0.5 }]);
+
+      const results = await service.search('how do we deploy', 'global', undefined, 'hybrid', 10);
+
+      expect(results.map(r => r.id).sort()).toEqual(['mem-keyword-only', 'mem-literal']);
+      expect(storage.sqlite.fullTextSearch).toHaveBeenCalledTimes(1);
+      expect(storage.sqlite.fullTextSearch).toHaveBeenCalledWith('global', 'how do we deploy', 20, undefined);
+    });
+
+    it('phase 2: LLM paraphrase variants widen the candidate pool, capped by max_variants', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['mem-literal', expansionMakeMem('mem-literal')],
+        ['mem-keyword-only', expansionMakeMem('mem-keyword-only')],
+        ['mem-llm-only', expansionMakeMem('mem-llm-only')],
+      ]);
+      const queryExpansionProvider = {
+        configured: true,
+        generateVariants: vi.fn(async () => ['paraphrase one', 'paraphrase two']),
+      };
+      const { service, storage, embedding } = createSearchService({
+        memories,
+        ranking: noRanking,
+        queryExpansion: {
+          enabled: true, max_variants: 5, keyword_stripped: true,
+          llm_paraphrase: { enabled: true, mode: 'paraphrase', variant_count: 2, timeout_ms: 3000 },
+        },
+        queryExpansionProvider,
+      });
+      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+        texts.map(t => {
+          if (t === 'deploy') return [9, 9, 9];
+          if (t === 'paraphrase one') return [7, 7, 7];
+          return [1, 2, 3];
+        }));
+      storage.qdrant.search.mockImplementation(async (_ns: string, _col: string | undefined, vector: number[]) => {
+        if (vector[0] === 9) return [{ id: 'mem-keyword-only', score: 0.8, payload: {} }];
+        if (vector[0] === 7) return [{ id: 'mem-llm-only', score: 0.85, payload: {} }];
+        return [{ id: 'mem-literal', score: 0.5, payload: {} }];
+      });
+
+      const results = await service.search('how do we deploy', 'global', undefined, 'semantic', 10);
+
+      expect(queryExpansionProvider.generateVariants).toHaveBeenCalledWith('how do we deploy', 'paraphrase', 2, 3000);
+      // original + keyword + 2 LLM variants = 4, under max_variants=5, so
+      // both LLM-only and keyword-only candidates are searched for.
+      expect(results.map(r => r.id).sort()).toEqual(['mem-keyword-only', 'mem-literal', 'mem-llm-only']);
+    });
+
+    it('degrades to phase-1-only variants when the LLM provider fails mid-call, without an unhandled rejection', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['mem-literal', expansionMakeMem('mem-literal')],
+        ['mem-keyword-only', expansionMakeMem('mem-keyword-only')],
+      ]);
+      const queryExpansionProvider = {
+        configured: true,
+        generateVariants: vi.fn(async () => {
+          throw new Error('extraction endpoint timed out');
+        }),
+      };
+      const { service, storage, embedding } = createSearchService({
+        memories,
+        ranking: noRanking,
+        queryExpansion: {
+          enabled: true, max_variants: 5, keyword_stripped: true,
+          llm_paraphrase: { enabled: true, mode: 'paraphrase', variant_count: 2, timeout_ms: 3000 },
+        },
+        queryExpansionProvider,
+      });
+      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+        texts.map(t => (t === 'deploy' ? [9, 9, 9] : [1, 2, 3])));
+      storage.qdrant.search.mockImplementation(async (_ns: string, _col: string | undefined, vector: number[]) =>
+        vector[0] === 9
+          ? [{ id: 'mem-keyword-only', score: 0.9, payload: {} }]
+          : [{ id: 'mem-literal', score: 0.5, payload: {} }]);
+
+      // Resolves without throwing, and reflects only the phase-1 (original +
+      // keyword) variants — the LLM provider's failure never reaches the
+      // caller.
+      const results = await service.search('how do we deploy', 'global', undefined, 'semantic', 10);
+      expect(results.map(r => r.id).sort()).toEqual(['mem-keyword-only', 'mem-literal']);
     });
   });
 });

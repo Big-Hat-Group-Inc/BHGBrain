@@ -415,6 +415,37 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
       "lambda": 0.7,
       "candidate_pool_multiplier": 3,
       "candidate_pool_cap": 50
+    },
+    // Expansion multi-requête : la recherche/recall sémantique vectorise et
+    // recherche plus d'une représentation de la requête, en fusionnant les
+    // candidats par id (le score le plus élevé l'emporte) avant le
+    // classement (voir « Expansion multi-requête » ci-dessous).
+    "query_expansion": {
+      "enabled": true,
+      // Limite supérieure du nombre total de variantes recherchées
+      // (originale + sans mots vides + générées par LLM), indépendante de
+      // llm_paraphrase.variant_count.
+      "max_variants": 2,
+      // Variante déterministe, sans modèle : la requête sans mots vides
+      // anglais, recherchée aux côtés de l'originale dès qu'elle en diffère
+      // et n'est pas vide.
+      "keyword_stripped": true,
+      // Génération de variantes optionnelle, assistée par modèle.
+      // Désactivée par défaut : c'est la première dépendance de chat LLM
+      // sur le chemin actif et elle ajoute latence/coût par appel.
+      "llm_paraphrase": {
+        "enabled": false,
+        // "paraphrase" : reformule la requête. "hyde" : génère un passage
+        // de réponse hypothétique et le vectorise à la place (peut
+        // améliorer le recall, au prix d'éventuels détails hallucinés —
+        // voir le README ci-dessous).
+        "mode": "paraphrase",
+        "variant_count": 2,
+        // Délai d'expiration de la requête de chat-completion ; tout échec
+        // (délai dépassé, réponse non-2xx, clé manquante) dégrade
+        // silencieusement vers les variantes sans modèle ci-dessus.
+        "timeout_ms": 3000
+      }
     }
   },
 
@@ -535,7 +566,7 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
 | `BHGBRAIN_TOKEN` | Obligatoire pour HTTP non-loopback | — | Token Bearer pour l'authentification HTTP. Le serveur **refuse de démarrer** si l'hôte est non-loopback et que ce token n'est pas défini (sauf si `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Obligatoire pour Qdrant Cloud | — | Définissez `qdrant.api_key_env` dans la configuration sur le nom de cette variable. Le nom de champ de configuration par défaut est `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | Non | Auto-généré à partir du hostname | Remplace l'identifiant de l'appareil pour les configurations multi-appareils. Voir [Résolution de l'identité de l'appareil](#résolution-de-lidentité-de-lappareil). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | Non | Se rabat sur `OPENAI_API_KEY` | Clé API pour le modèle d'extraction LLM, utilisée quand `pipeline.extraction_enabled` vaut `true`. Également la valeur par défaut de `pipeline.summarization_model_env` (utilisée quand `pipeline.summarization_enabled` vaut `true`) — pointez ce champ vers une autre variable si vous voulez une clé séparée pour le résumé. |
+| `BHGBRAIN_EXTRACTION_API_KEY` | Non | Se rabat sur `OPENAI_API_KEY` | Clé API pour le modèle d'extraction LLM, utilisée quand `pipeline.extraction_enabled` vaut `true`. Également la valeur par défaut de `pipeline.summarization_model_env` (utilisée quand `pipeline.summarization_enabled` vaut `true`) — pointez ce champ vers une autre variable si vous voulez une clé séparée pour le résumé. Également lue par la phase de paraphrase/HyDE LLM de l'expansion multi-requête (`search.query_expansion.llm_paraphrase.enabled`, voir [Expansion multi-requête](#expansion-multi-requête)), qui résout la clé de la même façon depuis `pipeline.extraction_model_env`, avec repli sur `OPENAI_API_KEY` si non définie. |
 
 Générez un token Bearer sécurisé :
 
@@ -1740,6 +1771,35 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `candidate_pool_cap` | `50` | Borne supérieure de la taille de l'ensemble élargi, quel que soit `limit * candidate_pool_multiplier`. |
 
 **Ce n'est pas la même chose que la suppression des quasi-doublons de `memory://inject/{hint}` :** ce modèle de ressource (voir [Référence des ressources MCP](#ressources-mcp)) dispose déjà de son propre mécanisme de quasi-doublons, distinct — un rejet à seuil strict (réutilisant `deduplication.similarity_threshold`, par défaut `0.92`) plutôt que le compromis continu pertinence/diversité de MMR. Les deux sont intentionnellement indépendants : la configuration `search.mmr` n'a aucun effet sur `memory://inject/{hint}`, et réciproquement.
+
+---
+
+### Expansion multi-requête
+
+`recall` et `search` (en modes `semantic` et `hybrid`) vectorisent et recherchent plus d'une représentation de la requête, pas seulement la chaîne littérale. Une requête conversationnelle comme « comment déploie-t-on » peut se vectoriser assez loin d'une mémoire formulée « le déploiement se fait via `docker-compose up -d` » pour que la similarité cosinus tombe sous `min_score`, alors même que la mémoire répond clairement à la question. L'expansion de requête élargit le pool de candidats recherché pour un seul appel afin qu'une telle mémoire remonte quand même.
+
+**Ordre du pipeline de classement :** expansion de requête (vectorisation/recherche des variantes + fusion) → pertinence (cosinus / rang FTS / RRF) → prior composite → réordonnancement par diversité MMR → filtrage `min_score`/type/tags en aval et troncature au `limit` de l'appelant. L'expansion de requête ne change que les candidats qui entrent dans le pipeline ; chaque étape suivante reste inchangée dans son mécanisme.
+
+**Deux phases activables indépendamment :**
+
+1. **Variante sans mots vides (activée par défaut, sans modèle).** En plus de la requête originale, une variante déterministe avec un petit ensemble fixe de mots vides anglais retirés (par ex. « how do we deploy » → « deploy ») est vectorisée et recherchée elle aussi, dès qu'elle diffère de l'originale et n'est pas vide. Une requête entièrement composée de mots vides (« is it ») ou déjà composée uniquement de mots pleins (« deploy production ») ne produit pas de variante supplémentaire. Les deux vectorisations passent par un seul appel `embedBatch` groupé, si bien que cette phase ne coûte qu'un aller-retour Qdrant supplémentaire, pas un appel d'API d'embedding supplémentaire.
+2. **Paraphrase LLM / HyDE (désactivée par défaut, conditionnée au modèle).** Lorsque `search.query_expansion.llm_paraphrase.enabled` vaut `true` *et* qu'une clé API se résout (depuis `pipeline.extraction_model_env`, avec repli sur `OPENAI_API_KEY`), un appel de chat-completion génère 1 à 3 variantes supplémentaires — soit des paraphrases reformulées de la requête (`mode: "paraphrase"`, par défaut), soit un passage de réponse hypothétique à vectoriser à la place (`mode: "hyde"`). HyDE peut améliorer le recall mais risque d'attirer l'embedding vers des détails hallucinés (noms d'outils, chiffres) jamais mentionnés dans la requête, d'où son caractère optionnel plutôt que par défaut. Tout échec — clé manquante, réponse non-2xx, délai dépassé — dégrade silencieusement vers les variantes de la phase 1 ; un appel de recherche n'échoue jamais parce que la génération de paraphrase a échoué.
+
+**Fusion :** les candidats de chaque variante recherchée sont fusionnés par id de mémoire, en conservant le score **maximal** par id (ni somme ni moyenne — une mémoire trouvée par deux variantes n'est pas gonflée par rapport à une mémoire trouvée seulement par sa meilleure variante), puis tronqués au `limit` de l'appelant avant que le scoring/classement ne se poursuive. Cela signifie que `semantic_score` sur un résultat représente désormais « le meilleur score parmi toutes les variantes recherchées », plutôt que « le score contre la requête littérale » — un changement de ce que représente ce champ, même si sa plage numérique et son calibrage vis-à-vis de `min_score`/du classement composite restent inchangés.
+
+**Non appliqué au texte intégral :** le `mode: "fulltext"` autonome et la branche texte intégral du mode hybride recherchent toujours uniquement la requête originale — l'appariement conjonctif de termes basé sur `LIKE` a une faiblesse liée mais distincte vis-à-vis des mots vides, suivie séparément (migration du texte intégral vers un véritable index BM25).
+
+**Configuration** (`search.query_expansion` dans `config.json`, voir [Configuration](#configuration)) :
+
+| Champ | Défaut | Signification |
+|---|---|---|
+| `enabled` | `true` | Interrupteur général de la fonctionnalité. `false` rétablit exactement le profil de coût antérieur à l'expansion (une vectorisation par requête). |
+| `max_variants` | `2` | Borne supérieure du nombre total de variantes (originale + sans mots vides + LLM), indépendante de `llm_paraphrase.variant_count`. Les variantes au-delà de la limite sont abandonnées, pas mises en file d'attente. |
+| `keyword_stripped` | `true` | Active la phase 1 (la variante déterministe sans modèle). |
+| `llm_paraphrase.enabled` | `false` | Active la phase 2. Nécessite une clé API résoluble, sinon l'expansion LLM est silencieusement ignorée (journalisée une seule fois au démarrage, pas à chaque appel). |
+| `llm_paraphrase.mode` | `"paraphrase"` | `"paraphrase"` reformule la requête ; `"hyde"` génère un passage de réponse hypothétique à vectoriser. |
+| `llm_paraphrase.variant_count` | `2` | Combien de variantes de paraphrase/HyDE demander par appel (1–3). |
+| `llm_paraphrase.timeout_ms` | `3000` | Délai d'expiration de la requête de chat-completion ; un dépassement compte comme un échec et dégrade vers la phase 1. |
 
 ---
 
