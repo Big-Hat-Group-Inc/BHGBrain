@@ -3199,6 +3199,50 @@ Recrea una memoria activa a partir del resumen y las etiquetas conservados en el
 
 ---
 
+### `feedback` — Registrar la Utilidad de un Recuerdo
+
+Registra si una memoria previamente devuelta por `recall` o `search` resultó
+realmente útil, como un evento inmutable en una tabla dedicada `recall_feedback`
+vinculada a la memoria. **Esta versión es puramente aditiva**: no tiene efecto sobre
+el ranking, el ciclo de vida, ni sobre ningún resultado de `recall`/`search`/`review`
+— no existe agregación, ni superficie de lectura/listado, ni acoplamiento con el
+ranking o el ciclo de vida. Los eventos se recopilan para que un cambio futuro pueda
+ajustar los pesos de `search.ranking`, las tasas de decaimiento y los umbrales de
+deduplicación con base en evidencia en lugar de valores por defecto elegidos por
+inspección.
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Predeterminado | Descripción |
+|---|---|---|---|---|
+| `id` | `string (UUID)` | **Sí** | - | El ID de la memoria de un resultado previo de `recall`/`search`. |
+| `useful` | `boolean` | **Sí** | - | Si el resultado fue útil. |
+| `query` | `string (máx. 500 caracteres)` | No | - | La consulta que produjo este resultado, conservada para análisis futuro. No se valida contra ninguna llamada previa. |
+| `score` | `number (0-1)` | No | - | El score observado por quien llama para este resultado, conservado para análisis futuro. |
+
+**Salida:**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "useful": true,
+  "recorded_at": "2026-03-01T00:00:00.000Z"
+}
+```
+
+Busca la memoria de la misma manera que `tag`/`forget` (solo filas activas) y
+devuelve `NOT_FOUND` si no existe, incluyendo un ID que solo existe en el archivo.
+`query`/`score` se almacenan exactamente como se proporcionan — `null` cuando se
+omiten, nunca un valor predeterminado inventado — y no se contrastan contra ninguna
+llamada real previa de `recall`/`search`, el mismo modelo de confianza que `tag`/
+`forget` ya extienden a cualquier `id` proporcionado por quien llama. Múltiples
+eventos de feedback para la misma memoria se conservan cada uno como fila distinta;
+ninguno sobrescribe uno anterior. Registrar feedback nunca modifica los campos
+propios de la memoria referenciada (`access_count`, `importance`, `retention_tier`,
+`review_due`, `updated_at` permanecen inalterados).
+
+---
+
 ### `relate` — Conectar Memorias con Bordes Tipados
 
 Conecta memorias con bordes tipados y dirigidos — una relación general, autorada por

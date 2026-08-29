@@ -13,7 +13,7 @@ import {
   SearchInputSchema, TagInputSchema, CollectionsInputSchema,
   CategoryInputSchema, BackupInputSchema, RepairInputSchema,
   RevisionsInputSchema, ReviewInputSchema, ConsolidateInputSchema,
-  RelateInputSchema,
+  RelateInputSchema, FeedbackInputSchema,
   type RepairInput, type ConsolidateInput,
 } from '../domain/schemas.js';
 import type {
@@ -133,6 +133,7 @@ async function dispatch(
     case 'import': return handleImport(ctx, args, logCtx);
     case 'revisions': return handleRevisions(ctx, args, clientId, logCtx);
     case 'review': return handleReview(ctx, args, clientId, logCtx);
+    case 'feedback': return handleFeedback(ctx, args, clientId, logCtx);
     case 'relate': return handleRelate(ctx, args, clientId, logCtx);
     case 'repair': return handleRepair(ctx, args);
     case 'consolidate': return handleConsolidate(ctx, args, clientId, logCtx);
@@ -646,6 +647,33 @@ async function handleReview(
 
   ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
   return { id: restoredId, restored_from: archived.memory_id, archive_id: archived.id, restored: true };
+}
+
+// Records whether a previously recalled/searched memory was useful, as an
+// append-only event (add-recall-feedback-signal). Purely additive: no
+// aggregation, no read surface, no effect on ranking or lifecycle in this
+// version — see design.md Non-Goals.
+async function handleFeedback(
+  ctx: ToolContext, args: unknown, clientId: string, logCtx: ToolLogContext,
+): Promise<{ id: string; useful: boolean; recorded_at: string }> {
+  const input = parseInput(FeedbackInputSchema, args);
+  const mem = ctx.storage.sqlite.getMemoryById(input.id);
+  if (!mem) throw notFound(`Memory ${input.id} not found`);
+  logCtx.namespace = mem.namespace;
+
+  const created_at = new Date().toISOString();
+  ctx.storage.sqlite.recordFeedback({
+    memory_id: input.id,
+    namespace: mem.namespace,
+    query: input.query ?? null,
+    score: input.score ?? null,
+    useful: input.useful,
+    client_id: clientId,
+    created_at,
+  });
+  ctx.storage.sqlite.flushIfDirty();
+
+  return { id: input.id, useful: input.useful, recorded_at: created_at };
 }
 
 // Directed, typed edges between memories (add-memory-links): `add`/`list`/

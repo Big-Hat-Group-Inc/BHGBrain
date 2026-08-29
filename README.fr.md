@@ -3204,6 +3204,51 @@ Recrée un souvenir actif à partir du résumé et des tags conservés dans l'en
 
 ---
 
+### `feedback` — Enregistrer l'utilité d'un souvenir rappelé
+
+Enregistre si un souvenir précédemment renvoyé par `recall` ou `search` s'est avéré
+réellement utile, sous forme d'événement immuable dans une table dédiée
+`recall_feedback` rattachée au souvenir. **Cette version est purement additive** :
+elle n'a aucun effet sur le classement, le cycle de vie, ni sur aucun résultat de
+`recall`/`search`/`review` — aucune agrégation, aucune surface de lecture/liste,
+aucun couplage au classement ou au cycle de vie n'existe encore. Les événements sont
+collectés afin qu'un futur changement puisse ajuster les poids de `search.ranking`,
+les taux de décroissance et les seuils de déduplication à partir de preuves plutôt
+que de valeurs par défaut choisies par inspection.
+
+**Entrée :**
+
+| Paramètre | Type | Requis | Défaut | Description |
+|---|---|---|---|---|
+| `id` | `string (UUID)` | **Oui** | - | L'ID du souvenir issu d'un résultat `recall`/`search` précédent. |
+| `useful` | `boolean` | **Oui** | - | Si le résultat était utile. |
+| `query` | `string (500 caractères max)` | Non | - | La requête ayant produit ce résultat, conservée pour une analyse future. Non validée par rapport à un appel antérieur. |
+| `score` | `number (0-1)` | Non | - | Le score observé par l'appelant pour ce résultat, conservé pour une analyse future. |
+
+**Sortie :**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "useful": true,
+  "recorded_at": "2026-03-01T00:00:00.000Z"
+}
+```
+
+Recherche le souvenir de la même manière que `tag`/`forget` (lignes actives
+uniquement) et renvoie `NOT_FOUND` s'il n'existe pas, y compris un ID qui n'existe
+que dans l'archive. `query`/`score` sont stockés exactement tels que fournis —
+`null` en cas d'omission, jamais une valeur par défaut inventée — et ne sont pas
+recoupés avec un véritable appel `recall`/`search` antérieur, le même modèle de
+confiance que `tag`/`forget` accordent déjà à tout `id` fourni par l'appelant.
+Plusieurs événements de feedback pour le même souvenir sont chacun conservés comme
+des lignes distinctes ; aucun n'écrase un événement antérieur. L'enregistrement d'un
+feedback ne modifie jamais les champs propres du souvenir référencé
+(`access_count`, `importance`, `retention_tier`, `review_due`, `updated_at`
+restent tous inchangés).
+
+---
+
 ### `relate` — Connecter des souvenirs par arêtes typées
 
 Connecte des souvenirs par des arêtes typées et dirigées — une relation générale,

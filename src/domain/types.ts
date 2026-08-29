@@ -270,6 +270,20 @@ export interface ArchiveRecord {
   tags: string[];
 }
 
+// Append-only usefulness-feedback event for a recalled/searched memory
+// (add-recall-feedback-signal). One row per `feedback` call — never
+// aggregated or mutated after insert. See `recall_feedback` in
+// src/storage/sqlite.ts.
+export interface RecallFeedbackEntry {
+  memory_id: string;
+  namespace: string;
+  query: string | null;
+  score: number | null;
+  useful: boolean;
+  client_id: string;
+  created_at: string;
+}
+
 export interface MemoryRevisionRecord {
   id: number;
   memory_id: string;

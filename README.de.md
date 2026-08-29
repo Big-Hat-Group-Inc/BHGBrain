@@ -3199,6 +3199,50 @@ Erstellt eine aktive Erinnerung aus der gespeicherten Zusammenfassung und den Ta
 
 ---
 
+### `feedback` — Nützlichkeit einer Erinnerung protokollieren
+
+Protokolliert, ob eine zuvor von `recall` oder `search` zurückgegebene Erinnerung
+tatsächlich nützlich war, als unveränderliches Ereignis in einer eigenen
+`recall_feedback`-Tabelle, die mit der Erinnerung verknüpft ist. **Diese Version ist
+rein additiv**: Sie hat keine Auswirkung auf Ranking, Lebenszyklus oder irgendein
+Ergebnis von `recall`/`search`/`review` — es gibt keine Aggregation, keine
+Lese-/Listenoberfläche, keine Kopplung an Ranking oder Lebenszyklus. Die Ereignisse
+werden gesammelt, damit eine zukünftige Änderung die Gewichte von `search.ranking`,
+Verfallsraten und Dedup-Schwellenwerte anhand von Evidenz statt anhand von durch
+Inspektion gewählten Vorgaben anpassen kann.
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `id` | `string (UUID)` | **Ja** | - | Die Erinnerungs-ID aus einem vorherigen `recall`/`search`-Ergebnis. |
+| `useful` | `boolean` | **Ja** | - | Ob das Ergebnis nützlich war. |
+| `query` | `string (max. 500 Zeichen)` | Nein | - | Die Abfrage, die dieses Ergebnis erzeugt hat, für spätere Analysen übernommen. Wird nicht gegen einen vorherigen Aufruf geprüft. |
+| `score` | `number (0–1)` | Nein | - | Der vom Aufrufer beobachtete Score für dieses Ergebnis, für spätere Analysen übernommen. |
+
+**Ausgabe:**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "useful": true,
+  "recorded_at": "2026-03-01T00:00:00.000Z"
+}
+```
+
+Schlägt die Erinnerung auf dieselbe Weise nach wie `tag`/`forget` (nur aktive Zeilen)
+und liefert `NOT_FOUND`, falls sie nicht existiert — auch für eine ID, die nur im
+Archiv existiert. `query`/`score` werden genau wie angegeben gespeichert — `null`, wenn
+weggelassen, niemals ein erfundener Standardwert — und nicht gegen einen echten
+vorherigen `recall`/`search`-Aufruf geprüft, dasselbe Vertrauensmodell, das `tag`/
+`forget` bereits jeder von einem Aufrufer angegebenen `id` entgegenbringen. Mehrere
+Feedback-Ereignisse für dieselbe Erinnerung werden jeweils als eigene Zeile
+gespeichert; keines überschreibt ein früheres. Das Protokollieren von Feedback
+verändert niemals die eigenen Felder der referenzierten Erinnerung (`access_count`,
+`importance`, `retention_tier`, `review_due`, `updated_at` bleiben alle unverändert).
+
+---
+
 ### `relate` — Erinnerungen mit typisierten Kanten verbinden
 
 Verbindet Erinnerungen mit typisierten, gerichteten Kanten — einer allgemeinen,

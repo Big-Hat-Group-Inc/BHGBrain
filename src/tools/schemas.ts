@@ -296,6 +296,24 @@ export const MCP_TOOL_DEFINITIONS = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
+    name: 'feedback',
+    title: 'Feedback',
+    description: 'Record whether a previously recalled/searched memory was useful. Purely additive — has no effect on ranking, lifecycle, or future recall results in this version.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        id: { type: 'string', format: 'uuid', description: 'The memory ID from a prior recall/search result' },
+        useful: { type: 'boolean', description: 'Whether the result was useful' },
+        query: { type: 'string', maxLength: 500, description: 'The query that produced this result, for later analysis (not validated against any prior call)' },
+        score: { type: 'number', minimum: 0, maximum: 1, description: 'The score the caller observed for this result, for later analysis' },
+      },
+      required: ['id', 'useful'],
+      additionalProperties: false,
+    },
+    // Records an event; does not mutate the referenced memory itself.
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
     name: 'relate',
     title: 'Relate',
     description: 'Connect memories with typed, directed edges. action: "add" creates an edge between two memories (idempotent: re-adding an identical edge returns the existing one); "list" returns a memory\'s edges, either direction, optionally filtered by relation; "remove" deletes a specific edge. Relations: refines, contradicts, derived_from, about_same_entity, follows.',

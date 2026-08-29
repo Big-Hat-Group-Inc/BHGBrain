@@ -2710,7 +2710,7 @@ bhgbrain server token                 # Generate a new random bearer token
 
 ## MCP Tools Reference
 
-BHGBrain exposes 15 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
+BHGBrain exposes 16 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
 
 ```json
 {
@@ -2736,7 +2736,7 @@ annotations entirely.
 **outputSchema:** `recall`, `search`, and `remember` declare an `outputSchema`
 describing their `structuredContent` shape (mirroring the `SearchResult`/
 `WriteResult` types), so MCP clients can validate results instead of only
-JSON-parsing the text block. The other twelve tools' result shapes are action-dependent
+JSON-parsing the text block. The other thirteen tools' result shapes are action-dependent
 and are not yet schema-described.
 
 ---
@@ -3346,6 +3346,47 @@ tag, and freshly embedded so it participates in search. The archive row is retai
 (not deleted), unlike the CLI's `archive restore` command. Records a `RESTORE` audit
 event linking the archive origin. Returns `NOT_FOUND` if no archive record exists for
 the given ID.
+
+---
+
+### `feedback` - Record Recall Usefulness
+
+Records whether a memory previously returned by `recall` or `search` was actually
+useful, as an immutable event in a dedicated `recall_feedback` table keyed to the
+memory. **This version is purely additive**: it has no effect on ranking, lifecycle, or
+any `recall`/`search`/`review` result — no aggregation, no read/list surface, no
+ranking or lifecycle coupling exists yet. Events are collected so a future change can
+tune `search.ranking` weights, decay rates, and dedup thresholds against evidence
+instead of defaults chosen by inspection.
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `id` | `string (UUID)` | **Yes** | - | The memory ID from a prior `recall`/`search` result. |
+| `useful` | `boolean` | **Yes** | - | Whether the result was useful. |
+| `query` | `string (max 500 chars)` | No | - | The query that produced this result, carried through for future analysis. Not validated against any prior call. |
+| `score` | `number (0-1)` | No | - | The score the caller observed for this result, carried through for future analysis. |
+
+**Output:**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "useful": true,
+  "recorded_at": "2026-03-01T00:00:00.000Z"
+}
+```
+
+Looks the memory up the same way `tag`/`forget` do (active rows only) and returns
+`NOT_FOUND` if it does not exist, including an ID that exists only in the archive.
+`query`/`score` are stored exactly as given — `null` when omitted, never a fabricated
+default — and are not cross-checked against any real prior `recall`/`search` call, the
+same trust model `tag`/`forget` already extend to any caller-supplied `id`. Multiple
+feedback events for the same memory each persist as distinct rows; none overwrites an
+earlier one. Recording feedback never mutates the referenced memory's own fields
+(`access_count`, `importance`, `retention_tier`, `review_due`, `updated_at` are all
+left untouched).
 
 ---
 

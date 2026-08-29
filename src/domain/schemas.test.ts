@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   RememberInputSchema, RecallInputSchema, ForgetInputSchema,
   SearchInputSchema, TagInputSchema, CollectionsInputSchema,
-  CategoryInputSchema,
+  CategoryInputSchema, FeedbackInputSchema,
 } from './schemas.js';
 
 describe('RememberInputSchema', () => {
@@ -196,5 +196,43 @@ describe('CategoryInputSchema', () => {
     for (const slot of ['company-values', 'architecture', 'coding-requirements', 'custom']) {
       expect(() => CategoryInputSchema.parse({ action: 'set', slot, name: 'test', content: 'test' })).not.toThrow();
     }
+  });
+});
+
+describe('FeedbackInputSchema', () => {
+  const validId = '123e4567-e89b-12d3-a456-426614174000';
+
+  it('accepts valid minimal input (id + useful only)', () => {
+    const result = FeedbackInputSchema.parse({ id: validId, useful: true });
+    expect(result.id).toBe(validId);
+    expect(result.useful).toBe(true);
+    expect(result.query).toBeUndefined();
+    expect(result.score).toBeUndefined();
+  });
+
+  it('accepts full input with query and score', () => {
+    const result = FeedbackInputSchema.parse({
+      id: validId, useful: false, query: 'search text', score: 0.75,
+    });
+    expect(result.query).toBe('search text');
+    expect(result.score).toBe(0.75);
+  });
+
+  it('rejects a non-UUID id', () => {
+    expect(() => FeedbackInputSchema.parse({ id: 'not-a-uuid', useful: true })).toThrow();
+  });
+
+  it('rejects score outside [0,1]', () => {
+    expect(() => FeedbackInputSchema.parse({ id: validId, useful: true, score: 1.5 })).toThrow();
+    expect(() => FeedbackInputSchema.parse({ id: validId, useful: true, score: -0.1 })).toThrow();
+  });
+
+  it('rejects unknown keys', () => {
+    expect(() => FeedbackInputSchema.parse({ id: validId, useful: true, extra: 'nope' })).toThrow();
+  });
+
+  it('rejects query over 500 chars', () => {
+    const longQuery = 'a'.repeat(501);
+    expect(() => FeedbackInputSchema.parse({ id: validId, useful: true, query: longQuery })).toThrow();
   });
 });

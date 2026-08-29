@@ -409,6 +409,100 @@ describe('review tool', () => {
   });
 });
 
+describe('feedback tool', () => {
+  const UUID = '550e8400-e29b-41d4-a716-446655440099';
+  type FeedbackStorage = StorageManager & {
+    recordFeedback: ReturnType<typeof vi.fn>;
+  };
+  let ctx: ToolContext;
+  let storage: FeedbackStorage;
+
+  beforeEach(() => {
+    storage = {
+      sqlite: {
+        getMemoryById: vi.fn(() => null),
+        recordFeedback: vi.fn(),
+        flushIfDirty: vi.fn(),
+      },
+    } as unknown as FeedbackStorage;
+
+    ctx = {
+      config: { device: { id: 'local-device' } } as ToolContext['config'],
+      storage,
+      embedding: { embed: vi.fn(async () => [1, 2, 3]) } as unknown as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  });
+
+  it('records feedback for an existing memory and returns id/useful/recorded_at', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: UUID, namespace: 'global',
+    });
+
+    const result = await handleTool(ctx, 'feedback', { id: UUID, useful: true }, 'c1') as {
+      id: string; useful: boolean; recorded_at: string;
+    };
+
+    expect(storage.sqlite.getMemoryById).toHaveBeenCalledWith(UUID);
+    expect(storage.sqlite.recordFeedback).toHaveBeenCalledWith(expect.objectContaining({
+      memory_id: UUID, namespace: 'global', useful: true, query: null, score: null, client_id: 'c1',
+    }));
+    expect(storage.sqlite.flushIfDirty).toHaveBeenCalled();
+    expect(result.id).toBe(UUID);
+    expect(result.useful).toBe(true);
+    expect(result.recorded_at).toEqual(expect.any(String));
+  });
+
+  it('returns NOT_FOUND for a nonexistent or archived id', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue(null);
+
+    const result = await handleTool(ctx, 'feedback', { id: UUID, useful: true }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('NOT_FOUND');
+    expect(storage.sqlite.recordFeedback).not.toHaveBeenCalled();
+  });
+
+  it('persists optional query/score when provided', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: UUID, namespace: 'global',
+    });
+
+    await handleTool(ctx, 'feedback', { id: UUID, useful: true, query: 'find the config docs', score: 0.82 }, 'c1');
+
+    expect(storage.sqlite.recordFeedback).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'find the config docs', score: 0.82,
+    }));
+  });
+
+  it('records query/score as null when omitted', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: UUID, namespace: 'global',
+    });
+
+    await handleTool(ctx, 'feedback', { id: UUID, useful: false }, 'c1');
+
+    expect(storage.sqlite.recordFeedback).toHaveBeenCalledWith(expect.objectContaining({
+      query: null, score: null,
+    }));
+  });
+
+  it('records useful: false distinctly from useful: true', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: UUID, namespace: 'global',
+    });
+
+    const result = await handleTool(ctx, 'feedback', { id: UUID, useful: false }, 'c1') as { useful: boolean };
+
+    expect(storage.sqlite.recordFeedback).toHaveBeenCalledWith(expect.objectContaining({ useful: false }));
+    expect(result.useful).toBe(false);
+  });
+});
+
 describe('consolidate tool', () => {
   const T = '550e8400-e29b-41d4-a716-446655440020';
   const S1 = '550e8400-e29b-41d4-a716-446655440021';

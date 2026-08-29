@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SqliteStore } from './sqlite.js';
+import type { Database } from 'sql.js';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -236,6 +237,79 @@ describe('SqliteStore', () => {
     const entries = store.listAudit(10);
     expect(entries).toHaveLength(1);
     expect(entries[0]!.operation).toBe('ADD');
+  });
+
+  // -- Recall feedback (add-recall-feedback-signal) --
+
+  describe('recall_feedback', () => {
+    // recall_feedback has no read/list surface by design (design.md
+    // Non-Goals: "no read surface"), so tests reach into the underlying
+    // sql.js database directly to verify persistence instead of adding
+    // production read paths just for test introspection.
+    const rawRows = (): Array<{
+      memory_id: string; namespace: string; query: string | null; score: number | null;
+      useful: number; client_id: string; created_at: string;
+    }> => {
+      const db = (store as unknown as { db: Database }).db;
+      const result = db.exec('SELECT memory_id, namespace, query, score, useful, client_id, created_at FROM recall_feedback ORDER BY id ASC');
+      if (result.length === 0) return [];
+      const [{ columns, values }] = result;
+      return values.map(row => {
+        const obj: Record<string, unknown> = {};
+        columns.forEach((col, i) => { obj[col] = row[i]; });
+        return obj as ReturnType<typeof rawRows>[number];
+      });
+    };
+
+    it('persists a feedback row with correct memory_id/namespace/useful/created_at', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      const createdAt = new Date().toISOString();
+
+      store.recordFeedback({
+        memory_id: mem.id, namespace: 'global', query: 'q', score: 0.5, useful: true,
+        client_id: 'c1', created_at: createdAt,
+      });
+
+      const rows = rawRows();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.memory_id).toBe(mem.id);
+      expect(rows[0]!.namespace).toBe('global');
+      expect(rows[0]!.useful).toBe(1);
+      expect(rows[0]!.created_at).toBe(createdAt);
+    });
+
+    it('persists multiple feedback rows for the same memory_id as an event stream', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+
+      store.recordFeedback({
+        memory_id: mem.id, namespace: 'global', query: null, score: null, useful: true,
+        client_id: 'c1', created_at: new Date().toISOString(),
+      });
+      store.recordFeedback({
+        memory_id: mem.id, namespace: 'global', query: null, score: null, useful: false,
+        client_id: 'c1', created_at: new Date().toISOString(),
+      });
+
+      const rows = rawRows();
+      expect(rows).toHaveLength(2);
+      expect(rows.map(r => r.useful)).toEqual([1, 0]);
+    });
+
+    it('applies assertMutableAllowed the same as other mutation methods', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      store.flush();
+      store.beginLifecycleOperation('restore');
+
+      expect(() => store.recordFeedback({
+        memory_id: mem.id, namespace: 'global', query: null, score: null, useful: true,
+        client_id: 'c1', created_at: new Date().toISOString(),
+      })).toThrow(/lifecycle operation/);
+
+      store.endLifecycleOperation('restore');
+    });
   });
 
   // -- Collections --

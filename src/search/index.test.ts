@@ -50,6 +50,10 @@ describe('SearchService', () => {
         recordAccessBatch: vi.fn(),
         touchMemory: vi.fn(),
         scheduleDeferredFlush: vi.fn(),
+        // add-recall-feedback-signal: present on the mock so a regression
+        // test can assert search() never touches it (composite ranking
+        // must stay inert to recorded feedback in this version).
+        recordFeedback: vi.fn(),
       },
       qdrant: {
         search: vi.fn(async () => []),
@@ -783,6 +787,49 @@ describe('SearchService', () => {
       // either way.
       expect(enabledResults[0].semantic_score).toBe(0.7);
       expect(disabledResults[0].semantic_score).toBe(0.7);
+    });
+
+    // Regression guard for add-recall-feedback-signal: recall_feedback is a
+    // purely additive, write-only event stream that composite ranking must
+    // never read from — recorded feedback (in any quantity or mix of
+    // `useful` values) has no read/list surface and no wiring into
+    // buildSearchResults in this version (design.md Non-Goals).
+    it('never touches recall_feedback: composite ranking stays inert to recorded feedback', async () => {
+      // Freeze time across both search() calls: the composite prior's decay
+      // term is a function of Date.now(), so without pinning it, two calls
+      // separated by even a few milliseconds of real wall-clock time produce
+      // spuriously different scores that would drown out the actual signal
+      // under test (recall_feedback's effect, which should be exactly zero).
+      vi.useFakeTimers();
+      try {
+        const memories = new Map<string, StoredMemory>([
+          ['mem-a', makeMem('mem-a', { importance: 0.9, access_count: 100 })],
+        ]);
+        const { service, storage } = createSearchService({ memories });
+        storage.qdrant.search.mockResolvedValue([{ id: 'mem-a', score: 0.7, payload: {} }]);
+
+        const baselineResults = await service.search('hello', 'global', undefined, 'semantic', 10);
+
+        // Simulate feedback having been recorded for this memory, in bulk and
+        // in a mix of verdicts, exactly the scenario the spec calls out.
+        for (let i = 0; i < 5; i++) {
+          storage.sqlite.recordFeedback({
+            memory_id: 'mem-a', namespace: 'global', query: 'hello', score: 0.7,
+            useful: i % 2 === 0, client_id: 'c1', created_at: new Date().toISOString(),
+          });
+        }
+
+        const afterFeedbackResults = await service.search('hello', 'global', undefined, 'semantic', 10);
+
+        // search() itself never calls into recordFeedback (or any
+        // feedback-reading method) — the only calls on that mock are the ones
+        // this test made directly above.
+        expect(storage.sqlite.recordFeedback).toHaveBeenCalledTimes(5);
+        expect(baselineResults[0].score).toBe(afterFeedbackResults[0].score);
+        expect(baselineResults.map(r => r.id)).toEqual(afterFeedbackResults.map(r => r.id));
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

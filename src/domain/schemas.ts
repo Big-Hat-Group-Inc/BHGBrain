@@ -160,6 +160,13 @@ export const RelateInputSchema = z.object({
   { message: 'from_id and to_id must differ', path: ['to_id'] },
 );
 
+export const FeedbackInputSchema = z.object({
+  id: z.string().uuid(),
+  useful: z.boolean(),
+  query: z.string().max(500).optional(),
+  score: z.number().min(0).max(1).optional(),
+}).strict();
+
 export const RepairInputSchema = z.object({
   // 'from-qdrant' (default): the pre-existing behavior — recover memories
   // missing from SQLite by scrolling Qdrant payloads. 're-embed': the
@@ -215,3 +222,4 @@ export type RevisionsInput = z.infer<typeof RevisionsInputSchema>;
 export type ReviewInput = z.infer<typeof ReviewInputSchema>;
 export type ConsolidateInput = z.infer<typeof ConsolidateInputSchema>;
 export type RelateInput = z.infer<typeof RelateInputSchema>;
+export type FeedbackInput = z.infer<typeof FeedbackInputSchema>;

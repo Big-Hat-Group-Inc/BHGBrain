@@ -7,6 +7,7 @@ import type {
   CategoryRecord,
   AuditEntry,
   ArchiveRecord,
+  RecallFeedbackEntry,
   MemoryRevisionRecord,
   MemoryLinkRecord,
   MemoryLinkRelation,
@@ -155,6 +156,7 @@ export interface SqliteStorage {
   deleteMemoriesInCollection(namespace: string, collection: string): { deleted: number; ids: string[] };
   insertAudit(entry: AuditEntry): void;
   listAudit(limit: number): AuditEntry[];
+  recordFeedback(entry: RecallFeedbackEntry): void;
   insertBackupMeta(path: string, sizeBytes: number, memoryCount: number, checksum: string): void;
   listBackups(): Array<{ path: string; size_bytes: number; memory_count: number; created_at: string }>;
   exportData(): Buffer;
@@ -296,6 +298,25 @@ CREATE TABLE IF NOT EXISTS memory_archive (
 
 CREATE INDEX IF NOT EXISTS idx_memory_archive_memory_id ON memory_archive(memory_id);
 CREATE INDEX IF NOT EXISTS idx_memory_archive_expired_at ON memory_archive(expired_at DESC);
+
+-- Append-only usefulness-feedback events (add-recall-feedback-signal). Each
+-- feedback tool call inserts one row; never mutated or collapsed into a
+-- running total on memories. Purely additive and otherwise inert in this
+-- version - no ranking, lifecycle, or search-behavior effect reads this
+-- table yet. See openspec/changes/add-recall-feedback-signal.
+CREATE TABLE IF NOT EXISTS recall_feedback (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  memory_id TEXT NOT NULL,
+  namespace TEXT NOT NULL,
+  query TEXT,
+  score REAL,
+  useful INTEGER NOT NULL CHECK(useful IN (0,1)),
+  client_id TEXT NOT NULL DEFAULT 'unknown',
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_recall_feedback_memory_id ON recall_feedback(memory_id);
+CREATE INDEX IF NOT EXISTS idx_recall_feedback_created_at ON recall_feedback(created_at DESC);
 
 CREATE TABLE IF NOT EXISTS bootstrap_sessions (
   namespace TEXT NOT NULL,
@@ -1671,6 +1692,23 @@ export class SqliteStore implements SqliteStorage {
     }
     stmt.free();
     return results;
+  }
+
+  recordFeedback(entry: RecallFeedbackEntry): void {
+    this.assertMutableAllowed();
+    this.db.run(
+      `INSERT INTO recall_feedback (memory_id, namespace, query, score, useful, client_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        entry.memory_id,
+        entry.namespace,
+        entry.query,
+        entry.score,
+        entry.useful ? 1 : 0,
+        entry.client_id,
+        entry.created_at,
+      ],
+    );
+    this.markDirty();
   }
 
   insertBackupMeta(path: string, sizeBytes: number, memoryCount: number, checksum: string): void {
