@@ -28,6 +28,9 @@ npm run start            # Run compiled code
 npm test                 # Run all tests once
 npm run test:watch       # Run tests in watch mode
 
+# Evaluation
+npm run eval              # Golden-set retrieval eval (recall@k/MRR report against src/eval/fixtures)
+
 # Build & Type Checking
 npm run lint             # Type check (tsc --noEmit) + eslint src
 ```
