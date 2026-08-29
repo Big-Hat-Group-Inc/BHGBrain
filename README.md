@@ -21,6 +21,7 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
    - [Device Identity Resolution](#device-identity-resolution)
    - [Shared Qdrant, Local SQLite](#shared-qdrant-local-sqlite)
    - [Repair and Recovery](#repair-and-recovery)
+   - [Embedding Model Migration](#embedding-model-migration)
 10. [Memory Management](#memory-management)
    - [Memory Data Model](#memory-data-model)
    - [Memory Types](#memory-types)
@@ -28,10 +29,13 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
    - [Retention Tiers](#retention-tiers)
    - [Tier Lifecycle - Assignment, Promotion, Sliding Window](#tier-lifecycle--assignment-promotion-sliding-window)
    - [Deduplication](#deduplication)
+   - [Auto-Tagging](#auto-tagging)
+   - [Content Provenance](#content-provenance)
    - [Content Normalization](#content-normalization)
    - [Importance Scoring](#importance-scoring)
    - [Categories - Persistent Policy Slots](#categories--persistent-policy-slots)
    - [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving)
+   - [Memory Distillation](#memory-distillation)
    - [Pre-Expiry Warnings](#pre-expiry-warnings)
    - [Resource Limits and Capacity Budgets](#resource-limits-and-capacity-budgets)
 11. [Search](#search)
@@ -45,12 +49,13 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
 13. [Health & Metrics](#health--metrics)
 14. [Security](#security)
 15. [MCP Resources](#mcp-resources)
-16. [Onboarding](#onboarding)
-17. [CLI Reference](#cli-reference)
-18. [MCP Tools Reference](#mcp-tools-reference)
-19. [Docker](#docker)
-20. [Upgrading](#upgrading)
-21. [Behavior Notes](#behavior-notes)
+16. [MCP Prompts](#mcp-prompts)
+17. [Onboarding](#onboarding)
+18. [CLI Reference](#cli-reference)
+19. [MCP Tools Reference](#mcp-tools-reference)
+20. [Docker](#docker)
+21. [Upgrading](#upgrading)
+22. [Behavior Notes](#behavior-notes)
 
 ---
 
@@ -73,7 +78,7 @@ graph TD
         RH["Resource Handler<br/><i>memory:// URIs</i>"]
 
         subgraph Storage["Storage Manager"]
-            subgraph SQLite["SQLite (sql.js)"]
+            subgraph SQLite["SQLite (node:sqlite)"]
                 S1["metadata"]
                 S2["fulltext (FTS)"]
                 S3["categories"]
@@ -109,7 +114,7 @@ graph TD
     class OpenAI external
 ```
 
-- **SQLite** (via `sql.js`, in-memory with periodic atomic flush to disk) is the **system of record** for all memory metadata, fulltext search index, categories, audit trail, revision history, and archive records.
+- **SQLite** (via `node:sqlite`'s native `DatabaseSync`, WAL-journaled with commit-level durability) is the **system of record** for all memory metadata, fulltext search index, categories, audit trail, revision history, and archive records.
 - **Qdrant** holds semantic vector embeddings for similarity search. Qdrant is always written after SQLite succeeds; failures are tracked via the `vector_synced` flag and surfaced in the health endpoint.
 - **OpenAI text-embedding-3-small** (default, configurable) generates 1536-dimensional embeddings for every memory.
 - **Atomic writes** ensure database files are never partially written - all disk I/O uses write-to-temp-then-rename.
@@ -121,7 +126,7 @@ graph TD
 
 | Requirement | Version | Notes |
 |---|---|---|
-| Node.js | ≥ 20.0.0 | LTS recommended |
+| Node.js | ≥ 22.0.0 | LTS recommended |
 | Qdrant | ≥ 1.10 | Must be running before starting BHGBrain. The bundled client (`@qdrant/js-client-rest` `~1.19.0`) calls the `query` API introduced in Qdrant 1.10; older servers will fail semantic search. |
 | OpenAI API key | - | For embeddings (`text-embedding-3-small` by default). Server starts in degraded mode if missing. |
 
@@ -269,6 +274,16 @@ The file is created automatically on first run with all defaults applied. Edit i
       "max_attempts": 3,
       "backoff_ms": 1000
     },
+    // Every vector is stamped with a provider-qualified identity
+    // (`<provider>/<model>@<dimensions>`) at write time. If the store's
+    // recorded expected identity (adopted on the first write after startup)
+    // differs from this configuration — e.g. after changing provider or
+    // model — the `embedding` health component degrades and, while this
+    // flag is true, vector-producing writes are refused with an error
+    // naming the `repair` tool's re-embed mode. Set to false only if you
+    // intentionally want writes to mix embedding spaces. See
+    // "Embedding Model Migration" below.
+    "refuse_writes_on_model_mismatch": true,
     // Name of the environment variable holding the OpenAI API key (ignored for Azure)
     "api_key_env": "OPENAI_API_KEY",
     // Azure-specific configuration (required when provider = "azure-foundry")
@@ -325,7 +340,10 @@ The file is created automatically on first run with all defaults applied. Edit i
     // Max memories included in auto-inject payload
     "auto_inject_limit": 10,
     // Maximum characters in tool response payloads
-    "max_response_chars": 50000
+    "max_response_chars": 50000,
+    // Per-namespace cap on memories with pinned: true (see remember/tag and
+    // memory://inject docs)
+    "pin_limit_per_namespace": 20
   },
 
   // Memory retention and lifecycle settings
@@ -376,7 +394,39 @@ The file is created automatically on first run with all defaults applied. Edit i
     "pre_expiry_warning_days": 7,
 
     // Qdrant segment compaction threshold (compact when this fraction of a segment is deleted)
-    "compaction_deleted_threshold": 0.10
+    "compaction_deleted_threshold": 0.10,
+
+    // Scheduled memory distillation: clusters related, still-active T2/T3
+    // episodic memories and consolidates each qualifying cluster into one
+    // durable T1 semantic memory via an LLM call, archiving the sources with
+    // lineage (see "Memory Distillation" below). Off by default and inert
+    // without a configured extraction API key.
+    "distillation": {
+      // Master switch. false (default): the scheduler never starts and
+      // `bhgbrain distill` still runs on demand but skips every cluster
+      // (no_key) unless an extraction API key is configured.
+      "enabled": false,
+
+      // Cron schedule for the background distillation job, evaluated in UTC.
+      // Defaults an hour after cleanup_schedule so a freshly-archived-by-GC
+      // store isn't also mid-distillation at the same moment.
+      "schedule": "0 3 * * *",
+
+      // Cosine similarity floor for two T2/T3 episodic memories to be
+      // clustered together. Conservative by design — a false merge is not
+      // reversible once sources are archived.
+      "similarity_threshold": 0.85,
+
+      // A cluster smaller than this is left alone (too weak a signal).
+      "min_cluster_size": 3,
+
+      // A cluster larger than this is deterministically split into
+      // max_cluster_size-sized chunks rather than distilled as one.
+      "max_cluster_size": 20,
+
+      // Upper bound on clusters distilled (LLM calls made) per scheduled tick.
+      "max_clusters_per_run": 10
+    }
   },
 
   // Deduplication settings
@@ -385,7 +435,20 @@ The file is created automatically on first run with all defaults applied. Edit i
     "enabled": true,
     // Cosine similarity threshold above which new content is considered an UPDATE of existing content.
     // Tier-specific adjustments are applied on top (see Deduplication section below).
-    "similarity_threshold": 0.92
+    "similarity_threshold": 0.92,
+    // How many of the top-10 fetched similarity candidates the classifier evaluates
+    // for corroboration (1-10; NOOP/DELETE/direct-UPDATE always use only the closest).
+    "candidate_window": 5,
+    // Independent kill switch for the corroboration path below; false restores
+    // pre-widening single-candidate-only classification regardless of the other
+    // three settings here.
+    "corroboration_enabled": true,
+    // Minimum number of window candidates (including the closest) that must score
+    // within corroboration_margin of the update threshold to escalate ADD to UPDATE.
+    "corroboration_count": 2,
+    // How far below the update threshold a candidate can score and still count
+    // toward corroboration.
+    "corroboration_margin": 0.03
   },
 
   // Resilience settings (circuit breakers for external dependencies)
@@ -407,6 +470,75 @@ The file is created automatically on first run with all defaults applied. Edit i
     "hybrid_weights": {
       "semantic": 0.7,
       "fulltext": 0.3
+    },
+    // Composite ranking: orders results by relevance x a prior derived from
+    // importance, access frequency, and tier-aware recency decay (see
+    // "Composite Ranking" below). Set enabled: false to restore pure-relevance
+    // ordering (the pre-ranking behavior).
+    "ranking": {
+      "enabled": true,
+      "w_importance": 0.3,
+      "w_access": 0.2,
+      "access_norm": 50,
+      // Per-day exponential decay rate by retention tier. T0 is 0 (never decays).
+      "decay_per_day": {
+        "T0": 0,
+        "T1": 0.002,
+        "T2": 0.008,
+        "T3": 0.02
+      }
+    },
+    // Opt-in LLM rerank stage for `recall` only (see "Rerank" below). Disabled
+    // by default: when enabled, sends the query and each candidate's text to
+    // the configured LLM for a relevance judgment, replacing `score` (never
+    // `semantic_score`, so min_score filtering is unaffected) for scored
+    // candidates. Requires its own BHGBRAIN_RERANK_API_KEY.
+    "rerank": {
+      "enabled": false,
+      "provider": "openai",
+      // How many of recall's (already-ranked) candidates to send to the LLM
+      // per call. 1-50.
+      "candidate_pool": 20,
+      "model": "gpt-4o-mini",
+      "model_env": "BHGBRAIN_RERANK_API_KEY",
+      // Any failure (timeout, non-2xx, malformed response) degrades to the
+      // pre-rerank order rather than failing the recall call.
+      "timeout_ms": 3000
+    },
+    // Maximal Marginal Relevance diversity reordering, applied after composite
+    // ranking (see "MMR Diversity Reranking" below). Set enabled: false to
+    // restore composite-relevance-only ordering exactly.
+    "mmr": {
+      "enabled": true,
+      "lambda": 0.7,
+      "candidate_pool_multiplier": 3,
+      "candidate_pool_cap": 50
+    },
+    // Multi-query expansion: semantic search/recall embed and search more than
+    // one representation of the query, merging candidates by id (max score
+    // wins) before ranking (see "Multi-Query Expansion" below).
+    "query_expansion": {
+      "enabled": true,
+      // Upper bound on total variants searched (original + keyword-stripped +
+      // LLM-generated), regardless of llm_paraphrase.variant_count.
+      "max_variants": 2,
+      // Deterministic, no-model variant: the query with English stopwords
+      // removed, searched alongside the original whenever it differs and is
+      // non-empty.
+      "keyword_stripped": true,
+      // Opt-in, model-backed variant generation. Off by default: this is the
+      // first live-path LLM chat dependency and adds latency/cost per call.
+      "llm_paraphrase": {
+        "enabled": false,
+        // "paraphrase": reword the query. "hyde": generate a hypothetical
+        // answer passage and embed that instead (can improve recall, at the
+        // cost of possible hallucinated specifics - see README below).
+        "mode": "paraphrase",
+        "variant_count": 2,
+        // Chat-completion request timeout; any failure (timeout, non-2xx,
+        // missing key) degrades silently to the no-model variants above.
+        "timeout_ms": 3000
+      }
     }
   },
 
@@ -428,12 +560,32 @@ The file is created automatically on first run with all defaults applied. Edit i
     "trust_proxy": false
   },
 
-  // Auto-inject payload budget (for memory://inject resource)
+  // Auto-inject payload budget (for memory://inject and memory://inject/{hint})
   "auto_inject": {
-    // Maximum characters included in the inject payload
+    // Budget quantity, interpreted per budget_unit below
     "max_chars": 30000,
     // Token budget (null = unlimited, character budget applies)
-    "max_tokens": null
+    "max_tokens": null,
+    // Fraction of the budget reserved for the memory section, so category
+    // content can no longer consume the entire payload before a single
+    // memory is injected. 0 restores the pre-existing behavior where
+    // categories may use the whole budget.
+    "memory_budget_fraction": 0.4,
+    // 'chars' (default): max_chars is a character budget, unchanged from
+    // before this option existed. 'tokens': max_chars is treated as an
+    // estimated token budget (chars/4, no tokenizer dependency), scaling
+    // every section's effective character budget by 4x.
+    "budget_unit": "chars",
+    // Greedy near-duplicate suppression within the hint-selected memory
+    // section: a candidate exceeding deduplication.similarity_threshold
+    // similarity to an already-selected memory is skipped. Pinned memories
+    // are exempt in both directions.
+    "dedup_suppression": true,
+    // Whether pinned memories are always included in the memory section
+    // (see defaults.pin_limit_per_namespace, and remember/tag's `pinned`
+    // parameter). false disables the step entirely; the pin cap is still
+    // enforced at write time regardless.
+    "pinned_enabled": true
   },
 
   // Observability settings
@@ -448,17 +600,62 @@ The file is created automatically on first run with all defaults applied. Edit i
 
   // Ingestion pipeline settings
   "pipeline": {
-    // Enable the extraction pass (currently runs deterministic single-candidate extraction)
-    "extraction_enabled": true,
-    // Model used for LLM-based extraction (planned for future use)
+    // Enable LLM-backed multi-candidate extraction: splits multi-fact `remember`
+    // content into atomic candidate memories before dedup/write. Defaults to
+    // false — opt in deliberately, since enabling it spends an LLM call (cost +
+    // latency) on every sufficiently long `remember`. When false, or when no API
+    // key resolves, extraction always emits exactly one candidate (today's
+    // behavior).
+    "extraction_enabled": false,
+    // Chat-completions model used for extraction
     "extraction_model": "gpt-4o-mini",
-    // Env var name for the extraction model API key
+    // Env var name for the extraction model API key; falls back to OPENAI_API_KEY
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // Content shorter than this (chars) skips the LLM call entirely and goes
+    // straight to single-candidate extraction
+    "extraction_min_chars": 120,
+    // Candidates beyond this cap are dropped (not merged), logged, and counted
+    "extraction_max_candidates": 6,
+    // Extraction request timeout in milliseconds, enforced via AbortController
+    "extraction_timeout_ms": 4000,
     // When true, fall back to checksum + full-text-similarity dedup if embedding is unavailable
-    "fallback_to_threshold_dedup": true
+    "fallback_to_threshold_dedup": true,
+    // Enable an optional LLM-backed summarization tier: a cheap chat-completion
+    // call produces the memory's `summary` field instead of the free, built-in
+    // extractive summarizer. Defaults to false — like extraction, this is a new
+    // external call with cost/latency implications, opt in deliberately. Any
+    // failure (missing key, non-2xx, timeout, network error) falls back to the
+    // extractive tier for that write; summarization never blocks or fails a
+    // `remember`/`revert` call.
+    "summarization_enabled": false,
+    // Chat-completions model used for summarization
+    "summarization_model": "gpt-4o-mini",
+    // Env var name for the summarization model API key. Defaults to the same
+    // variable as extraction_model_env (both are cheap-model write-path calls
+    // against the same OpenAI account) — point it elsewhere for a separate key.
+    "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // Summarization request timeout in milliseconds, enforced via AbortController
+    "summarization_timeout_ms": 3000,
+    // Deterministic, dependency-free content tagging: derives additional tags
+    // from code-shaped tokens, file paths, repo shorthand (owner/repo), and
+    // @mentions found in the normalized content, and unions them with any
+    // caller-supplied tags. No LLM call, no network. false restores exact
+    // pre-feature behavior (candidate tags are exactly the caller-supplied
+    // tags). See "Auto-Tagging" below.
+    "auto_tag_enabled": true,
+    // Upper bound on auto-derived tags added per memory, before merging with
+    // caller-supplied tags and trimming to the 20-tag-per-memory cap
+    // (trimming always prefers caller-supplied tags).
+    "auto_tag_max_per_memory": 6
   },
 
-  // Auto-summarize memory content on ingestion
+  // Controls the quality tier used to generate each memory's `summary` field.
+  // true (default): a dependency-free extractive summarizer scores every
+  // sentence in the content by term frequency and picks the most representative
+  // one (falling back further to the LLM tier above when
+  // pipeline.summarization_enabled is true and it resolves). false: the
+  // cheapest possible path — summary is just the first line of content,
+  // truncated to 120 chars — regardless of pipeline.summarization_enabled.
   "auto_summarize": true
 }
 ```
@@ -474,7 +671,8 @@ The file is created automatically on first run with all defaults applied. Edit i
 | `BHGBRAIN_TOKEN` | Required for non-loopback HTTP | — | Bearer token for HTTP authentication. Server **refuses to start** if the host is non-loopback and this is unset (unless `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Required for Qdrant Cloud | — | Set `qdrant.api_key_env` in config to the name of this variable. The default config field name is `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generated from hostname | Override the device identifier for multi-device setups. See [Device Identity Resolution](#device-identity-resolution). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model (future use). |
+| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model, used when `pipeline.extraction_enabled` is `true`. Also the default value of `pipeline.summarization_model_env` (used when `pipeline.summarization_enabled` is `true`) — point that field at a different variable if you want a separate key for summarization. Also read by multi-query expansion's LLM paraphrase/HyDE phase (`search.query_expansion.llm_paraphrase.enabled`, see [Multi-Query Expansion](#multi-query-expansion)), which resolves the key from `pipeline.extraction_model_env` the same way, falling back to `OPENAI_API_KEY` when unset. |
+| `BHGBRAIN_RERANK_API_KEY` | No | — (**no** fallback to `OPENAI_API_KEY`) | API key for the opt-in `recall` rerank stage, used when `search.rerank.enabled` is `true`. Unlike `BHGBRAIN_EXTRACTION_API_KEY`, this has no implicit fallback — enabling reranking is a deliberate, separately-keyed opt-in that never silently consumes the embedding or extraction key/budget. See [Rerank](#rerank). |
 
 Generate a secure bearer token:
 
@@ -507,9 +705,12 @@ node dist/index.js --stdio --config=/path/to/config.json
 
 ### HTTP mode
 
-> This transport is a plain REST API for scripts, health probes, and the CLI. It does
-> **not** implement MCP Streamable HTTP, so MCP clients must use stdio instead — see
-> [MCP Client Configuration](#mcp-client-configuration).
+> This transport serves real MCP over HTTP — the **Streamable HTTP** transport at
+> `/mcp`, so multiple MCP clients can share one long-running server process — alongside
+> a plain REST convenience API (`POST /tool/:name`, `GET /resource`) for scripts,
+> health probes, and the CLI. See
+> [MCP Client Configuration](#mcp-client-configuration) for how to point a
+> Streamable-HTTP-capable client at `/mcp`.
 
 HTTP is enabled by default on `127.0.0.1:3721`. Set `BHGBRAIN_TOKEN` before starting if you want authenticated access:
 
@@ -524,9 +725,16 @@ The server listens at `http://127.0.0.1:3721` by default. Available HTTP endpoin
 | Endpoint | Auth Required | Description |
 |---|---|---|
 | `GET /health` | No | Health check (unauthenticated for probe compatibility) |
-| `POST /tool/:name` | Yes | Invoke a named MCP tool |
-| `GET /resource?uri=...` | Yes | Read an MCP resource by URI |
+| `POST /mcp` | Yes | MCP Streamable HTTP: JSON-RPC requests; an `initialize` request creates a new session |
+| `GET /mcp` | Yes | MCP Streamable HTTP: standalone SSE channel for an existing session |
+| `DELETE /mcp` | Yes | MCP Streamable HTTP: terminates a session |
+| `POST /tool/:name` | Yes | REST convenience: invoke a named MCP tool directly |
+| `GET /resource?uri=...` | Yes | REST convenience: read an MCP resource by URI directly |
 | `GET /metrics` | Yes | Prometheus-format metrics (if `metrics_enabled: true`) |
+
+Every `/mcp` session is a fresh, in-memory MCP server sharing the same underlying
+storage as every other session and the REST endpoints — restarting the process drops
+all sessions, and spec-conformant clients re-initialize automatically.
 
 Health check example:
 
@@ -579,12 +787,36 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter (stdio transport)
+### OpenClaw / mcporter (Streamable HTTP transport)
 
-BHGBrain speaks MCP over **stdio only**. The HTTP server described in
-[HTTP mode](#http-mode) is a plain REST API (`POST /tool/:name`, `GET /resource`) — it
-is *not* an MCP Streamable HTTP endpoint, so MCP clients cannot connect to it. Point
-them at the `bhgbrain-server` binary instead:
+BHGBrain's HTTP server speaks real MCP at `/mcp` via the **Streamable HTTP**
+transport (see [HTTP mode](#http-mode)) — start the server once and point every MCP
+client at the same URL so they share one long-running process and one SQLite/Qdrant
+backend, instead of each client spawning its own isolated `--stdio` child:
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "http",
+      "url": "http://127.0.0.1:3721/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    }
+  }
+}
+```
+
+Start the server first (`node dist/index.js` or `bhgbrain server start`) with
+`BHGBRAIN_TOKEN` set to the same value used in the header above.
+
+#### stdio transport (spawn-per-client alternative)
+
+Clients that only support stdio (or that must not share a running server) can still
+spawn their own `bhgbrain-server --stdio` child process. This is fully supported, but
+each client that does this gets its own isolated process — no state is shared with
+other clients until it's written through to SQLite/Qdrant.
 
 ```json
 {
@@ -620,11 +852,13 @@ Or against a source checkout rather than the globally installed binary:
 }
 ```
 
-> **Running OpenClaw inside WSL or a container?** BHGBrain must be installed in that
-> same environment. stdio means the client spawns the server as a child process, so
-> the server cannot live in a separate distro or container. To share memory across
-> environments, give each install its own SQLite and point them all at the same Qdrant
-> cluster — see [Multi-Device Memory](#multi-device-memory).
+> **Running OpenClaw inside WSL or a container with the stdio transport?** BHGBrain
+> must be installed in that same environment. stdio means the client spawns the server
+> as a child process, so the server cannot live in a separate distro or container. The
+> Streamable HTTP transport above avoids this entirely — point clients in any
+> environment at the same `http://host:3721/mcp` URL. To share memory across separate
+> server instances instead, give each install its own SQLite and point them all at the
+> same Qdrant cluster — see [Multi-Device Memory](#multi-device-memory).
 
 ---
 
@@ -761,6 +995,61 @@ The repair tool:
 
 **Note**: Memories stored before the content-in-Qdrant feature was added (pre-1.3) do not have content in their Qdrant payload and cannot be recovered via repair. Only metadata (tags, type, importance) survives for those entries.
 
+### Embedding Model Migration
+
+Every vector is stamped at write time with a provider-qualified identity —
+`<provider>/<model>@<dimensions>` (e.g. `openai/text-embedding-3-small@1536`) — on
+both the SQLite row and the Qdrant payload. The store also remembers this identity as
+its expectation, adopted the first time it is written after startup.
+
+This exists because mixing embedding spaces is silent corruption: if you change
+`embedding.provider` or `embedding.model` in `config.json` while dimensions stay the
+same (e.g. switching to an Azure deployment of the same model family), nothing at the
+Qdrant layer detects it — new vectors land in the same collection as old ones, cosine
+similarity across the two spaces is meaningless, and both recall relevance and
+deduplication (the closest-candidate and candidate-window scores feeding the 0.92/0.98 thresholds) silently corrode.
+A dimension change fails loudly with an opaque Qdrant error instead; provenance
+stamping makes the same class of problem loud and actionable in both cases.
+
+**What happens after a model change:**
+
+1. On the next startup (or health check), the store's recorded expected identity no
+   longer matches the active configuration. The `embedding` health component degrades
+   with a message naming both identities, and a structured `embedding_identity_mismatch`
+   warning is logged.
+2. While `embedding.refuse_writes_on_model_mismatch` is `true` (the default),
+   vector-producing writes (remember, tag-triggered re-embeds, restore reconciliation)
+   fail with an actionable `CONFLICT` error naming the re-embed path. Reads keep
+   working — recall and search still serve the old vectors, just at degraded health.
+3. Run the migration:
+
+   ```bash
+   bhgbrain repair --re-embed              # migrate stale-stamped rows
+   bhgbrain repair --re-embed --dry-run    # preview how many rows would be re-embedded
+   bhgbrain repair --re-embed --include-legacy   # also sweep up pre-provenance rows (no stamp at all)
+   ```
+
+   Or via the `repair` MCP tool with `mode: "re-embed"` (see
+   [MCP Tools Reference](#mcp-tools-reference)). The migration re-embeds mismatched
+   memories in bounded, resumable batches — the stamp itself is the progress marker,
+   so an interrupted run resumes without repeating completed rows, and a single
+   memory's embed/upsert failure is isolated rather than aborting the batch.
+4. Once no stale-stamped rows remain, the store's expected identity updates
+   automatically and the `embedding` health degradation clears — no restart needed.
+
+**Notes:**
+- Legacy rows written before provenance stamping have no stamp (`null`) and are
+  treated as "unknown" — excluded from re-embed unless `--include-legacy` /
+  `include_legacy: true` is passed, so a first upgrade doesn't trigger a surprise
+  full-corpus re-embed (and its embedding API cost) on its own.
+- Re-embedding is always operator-initiated — it is never triggered automatically,
+  because it calls the paid embedding API once per migrated memory.
+- Set `embedding.refuse_writes_on_model_mismatch` to `false` only if you intentionally
+  want writes to proceed and mix embedding spaces (e.g. a deliberate, monitored
+  migration window) — the stamp still records what happened.
+- Archived memories are never re-embedded; their vectors are already gone by design
+  (see [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving)).
+
 ### Multi-Device Configuration Example
 
 **Device A** (`config.json`):
@@ -808,8 +1097,8 @@ Every memory stored in BHGBrain is a `MemoryRecord` with the following fields:
 | `category` | `string \| null` | Category name if this memory is attached to a persistent policy category |
 | `content` | `string` | The full memory content (up to 100,000 characters) |
 | `summary` | `string` | Auto-generated first-line summary (up to 120 characters) |
-| `tags` | `string[]` | Free-form tags (alphanumeric + hyphens, max 20 tags, max 100 chars each) |
-| `source` | `"cli" \| "api" \| "agent" \| "import"` | How the memory was created |
+| `tags` | `string[]` | Free-form tags (alphanumeric + hyphens, max 20 tags, max 100 chars each). Includes both caller-supplied tags and any content-derived tags auto-tagging adds — see [Auto-Tagging](#auto-tagging). |
+| `source` | `"cli" \| "api" \| "agent" \| "import" \| "distillation"` | How the memory was created. `"distillation"` is written only by the scheduled distillation job (see [Memory Distillation](#memory-distillation)) |
 | `checksum` | `string` | SHA-256 hash of normalized content (used for exact deduplication) |
 | `embedding` | `number[]` | Vector embedding (not stored in SQLite; lives in Qdrant) |
 | `importance` | `number (0-1)` | Importance score (default 0.5) |
@@ -821,8 +1110,10 @@ Every memory stored in BHGBrain is a `MemoryRecord` with the following fields:
 | `last_accessed` | `string (ISO 8601)` | Timestamp of most recent retrieval |
 | `last_operation` | `"ADD" \| "UPDATE" \| "DELETE" \| "NOOP"` | Most recent write operation applied |
 | `merged_from` | `string \| null` | ID of the memory this was merged from (dedup UPDATE path) |
+| `derived_from` | `string[] \| null` | IDs of the archived T2/T3 episodic source memories this memory was distilled from. Set only by the distillation job; `null` for every ordinary write (see [Memory Distillation](#memory-distillation)) |
 | `archived` | `boolean` | Whether this memory is soft-archived (excluded from search/recall) |
 | `vector_synced` | `boolean` | Whether the Qdrant vector is in sync with SQLite state |
+| `pinned` | `boolean` | Whether this memory is always included in [`memory://inject`](#memoryinject---session-context-injection) payloads, bounded by `defaults.pin_limit_per_namespace`; has no effect on `search`/`recall` |
 | `device_id` | `string \| null` | Identifier of the BHGBrain instance that created this memory (see [Multi-Device Memory](#multi-device-memory)) |
 | `created_at` | `string (ISO 8601)` | Creation timestamp |
 | `updated_at` | `string (ISO 8601)` | Last update timestamp |
@@ -843,6 +1134,7 @@ CREATE INDEX idx_memories_expiry      ON memories(decay_eligible, expires_at);
 CREATE INDEX idx_memories_review_due  ON memories(retention_tier, review_due);
 CREATE INDEX idx_memories_archived    ON memories(archived);
 CREATE INDEX idx_memories_vector_sync ON memories(vector_synced);
+CREATE INDEX idx_memories_pinned      ON memories(namespace, pinned);
 ```
 
 #### Qdrant Payload Indexes
@@ -914,7 +1206,7 @@ Every memory is assigned a **retention tier** at ingestion time that governs its
 
 **Key properties by tier:**
 
-- **T0**: `expires_at` is always `null`. `decay_eligible` is always `false`. T0 memories cannot be automatically cleaned up. Updates to T0 memories trigger a revision snapshot in the `memory_revisions` table (append-only history). T0 memories receive a +0.1 score boost in hybrid search results.
+- **T0**: `expires_at` is always `null`. `decay_eligible` is always `false`. T0 memories cannot be automatically cleaned up. Updates to T0 memories trigger a revision snapshot in the `memory_revisions` table (append-only history). T0 memories never decay in composite ranking (`decay_per_day.T0` defaults to `0`), giving them a durable ranking edge across all search modes.
 
 - **T1**: `review_due` is set to `created_at + 365 days` and reset on each access. Memories approaching their `expires_at` are flagged with `expiring_soon: true` in search results.
 
@@ -1081,9 +1373,12 @@ flowchart TD
     G --> H{"Highest Cosine<br/>Similarity Score"}
     H -->|"score ≥ noop threshold"| NOOP2["🔄 NOOP<br/>Near-duplicate found"]
     H -->|"score ≥ update threshold"| UPD["✏️ UPDATE Path"]
-    H -->|"score < update threshold"| ADD["➕ ADD Path"]
+    H -->|"score < update threshold"| WIN{"candidate_window:<br/>N corroborators ≥<br/>(update − margin)?"}
+    WIN -->|"Yes (≥ corroboration_count)"| CORR["✏️ UPDATE Path<br/>(corroborated)"]
+    WIN -->|"No"| ADD["➕ ADD Path"]
 
     UPD --> U1["Merge tags (union)"]
+    CORR --> U1
     U1 --> U2["Replace content"]
     U2 --> U3["importance = max(old, new)"]
     U3 --> U4["SQLite UPDATE"]
@@ -1101,9 +1396,9 @@ flowchart TD
 
     class REJECT reject
     class NOOP1,NOOP2 noop
-    class UPD,U1,U2,U3,U4,U5 update
+    class UPD,CORR,U1,U2,U3,U4,U5 update
     class ADD,A1,A2,A3 add
-    class A,B,C,D,E,F,G,H process
+    class A,B,C,D,E,F,G,H,WIN process
 ```
 
 #### Phase 1: Exact Deduplication (Checksum)
@@ -1120,12 +1415,23 @@ If no exact match is found, the content is embedded and the top 10 most similar 
 
 | Decision | Condition | Effect |
 |---|---|---|
-| `NOOP` | Score ≥ noop threshold | Content is considered a duplicate; return the existing memory's ID without writing |
-| `DELETE` | Score ≥ update threshold **and** the content explicitly invalidates the match (e.g. "no longer true", "correction:", "forget that") | The existing memory is deleted and the candidate is stored as a new memory referencing it via `merged_from` |
-| `UPDATE` | Score ≥ update threshold | Content is an update of existing; merge tags, update content and checksum, preserve ID |
-| `ADD` | Score < update threshold | Genuinely new memory; create with a new UUID |
+| `NOOP` | Closest candidate's score ≥ noop threshold | Content is considered a duplicate; return the existing memory's ID without writing |
+| `DELETE` | Closest candidate's score ≥ update threshold **and** the content explicitly invalidates the match (e.g. "no longer true", "correction:", "forget that") | The existing memory is deleted and the candidate is stored as a new memory referencing it via `merged_from` |
+| `DELETE` (opt-in) | Closest candidate's score is in the update band, the phrase heuristic above did **not** fire, `pipeline.contradiction_detection.enabled` is `true`, and an LLM entailment check classifies the candidate as `contradict` relative to the matched memory | Same effect as the phrase-triggered `DELETE` above — the existing memory is deleted and the candidate is stored as a new memory referencing it via `merged_from` |
+| `UPDATE` | Closest candidate's score ≥ update threshold | Content is an update of existing; merge tags, update content and checksum, preserve ID |
+| `UPDATE` (corroborated) | Closest candidate's score < update threshold, **but** at least `deduplication.corroboration_count` candidates within the top `deduplication.candidate_window` (including the closest) score ≥ `update threshold − deduplication.corroboration_margin` | Several near-identical memories independently cluster near the threshold; merge into the highest-scoring candidate exactly as a direct `UPDATE` would |
+| `ADD` | Closest candidate's score < update threshold and no corroborated cluster is found | Genuinely new memory; create with a new UUID |
 
-The diagram above shows the NOOP/UPDATE/ADD paths; DELETE is a variant of the UPDATE path taken only when the invalidation heuristic fires.
+The diagram above shows the NOOP/UPDATE/ADD paths; DELETE is a variant of the UPDATE path taken when either the phrase-based invalidation heuristic fires, or (opt-in, see below) an LLM entailment check classifies an update-band candidate as contradicting the existing memory. NOOP and DELETE are always decided against the single closest candidate only — corroboration never applies to them (see "Candidate window and corroboration" below).
+
+**Contradiction detection (opt-in, default off):** the phrase heuristic above only catches candidates that explicitly say they're a correction ("no longer true", "correction:", ...). A same-topic candidate that conflicts without using one of those phrases — e.g. "We migrated to Postgres" arriving when the store already has "we use MySQL" — silently falls through to `UPDATE` and both facts coexist. Setting `pipeline.contradiction_detection.enabled: true` closes that gap: for candidates that land in the update band *and* don't already trip the phrase heuristic, the pipeline makes one LLM call (reusing the `pipeline.extraction_model` / `pipeline.extraction_model_env` credentials — no separate model or API key configuration) that classifies the candidate against the matched memory as `agree`, `refine`, or `contradict`. Only `contradict` changes behavior, routing to the same delete-and-replace path as the phrase heuristic; `agree`/`refine` fall through to the existing `UPDATE` merge, identical to today's behavior. The phrase heuristic is always checked first and short-circuits without an LLM call whenever it matches, so explicit corrections stay free and instant.
+
+| `pipeline.contradiction_detection.*` field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Turns the LLM entailment check on for update-band writes. Off by default: zero behavior change, zero extra latency/cost, until an operator opts in. |
+| `timeout_ms` | `5000` | Upper bound on the entailment call. On timeout, network error, non-2xx response, or an unparseable/off-list classification, the pipeline fails open — proceeds exactly as if the feature were disabled for that write — and logs a `contradiction_check_degraded` warning rather than blocking or rejecting the write. |
+
+**Trade-off to weigh before enabling:** today's gap is a false *negative* (a real contradiction goes undetected; both memories persist, and a later explicit correction still fixes it). An LLM misclassifying `refine` as `contradict` is a false *positive* that silently deletes a memory that was still true — and because delete-and-replace does not preserve the deleted memory's content in memory revision history, that loss is not trivially recoverable. The check is prompted conservatively (temperature 0, "not confident → not contradict") and ships default-off for this reason; enable it with that trade-off in mind.
 
 **Tier-specific deduplication thresholds:**
 
@@ -1138,6 +1444,10 @@ The base `similarity_threshold` (default 0.92) is adjusted per tier because T0/T
 | `T2` | 0.98 | base (0.92) |
 | `T3` | 0.95 | max(base, 0.90) |
 
+**Candidate window and corroboration:**
+
+The Qdrant similarity search already fetches the top 10 candidates, but by default the classifier only inspects the single closest one for NOOP/DELETE/direct-UPDATE decisions. When that closest candidate falls *below* the update threshold, the pipeline additionally checks whether several other candidates independently cluster near the same threshold — several near-restatements of the same fact should merge into one memory rather than each ADD-ing a fresh variant. Concretely: within the top `deduplication.candidate_window` candidates (default 5, capped at 10 — the ceiling already fetched), if at least `deduplication.corroboration_count` (default 2) of them score at or above `update threshold − deduplication.corroboration_margin` (default 0.03), the write classifies `UPDATE` against the highest-scoring of those candidates instead of `ADD`. This is a one-way escalation only: it can turn an `ADD` into an `UPDATE`, but never changes a `NOOP` or `DELETE` decision, and it always targets the highest-scoring candidate (no new tie-breaking logic). Set `deduplication.corroboration_enabled: false` to disable this path entirely and restore pre-widening single-candidate-only classification; this is independent of `deduplication.enabled`, which turns off semantic dedup altogether. When the corroboration path fires it emits a structured `corroborated_dedup` warning log (`targetId`, `topScore`, `corroborators`) so operators can monitor how often it triggers and tune the margin/count.
+
 **UPDATE merge behavior:**
 - Tags are unioned (existing tags ∪ new tags)
 - Content is replaced with the new version
@@ -1146,6 +1456,109 @@ The base `similarity_threshold` (default 0.92) is adjusted per tier because T0/T
 
 **Fallback behavior:**
 If the embedding provider is unavailable and `pipeline.fallback_to_threshold_dedup: true`, the pipeline degrades to a vectorless dedup path instead of failing the write. Exact-checksum matches still short-circuit to `NOOP` as in Phase 1. For everything else, the pipeline uses SQLite full-text search over the same namespace/collection to find the closest existing memory and scores it with a deterministic word-overlap similarity (not the vector cosine score); at or above the `update` threshold the content is merged into that memory (`UPDATE`, with `vector_synced: false`), otherwise it is written as a new memory in SQLite only (`ADD`, `vector_synced: false`). Either way the memory is available for fulltext search but not semantic search until Qdrant sync is restored, and entering this path logs a structured `degraded_write` warning.
+
+---
+
+### Auto-Tagging
+
+Most writes carry no caller-supplied tags, which leaves the `tags` filter on
+`recall`/`search` and fulltext search's 2× tag-match weight with nothing to act on.
+When `pipeline.auto_tag_enabled` is `true` (default), the write pipeline runs a
+deterministic, dependency-free extractor over the normalized content of every
+candidate — no LLM call, no network — and unions the results with any
+caller-supplied tags. Extraction happens before dedup classification, so it never
+changes whether a write is `ADD`/`UPDATE`/`DELETE`/`NOOP`.
+
+**Extraction categories** (in priority order — higher-priority categories are kept
+first if the combined tag set must be trimmed):
+
+1. **Code-shaped tokens** — markdown inline-code spans (`` `useEffect` ``) and
+   camelCase/PascalCase/`snake_case`/dotted identifiers (`extractionEnabled`,
+   `search.ranking.enabled`), with a 5-character floor to cut noise from short
+   accidental matches.
+2. **File paths** — slash-separated paths ending in a recognized extension
+   (`src/pipeline/index.ts`), plus a closed set of bare dotted filenames
+   (`package.json`, `README.md`, `Dockerfile`, ...) matched without a directory.
+3. **Repo shorthand** — two-segment `owner/repo`-shaped slash tokens whose trailing
+   segment has no recognized extension (`bhgbrain/core`); a token whose trailing
+   segment does have one is classified as a file path instead.
+4. **@-mentions** — `@handle`-shaped tokens not immediately preceded by a word
+   character, excluding email addresses (`jsmith@example.com` produces no mention
+   tag).
+
+**Slugification:** every matched token is normalized to satisfy `TagSchema`
+(`^[a-zA-Z0-9-]+$`, max 100 chars) unchanged — lowercased, a leading `@` mapped to an
+`at-` prefix (so `@jsmith` → `at-jsmith` instead of colliding with a plain word tag),
+every run of other characters collapsed to a single `-`, leading/trailing `-`
+trimmed, and truncated to 100 characters. Candidates that slugify to fewer than 2
+characters are dropped. Examples: `src/pipeline/index.ts` → `src-pipeline-index-ts`,
+`bhgbrain/core` → `bhgbrain-core`, `` `useEffect` `` → `useeffect`.
+
+**Merging and caps:** auto-derived tags are deduplicated and unioned with
+caller-supplied tags (`caller tags ∪ auto tags`, caller tags always listed first),
+then trimmed to the existing 20-tag-per-memory cap — trimming always drops
+auto-derived tags first, never a caller-supplied one. On `UPDATE`, auto-derived tags
+flow into the existing tag-merge union exactly like any other candidate tag.
+
+| Config field | Default | Meaning |
+|---|---|---|
+| `pipeline.auto_tag_enabled` | `true` | Kill switch. `false` restores exact pre-feature behavior: candidate tags are exactly the caller-supplied `tags` input. |
+| `pipeline.auto_tag_max_per_memory` | `6` | Upper bound on auto-derived tags added per memory, applied before merging with caller-supplied tags. |
+
+No schema or storage changes: auto-derived tags are stored as ordinary `tags` array
+entries — same column, same fulltext 2× weighting, same `tags` filter push-down on
+`recall`/`search`. `import` and `remember` both route through the same write
+pipeline, so both benefit without separate wiring.
+
+**Known imprecision:** pattern-based extraction occasionally tags ordinary
+capitalized prose or brand names that happen to be camelCase/PascalCase-shaped
+(e.g. `GitHub` → `github`) — this is accepted as inherent to a deterministic v1
+extractor rather than semantic understanding; use the `tag` tool's `remove` action to
+correct outliers, or set `pipeline.auto_tag_enabled: false` to disable extraction
+entirely.
+
+---
+
+### Content Provenance
+
+`remember`'s `origin`/`confidence` fields let a caller record *where a memory's
+content came from* and *how much to trust it* — distinct from `embedding_model`
+(see [Embedding Model Migration](#embedding-model-migration)), which records which
+embedding model produced the *vector*, not where the belief came from.
+
+- **`origin`** (`{ session_id?, tool?, repo?, branch? }`, all optional free-form
+  strings) identifies the session/tool/repo/branch that produced a memory. `null`
+  when the caller supplies nothing — the common case, and always the case for
+  memories written before this field existed. Not derived automatically from the
+  MCP transport: there is no standardized session/tool identity across clients
+  (Claude CLI, Codex, Gemini, ...), so this is caller-supplied only.
+- **`confidence`** (`number`, `[0, 1]`) is how much to trust a memory's content.
+  When a `remember` call omits it, it defaults per-`source` from
+  `pipeline.default_confidence` (config, defaults `cli: 1.0, api: 1.0, agent: 0.7,
+  import: 0.5`) — an explicit user statement defaults to full trust, an agent's
+  inference defaults lower. On a dedup **UPDATE**, `confidence` merges via
+  `max(existing, incoming)` (a second confirmation never lowers trust, same policy
+  as `importance`); `origin` is replaced only when the incoming call supplies one,
+  otherwise the existing origin is kept.
+
+Both fields are surfaced on every read path that already returns memory records —
+`recall`, `search`, `memory://{id}`, `memory://list` — no new tool or resource.
+Example `remember` call:
+
+```json
+{
+  "content": "The user said the deploy window is Tuesdays 2-4pm UTC.",
+  "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+  "confidence": 1.0
+}
+```
+
+| Config field | Default | Meaning |
+|---|---|---|
+| `pipeline.default_confidence.cli` | `1.0` | Default `confidence` for `source: "cli"` writes that omit it. |
+| `pipeline.default_confidence.api` | `1.0` | Default `confidence` for `source: "api"` writes that omit it. |
+| `pipeline.default_confidence.agent` | `0.7` | Default `confidence` for `source: "agent"` writes that omit it. |
+| `pipeline.default_confidence.import` | `0.5` | Default `confidence` for `source: "import"` writes that omit it. |
 
 ---
 
@@ -1262,7 +1675,7 @@ The server runs a scheduled cleanup job (default: daily at 2:00 AM UTC, configur
 
 1. **Identify expired memories:** Query SQLite for all memories where `decay_eligible = true` AND `expires_at < now()`. Only `T2`/`T3` are eligible for direct archive-and-delete:
    - `T0` is always excluded (T0 is never decay eligible).
-   - `T1` is never directly deleted. Expired or `review_due`-past `T1` memories are surfaced as **review candidates** in the GC result instead, so an operator can decide whether to promote, re-save, or manually delete them.
+   - `T1` is never directly deleted. Expired or `review_due`-past `T1` memories are surfaced as **review candidates** in the GC result instead, so an operator can decide whether to promote, re-save, or manually delete them — or, via MCP, list and disposition them through the `review` tool (`action: "list"` / `"keep"` / `"archive"`; see [MCP Tools Reference](#mcp-tools-reference)).
 
 2. **Archive before delete (if enabled):** For each `T2`/`T3` candidate, write a summary record to the `memory_archive` table and log a distinct `ARCHIVE` audit event:
 
@@ -1313,6 +1726,8 @@ memory_revisions {
 
 Only T0 memories have revision history. The vector embedding in Qdrant always reflects the current content only.
 
+Revision history is readable via the `revisions` tool (`action: "list"`) or the `memory://{id}/revisions` resource, newest first. `revisions` (`action: "revert"`) restores a memory's content to a chosen prior revision — re-embedding, re-upserting the vector, and appending (not rewriting) the revert itself as a new history entry — and records a `REVISE` audit event naming the source revision. See [MCP Tools Reference](#mcp-tools-reference) and [MCP Resources](#mcp-resources).
+
 #### Stale Marking (Consolidation Pass)
 
 The `bhgbrain gc --consolidate` command (or `RetentionService.runConsolidation()`) performs a secondary pass that marks memories as **stale** candidates:
@@ -1323,7 +1738,8 @@ The `bhgbrain gc --consolidate` command (or `RetentionService.runConsolidation()
 
 #### Archive Search and Restore
 
-Deleted memories (when `archive_before_delete: true`) can be inspected and restored:
+Deleted memories (when `archive_before_delete: true`) can be inspected and restored
+from the CLI:
 
 ```bash
 bhgbrain archive list                 # List recently archived memories
@@ -1331,7 +1747,81 @@ bhgbrain archive search <query>       # Search archived summaries by text
 bhgbrain archive restore <memory_id>  # Restore an archived memory
 ```
 
-**Restore semantics:** A restored memory is re-created as a **new** `T2` memory from the archived summary text. The original content (if longer than the summary) cannot be recovered - the archive stores only the 120-character summary. The restored memory receives fresh timestamps and a new UUID, and is re-embedded in Qdrant.
+**Restore semantics:** A restored memory is re-created as a **new** memory (at its
+original tier) from the archived summary text. The original content (if longer than
+the summary) cannot be recovered - the archive stores only the 120-character summary.
+The restored memory receives fresh timestamps and a new UUID, and is re-embedded in
+Qdrant. The CLI's `archive restore` additionally deletes the archive row once restored.
+
+MCP clients have an equivalent path: the `search` tool's `include_archived` parameter
+finds archived memories by summary/tag term (marked `archived: true`, never
+access-recorded), and the `review` tool's `restore` action recreates an active memory
+from an archived record — tagged `restored-from-archive`, with the archive row
+**retained** (unlike the CLI path) so its origin stays inspectable. See
+[MCP Tools Reference](#mcp-tools-reference).
+
+---
+
+### Memory Distillation
+
+<a id="memory-distillation"></a>
+
+A scheduled "sleep" job that turns clusters of related, still-active `T2`/`T3`
+`episodic` memories into a single durable `T1` `semantic` memory — e.g. five separate
+memories like "deployed via GitHub Actions", "switched CI to Actions", "Actions runner
+pinned to node20" become one memory: "we deploy via GitHub Actions." **Off by default**
+(`retention.distillation.enabled: false`) — this is the only feature in BHGBrain that
+makes an outbound LLM call, and archiving sources loses their full content
+irreversibly, so it requires deliberate opt-in.
+
+**Enabling it:**
+
+1. Set `retention.distillation.enabled: true` in `config.json`.
+2. Provision an extraction API key: `pipeline.extraction_model_env` (default
+   `BHGBRAIN_EXTRACTION_API_KEY`) must resolve to a set environment variable — no new
+   env var is introduced; distillation reuses the same key already documented for
+   `pipeline.extraction_enabled` and `search.rerank`.
+
+**How it works (each scheduled tick, or `bhgbrain distill`):**
+
+1. **Cluster:** For each namespace/collection holding `T2`/`T3` `episodic` memories,
+   fetch their vectors from Qdrant and greedily union-find memories whose cosine
+   similarity is `≥ retention.distillation.similarity_threshold` (default `0.85`) into
+   connected components. Clusters smaller than `min_cluster_size` (default `3`) are
+   left alone; clusters larger than `max_cluster_size` (default `20`) are split into
+   `max_cluster_size`-sized chunks. At most `max_clusters_per_run` (default `10`)
+   clusters — the largest first — are processed per run.
+2. **Distill:** For each qualifying cluster, its members' contents (oldest to newest)
+   are sent to the configured `pipeline.extraction_model` as one chat-completion call,
+   asking for a single consolidated fact. On conflicting sources, the prompt asks the
+   model to prefer the most recently updated one — a mitigation, not entailment-based
+   contradiction detection. A cluster is **skipped** (never a hard failure of the job)
+   when no API key is configured or the LLM call fails; skips are counted by reason
+   (`no_key` / `llm_error`).
+3. **Write:** The consolidated fact is written through the same `remember` write
+   pipeline every other memory goes through — checksum dedup, embedding, audit
+   logging — with `source: "distillation"`, `type: "semantic"`, `retention_tier: "T1"`,
+   and `derived_from` set to the cluster's source memory ids. A cluster that re-forms
+   after a prior distillation run **updates** the earlier distilled memory (via the
+   normal dedup path) instead of creating a duplicate.
+4. **Archive sources:** Only after the distilled memory is confirmed durably written
+   are the cluster's source memories archived and deleted through the same
+   `memory_archive` path GC uses, with a dedicated `DISTILL` audit entry (`action:
+   "distill"`) referencing both the new memory id and the archived source ids. If
+   archival/deletion fails after a successful distilled write, the write is **not**
+   rolled back — sources are left active and the run is reported degraded (a still-
+   active source is safe: the next run may re-cluster it, and the dedup path UPDATEs
+   rather than duplicates).
+
+```bash
+bhgbrain distill                      # Run distillation
+bhgbrain distill --dry-run            # Show candidate clusters (ids + summaries) without calling the LLM or writing/archiving anything
+```
+
+`health://status`'s `retention.distillation` field reports `last_run_at`,
+`last_run_degraded`, and cumulative `distilled_total`/`skipped_total` counts, and
+`bhgbrain_distill_*` counters/histograms follow the same naming convention as
+`bhgbrain_gc_*` (see [Health & Metrics](#health--metrics)).
 
 ---
 
@@ -1410,15 +1900,17 @@ Semantic search uses OpenAI embeddings and Qdrant vector similarity (cosine dist
 
 ### Fulltext Search
 
-Fulltext search uses SQLite's internal text matching to find memories containing specific words or phrases.
+Fulltext search uses a real SQLite FTS5 index to find memories containing specific words or phrases, with English stemming and BM25 relevance ranking.
 
 **How it works:**
 1. The query is split into lowercase terms.
-2. Each term is matched against the `memories_fts` shadow table using `LIKE %term%` on `content`, `summary`, and `tags` columns.
-3. Results are ranked by the number of matching terms (more matches = higher rank).
-4. The rank is normalized to a 0.0-1.0 score: `min(1.0, term_count / 10)`.
+2. Each term is matched against the `memories_fts` FTS5 virtual table (`content`/`summary`/`tags` columns, `porter unicode61` tokenizer) as a literal phrase, joined with `AND` — every term must match, and FTS5 query syntax embedded in a term (`NEAR`, `*`, parens, `AND`/`OR`, column filters) is treated as inert literal text rather than parsed as an operator.
+3. The `porter` tokenizer stems both the index and the query, so a query term matches other inflected forms of the same word (e.g. "runs" matches "running"; "deploy" matches "deployed") - not just exact substrings.
+4. Results are ranked with `bm25()`, weighting `summary` and `tags` matches 2x above `content` matches (mirroring the pre-FTS5 term-frequency weighting).
 5. Archived memories are excluded (the FTS table is kept in sync with the main memories table - archived rows are removed from FTS).
 6. Access metadata is updated for returned results.
+
+**Fallback:** if the running SQLite build has no `fts5` module compiled in (verified via a startup capability probe, not assumed), fulltext search degrades to a legacy `LIKE '%term%'` matcher with a hand-rolled term-frequency rank instead of erroring. This is visible, not silent: `health://status`'s `sqlite` component carries a `message`, and a `fts5_unavailable` warning is logged once at startup. See [Health Endpoint](#health-endpoint).
 
 **When to use:** Exact keyword searches, searching for specific identifiers (memory IDs, project names, system names), when you know the exact terminology used.
 
@@ -1448,14 +1940,14 @@ flowchart TD
     end
 
     subgraph Fulltext["Fulltext Search"]
-        P2["Tokenize Query"] --> FTS["SQLite FTS<br/>LIKE matching"]
-        FTS --> FR["Ranked Results<br/><i>by term count</i>"]
+        P2["Tokenize Query"] --> FTS["SQLite FTS5<br/>MATCH + porter stemming"]
+        FTS --> FR["Ranked Results<br/><i>by BM25</i>"]
     end
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
     FR --> RRF
-    RRF --> BOOST["T0 Score Boost<br/><i>+0.1 for foundational</i>"]
-    BOOST --> TOP["Return Top N Results"]
+    RRF --> RANK["Composite Ranking<br/><i>relevance x importance/access/decay prior</i>"]
+    RANK --> TOP["Return Top N Results"]
     TOP --> TRACK["Update Access Tracking<br/><i>count++, sliding window reset</i>"]
 
     classDef search fill:#4a90d9,stroke:#2c5f8a,color:#fff
@@ -1463,7 +1955,7 @@ flowchart TD
     classDef result fill:#5ba85b,stroke:#3d7a3d,color:#fff
 
     class P1,QD,SR,P2,FTS,FR search
-    class RRF,BOOST fusion
+    class RRF,RANK fusion
     class TOP,TRACK result
 ```
 
@@ -1483,7 +1975,7 @@ Hybrid search combines semantic and fulltext results using **Reciprocal Rank Fus
 
 4. Items appearing in only one list receive `0` contribution from the other.
 5. The merged list is sorted by RRF score (descending).
-6. T0 memories receive a **+0.1 score boost** applied after RRF fusion, ensuring foundational knowledge surfaces prominently.
+6. **Composite ranking** (see below) is applied to every mode's results, including this RRF score, and the list is re-sorted by the composite score.
 7. The top `limit` results are returned.
 
 **Graceful degradation:** If the embedding provider is unavailable, hybrid search silently falls back to fulltext-only results rather than erroring.
@@ -1499,6 +1991,125 @@ Hybrid search combines semantic and fulltext results using **Reciprocal Rank Fus
   "limit": 10
 }
 ```
+
+---
+
+### Composite Ranking
+
+Every search mode (`semantic`, `fulltext`, `hybrid`) orders its results by a composite score rather than relevance alone. Relevance (cosine similarity, FTS rank, or RRF score, depending on mode) is multiplied by a **prior** derived from signals every memory already carries - `importance`, `access_count`, and how recently it was updated - so that a memory confirmed useful many times, marked important, or edited recently outranks an equally-relevant stale look-alike.
+
+```
+final_score = relevance x (w_base + w_importance x importance + w_access x log1p(access_count) / log1p(access_norm))
+                        x exp(-decay_per_day[tier] x age_days)
+```
+
+- `w_base` is a fixed `1.0` and is not configurable.
+- `age_days` is measured from `updated_at`, so an `UPDATE` resets a memory's effective age - a freshly edited memory is "young" again.
+- `T0` memories have a `decay_per_day` of `0` by default and therefore never decay, giving foundational knowledge a durable edge (this replaces the old flat `+0.1` T0 boost).
+- Access frequency is log-damped (`log1p`) so a handful of extra recalls cannot dominate the ordering, and normalized by `access_norm` (default `50`) so the access term stays roughly comparable in scale to the importance term.
+
+**Configuration** (`search.ranking` in `config.json`, see [Configuration](#configuration)):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Set `false` to disable composite ranking entirely and restore pure-relevance ordering. |
+| `w_importance` | `0.3` | Weight applied to a memory's `importance` (0-1). |
+| `w_access` | `0.2` | Weight applied to the log-damped access count. |
+| `access_norm` | `50` | Normalizes the access-count term; larger values require more accesses to reach the same boost. |
+| `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Per-tier exponential decay rate applied to `age_days`. `T2`'s default gives a half-life of roughly 87 days, aligned with its 90-day TTL. |
+
+**What composite ranking does *not* affect:** the raw `semantic_score` and `fulltext_score` fields on each result, and the field `recall`'s `min_score` threshold applies to (`semantic_score`) - see [Recall vs Search](#recall-vs-search---differences). Composite ranking changes result *ordering*, never which memories clear the `min_score` gate.
+
+---
+
+### Rerank
+
+`recall` supports an opt-in stage that re-scores its candidate pool with an LLM relevance judgment before `min_score` filtering and truncation to `limit`. Composite ranking and MMR (above) both derive their ordering entirely from the query embedding — a coarse proxy that reliably narrows the field to a plausible top 20 but routinely misorders that top 20. Reranking spends one extra LLM call per `recall` to judge the query and each candidate's *text* together, at the cost of added latency.
+
+**Disabled by default.** Stock installs never make the extra call — `recall` is byte-for-byte unchanged until `search.rerank.enabled: true` is set.
+
+**Ranking pipeline order:** relevance → composite prior → MMR diversity reorder → **rerank** (`recall` only) → `min_score` filtering and truncation to `limit`.
+
+**How it works:**
+1. When enabled, `recall` widens its fetched candidate pool to at least `search.rerank.candidate_pool`.
+2. The top `candidate_pool` candidates (by pre-rerank score) are sent to the configured LLM in a single batched call, alongside the query text.
+3. The LLM returns a relevance judgment in `[0, 1]` per candidate. Each successfully-scored candidate's `score` is replaced with the clamped judgment (its raw value is also exposed as `rerank_score` on the result), and the full list is re-sorted by the new `score`.
+4. Any candidate the response omits, or that fails to parse, keeps its pre-rerank `score` rather than being dropped.
+5. `min_score` and `limit` are then applied exactly as before — `min_score` is calibrated against `semantic_score`, which reranking never touches, so filtering and result membership are unaffected by whether reranking ran.
+
+**Failure is always graceful:** a provider error, timeout, or malformed response degrades to the pre-rerank order — `recall` never fails because reranking failed. The degradation is observable via a `search_rerank_degraded` metric counter and a structured `rerank_degraded` warning log.
+
+**Scoped to `recall` only:** `search` and `memory://inject`/`memory://inject/{hint}` are unaffected by `search.rerank` configuration in this release.
+
+**Configuration** (`search.rerank` in `config.json`, see [Configuration](#configuration)):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Set `true` to turn on the rerank stage for `recall`. |
+| `provider` | `"openai"` | Rerank provider. Currently the only supported value. |
+| `candidate_pool` | `20` | How many of `recall`'s (already-ranked) candidates to send to the LLM per call, `1`-`50`. |
+| `model` | `"gpt-4o-mini"` | Chat-completions model used for scoring. |
+| `model_env` | `"BHGBRAIN_RERANK_API_KEY"` | Name of the environment variable holding the API key. **No fallback** to `OPENAI_API_KEY` — see [Environment Variables](#environment-variables). |
+| `timeout_ms` | `3000` | Request timeout; a timeout degrades to the pre-rerank order like any other failure. |
+
+**Independent of the extraction pipeline:** reranking resolves its own `search.rerank.model`/`model_env` and never reads `pipeline.extraction_model`/`extraction_model_env` — it works regardless of whether `pipeline.extraction_enabled` is set.
+
+---
+
+### MMR Diversity Reranking
+
+`recall` and `search` (in `semantic` and `hybrid` modes) apply a further reordering pass after composite ranking: **Maximal Marginal Relevance (MMR)**. Composite ranking alone can still return a top-K dominated by several near-duplicate memories - two facts at 0.85 cosine similarity, say, both survive write-time dedup (which only collapses ≥ 0.92) and both rank near the top together. MMR trades a configurable amount of top-ranked relevance for diversity so the returned page spends its slots on *distinct* facts instead.
+
+**Ranking pipeline order:** relevance (cosine / FTS rank / RRF) → composite prior (importance/access/decay) → **MMR diversity reorder** → downstream `min_score` / type / tags filtering and truncation to the caller's `limit`.
+
+**How it works:**
+1. `recall`/`search` fetch a wider candidate pool than `limit` (see Candidate pool sizing below) so there is genuine headroom to diversify among.
+2. Each candidate's composite score is min-max normalized across the fetched pool, so `lambda` means the same thing regardless of whether the pool's scores are cosine-scale (semantic mode) or RRF-scale (hybrid mode, typically two orders of magnitude smaller).
+3. Starting from the highest-scoring candidate, MMR greedily selects the next candidate maximizing `lambda * normalized_relevance - (1 - lambda) * max_similarity_to_already_selected`, where similarity is cosine similarity against every already-selected candidate that carries a vector.
+4. This is a **full-pool reorder, never a truncator** - every candidate fetched is still present afterward, only reordered. `min_score`, type/tags filtering, and truncation to `limit` all run downstream, unaffected in mechanism, so a `min_score` gate can never under-return results just because MMR ran first.
+5. Candidates missing a vector (a fulltext-only match in hybrid mode, for example) are never penalized and never able to penalize others - they contribute `0` similarity.
+
+**Fulltext mode is unaffected:** `mode: 'fulltext'` carries no vectors to diversify against, so MMR never runs regardless of `search.mmr.enabled`.
+
+**Configuration** (`search.mmr` in `config.json`, see [Configuration](#configuration)):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Set `false` to disable MMR entirely and restore composite-relevance-only ordering exactly. |
+| `lambda` | `0.7` | Relevance/diversity trade-off, `0`-`1`. Close to `1` approximates pure composite-relevance ordering; close to `0` favors dissimilarity among candidates over relevance. |
+| `candidate_pool_multiplier` | `3` | Widens the pool fetched from the store to `limit * candidate_pool_multiplier` when MMR is eligible, giving genuine diversity headroom beyond the caller's `limit`. |
+| `candidate_pool_cap` | `50` | Upper bound on the widened pool size, regardless of `limit * candidate_pool_multiplier`. |
+
+**Not the same as `memory://inject/{hint}`'s near-duplicate suppression:** that resource template (see [MCP Resources Reference](#mcp-resources-reference)) already has its own, separate near-duplicate mechanism - a hard threshold drop (reusing `deduplication.similarity_threshold`, default `0.92`) rather than MMR's continuous relevance/diversity trade-off. The two are intentionally independent: `search.mmr` configuration has no effect on `memory://inject/{hint}`, and vice versa.
+
+---
+
+### Multi-Query Expansion
+
+`recall` and `search` (in `semantic` and `hybrid` modes) embed and search more than one representation of the query, not just the literal string. A conversational query like "how do we deploy" can embed far enough from a memory phrased "deployment runs via `docker-compose up -d`" that cosine similarity lands below `min_score`, even though the memory plainly answers the question. Query expansion widens the candidate pool searched for a single call so a memory like that still surfaces.
+
+**Ranking pipeline order:** query expansion (variant embed/search + merge) → relevance (cosine / FTS rank / RRF) → composite prior → MMR diversity reorder → downstream `min_score` / type / tags filtering and truncation to the caller's `limit`. Expansion only changes which candidates enter the pipeline; every stage after it is unaffected in mechanism.
+
+**Two independently gated phases:**
+
+1. **Keyword-stripped variant (default on, no model).** Alongside the original query, a deterministic variant with a small fixed set of English stopwords removed (e.g. "how do we deploy" → "deploy") is embedded and searched too, whenever it differs from the original and is non-empty. An all-stopword query ("is it") or an already-content-word-only query ("deploy production") produces no extra variant. Both embeds go through one batched `embedBatch` call, so this phase costs one extra Qdrant round trip, not an extra embedding API call.
+2. **LLM paraphrase / HyDE (default off, model-gated).** When `search.query_expansion.llm_paraphrase.enabled` is `true` *and* an API key resolves (from `pipeline.extraction_model_env`, falling back to `OPENAI_API_KEY`), a chat-completion call generates 1-3 additional variants - either reworded paraphrases of the query (`mode: "paraphrase"`, the default) or a hypothetical answer passage to embed instead (`mode: "hyde"`). HyDE can improve recall but risks pulling the embedding toward hallucinated specifics (tool names, numbers) the query never mentioned, so it is opt-in rather than the default. Any failure - missing key, non-2xx response, timeout - degrades silently to the phase-1 variants; a search call never fails because paraphrase generation failed.
+
+**Merging:** candidates from every searched variant are merged by memory id, keeping the **max** score per id (not summed or averaged - a memory matched by two variants isn't inflated relative to one matched by only its best variant), then truncated back to the caller's `limit` before scoring/ranking continue. This means `semantic_score` on a result now means "best score across every variant searched," rather than "score against the literal query" - a change in what the field represents, though its numeric range and calibration against `min_score`/composite ranking are unchanged.
+
+**Not applied to fulltext:** standalone `mode: "fulltext"` and hybrid's fulltext leg always search the single original query string - the FTS5/BM25 index (see [Fulltext Search](#fulltext-search)) applies porter stemming to every term, which closes most of the inflection gap query expansion exists for, but it does not strip stopwords, so an all-stopword query still returns nothing via the fulltext leg.
+
+**Configuration** (`search.query_expansion` in `config.json`, see [Configuration](#configuration)):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Kill switch for the whole feature. `false` restores the pre-expansion, single-embed-per-query cost profile exactly. |
+| `max_variants` | `2` | Upper bound on the total variant count (original + keyword-stripped + LLM), independent of `llm_paraphrase.variant_count`. Variants beyond the cap are dropped, not queued. |
+| `keyword_stripped` | `true` | Enables phase 1 (the deterministic no-model variant). |
+| `llm_paraphrase.enabled` | `false` | Enables phase 2. Requires a resolvable API key or LLM expansion is silently skipped (logged once at startup, not per call). |
+| `llm_paraphrase.mode` | `"paraphrase"` | `"paraphrase"` rewords the query; `"hyde"` generates a hypothetical answer passage to embed. |
+| `llm_paraphrase.variant_count` | `2` | How many paraphrase/HyDE variants to request per call (1-3). |
+| `llm_paraphrase.timeout_ms` | `3000` | Chat-completion request timeout; a timeout counts as a failure and degrades to phase 1. |
 
 ---
 
@@ -1520,7 +2131,7 @@ BHGBrain exposes two tools for memory retrieval with different semantics:
 | **Intended caller** | AI agents during task execution | Humans or admin agents doing investigation |
 
 **Score filtering in recall:**
-The `min_score` parameter (default 0.6) acts as a quality gate - only memories with cosine similarity ≥ 0.6 are returned. This prevents irrelevant results. You can lower `min_score` to retrieve more results at the cost of precision.
+The `min_score` parameter (default 0.6) acts as a quality gate - it is applied to the `semantic_score` field (cosine similarity), not the composite-ranked `score`, since `recall` runs in semantic mode - only memories with cosine similarity ≥ 0.6 are returned. This prevents irrelevant results. You can lower `min_score` to retrieve more results at the cost of precision.
 
 ```json
 // Recall example - semantic, filtered by type and tags
@@ -1538,7 +2149,7 @@ The `min_score` parameter (default 0.6) acts as a quality gate - only memories w
 
 ### Filtering
 
-Both `recall` and `search` support namespace and collection scoping. `recall` additionally supports type and tag filtering.
+Both `recall` and `search` support namespace and collection scoping, plus time-scoped (`after`/`before`) filtering. `recall` additionally supports type and tag filtering.
 
 **Namespace filtering:** Always applied. All searches are scoped to a single namespace. There is no cross-namespace search.
 
@@ -1546,19 +2157,21 @@ Both `recall` and `search` support namespace and collection scoping. `recall` ad
 - In semantic search, the Qdrant collection `bhgbrain_{namespace}_general` is searched (the default collection for the namespace).
 - In fulltext search, all memories in the namespace are searched regardless of collection.
 
-**Type filtering (`recall` only):** Pass `"type": "episodic"` | `"semantic"` | `"procedural"` to restrict results to a single memory type. Filtering is applied after semantic search, so the full candidate set is retrieved from Qdrant first.
+**Type filtering (`recall` only):** Pass `"type": "episodic"` | `"semantic"` | `"procedural"` to restrict results to a single memory type. The filter is pushed down into the store (a Qdrant payload filter on the semantic path, a SQL predicate on the fulltext path) so `limit` counts matching memories instead of being spent on non-matching candidates before filtering runs. A defensive post-retrieval re-check still runs and is expected to be a no-op in steady state; if it ever removes a store-returned result, a `recall_zero_after_filter` counter increments so filter starvation stays observable.
 
-**Tag filtering (`recall` only):** Pass `"tags": ["auth", "security"]` to restrict results to memories that have at least one of the specified tags. Filtering is applied post-retrieval.
+**Tag filtering (`recall` only):** Pass `"tags": ["auth", "security"]` to restrict results to memories that have at least one of the specified tags (match-any). Like type filtering, this is pushed down into the store rather than applied only after retrieval.
+
+**Time-scoped filtering (`recall` and `search`):** Pass `after` and/or `before` (ISO 8601 timestamps) to restrict results to memories whose `created_at` falls within the requested window - both bounds are inclusive, and either may be omitted for an open-ended window. Bounds compare against `created_at` (when the memory was first recorded), not `updated_at` (which drives the separate recency-decay signal in composite ranking) - "what did we decide last week" means filtering on when it was recorded, not when it was last touched. Like type/tags, the filter is pushed down into the store: a Qdrant `range` payload filter on `created_at` (backed by a `datetime` payload index) on the semantic/hybrid path, and `created_at >= ?` / `created_at <= ?` SQL predicates on the fulltext path - so `limit` counts in-window matches rather than being spent on out-of-window candidates before filtering runs. A malformed timestamp or an `after` later than `before` is rejected before any store is queried. A defensive post-retrieval re-check still runs (`recall_zero_after_filter` / `search_zero_after_filter`), mirroring type/tags.
 
 ---
 
-### Score Thresholds and Tier Boosts
+### Score Thresholds and Composite Ranking
 
-**`min_score` (recall only):** A minimum cosine similarity score between 0 and 1. Memories below this threshold are excluded from `recall` results. Default: 0.6.
+**`min_score` (recall only):** A minimum cosine-similarity score between 0 and 1, applied to the `semantic_score` field specifically - not the composite-ranked `score` - since `recall` hardcodes semantic mode and `min_score`'s default is calibrated for a cosine-similarity range, not hybrid RRF scores or the composite prior. Memories below this threshold are excluded from `recall` results. Default: 0.6.
 
 **Expired memory exclusion:** Qdrant's vector search filter excludes memories where `decay_eligible = true AND expires_at < now()`. T0/T1 memories (decay_eligible = false) are never excluded by the vector-side filter. SQLite-side, the lifecycle service re-checks expiry on any memory returned from the vector store.
 
-**T0 score boost (hybrid search):** After RRF fusion, T0 (foundational) memories receive an additional +0.1 added to their score. This ensures that architecturally significant content surfaces in hybrid results even if its exact terminology doesn't match the query well.
+**Composite ranking (all modes):** `score` is relevance multiplied by an importance/access/recency prior - see [Composite Ranking](#composite-ranking) above. T0 (foundational) memories never decay by default, ensuring architecturally significant content stays durably ranked even as it ages.
 
 ---
 
@@ -1732,6 +2345,8 @@ Returns a `HealthSnapshot`:
 
 `components.retention` also goes `"degraded"` (with a message) when the most recent GC run — scheduled or manual — reported a partial failure (an archive or delete step failed), independent of tier-capacity pressure. It clears back to `"healthy"` on the next clean GC run.
 
+`components.sqlite` stays `"healthy"` but carries a `message` when the running SQLite build has no `fts5` module: fulltext search runs on the legacy `LIKE`-based matcher (see [Fulltext Search](#fulltext-search)) rather than an FTS5/BM25 index. This is also logged once at startup (`event: "fts5_unavailable"`).
+
 **Overall status logic:**
 - `unhealthy` - if SQLite or Qdrant is unhealthy
 - `degraded` - if embedding is degraded/unhealthy, OR retention is degraded (over capacity or unsynced vectors)
@@ -1777,9 +2392,22 @@ label-less format).
 | `bhgbrain_tool_handler_ms_count` | counter | Number of tool handler latency samples, labeled `tool` and `status` |
 | `embedding_embed_batch_ms_p95` | histogram | 95th percentile embedding batch latency |
 | `search_total_ms_p95` | histogram | 95th percentile end-to-end search latency |
+| `search_result_count_avg` | histogram | Average number of results returned per `search`/`recall` call, labeled `mode` (`semantic`/`fulltext`/`hybrid`). Counts mode-specific results only - archived matches appended by `include_archived` are excluded. |
+| `search_result_count_p50` | histogram | 50th percentile result count, labeled `mode` |
+| `search_result_count_p95` | histogram | 95th percentile result count, labeled `mode` |
+| `search_result_count_p99` | histogram | 99th percentile result count, labeled `mode` |
+| `search_result_count_count` | counter | Number of `search_result_count` samples, labeled `mode` |
+| `search_result_score_avg` | histogram | Average composite result score per `search`/`recall` call, labeled `mode`. One sample per result; excludes archived matches, which carry a placeholder (non-relevance) score. |
+| `search_result_score_p50` | histogram | 50th percentile composite result score, labeled `mode` |
+| `search_result_score_p95` | histogram | 95th percentile composite result score, labeled `mode` |
+| `search_result_score_p99` | histogram | 99th percentile composite result score, labeled `mode` |
+| `search_result_score_count` | counter | Number of `search_result_score` samples, labeled `mode` |
 | `bhgbrain_memory_count` | gauge | Current total memory count (updated on write/delete) |
 | `bhgbrain_rate_limit_buckets` | gauge | Active rate limit tracking buckets |
 | `bhgbrain_rate_limited_total` | counter | Total rate-limited requests |
+| `recall_zero_after_filter` | counter | Incremented when `recall`'s defensive post-retrieval type/tags/`after`/`before` re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
+| `search_zero_after_filter` | counter | Incremented when `search`'s defensive post-retrieval `after`/`before` re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
+| `search_embedding_degraded` | counter | Incremented when `hybrid`-mode search falls back to fulltext-only because the embedding provider or vector store is unavailable, labeled `namespace` |
 
 For example:
 
@@ -1897,8 +2525,23 @@ BHGBrain exposes MCP resources (readable via `ReadResource`) in addition to tool
 | URI Template | Name | Description |
 |---|---|---|
 | `memory://{id}` | Memory Details | Full memory record by UUID |
+| `memory://{id}/revisions` | Memory Revisions | Revision history for a memory, newest first |
+| `memory://inject/{hint}` | Session Inject (Hinted) | Budgeted context block whose memory section is selected by hybrid relevance to the hint, instead of recency |
 | `category://{name}` | Category | Full category content by name |
 | `collection://{name}` | Collection | Memories in a specific collection |
+
+### Resource List Change Notifications
+
+BHGBrain declares the `resources.listChanged` MCP capability. After a `collections`
+call with `action: "create"` or `"delete"`, or a `category` call with `action: "set"`
+or `"delete"`, succeeds, the server sends a `notifications/resources/list_changed`
+notification so a connected client knows `collection://list` / `category://list`
+changed instead of relying on a stale cached copy. Read actions (`list`, `get`) and
+failed mutations never trigger a notification; plain memory writes (`remember`,
+`forget`, etc.) don't either — `memory://list` churns too often per call for the
+notification to be useful there. This notification is sent over the stdio transport
+only (one long-lived `Server` per stdio connection); it is not wired to the
+per-session Streamable HTTP `/mcp` connections.
 
 ### `memory://list` - Paginated Memory Listing
 
@@ -1925,9 +2568,27 @@ Pagination uses composite cursors (`created_at|id`) for stable ordering. Ties at
 
 The inject resource builds a budgeted text payload for injecting into an LLM context window:
 
-1. All category content is prepended first (full content, in order).
-2. Top recent memories are appended (content or summary depending on space).
-3. The payload is truncated at `auto_inject.max_chars` (default 30,000 characters).
+1. Category content is prepended first (full content, in order), capped to its
+   reserved share of the budget: `(1 - auto_inject.memory_budget_fraction) × budget`.
+   Whatever categories leave unused rolls into the memory section below (no waste).
+2. **Pinned memories are always included next**, ahead of recency/relevance
+   selection, regardless of where they would otherwise rank (see [Pinning Memories
+   for Guaranteed Inject](#pinning-memories-for-guaranteed-inject) below).
+3. Memories are appended (content or summary depending on space) into the remaining
+   budget — always at least `auto_inject.memory_budget_fraction × budget` when
+   memories exist, so category content can no longer starve the memory section.
+   - `memory://inject` (no hint): top memories by **recency**, unchanged from before
+     this option existed.
+   - `memory://inject/{hint}`: top memories by **hybrid relevance** to the hint (see
+     below).
+   - A memory that is both pinned and independently selected here is excluded from
+     this step (matched by ID) so it appears exactly once, not twice, and doesn't
+     consume an extra slot of `auto_inject_limit`.
+4. The payload is truncated at `auto_inject.max_chars`, interpreted per
+   `auto_inject.budget_unit` (default 30,000 characters). This applies to pinned
+   content too: if a namespace's pinned memories alone exceed the memory section's
+   reserved share, they truncate per-item like any other content and `truncated`
+   is `true`.
 
 Query parameters:
 - `namespace` - namespace to inject from (default: `global`)
@@ -1944,6 +2605,118 @@ Response:
 ```
 
 Touching a memory via `memory://{id}` increments its access count and schedules a deferred flush.
+
+### `memory://inject/{hint}` - Relevance-Conditioned Session Injection
+
+A parameterized variant of `memory://inject` that selects the memory section by
+**hybrid relevance to a caller-provided hint** (a task phrase, repo name, or topic)
+instead of recency:
+
+- The hint is a URI path segment: URI-decoded once, trimmed, and capped to 500
+  characters (the same limit `search`/`recall` enforce on a query) before it drives
+  hybrid search over the resolved namespace.
+- Selection reuses the same composite/RRF ranking, expiry filtering, and top-K limit
+  (`defaults.auto_inject_limit`) as a normal `search`/`recall` call. Unlike the
+  hintless path, a hinted read **records access** on the selected memories — it's a
+  recall in every meaningful sense.
+- If the embedding provider is unavailable, selection degrades gracefully to the
+  fulltext leg — the payload still gets produced, just without the semantic
+  contribution.
+- An empty hint (blank after trimming) falls back to the recency behavior above.
+- **Near-duplicate suppression**: when `auto_inject.dedup_suppression` is `true`
+  (default), a candidate whose vector similarity to an already-selected memory
+  exceeds `deduplication.similarity_threshold` is skipped, and the freed budget goes
+  to the next distinct candidate. **Pinned memories are exempt from this in both
+  directions**: two near-duplicate pinned memories are both injected (never
+  suppressed against each other), and a pinned memory never suppresses — and is
+  never suppressed by — a relevance-selected candidate that happens to be a
+  near-duplicate of it.
+
+Example: `memory://inject/deploy%20to%20production` conditions selection on
+"deploy to production".
+
+The response shape is identical to `memory://inject`.
+
+### Pinning Memories for Guaranteed Inject
+
+Both `memory://inject` and `memory://inject/{hint}` normally select their memory
+section by recency or relevance, which means a specific fact only makes it into the
+injected context if it happens to rank well — a critical operating rule ("always use
+pnpm, never npm") can silently drop out if nothing referenced it recently and it
+doesn't match the current hint. **Pinning** closes that gap: a pinned memory is
+always included in the memory section, regardless of recency or relevance rank.
+
+- **Set via `remember`** at write time (`pinned: true`/`false`) — on a dedup
+  **UPDATE**, omitting `pinned` preserves the existing memory's pin state, so a
+  content correction doesn't silently unpin a critical fact; pass it explicitly to
+  change it.
+- **Set via `tag`** as a dedicated, lightweight toggle (`pinned: true`/`false`) that
+  doesn't touch content or require re-submitting it.
+- **Bounded per namespace**: `defaults.pin_limit_per_namespace` (default `20`) caps
+  how many memories can be pinned at once, enforced at write time. Pinning beyond
+  the cap returns `INVALID_INPUT`; unpin one first to make room.
+- **Draws from the existing memory-section budget** (`auto_inject.memory_budget_fraction`
+  share) — there is no separate carve-out. If pinned content alone exceeds that
+  share, it truncates per-item like any other content and the payload's `truncated`
+  flag is set.
+- **Exempt from near-duplicate suppression** in both directions (see above).
+- **No effect on `search`/`recall`**: `pinned` never appears in `SearchResult` and
+  never influences ranking or ordering — this is deliberately distinct from the `T0`
+  retention tier, which only affects retention/ranking and has no inject-inclusion
+  guarantee of its own. A memory can be `T0` and pinned, `T0` and unpinned, or any
+  tier and pinned — the two are orthogonal.
+- **Kill switch**: `auto_inject.pinned_enabled: false` (default `true`) disables the
+  pinned-inclusion step entirely — both inject templates behave exactly as if no
+  memory were pinned. The per-namespace cap is still enforced at write time
+  regardless of this switch.
+- **Durable**: pin state is persisted to the Qdrant payload and restored by
+  `repair --mode from-qdrant` and cross-device sync, so it survives a SQLite rebuild.
+
+### `memory://{id}/revisions` - Revision History
+
+Returns the recorded revision history for a memory, newest first, under the same visibility rules as `memory://{id}` (`NOT_FOUND` for an unknown or expired-and-visibility-excluded memory). Only T0 memories accumulate revisions (see [T0 Revision History](#t0-revision-history)), so other tiers return an empty list.
+
+Response:
+```json
+{
+  "id": "<uuid>",
+  "revisions": [
+    { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+To read this from a stdio client that lacks resource support, use the `revisions` tool's `list` action instead (same data — see [MCP Tools Reference](#mcp-tools-reference)).
+
+---
+
+## MCP Prompts
+
+BHGBrain declares the `prompts` MCP capability and serves two prompts via `ListPrompts`/`GetPrompt`, alongside its tools and resources:
+
+| Prompt | Arguments | Description |
+|---|---|---|
+| `bootstrap-interview` | `section` (optional, `1`-`10`) | Drives the [bootstrap interview](#option-1-interactive-bootstrap-tool-recommended) via the `bootstrap` tool. Omit `section` for an overview of every section; specify it to jump straight to that section's questions. An out-of-range or non-integer `section` is rejected as a JSON-RPC InvalidParams error. |
+| `session-context` | `hint` (optional) | Returns the same budgeted [`memory://inject`](#memoryinject---session-context-injection) (or `memory://inject/{hint}` when `hint` is given) context block as a single prompt message, for priming a new session with relevant memories and policy categories. |
+
+Both prompts return a single `user`-role text message. For clients without prompt
+support, the same functionality is reachable directly through the `bootstrap` tool and
+the `memory://inject` resource, respectively — the prompts are a discoverability
+layer, not new behavior.
+
+Example:
+
+```json
+// List available prompts
+{ "method": "prompts/list" }
+
+// Jump straight to section 3 of the bootstrap interview
+{ "method": "prompts/get", "params": { "name": "bootstrap-interview", "arguments": { "section": "3" } } }
+
+// Get the session context block, biased toward a topic
+{ "method": "prompts/get", "params": { "name": "session-context", "arguments": { "hint": "deploy to production" } } }
+```
 
 ---
 
@@ -2046,12 +2819,24 @@ bhgbrain gc                           # Run cleanup
 bhgbrain gc --dry-run                 # Show candidates and review items without deleting
 bhgbrain gc --tier T3                 # Clean up only T3 memories
 
+# Memory distillation (clusters T2/T3 episodic memories into T1 semantic
+# memories via an LLM call — see Memory Distillation. Off by default;
+# requires retention.distillation.enabled: true and an extraction API key)
+bhgbrain distill                      # Run distillation
+bhgbrain distill --dry-run            # Show candidate clusters without calling the LLM or writing/archiving anything
+
 # Audit log
 bhgbrain audit                        # Show recent audit entries
 
 # Repair (multi-device recovery)
 bhgbrain repair --from-qdrant                # Hydrate local SQLite from Qdrant (current device's memories only, by default)
 bhgbrain repair --from-qdrant --all-devices  # Hydrate from every device's memories, not just the current one
+
+# Repair (embedding model migration — see Embedding Model Migration)
+bhgbrain repair --re-embed                   # Migrate vectors stamped with a stale embedding identity
+bhgbrain repair --re-embed --dry-run         # Preview how many rows would be re-embedded
+bhgbrain repair --re-embed --include-legacy  # Also sweep up pre-provenance rows (no stamp at all)
+bhgbrain repair --re-embed --batch-size 100  # Tune the per-batch size (default 50)
 
 # Category management
 bhgbrain category list                # List all categories
@@ -2074,7 +2859,7 @@ bhgbrain server token                 # Generate a new random bearer token
 
 ## MCP Tools Reference
 
-BHGBrain exposes 11 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
+BHGBrain exposes 16 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
 
 ```json
 {
@@ -2085,6 +2870,23 @@ BHGBrain exposes 11 MCP tools. All tools validate input with Zod schemas and ret
   }
 }
 ```
+
+**Titles and annotations:** every tool declares a human-readable `title` and MCP
+behavioral `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`, and
+`openWorldHint: false` — every tool operates on the local store, never an open
+external domain). `recall` and `search` are `readOnlyHint: true` and omit
+`destructiveHint`/`idempotentHint` (meaningless per spec once `readOnlyHint` is set).
+`forget`, `collections`, `category`, `backup`, and `revisions` declare
+`destructiveHint: true`. This means a spec-compliant client no longer treats every
+read as being exactly as dangerous as a delete, which is what happens under the MCP
+spec's defaults (`readOnlyHint: false`, `destructiveHint: true`) when a tool omits
+annotations entirely.
+
+**outputSchema:** `recall`, `search`, and `remember` declare an `outputSchema`
+describing their `structuredContent` shape (mirroring the `SearchResult`/
+`WriteResult` types), so MCP clients can validate results instead of only
+JSON-parsing the text block. The other thirteen tools' result shapes are action-dependent
+and are not yet schema-described.
 
 ---
 
@@ -2100,11 +2902,25 @@ Store content in BHGBrain with automatic deduplication, normalization, embedding
 | `namespace` | `string` | No | `"global"` | Namespace scope. Pattern: `^[a-zA-Z0-9/-]{1,200}$` |
 | `collection` | `string` | No | `"general"` | Collection within the namespace. Max 100 chars. |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | No | `"semantic"` | Memory type. Influences default tier assignment. |
-| `tags` | `string[]` | No | `[]` | Tags for filtering and classification. Max 20 tags, each max 100 chars. Pattern: `^[a-zA-Z0-9-]+$` |
+| `tags` | `string[]` | No | `[]` | Tags for filtering and classification. Max 20 tags, each max 100 chars. Pattern: `^[a-zA-Z0-9-]+$`. The stored memory's `tags` may include additional content-derived entries auto-tagging adds on top of these — see [Auto-Tagging](#auto-tagging). |
 | `category` | `string` | No | - | Attach to a category slot (implies T0 tier). Max 100 chars. |
 | `importance` | `number (0-1)` | No | `0.5` | Importance score. Higher values are prioritized in stale cleanup. |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | No | `"cli"` | Source of the memory. Affects default tier (e.g., agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | No | auto-assigned | Explicit tier override. Takes precedence over all heuristics. |
+| `pinned` | `boolean` | No | `false` on ADD; preserved on UPDATE | Pin this memory so it is always included in `memory://inject` payloads (see [Session Inject](#memoryinject---session-context-injection)), bounded by `defaults.pin_limit_per_namespace` (default 20). On a dedup **UPDATE**, omitting `pinned` preserves the existing memory's pin state — pass it explicitly to change it. Exceeding the per-namespace cap when newly pinning returns `INVALID_INPUT`. |
+| `origin` | `object` | No | `null` | Caller-supplied content provenance: `{ session_id?, tool?, repo?, branch? }`, all optional free-form strings (max 200/100/200/200 chars respectively). Unknown keys are rejected. Distinct from the vector-identity `embedding_model` field — see [Content Provenance](#content-provenance). On a dedup **UPDATE**, omitting `origin` preserves the existing memory's origin; passing one replaces it. |
+| `confidence` | `number (0-1)` | No | per-`source` (see below) | How much to trust this memory's content. Defaults from `pipeline.default_confidence[source]` (config, defaults `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`) when omitted. On a dedup **UPDATE**, the merged value is `max(existing, incoming)` — a second confirmation never lowers trust. See [Content Provenance](#content-provenance). |
+
+**Long content is rejected, not silently mush-embedded:** content longer than
+`pipeline.long_content_threshold_chars` (config, default `8,000` characters ≈ 1–2
+pages) is rejected with an `INVALID_INPUT` error naming the character count, the
+threshold, and the fix — call [`import`](#import---bulk-profile-import) with
+`format: "freeform"` instead, or split the content into smaller `remember` calls. This
+is intentional: embedding several thousand words as a single vector produces a
+low-quality "mush vector" that matches many unrelated queries weakly instead of any one
+query strongly. The 100,000-character hard cap in the table above still applies as an
+absolute ceiling, but `long_content_threshold_chars` is the limit callers will actually
+hit first.
 
 **Output:**
 
@@ -2118,12 +2934,53 @@ Store content in BHGBrain with automatic deduplication, normalization, embedding
 }
 ```
 
+> **MCP envelope note (since v1.17.0):** the object/array shown above (and in the
+> multi-candidate example below) is what `handleRemember` returns internally and
+> exactly what `POST /tool/:name` (REST) still returns. Over the **MCP transport**
+> (stdio and Streamable HTTP `/mcp`), the `CallTool` response normalizes a successful
+> result to `{ "results": [...] }` — a one-element array for a single candidate,
+> multiple elements when multi-candidate extraction splits content — both in
+> `structuredContent` and the JSON text block, so a single `outputSchema` can describe
+> both cases. A brittle MCP-side parser expecting the bare object must be updated to
+> read `results[0]` (or iterate `results`); REST clients are unaffected.
+
 `operation` is one of:
 - `ADD` - new memory created
 - `UPDATE` - existing similar memory was updated (content merged)
 - `NOOP` - exact or near-exact duplicate; existing memory returned
 
 For `UPDATE` operations, `merged_with_id` contains the ID of the memory that was updated.
+
+**Multi-candidate extraction:** when `pipeline.extraction_enabled` is `true` (default
+`false`) and the content is at least `pipeline.extraction_min_chars` long, `remember`
+may split multi-fact content into several atomic candidate memories via an LLM call,
+each independently deduplicated/classified. In that case the tool returns a **JSON
+array** of the same per-candidate object shown above — one entry per candidate —
+instead of a single object:
+
+```json
+[
+  {
+    "id": "3f4a1b2c-...",
+    "summary": "Alice owns the infra repo",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  },
+  {
+    "id": "9c7d2e5f-...",
+    "summary": "Deploys go through GitHub Actions",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  }
+]
+```
+
+Extraction failure of any kind (network error, timeout, malformed/empty response) falls
+back to today's single-object response transparently — extraction never blocks or fails
+a `remember` call. Any caller that assumes `remember` always returns a single object
+must be updated to branch on array-vs-object before enabling `extraction_enabled`.
 
 **Examples:**
 
@@ -2168,10 +3025,13 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
 | `query` | `string` | **Yes** | - | Recall query. Max 500 characters. |
 | `namespace` | `string` | No | `"global"` | Namespace to search. |
 | `collection` | `string` | No | - | Filter to a specific collection. Omit to search the default collection. |
-| `type` | `"episodic" \| "semantic" \| "procedural"` | No | - | Filter results to a specific memory type. Applied post-retrieval. |
-| `tags` | `string[]` | No | - | Filter to memories with at least one matching tag. Applied post-retrieval. |
+| `type` | `"episodic" \| "semantic" \| "procedural"` | No | - | Filter results to a specific memory type. Pushed down into the store so `limit` counts matching memories. |
+| `tags` | `string[]` | No | - | Filter to memories with at least one matching tag (match-any). Pushed down into the store so `limit` counts matching memories. Matches both caller-supplied and auto-derived tags equally — see [Auto-Tagging](#auto-tagging). |
 | `limit` | `integer (1-20)` | No | `5` | Maximum number of results. |
-| `min_score` | `number (0-1)` | No | `0.6` | Minimum cosine similarity score. Results below this threshold are excluded. |
+| `min_score` | `number (0-1)` | No | `0.6` | Minimum cosine-similarity score, applied to `semantic_score` (not the fused/adjusted `score`). Results below this threshold are excluded. |
+| `after` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at >= after` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the store so `limit` counts matching memories. |
+| `before` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at <= before` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the store so `limit` counts matching memories. |
+| `follow_links` | `boolean` | No | `false` | Also return each result's one-hop linked memories (edges created via the `relate` tool, both directions, all relations). Appended entries are marked `linked_from`/`link_relation`/`link_direction` so a client can tell an expanded neighbor from a directly relevant hit; see `relate` below. |
 
 **Output:**
 
@@ -2190,11 +3050,26 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
       "expires_at": null,
       "expiring_soon": false,
       "created_at": "2026-01-01T00:00:00Z",
-      "last_accessed": "2026-03-15T12:00:00Z"
+      "last_accessed": "2026-03-15T12:00:00Z",
+      "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+      "confidence": 1.0
     }
   ]
 }
 ```
+
+Every result also carries `origin`/`confidence` (see [Content Provenance](#content-provenance)
+under `remember`) — `origin` is `null` when the memory was written without one; `confidence`
+defaults per-source when the writer omitted it.
+
+With `follow_links: true`, each base result's one-hop neighbors are appended after the
+base results (never reducing how many base results `limit` allows), deduplicated
+against the base set and each other, and capped at `limit` appended entries total.
+Appended entries carry `score: 0` (a placeholder, not a relevance score — the same
+convention `search`'s `include_archived` uses) plus `linked_from` (the base result's
+id), `link_relation`, and `link_direction` (`"outgoing"` if the base result is the
+edge's source, `"incoming"` if it is the target). A neighbor that is itself archived
+is skipped.
 
 ---
 
@@ -2234,14 +3109,17 @@ Search memories using semantic, fulltext, or hybrid modes. Offers more control t
 | `collection` | `string` | No | - | Filter to a specific collection. |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | No | `"hybrid"` | Search algorithm. |
 | `limit` | `integer (1-50)` | No | `10` | Maximum number of results. |
+| `include_archived` | `boolean` | No | `false` | Also search archived memories (see [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving)) for a summary/tag term match. Matches are appended after active results, marked `archived: true`, and never reduce how many active results `limit` allows. Archived hits are not access-recorded. |
+| `after` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at >= after` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the vector/fulltext store so `limit` counts matching memories - `search`'s first pushed-down filter. |
+| `before` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at <= before` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the vector/fulltext store so `limit` counts matching memories. |
 
-**Output:** Same structure as `recall` - `{ "results": [...] }` - but without the `min_score` gate and supporting up to 50 results.
+**Output:** Same structure as `recall` - `{ "results": [...] }` - but without the `min_score` gate and supporting up to 50 results. Archived matches (when `include_archived: true`) carry `archived: true`, use the retained summary as `content`, and have no meaningful `score` (they're metadata-term matches, not ranked).
 
 ---
 
 ### `tag` - Manage Tags
 
-Add or remove tags from a memory. Tags are merged/filtered atomically; the memory content and embedding are not affected.
+Add or remove tags from a memory, and/or pin/unpin it. Tags and pin state are updated atomically; the memory content and embedding are not affected.
 
 **Input:**
 
@@ -2250,6 +3128,7 @@ Add or remove tags from a memory. Tags are merged/filtered atomically; the memor
 | `id` | `string (UUID)` | **Yes** | - | Memory to tag. |
 | `add` | `string[]` | No | `[]` | Tags to add. Max 20 tags total after merge. |
 | `remove` | `string[]` | No | `[]` | Tags to remove. |
+| `pinned` | `boolean` | No | unchanged | Pin (`true`) or unpin (`false`) this memory, independent of tags — a dedicated toggle for [inject pinning](#memoryinject---session-context-injection) that doesn't require re-submitting content. Omit to leave pin state unchanged. Pinning a not-yet-pinned memory when the namespace is already at `defaults.pin_limit_per_namespace` returns `INVALID_INPUT`. |
 
 **Output:**
 
@@ -2260,7 +3139,7 @@ Add or remove tags from a memory. Tags are merged/filtered atomically; the memor
 }
 ```
 
-Returns `INVALID_INPUT` if adding tags would exceed the 20-tag limit.
+Returns `INVALID_INPUT` if adding tags would exceed the 20-tag limit, or if pinning would exceed `defaults.pin_limit_per_namespace`.
 
 ---
 
@@ -2481,22 +3360,294 @@ Import a structured profile or freeform document as discrete memories in one sho
 - Deduplication applies via the existing write pipeline — safe to re-import.
 - `dry_run: true` returns memory previews with zero writes.
 - Headings numbered outside the 10 storage-mapped sections (e.g. a document written against an older 12-section template) are not silently dropped — their numbers are reported in `sections_ignored` so you know content was skipped instead of losing it without notice.
+- If [`remember`](#remember---store-a-memory) rejected your content for exceeding `pipeline.long_content_threshold_chars`, use `import` with `format: "freeform"` here instead — it splits the document by heading/paragraph boundaries and embeds each chunk independently, avoiding the single mush-vector problem `remember`'s threshold guards against.
 
 ---
 
-### `repair` — Rebuild SQLite from Qdrant
+### `revisions` - List or Revert Memory Revision History
 
-Recover memories from Qdrant into the local SQLite database. Used for multi-device setup, data loss recovery, or new device onboarding. See [Repair and Recovery](#repair-and-recovery).
+List a memory's revision history, or revert its content to a prior revision. Namespace
+visibility is resolved the same way `forget` and `tag` do (the memory is looked up by
+ID first). Only T0 memories accumulate revisions — see
+[T0 Revision History](#t0-revision-history).
 
 **Input:**
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `dry_run` | `boolean` | No | `false` | When `true`, reports what would be recovered without making changes. |
-| `device_id` | `string` | No | — | Filter recovery to memories created by a specific device. Mutually exclusive with `all_devices`. |
-| `all_devices` | `boolean` | No | `false` | Explicitly recover memories from every device. Mutually exclusive with `device_id`. This is also the default behavior when neither field is provided. |
+| `action` | `"list" \| "revert"` | **Yes** | - | Which operation to perform. |
+| `id` | `string (UUID)` | **Yes** | - | The memory ID. |
+| `revision` | `number` | Required for `revert` | - | The revision number to revert to. |
+
+**Output (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revisions": [
+    { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+A memory with no content changes returns an empty `revisions` array, not an error.
+
+**Output (`action: "revert"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revision": 1,
+  "content": "the restored content"
+}
+```
+
+**Notes:**
+- Revert restores the target revision's content through the same path `remember`'s UPDATE dedup path uses: new checksum, re-embedded vector, re-upserted into Qdrant. The pre-revert content is preserved as a new, append-only history entry (history is never rewritten).
+- A `REVISE` audit event records the source revision number, distinguishable from the generic REVISE the write pipeline logs on ordinary T0 content changes.
+- Reverting requires the embedding provider — if it is unavailable the revert fails with `EMBEDDING_UNAVAILABLE` and the memory is left completely unchanged (no partial write, no vector desync).
+- Reverting to a revision number that does not exist for the memory returns `NOT_FOUND`.
+
+---
+
+### `review` - Review Queue and Archive Recall
+
+Lists and dispositions the T1 review queue, and restores archived memories. Closes the
+read side of the tiered lifecycle: `review_due` (stamped on T1 memories, see
+[Tier Lifecycle](#tier-lifecycle---assignment-promotion-sliding-window)) and
+`archived_memories` (see [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving))
+both have write paths but previously had no MCP-facing read surface. Content revision
+is deliberately not duplicated here — use `remember`'s UPDATE path for that.
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `action` | `"list" \| "keep" \| "archive" \| "restore"` | **Yes** | - | Which operation to perform. |
+| `id` | `string (UUID)` | Required for `keep`/`archive`/`restore` | - | The memory ID. For `restore`, the original memory's ID, looked up in the archive. |
+| `days` | `integer (0-3650)` | No | `0` | (`list` only) Look-ahead window in days beyond "due now". `0` returns only memories already due. |
+| `namespace` | `string` | No | `"global"` | Namespace scope. |
+| `limit` | `integer (1-100)` | No | `20` | (`list` only) Page size. |
+| `cursor` | `string` | No | - | (`list` only) Pagination cursor returned by a prior `list` call. |
+
+**Output (`action: "list"`):**
+
+```json
+{
+  "items": [
+    {
+      "id": "3f4a1b2c-...",
+      "namespace": "global",
+      "collection": "general",
+      "summary": "Deployment runbook for the payments service",
+      "tags": ["deployment", "runbook"],
+      "retention_tier": "T1",
+      "review_due": "2026-03-01T00:00:00.000Z",
+      "expires_at": "2026-03-01T00:00:00.000Z"
+    }
+  ],
+  "cursor": "2026-03-01T00:00:00.000Z|3f4a1b2c-..."
+}
+```
+
+Items are non-archived T1 memories whose `review_due` is at or before "now + `days`",
+returned oldest-due-first. `cursor` is `null` once the last page is reached; pass it
+back as the `cursor` input to fetch the next page.
+
+**Output (`action: "keep"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "review_due": "2027-03-01T00:00:00.000Z",
+  "expires_at": "2027-03-01T00:00:00.000Z"
+}
+```
+
+Confirms the memory is still accurate: re-extends both `review_due` and `expires_at`
+per the memory's tier lifecycle policy (reusing the same computation `remember` and
+access-driven promotion use), regardless of `sliding_window_enabled` — an explicit
+human confirmation gets the full extension even when passive sliding-window renewal is
+disabled. Records a `REVISE` audit event noting a review confirmation. Returns
+`NOT_FOUND` if the memory does not exist.
+
+**Output (`action: "archive"`):**
+
+```json
+{ "id": "3f4a1b2c-...", "archived": true }
+```
+
+Routes the memory through the same archive transition GC uses: its vector is removed,
+its row is moved to `archived_memories` (summary, tags, tier, and access stats
+retained; content and vector are not), and an `ARCHIVE` audit event is recorded.
+Returns `NOT_FOUND` if the ID has never existed, and `CONFLICT` if it is already
+archived.
+
+**Output (`action: "restore"`):**
+
+```json
+{
+  "id": "9c2e5f10-...",
+  "restored_from": "3f4a1b2c-...",
+  "archive_id": 42,
+  "restored": true
+}
+```
+
+Re-creates an active memory from the archive record's retained summary and tags at the
+original tier — a provenance-carrying **stub**, not a resurrection: the original
+content and vector were never retained, so the restored memory's content is its
+archived summary, tagged with its original tags plus a `restored-from-archive` marker
+tag, and freshly embedded so it participates in search. The archive row is retained
+(not deleted), unlike the CLI's `archive restore` command. Records a `RESTORE` audit
+event linking the archive origin. Returns `NOT_FOUND` if no archive record exists for
+the given ID.
+
+---
+
+### `feedback` - Record Recall Usefulness
+
+Records whether a memory previously returned by `recall` or `search` was actually
+useful, as an immutable event in a dedicated `recall_feedback` table keyed to the
+memory. **This version is purely additive**: it has no effect on ranking, lifecycle, or
+any `recall`/`search`/`review` result — no aggregation, no read/list surface, no
+ranking or lifecycle coupling exists yet. Events are collected so a future change can
+tune `search.ranking` weights, decay rates, and dedup thresholds against evidence
+instead of defaults chosen by inspection.
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `id` | `string (UUID)` | **Yes** | - | The memory ID from a prior `recall`/`search` result. |
+| `useful` | `boolean` | **Yes** | - | Whether the result was useful. |
+| `query` | `string (max 500 chars)` | No | - | The query that produced this result, carried through for future analysis. Not validated against any prior call. |
+| `score` | `number (0-1)` | No | - | The score the caller observed for this result, carried through for future analysis. |
 
 **Output:**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "useful": true,
+  "recorded_at": "2026-03-01T00:00:00.000Z"
+}
+```
+
+Looks the memory up the same way `tag`/`forget` do (active rows only) and returns
+`NOT_FOUND` if it does not exist, including an ID that exists only in the archive.
+`query`/`score` are stored exactly as given — `null` when omitted, never a fabricated
+default — and are not cross-checked against any real prior `recall`/`search` call, the
+same trust model `tag`/`forget` already extend to any caller-supplied `id`. Multiple
+feedback events for the same memory each persist as distinct rows; none overwrites an
+earlier one. Recording feedback never mutates the referenced memory's own fields
+(`access_count`, `importance`, `retention_tier`, `review_due`, `updated_at` are all
+left untouched).
+
+---
+
+### `relate` - Connect Memories with Typed Edges
+
+Connects memories with typed, directed edges — a general, caller-authored relationship
+alongside the write pipeline's automatic `merged_from` replacement pointer (which
+`relate` leaves untouched). Five relations are supported: `refines`, `contradicts`,
+`derived_from`, `about_same_entity`, `follows`. Edges are directed (`from_id` → `to_id`)
+but `list` and `recall`'s `follow_links` (see above) walk both directions, so
+conceptually symmetric relations (`contradicts`, `about_same_entity`) behave
+symmetrically in practice.
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `action` | `"add" \| "list" \| "remove"` | **Yes** | - | Which operation to perform. |
+| `from_id` | `string (UUID)` | Required for `add`/`remove` | - | Source memory ID. |
+| `to_id` | `string (UUID)` | Required for `add`/`remove` | - | Target memory ID. Must differ from `from_id`. |
+| `relation` | `"refines" \| "contradicts" \| "derived_from" \| "about_same_entity" \| "follows"` | Required for `add`/`remove` | - | Edge type. |
+| `id` | `string (UUID)` | Required for `list` | - | The memory whose edges to list. |
+| `direction` | `"from" \| "to" \| "both"` | No | `"both"` | (`list` only) Filter edges by direction relative to `id`. |
+
+**Output (`action: "add"`):**
+
+```json
+{
+  "id": 42,
+  "namespace": "global",
+  "from_id": "3f4a1b2c-...",
+  "to_id": "9c2e5f10-...",
+  "relation": "refines",
+  "created_at": "2026-03-01T00:00:00.000Z",
+  "created": true
+}
+```
+
+Idempotent: re-adding an edge identical to one that already exists (same `from_id`,
+`to_id`, and `relation`) returns the existing row with `created: false` instead of
+erroring or creating a duplicate. Returns `NOT_FOUND` if either memory ID does not
+exist, and `INVALID_INPUT` if `from_id === to_id` or the two memories belong to
+different namespaces (cross-collection links within the same namespace are allowed).
+
+**Output (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "links": [
+    {
+      "id": 42,
+      "from_id": "3f4a1b2c-...",
+      "to_id": "9c2e5f10-...",
+      "relation": "refines",
+      "direction": "outgoing",
+      "created_at": "2026-03-01T00:00:00.000Z",
+      "created_by": "c1"
+    }
+  ]
+}
+```
+
+Returns every edge touching `id`, in either direction unless `direction` narrows it,
+each marked `outgoing` (`id` is `from_id`) or `incoming` (`id` is `to_id`). Uses the
+archived-inclusive lookup, so edges on a memory about to be archived remain listable.
+Returns `NOT_FOUND` if `id` does not exist.
+
+**Output (`action: "remove"`):**
+
+```json
+{ "removed": true, "from_id": "3f4a1b2c-...", "to_id": "9c2e5f10-...", "relation": "refines" }
+```
+
+Deletes the named edge. Returns `NOT_FOUND` if it does not exist.
+
+Deleting a memory (via `forget`, or `review`'s `archive` action) cascade-deletes every
+edge that referenced it, so `memory_links` never carries a dangling reference to a
+missing memory. No new `AuditOperation` is recorded for `relate` — the edge table
+itself, with `created_at`/`created_by` on each row, is the durable record.
+
+---
+
+### `repair` — Rebuild SQLite from Qdrant, or migrate stale embedding stamps
+
+Repairs local state from external sources. `mode: "from-qdrant"` (default) recovers
+memories from Qdrant into the local SQLite database — used for multi-device setup,
+data loss recovery, or new device onboarding. `mode: "re-embed"` migrates memories
+whose embedding stamp differs from the active `embedding.provider`/`embedding.model`
+— see [Embedding Model Migration](#embedding-model-migration). See also
+[Repair and Recovery](#repair-and-recovery).
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `mode` | `"from-qdrant" \| "re-embed"` | No | `"from-qdrant"` | Which repair operation to run. |
+| `dry_run` | `boolean` | No | `false` | When `true`, reports what would change without making changes. |
+| `device_id` | `string` | No | — | (`from-qdrant` only) Filter recovery to memories created by a specific device. Mutually exclusive with `all_devices`. |
+| `all_devices` | `boolean` | No | `false` | (`from-qdrant` only) Explicitly recover memories from every device. Mutually exclusive with `device_id`. This is also the default behavior when neither field is provided. |
+| `include_legacy` | `boolean` | No | `false` | (`re-embed` only) Also re-embed legacy rows with no embedding stamp at all (predating provenance stamping), not just rows stamped with a different model. |
+| `batch_size` | `number` | No | `50` | (`re-embed` only) Memories re-embedded per batch (1-500). |
+
+**Output (`mode: "from-qdrant"`):**
 
 ```json
 {
@@ -2515,8 +3666,122 @@ Recover memories from Qdrant into the local SQLite database. Used for multi-devi
 **Notes:**
 - Only points with `content` in their Qdrant payload can be recovered. Pre-1.3 memories without content in Qdrant are reported as `skipped_no_content`.
 - Recovered memories preserve their original `device_id` from the Qdrant payload. If no `device_id` exists in the payload, the local device's ID is used.
+- Recovered memories also preserve whatever embedding identity (if any) their source vector was already stamped with, rather than claiming the active configuration's identity — recovery reconstructs metadata for an existing vector, it does not produce a new one.
 - Passing both `device_id` and `all_devices: true` is rejected as invalid input.
 - After recovery, run `npm run build` and restart the server if needed. The recovered memories are immediately available for search and recall.
+
+**Output (`mode: "re-embed"`):**
+
+```json
+{
+  "mode": "re-embed",
+  "dry_run": false,
+  "active_identity": "openai/text-embedding-3-small@1536",
+  "include_legacy": false,
+  "updated": 118,
+  "failed": 0,
+  "remaining": 0,
+  "bound_reached": false,
+  "converged": true
+}
+```
+
+**Notes:**
+- Selection is based on the stamp itself, so an interrupted run resumes safely — rows already re-stamped with the active identity simply stop matching on the next call.
+- A per-memory embed/upsert failure is isolated (counted in `failed`, left for a future run) rather than aborting the whole batch.
+- `converged: true` means no stale-stamped rows remain (within the requested `include_legacy` scope); the store's expected identity is updated and the `embedding` health degradation clears immediately, without a restart.
+- Also available from the CLI: `bhgbrain repair --re-embed [--include-legacy] [--batch-size <n>] [--dry-run]`.
+
+---
+
+### `consolidate` - Duplicate Cluster Discovery and Merge
+
+Discovers and merges near-duplicate *existing* memories — the read-side gap write-time
+dedup leaves open. Dedup (see [Deduplication](#deduplication)) only ever compares an
+incoming write against what's already stored; nothing looks
+*backward* across memories that already exist. Imports and degraded-window writes (an
+embedding-provider outage falling back to a looser checksum/Jaccard heuristic)
+routinely leave near-duplicates that write-time dedup structurally cannot catch after
+the fact. `action: "list"` scans one namespace/collection for clusters of near-duplicate
+memories using a bounded, paginated per-point similarity query (never a full pairwise
+scan); `action: "merge"` consolidates an explicit, human-chosen cluster into one target
+memory, reusing the `review` tool's archive transition per source. There is no
+automatic or scheduled merge path — `merge` always requires an explicit `target_id` and
+`source_ids`.
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `action` | `"list" \| "merge"` | **Yes** | - | Which operation to perform. |
+| `namespace` | `string` | No | `"global"` | Namespace scope. |
+| `collection` | `string` | No | `"general"` | Collection scope. Clusters never span collections. |
+| `cursor` | `string` | No | - | (`list` only) Pagination cursor returned by a prior `list` call. |
+| `min_cluster_size` | `integer (>= 2)` | No | `2` | (`list` only) Clusters smaller than this are dropped from the result. |
+| `target_id` | `string (UUID)` | Required for `merge` | - | The memory every source is merged into. Content and embedding are left unchanged. |
+| `source_ids` | `array<string (UUID)>` | Required for `merge` | - | Memory IDs to merge into `target_id` and archive. Must not include `target_id`. |
+
+**Output (`action: "list"`):**
+
+```json
+{
+  "clusters": [
+    {
+      "members": [
+        {
+          "id": "3f4a1b2c-...",
+          "summary": "Deployment runbook for the payments service",
+          "tags": ["deployment", "runbook"],
+          "importance": 0.7,
+          "access_count": 4,
+          "updated_at": "2026-02-01T00:00:00.000Z"
+        },
+        {
+          "id": "9c2e5f10-...",
+          "summary": "Payments service deployment runbook (v2)",
+          "tags": ["deployment"],
+          "importance": 0.5,
+          "access_count": 1,
+          "updated_at": "2026-01-15T00:00:00.000Z"
+        }
+      ],
+      "suggested_target": "3f4a1b2c-..."
+    }
+  ],
+  "cursor": null
+}
+```
+
+Memories are grouped into a cluster when they're connected, within the scanned page, by
+a similarity edge at or above `consolidation.similarity_threshold` (default `0.9` —
+deliberately below the write-time dedup UPDATE thresholds, so `list` surfaces
+candidates dedup itself would not have auto-merged). `suggested_target` is a **hint
+only**: the member with the highest `importance` (ties broken by `access_count`, then
+most-recently `updated_at`). `merge` never infers `target_id` from it — a caller must
+name it explicitly. `cursor` is `null` once the scanned page is smaller than
+`consolidation.max_scan_per_call`; pass it back to continue scanning a larger
+namespace/collection across multiple calls.
+
+**Output (`action: "merge"`):**
+
+```json
+{ "target_id": "3f4a1b2c-...", "merged": ["9c2e5f10-..."], "failed": [] }
+```
+
+On success, the target's `tags` become the union of its own tags and every source's
+tags, its `importance` becomes the maximum across the target and all sources, and its
+`merged_from` field records every merged source id (comma-joined, appended to any prior
+value — a memory can be the target of more than one consolidation over its life). Each
+source is archived through the same transition `review`'s `archive` action uses:
+vector removed, row moved to `archived_memories`, and an `ARCHIVE` audit event recorded
+with `action: "consolidate"` and `merged_into` naming the target. Rejects with
+`INVALID_INPUT` if `target_id` appears in `source_ids` or if a source belongs to a
+different namespace/collection than the target (nothing is archived in that case), and
+`NOT_FOUND` if a source id has never existed. A source that is already archived is
+silently skipped rather than rejected, so retrying a `merge` call that partially
+succeeded is safe. If archiving a source fails partway through, the response's
+`merged`/`failed` arrays distinguish what succeeded from what didn't — the failed
+source is left live, not both archived and undeleted.
 
 ---
 
@@ -2615,7 +3880,7 @@ When a container starts with an empty `/data` volume and connects to a Qdrant in
 docker build -t bhgbrain .
 ```
 
-The image uses a multi-stage build on `node:20-slim` (~200MB final size). The healthcheck uses Node.js native `fetch()` — no `curl` required.
+The image uses a multi-stage build on `node:22-slim` (~200MB final size). The healthcheck uses Node.js native `fetch()` — no `curl` required.
 
 ---
 
@@ -2768,7 +4033,7 @@ Once the drift check finishes, the guard is released — re-embedding the drifte
 
 - Tool call responses include structured JSON payloads.
 - Error responses set `isError: true` in the MCP protocol for client-side routing.
-- Parameterized resources (`memory://{id}`, `category://{name}`, `collection://{name}`) are exposed as MCP resource templates via `resources/templates/list`.
+- Parameterized resources (`memory://{id}`, `memory://inject/{hint}`, `category://{name}`, `collection://{name}`) are exposed as MCP resource templates via `resources/templates/list`.
 
 ### Search and Pagination
 

@@ -38,7 +38,7 @@ function parseBootstrapInput(args: unknown): BootstrapInput {
     return BootstrapInputSchema.parse(args);
   } catch (err) {
     if (err instanceof z.ZodError) {
-      const messages = err.errors.map(e => `${e.path.join('.')}: ${e.message}`).join('; ');
+      const messages = err.issues.map(e => `${e.path.join('.')}: ${e.message}`).join('; ');
       throw invalidInput(messages);
     }
     throw err;

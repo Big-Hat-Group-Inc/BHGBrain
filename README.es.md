@@ -21,6 +21,7 @@ BHGBrain almacena memorias en SQLite (metadatos + búsqueda de texto completo) y
    - [Resolución de Identidad de Dispositivo](#resolución-de-identidad-de-dispositivo)
    - [Qdrant Compartido, SQLite Local](#qdrant-compartido-sqlite-local)
    - [Reparación y Recuperación](#reparación-y-recuperación)
+   - [Migración de Modelo de Embedding](#migración-de-modelo-de-embedding)
 10. [Gestión de Memorias](#gestión-de-memorias)
     - [Modelo de Datos de Memoria](#modelo-de-datos-de-memoria)
     - [Tipos de Memoria](#tipos-de-memoria)
@@ -28,10 +29,13 @@ BHGBrain almacena memorias en SQLite (metadatos + búsqueda de texto completo) y
     - [Niveles de Retención](#niveles-de-retención)
     - [Ciclo de Vida por Nivel — Asignación, Promoción, Ventana Deslizante](#ciclo-de-vida-por-nivel--asignación-promoción-ventana-deslizante)
     - [Deduplicación](#deduplicación)
+    - [Etiquetado Automático](#etiquetado-automático)
+    - [Procedencia del Contenido](#procedencia-del-contenido)
     - [Normalización de Contenido](#normalización-de-contenido)
     - [Puntuación de Importancia](#puntuación-de-importancia)
     - [Categorías — Slots de Política Persistente](#categorías--slots-de-política-persistente)
     - [Decaimiento, Limpieza y Archivado](#decaimiento-limpieza-y-archivado)
+    - [Destilación de Memoria](#destilación-de-memoria)
     - [Advertencias de Expiración Anticipada](#advertencias-de-expiración-anticipada)
     - [Límites de Recursos y Presupuestos de Capacidad](#límites-de-recursos-y-presupuestos-de-capacidad)
 11. [Búsqueda](#búsqueda)
@@ -45,11 +49,13 @@ BHGBrain almacena memorias en SQLite (metadatos + búsqueda de texto completo) y
 13. [Salud y Métricas](#salud-y-métricas)
 14. [Seguridad](#seguridad)
 15. [Recursos MCP](#recursos-mcp)
-16. [Prompt de Bootstrap](#prompt-de-bootstrap)
-17. [Referencia de la CLI](#referencia-de-la-cli)
-18. [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)
-19. [Actualización](#actualización)
-20. [Notas de Comportamiento](#notas-de-comportamiento)
+16. [Prompts MCP](#prompts-mcp)
+17. [Incorporación](#incorporación)
+18. [Referencia de la CLI](#referencia-de-la-cli)
+19. [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)
+20. [Docker](#docker)
+21. [Actualización](#actualización)
+22. [Notas de Comportamiento](#notas-de-comportamiento)
 
 ---
 
@@ -72,7 +78,7 @@ graph TD
         RH["Resource Handler<br/><i>memory:// URIs</i>"]
 
         subgraph Storage["Storage Manager"]
-            subgraph SQLite["SQLite (sql.js)"]
+            subgraph SQLite["SQLite (node:sqlite)"]
                 S1["metadata"]
                 S2["fulltext (FTS)"]
                 S3["categories"]
@@ -108,7 +114,7 @@ graph TD
     class OpenAI external
 ```
 
-- **SQLite** (vía `sql.js`, en memoria con volcado atómico periódico a disco) es el **sistema de registro** para todos los metadatos de memoria, índice de búsqueda de texto completo, categorías, historial de auditoría, historial de revisiones y registros de archivo.
+- **SQLite** (vía el `DatabaseSync` nativo de `node:sqlite`, con journaling WAL y durabilidad a nivel de confirmación) es el **sistema de registro** para todos los metadatos de memoria, índice de búsqueda de texto completo, categorías, historial de auditoría, historial de revisiones y registros de archivo.
 - **Qdrant** almacena embeddings de vectores semánticos para búsqueda por similitud. Qdrant siempre se escribe después de que SQLite tiene éxito; los fallos se rastrean mediante el indicador `vector_synced` y se exponen en el endpoint de salud.
 - **OpenAI text-embedding-3-small** (por defecto, configurable) genera embeddings de 1536 dimensiones para cada memoria.
 - Las **escrituras atómicas** garantizan que los archivos de base de datos nunca se escriban parcialmente — todas las E/S de disco utilizan escritura-en-temporal-luego-renombrar.
@@ -120,7 +126,7 @@ graph TD
 
 | Requisito | Versión | Notas |
 |---|---|---|
-| Node.js | ≥ 20.0.0 | Se recomienda LTS |
+| Node.js | ≥ 22.0.0 | Se recomienda LTS |
 | Qdrant | ≥ 1.10 | Debe estar en ejecución antes de iniciar BHGBrain. El cliente incluido (`@qdrant/js-client-rest` `~1.19.0`) llama a la API `query` introducida en Qdrant 1.10; los servidores más antiguos fallarán en la búsqueda semántica. |
 | Clave API de OpenAI | — | Para embeddings (`text-embedding-3-small` por defecto). El servidor inicia en modo degradado si no está presente. |
 
@@ -186,6 +192,12 @@ Establece `qdrant.mode` en `external` en tu configuración y apunta `external_ur
 }
 ```
 
+Para Azure, `embedding.model` es el nombre del despliegue que se envía a la API, no la etiqueta pública de la familia de modelos. Las credenciales de Azure se cargan una sola vez al iniciar desde `AZURE_FOUNDRY_API_KEY`; rotar ese secreto requiere reiniciar el proceso o recargar la configuración explícitamente.
+
+`embedding.model` DEBE ser uno de los modelos admitidos — `text-embedding-ada-002`, `text-embedding-3-small` o `text-embedding-3-large` — tanto para `openai` como para `azure-foundry`. Esto se valida al iniciar: un modelo no admitido o mal escrito (o, en el caso de Azure, un nombre de despliegue que no corresponde a ninguna familia de modelos admitida) hace fallar la validación de configuración de inmediato, con un error que lista los modelos admitidos, en lugar de arrancar y producir silenciosamente vectores con la dimensión incorrecta.
+
+> **¿Aprovisionando desde cero?** Los scripts de PowerShell en [`scripts/azure/`](./scripts/azure/README.md) crean un recurso de Azure AI Foundry / Azure OpenAI, despliegan un modelo de embedding (con el nombre de despliegue igual al nombre del modelo, como se requiere) y configuran el `config.json` de BHGBrain más `AZURE_FOUNDRY_API_KEY` por ti — partiendo de nada más que una suscripción de Azure.
+
 ---
 
 ## Instalación
@@ -232,17 +244,45 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
 
   // Configuración del proveedor de embeddings
   "embedding": {
-    // Solo se admite "openai" actualmente
+    // Proveedor: "openai" o "azure-foundry"
     "provider": "openai",
-    // Modelo de OpenAI a usar para embeddings. Debe ser uno de los modelos admitidos:
-    // "text-embedding-ada-002", "text-embedding-3-small", "text-embedding-3-large".
-    // Un modelo no admitido provoca un error de validación de configuración al iniciar.
+    // Nombre del modelo (para OpenAI) o nombre del despliegue de Azure (para Azure).
+    // Debe ser uno de los modelos admitidos: "text-embedding-ada-002",
+    // "text-embedding-3-small", "text-embedding-3-large". Un valor no admitido
+    // hace fallar la validación de configuración al iniciar, para cualquiera de los dos proveedores.
     "model": "text-embedding-3-small",
-    // Nombre de la variable de entorno que contiene la clave API de OpenAI
+    // Nombre de la variable de entorno que contiene la clave API de OpenAI (ignorado para Azure)
     "api_key_env": "OPENAI_API_KEY",
     // Dimensiones vectoriales producidas por el modelo. Debe coincidir con la salida del modelo.
     // IMPORTANTE: Cambiar esto después de crear colecciones requiere recrearlas.
-    "dimensions": 1536
+    "dimensions": 1536,
+    // Tiempo de espera de la solicitud en milisegundos
+    "request_timeout_ms": 30000,
+    // Número máximo de entradas por solicitud de embedding (umbral de fragmentación)
+    "max_batch_inputs": 2048,
+    // Configuración de reintentos para fallos transitorios
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 1000
+    },
+    // Cada vector se marca con una identidad cualificada por proveedor
+    // (`<provider>/<model>@<dimensions>`) en el momento de la escritura. Si la
+    // identidad esperada registrada por el almacén (adoptada en la primera
+    // escritura tras el arranque) difiere de esta configuración — p. ej. tras
+    // cambiar de proveedor o modelo — el componente de salud `embedding` se
+    // degrada y, mientras este flag sea true, las escrituras que producen
+    // vectores se rechazan con un error que nombra el modo re-embed de la
+    // herramienta `repair`. Establézcalo en false solo si desea que las
+    // escrituras mezclen espacios de embedding intencionadamente. Ver
+    // "Migración de Modelo de Embedding" más abajo.
+    "refuse_writes_on_model_mismatch": true,
+    // Configuración específica de Azure (requerida cuando provider = "azure-foundry")
+    "azure": {
+      // Nombre del recurso de Azure usado para construir la URL del endpoint
+      "resource_name": "my-foundry-resource",
+      // Nombre de la variable de entorno que contiene la clave API de Azure
+      "api_key_env": "AZURE_FOUNDRY_API_KEY"
+    }
   },
 
   // Configuración de conexión a Qdrant
@@ -290,7 +330,10 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     // Número máximo de memorias incluidas en el payload de auto-inject
     "auto_inject_limit": 10,
     // Número máximo de caracteres en los payloads de respuesta de herramientas
-    "max_response_chars": 50000
+    "max_response_chars": 50000,
+    // Límite por namespace de memorias con pinned: true (ver la
+    // documentación de remember/tag y memory://inject)
+    "pin_limit_per_namespace": 20
   },
 
   // Configuración de retención y ciclo de vida de memorias
@@ -342,7 +385,41 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     "pre_expiry_warning_days": 7,
 
     // Umbral de compactación de segmentos de Qdrant (compactar cuando esta fracción de un segmento está eliminada)
-    "compaction_deleted_threshold": 0.10
+    "compaction_deleted_threshold": 0.10,
+
+    // Destilación de memoria programada: agrupa memorias episódicas T2/T3
+    // relacionadas y aún activas, y consolida cada clúster calificado en una
+    // memoria semántica T1 duradera mediante una llamada LLM, archivando las
+    // fuentes con su linaje (ver "Destilación de Memoria" más abajo).
+    // Desactivada por defecto y sin efecto sin una clave API de extracción
+    // configurada.
+    "distillation": {
+      // Interruptor principal. false (por defecto): el planificador nunca se
+      // inicia, y `bhgbrain distill` omite cada clúster (no_key) a menos que
+      // haya una clave API de extracción configurada.
+      "enabled": false,
+
+      // Expresión cron para el trabajo de destilación en segundo plano (UTC).
+      // Por defecto, una hora después de cleanup_schedule, para que un
+      // almacén recién archivado por GC no esté también en destilación al
+      // mismo tiempo.
+      "schedule": "0 3 * * *",
+
+      // Umbral de similitud coseno a partir del cual dos memorias episódicas
+      // T2/T3 se agrupan en el mismo clúster. Deliberadamente conservador —
+      // una fusión incorrecta no es reversible una vez archivadas las fuentes.
+      "similarity_threshold": 0.85,
+
+      // Un clúster más pequeño que este valor se deja intacto (señal demasiado débil).
+      "min_cluster_size": 3,
+
+      // Un clúster más grande que este valor se divide de forma determinista
+      // en bloques de este tamaño, en vez de destilarse como uno solo.
+      "max_cluster_size": 20,
+
+      // Límite superior de clústeres destilados (llamadas LLM) por ejecución programada.
+      "max_clusters_per_run": 10
+    }
   },
 
   // Configuración de deduplicación
@@ -351,7 +428,20 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     "enabled": true,
     // Umbral de similitud coseno por encima del cual el nuevo contenido se considera una ACTUALIZACIÓN del existente.
     // Los ajustes específicos por nivel se aplican además de esto (ver sección de Deduplicación más adelante).
-    "similarity_threshold": 0.92
+    "similarity_threshold": 0.92,
+    // Cuántos de los 10 candidatos de similitud recuperados evalúa el clasificador
+    // para corroboración (1-10; NOOP/DELETE/UPDATE directo siempre usan solo el más cercano).
+    "candidate_window": 5,
+    // Interruptor independiente para la ruta de corroboración descrita abajo; false
+    // restaura la clasificación previa al ensanchado (solo el candidato único),
+    // sin importar los otros tres valores aquí.
+    "corroboration_enabled": true,
+    // Número mínimo de candidatos de la ventana (incluido el más cercano) que deben
+    // puntuar dentro de corroboration_margin del umbral de actualización para escalar ADD a UPDATE.
+    "corroboration_count": 2,
+    // Cuán por debajo del umbral de actualización puede puntuar un candidato y aun así
+    // contar para la corroboración.
+    "corroboration_margin": 0.03
   },
 
   // Configuración de búsqueda
@@ -361,6 +451,82 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     "hybrid_weights": {
       "semantic": 0.7,
       "fulltext": 0.3
+    },
+    // Ranking compuesto: ordena los resultados por relevancia x un prior
+    // derivado de la importancia, la frecuencia de acceso y la decadencia por
+    // antigüedad según el nivel (ver "Ranking Compuesto" más abajo).
+    // enabled: false restaura el orden por relevancia pura.
+    "ranking": {
+      "enabled": true,
+      "w_importance": 0.3,
+      "w_access": 0.2,
+      "access_norm": 50,
+      // Tasa de decadencia exponencial diaria por nivel de retención. T0 es 0 (nunca decae).
+      "decay_per_day": {
+        "T0": 0,
+        "T1": 0.002,
+        "T2": 0.008,
+        "T3": 0.02
+      }
+    },
+    // Etapa opcional de rerank con LLM, solo para `recall` (ver "Rerank" más
+    // abajo). Deshabilitada por defecto: cuando está activa, envía la
+    // consulta y el texto de cada candidato al LLM configurado para obtener
+    // un juicio de relevancia, reemplazando `score` (nunca `semantic_score`,
+    // por lo que el filtrado por min_score no se ve afectado) para los
+    // candidatos puntuados. Requiere su propia BHGBRAIN_RERANK_API_KEY.
+    "rerank": {
+      "enabled": false,
+      "provider": "openai",
+      // Cuántos de los candidatos ya rankeados de `recall` se envían al LLM
+      // por llamada. 1-50.
+      "candidate_pool": 20,
+      "model": "gpt-4o-mini",
+      "model_env": "BHGBRAIN_RERANK_API_KEY",
+      // Cualquier fallo (timeout, respuesta no 2xx, respuesta malformada)
+      // degrada al orden previo al rerank en lugar de fallar la llamada a recall.
+      "timeout_ms": 3000
+    },
+    // Reordenamiento por diversidad de Maximal Marginal Relevance, aplicado
+    // después del ranking compuesto (ver "Reordenamiento por Diversidad MMR"
+    // más abajo). enabled: false restaura exactamente el orden por
+    // relevancia compuesta pura.
+    "mmr": {
+      "enabled": true,
+      "lambda": 0.7,
+      "candidate_pool_multiplier": 3,
+      "candidate_pool_cap": 50
+    },
+    // Expansión de consultas múltiples: la búsqueda/recall semántica
+    // incrusta y busca más de una representación de la consulta, fusionando
+    // candidatos por id (gana el score más alto) antes del ranking (ver
+    // "Expansión de Consultas Múltiples" más abajo).
+    "query_expansion": {
+      "enabled": true,
+      // Límite superior del total de variantes buscadas (original +
+      // sin-palabras-vacías + generadas por LLM), independiente de
+      // llm_paraphrase.variant_count.
+      "max_variants": 2,
+      // Variante determinista sin modelo: la consulta sin palabras vacías
+      // en inglés, buscada junto al original siempre que difiera y no esté
+      // vacía.
+      "keyword_stripped": true,
+      // Generación de variantes opcional respaldada por modelo. Desactivada
+      // por defecto: es la primera dependencia de chat LLM en el camino
+      // en vivo y añade latencia/costo por llamada.
+      "llm_paraphrase": {
+        "enabled": false,
+        // "paraphrase": reformula la consulta. "hyde": genera un pasaje de
+        // respuesta hipotética y lo incrusta en su lugar (puede mejorar el
+        // recall, a costa de posibles detalles alucinados — ver el README
+        // más abajo).
+        "mode": "paraphrase",
+        "variant_count": 2,
+        // Tiempo de espera de la solicitud de chat-completion; cualquier
+        // fallo (tiempo agotado, respuesta no-2xx, clave faltante)
+        // degrada silenciosamente a las variantes sin modelo de arriba.
+        "timeout_ms": 3000
+      }
     }
   },
 
@@ -382,12 +548,33 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     "trust_proxy": false
   },
 
-  // Presupuesto del payload de auto-inject (para el recurso memory://inject)
+  // Presupuesto del payload de auto-inject (para memory://inject y memory://inject/{hint})
   "auto_inject": {
-    // Número máximo de caracteres incluidos en el payload de inject
+    // Cantidad del presupuesto, interpretada según budget_unit más abajo
     "max_chars": 30000,
     // Presupuesto de tokens (null = ilimitado, se aplica el presupuesto de caracteres)
-    "max_tokens": null
+    "max_tokens": null,
+    // Fracción del presupuesto reservada para la sección de memorias, para
+    // que el contenido de categorías ya no pueda consumir todo el payload
+    // antes de inyectar una sola memoria. 0 restaura el comportamiento
+    // previo donde las categorías pueden usar todo el presupuesto.
+    "memory_budget_fraction": 0.4,
+    // 'chars' (predeterminado): max_chars es un presupuesto de caracteres,
+    // sin cambios respecto a antes de esta opción. 'tokens': max_chars se
+    // trata como un presupuesto de tokens estimado (caracteres/4, sin
+    // dependencia de un tokenizador), escalando por 4 el presupuesto de
+    // caracteres efectivo de cada sección.
+    "budget_unit": "chars",
+    // Supresión voraz de casi-duplicados dentro de la sección de memorias
+    // seleccionada por hint: se omite un candidato cuya similitud con una
+    // memoria ya seleccionada supere deduplication.similarity_threshold.
+    // Las memorias fijadas (pinned) están exentas en ambas direcciones.
+    "dedup_suppression": true,
+    // Si las memorias fijadas se incluyen siempre en la sección de memorias
+    // (ver defaults.pin_limit_per_namespace y el parámetro `pinned` de
+    // remember/tag). false desactiva este paso por completo; el límite de
+    // fijado se sigue aplicando al escribir independientemente de esto.
+    "pinned_enabled": true
   },
 
   // Configuración de observabilidad
@@ -402,17 +589,65 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
 
   // Configuración del pipeline de ingesta
   "pipeline": {
-    // Habilitar el paso de extracción (actualmente ejecuta extracción determinística de un solo candidato)
-    "extraction_enabled": true,
-    // Modelo usado para extracción basada en LLM (planificado para uso futuro)
+    // Habilita la extracción multi-candidato basada en LLM: divide contenido de
+    // `remember` con múltiples hechos en memorias candidatas atómicas antes de
+    // deduplicar/escribir. Por defecto false — opt-in deliberado, ya que
+    // habilitarlo gasta una llamada LLM (coste + latencia) en cada `remember`
+    // suficientemente largo. Cuando es false, o si no se resuelve ninguna clave
+    // API, la extracción siempre emite exactamente un candidato (comportamiento actual).
+    "extraction_enabled": false,
+    // Modelo de chat-completions usado para la extracción
     "extraction_model": "gpt-4o-mini",
-    // Nombre de la variable de entorno para la clave API del modelo de extracción
+    // Nombre de la variable de entorno para la clave API del modelo de extracción; recurre a OPENAI_API_KEY
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // El contenido más corto que esto (caracteres) omite la llamada LLM y va
+    // directamente a la extracción de un solo candidato
+    "extraction_min_chars": 120,
+    // Los candidatos que superen este límite se descartan (no se fusionan), se registran y se cuentan
+    "extraction_max_candidates": 6,
+    // Tiempo de espera de la solicitud de extracción en milisegundos, forzado vía AbortController
+    "extraction_timeout_ms": 4000,
     // Cuando es true, recurre a dedup por checksum + similitud de texto completo si el embedding no está disponible
-    "fallback_to_threshold_dedup": true
+    "fallback_to_threshold_dedup": true,
+    // Habilita un nivel opcional de resumen basado en LLM: una llamada de
+    // chat-completion económica produce el campo `summary` de la memoria en
+    // lugar del resumidor extractivo gratuito e integrado. Por defecto false —
+    // igual que la extracción, esto es una llamada externa nueva con
+    // implicaciones de coste/latencia, opt-in deliberado. Cualquier fallo
+    // (clave ausente, respuesta no-2xx, timeout, error de red) recurre al nivel
+    // extractivo para esa escritura; el resumen nunca bloquea ni hace fallar
+    // una llamada a `remember`/`revert`.
+    "summarization_enabled": false,
+    // Modelo de chat-completions usado para el resumen
+    "summarization_model": "gpt-4o-mini",
+    // Nombre de la variable de entorno para la clave API del modelo de resumen.
+    // Por defecto la misma variable que extraction_model_env (ambas son
+    // llamadas de modelo económico en la ruta de escritura contra la misma
+    // cuenta de OpenAI) — apúntala a otra variable si quieres una clave separada.
+    "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // Tiempo de espera de la solicitud de resumen en milisegundos, forzado vía AbortController
+    "summarization_timeout_ms": 3000,
+    // Etiquetado de contenido determinista y sin dependencias: deriva etiquetas
+    // adicionales de tokens con forma de código, rutas de archivo, abreviaturas de
+    // repositorio (owner/repo) y @menciones encontradas en el contenido
+    // normalizado, y las une con cualquier etiqueta proporcionada por el
+    // llamador. Sin llamadas a LLM, sin red. `false` restaura exactamente el
+    // comportamiento previo a esta función. Ver "Etiquetado Automático" abajo.
+    "auto_tag_enabled": true,
+    // Límite superior de etiquetas auto-derivadas añadidas por memoria, aplicado
+    // antes de fusionar con las etiquetas proporcionadas por el llamador y
+    // recortar al límite de 20 etiquetas por memoria (el recorte siempre
+    // prioriza las etiquetas proporcionadas por el llamador).
+    "auto_tag_max_per_memory": 6
   },
 
-  // Auto-resumir el contenido de la memoria en la ingesta
+  // Controla el nivel de calidad usado para generar el campo `summary` de cada
+  // memoria. true (por defecto): un resumidor extractivo sin dependencias
+  // puntúa cada frase del contenido por frecuencia de términos y elige la más
+  // representativa (recurriendo además al nivel LLM anterior cuando
+  // pipeline.summarization_enabled es true y responde correctamente). false: la
+  // ruta más económica posible — summary es simplemente la primera línea del
+  // contenido, truncada a 120 caracteres — sin importar pipeline.summarization_enabled.
   "auto_summarize": true
 }
 ```
@@ -423,11 +658,13 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
 
 | Variable | Requerida | Predeterminado | Descripción |
 |---|---|---|---|
-| `OPENAI_API_KEY` | Sí (para embeddings) | — | Clave API de OpenAI. El servidor inicia en **modo degradado** si no está presente — la búsqueda semántica y la ingesta fallarán, pero la búsqueda de texto completo y las lecturas de categorías siguen funcionando. |
+| `OPENAI_API_KEY` | Sí (para el proveedor OpenAI) | — | Clave API de OpenAI. El servidor inicia en **modo degradado** si no está presente — la búsqueda semántica y la ingesta fallarán, pero la búsqueda de texto completo y las lecturas de categorías siguen funcionando. |
+| `AZURE_FOUNDRY_API_KEY` | Sí (para el proveedor Azure) | — | Clave API de Azure para el endpoint de embeddings compatible con Azure OpenAI. Requerida cuando `embedding.provider = "azure-foundry"`. |
 | `BHGBRAIN_TOKEN` | Requerida para HTTP no-loopback | — | Bearer token para autenticación HTTP. El servidor **se niega a iniciar** si el host es no-loopback y esto no está configurado (a menos que `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Requerida para Qdrant Cloud | — | Establece `qdrant.api_key_env` en la configuración con el nombre de esta variable. El nombre predeterminado del campo de configuración es `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generado desde el hostname | Anular el identificador de dispositivo para configuraciones multi-dispositivo. Ver [Resolución de Identidad de Dispositivo](#resolución-de-identidad-de-dispositivo). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | No | Usa `OPENAI_API_KEY` como respaldo | Clave API para el modelo de extracción LLM (uso futuro). |
+| `BHGBRAIN_EXTRACTION_API_KEY` | No | Usa `OPENAI_API_KEY` como respaldo | Clave API para el modelo de extracción LLM, usada cuando `pipeline.extraction_enabled` es `true`. También el valor por defecto de `pipeline.summarization_model_env` (usado cuando `pipeline.summarization_enabled` es `true`) — apunta ese campo a otra variable si quieres una clave separada para el resumen. También la lee la fase de paráfrasis/HyDE con LLM de la expansión de consultas múltiples (`search.query_expansion.llm_paraphrase.enabled`, ver [Expansión de Consultas Múltiples](#expansión-de-consultas-múltiples)), que resuelve la clave de la misma forma desde `pipeline.extraction_model_env`, usando `OPENAI_API_KEY` como respaldo si no está definida. |
+| `BHGBRAIN_RERANK_API_KEY` | No | — (**sin** respaldo a `OPENAI_API_KEY`) | Clave API para la etapa opcional de rerank de `recall`, usada cuando `search.rerank.enabled` es `true`. A diferencia de `BHGBRAIN_EXTRACTION_API_KEY`, no tiene respaldo implícito — activar el rerank es una decisión deliberada con clave propia, que nunca consume silenciosamente la clave/presupuesto de embeddings o extracción. Ver [Rerank](#rerank). |
 
 Generar un bearer token seguro:
 
@@ -458,9 +695,12 @@ node dist/index.js --stdio --config=/path/to/config.json
 
 ### Modo HTTP
 
-> Este transporte es una API REST simple para scripts, sondas de salud y la CLI. **No**
-> implementa MCP Streamable HTTP: los clientes MCP deben usar stdio en su lugar (ver
-> «Configuración de clientes MCP»).
+> Este transporte habla MCP real sobre HTTP — el transporte **Streamable HTTP** en
+> `/mcp`, de modo que varios clientes MCP pueden compartir un único proceso de servidor
+> de larga duración — además de una API REST simple (`POST /tool/:name`,
+> `GET /resource`) para scripts, sondas de salud y la CLI. Ver
+> «Configuración de clientes MCP» para apuntar un cliente compatible con Streamable
+> HTTP a `/mcp`.
 
 HTTP está habilitado por defecto en `127.0.0.1:3721`. Establece `BHGBRAIN_TOKEN` antes de iniciar si deseas acceso autenticado:
 
@@ -475,9 +715,17 @@ El servidor escucha en `http://127.0.0.1:3721` por defecto. Endpoints HTTP dispo
 | Endpoint | Auth Requerida | Descripción |
 |---|---|---|
 | `GET /health` | No | Verificación de salud (sin autenticación para compatibilidad con sondas) |
-| `POST /tool/:name` | Sí | Invocar una herramienta MCP por nombre |
-| `GET /resource?uri=...` | Sí | Leer un recurso MCP por URI |
+| `POST /mcp` | Sí | MCP Streamable HTTP: solicitudes JSON-RPC; una solicitud `initialize` crea una nueva sesión |
+| `GET /mcp` | Sí | MCP Streamable HTTP: canal SSE independiente para una sesión existente |
+| `DELETE /mcp` | Sí | MCP Streamable HTTP: termina una sesión |
+| `POST /tool/:name` | Sí | Capa de conveniencia REST: invocar una herramienta MCP por nombre directamente |
+| `GET /resource?uri=...` | Sí | Capa de conveniencia REST: leer un recurso MCP por URI directamente |
 | `GET /metrics` | Sí | Métricas en formato Prometheus (si `metrics_enabled: true`) |
+
+Cada sesión `/mcp` es un servidor MCP nuevo, en memoria, que comparte el mismo
+almacenamiento subyacente que cualquier otra sesión y los endpoints REST — reiniciar el
+proceso elimina todas las sesiones, y los clientes conformes con la especificación se
+reinicializan automáticamente.
 
 Ejemplo de verificación de salud:
 
@@ -530,12 +778,38 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter (transporte stdio)
+### OpenClaw / mcporter (transporte Streamable HTTP)
 
-BHGBrain habla MCP **únicamente por stdio**. El servidor HTTP descrito en «Modo HTTP»
-es una API REST simple (`POST /tool/:name`, `GET /resource`): *no* es un endpoint MCP
-Streamable HTTP, por lo que los clientes MCP no pueden conectarse a él. Apúntalos al
-binario `bhgbrain-server` en su lugar:
+El servidor HTTP de BHGBrain habla MCP real en `/mcp` mediante el transporte
+**Streamable HTTP** (ver «Modo HTTP») — inicia el servidor una vez y apunta cada
+cliente MCP a la misma URL, de modo que compartan un proceso de larga duración y un
+backend SQLite/Qdrant, en lugar de que cada cliente lance su propio proceso hijo
+`--stdio` aislado:
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "http",
+      "url": "http://127.0.0.1:3721/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    }
+  }
+}
+```
+
+Inicia primero el servidor (`node dist/index.js` o `bhgbrain server start`) con
+`BHGBRAIN_TOKEN` fijado al mismo valor usado en el encabezado anterior.
+
+#### Transporte stdio (alternativa: un proceso por cliente)
+
+Los clientes que solo soportan stdio (o que no deben compartir un servidor en
+ejecución) todavía pueden lanzar su propio proceso hijo `bhgbrain-server --stdio`. Esto
+sigue totalmente soportado, pero cada cliente que lo haga obtiene su propio proceso
+aislado — ningún estado se comparte con otros clientes hasta que se escribe en
+SQLite/Qdrant.
 
 ```json
 {
@@ -571,11 +845,14 @@ O contra una copia del código fuente en lugar del binario instalado globalmente
 }
 ```
 
-> **¿Ejecutas OpenClaw dentro de WSL o de un contenedor?** BHGBrain debe estar
-> instalado en ese mismo entorno. stdio significa que el cliente lanza el servidor como
-> proceso hijo, así que el servidor no puede vivir en otra distribución o contenedor.
-> Para compartir memoria entre entornos, da a cada instalación su propia base SQLite y
-> apunta todas al mismo clúster de Qdrant (ver «Memoria Multi-Dispositivo»).
+> **¿Ejecutas OpenClaw dentro de WSL o de un contenedor con el transporte stdio?**
+> BHGBrain debe estar instalado en ese mismo entorno. stdio significa que el cliente
+> lanza el servidor como proceso hijo, así que el servidor no puede vivir en otra
+> distribución o contenedor. El transporte Streamable HTTP anterior evita esto por
+> completo — apunta a los clientes en cualquier entorno a la misma URL
+> `http://host:3721/mcp`. Para compartir memoria entre instancias de servidor
+> separadas, da a cada instalación su propia base SQLite y apunta todas al mismo
+> clúster de Qdrant (ver «Memoria Multi-Dispositivo»).
 
 ---
 
@@ -712,6 +989,69 @@ La herramienta de reparación:
 
 **Nota**: Las memorias almacenadas antes de que se añadiera la función de contenido en Qdrant (pre-1.3) no tienen contenido en su payload de Qdrant y no pueden recuperarse vía reparación. Solo los metadatos (etiquetas, tipo, importancia) sobreviven para esas entradas.
 
+### Migración de Modelo de Embedding
+
+Cada vector se marca en el momento de la escritura con una identidad cualificada por
+proveedor — `<provider>/<model>@<dimensions>` (p. ej. `openai/text-embedding-3-small@1536`)
+— tanto en la fila de SQLite como en el payload de Qdrant. El almacén también recuerda
+esta identidad como su expectativa, adoptada la primera vez que se escribe tras el
+arranque.
+
+Esto existe porque mezclar espacios de embedding es una corrupción silenciosa: si
+cambia `embedding.provider` o `embedding.model` en `config.json` manteniendo las
+mismas dimensiones (p. ej. cambiando a un despliegue de Azure de la misma familia de
+modelos), nada a nivel de Qdrant lo detecta — los nuevos vectores se mezclan en la
+misma colección que los antiguos, la similitud coseno entre los dos espacios carece
+de sentido, y tanto la relevancia del recall como la deduplicación (los puntajes del
+candidato más cercano y de la ventana de candidatos que alimentan los umbrales 0.92/0.98) se degradan silenciosamente. Un
+cambio de dimensiones falla ruidosamente con un error opaco de Qdrant; el marcado de
+procedencia hace que ambos casos sean ruidosos y accionables.
+
+**Qué ocurre tras un cambio de modelo:**
+
+1. En el siguiente arranque (o chequeo de salud), la identidad esperada registrada por
+   el almacén ya no coincide con la configuración activa. El componente de salud
+   `embedding` se degrada con un mensaje que nombra ambas identidades, y se registra
+   una advertencia estructurada `embedding_identity_mismatch`.
+2. Mientras `embedding.refuse_writes_on_model_mismatch` sea `true` (por defecto),
+   las escrituras que producen vectores (remember, re-embeddings disparados por
+   tags, reconciliación de restauración) fallan con un error `CONFLICT` accionable
+   que nombra la ruta de re-embedding. Las lecturas siguen funcionando — recall y
+   search siguen sirviendo los vectores antiguos, solo con salud degradada.
+3. Ejecute la migración:
+
+   ```bash
+   bhgbrain repair --re-embed              # migrar filas con marca obsoleta
+   bhgbrain repair --re-embed --dry-run    # previsualizar cuántas filas se re-embeberían
+   bhgbrain repair --re-embed --include-legacy   # incluir también filas sin marca alguna
+   ```
+
+   O mediante la herramienta MCP `repair` con `mode: "re-embed"` (ver
+   [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)). La migración
+   re-embebe las memorias no coincidentes en lotes acotados y reanudables — la
+   propia marca es el marcador de progreso, por lo que una ejecución interrumpida
+   se reanuda sin repetir filas ya completadas, y el fallo de un solo
+   embed/upsert se aísla en lugar de abortar todo el lote.
+4. Una vez que no quedan filas con marca obsoleta, la identidad esperada del
+   almacén se actualiza automáticamente y la degradación de salud `embedding`
+   desaparece — sin reinicio.
+
+**Notas:**
+- Las filas heredadas escritas antes del marcado de procedencia no tienen marca
+  (`null`) y se tratan como "desconocidas" — se excluyen del re-embedding a menos
+  que se pase `--include-legacy` / `include_legacy: true`, para que una primera
+  actualización no dispare por sorpresa un re-embedding completo del corpus (y su
+  coste de API de embedding).
+- El re-embedding siempre lo inicia el operador — nunca se dispara
+  automáticamente, porque llama a la API de pago de embeddings una vez por cada
+  memoria migrada.
+- Configure `embedding.refuse_writes_on_model_mismatch` en `false` solo si desea
+  intencionadamente que las escrituras continúen mezclando espacios de embedding
+  (p. ej. una ventana de migración deliberada y monitorizada) — la marca sigue
+  registrando lo que ocurrió.
+- Las memorias archivadas nunca se re-embeben; sus vectores ya se eliminaron por
+  diseño (ver [Decaimiento, Limpieza y Archivado](#decaimiento-limpieza-y-archivado)).
+
 ### Ejemplo de Configuración Multi-Dispositivo
 
 **Dispositivo A** (`config.json`):
@@ -759,8 +1099,8 @@ Cada memoria almacenada en BHGBrain es un `MemoryRecord` con los siguientes camp
 | `category` | `string \| null` | Nombre de categoría si esta memoria está adjunta a una categoría de política persistente |
 | `content` | `string` | El contenido completo de la memoria (hasta 100.000 caracteres) |
 | `summary` | `string` | Resumen de la primera línea generado automáticamente (hasta 120 caracteres) |
-| `tags` | `string[]` | Etiquetas de forma libre (alfanumérico + guiones, máx. 20 etiquetas, máx. 100 chars cada una) |
-| `source` | `"cli" \| "api" \| "agent" \| "import"` | Cómo se creó la memoria |
+| `tags` | `string[]` | Etiquetas de forma libre (alfanumérico + guiones, máx. 20 etiquetas, máx. 100 chars cada una). Incluye tanto etiquetas proporcionadas por el llamador como etiquetas auto-derivadas del contenido — ver [Etiquetado Automático](#etiquetado-automático). |
+| `source` | `"cli" \| "api" \| "agent" \| "import" \| "distillation"` | Cómo se creó la memoria. `"distillation"` solo lo escribe el trabajo de destilación programado (ver [Destilación de Memoria](#destilación-de-memoria)) |
 | `checksum` | `string` | Hash SHA-256 del contenido normalizado (usado para deduplicación exacta) |
 | `embedding` | `number[]` | Embedding vectorial (no almacenado en SQLite; vive en Qdrant) |
 | `importance` | `number (0–1)` | Puntuación de importancia (por defecto 0.5) |
@@ -772,8 +1112,10 @@ Cada memoria almacenada en BHGBrain es un `MemoryRecord` con los siguientes camp
 | `last_accessed` | `string (ISO 8601)` | Marca de tiempo de la recuperación más reciente |
 | `last_operation` | `"ADD" \| "UPDATE" \| "DELETE" \| "NOOP"` | Operación de escritura más reciente aplicada |
 | `merged_from` | `string \| null` | ID de la memoria desde la que se fusionó esta (ruta UPDATE de dedup) |
+| `derived_from` | `string[] \| null` | IDs de las memorias episódicas T2/T3 archivadas de las que se destiló esta memoria. Solo lo establece el trabajo de destilación; `null` en cualquier escritura ordinaria (ver [Destilación de Memoria](#destilación-de-memoria)) |
 | `archived` | `boolean` | Si esta memoria está archivada de forma flexible (excluida de búsqueda/recall) |
 | `vector_synced` | `boolean` | Si el vector de Qdrant está sincronizado con el estado de SQLite |
+| `pinned` | `boolean` | Si esta memoria se incluye siempre en los payloads de `memory://inject`, limitado por `defaults.pin_limit_per_namespace`; no afecta a `search`/`recall` |
 | `device_id` | `string \| null` | Identificador de la instancia de BHGBrain que creó esta memoria (ver [Memoria Multi-Dispositivo](#memoria-multi-dispositivo)) |
 | `created_at` | `string (ISO 8601)` | Marca de tiempo de creación |
 | `updated_at` | `string (ISO 8601)` | Marca de tiempo de la última actualización |
@@ -794,6 +1136,7 @@ CREATE INDEX idx_memories_expiry      ON memories(decay_eligible, expires_at);
 CREATE INDEX idx_memories_review_due  ON memories(retention_tier, review_due);
 CREATE INDEX idx_memories_archived    ON memories(archived);
 CREATE INDEX idx_memories_vector_sync ON memories(vector_synced);
+CREATE INDEX idx_memories_pinned      ON memories(namespace, pinned);
 ```
 
 #### Índices de Payload de Qdrant
@@ -865,7 +1208,7 @@ A cada memoria se le asigna un **nivel de retención** en el momento de la inges
 
 **Propiedades clave por nivel:**
 
-- **T0**: `expires_at` es siempre `null`. `decay_eligible` es siempre `false`. Las memorias T0 no pueden ser limpiadas automáticamente. Las actualizaciones a memorias T0 desencadenan una instantánea de revisión en la tabla `memory_revisions` (historial de solo adición). Las memorias T0 reciben un impulso de puntuación de +0.1 en los resultados de búsqueda híbrida.
+- **T0**: `expires_at` es siempre `null`. `decay_eligible` es siempre `false`. Las memorias T0 no pueden ser limpiadas automáticamente. Las actualizaciones a memorias T0 desencadenan una instantánea de revisión en la tabla `memory_revisions` (historial de solo adición). Las memorias T0 nunca decaen en el ranking compuesto (`decay_per_day.T0` es `0` por defecto), lo que les da una ventaja de ranking duradera en todos los modos de búsqueda.
 
 - **T1**: `review_due` se establece en `created_at + 365 días` y se restablece en cada acceso. Las memorias que se acercan a su `expires_at` se marcan con `expiring_soon: true` en los resultados de búsqueda.
 
@@ -1032,9 +1375,12 @@ flowchart TD
     G --> H{"Highest Cosine<br/>Similarity Score"}
     H -->|"score ≥ noop threshold"| NOOP2["🔄 NOOP<br/>Near-duplicate found"]
     H -->|"score ≥ update threshold"| UPD["✏️ UPDATE Path"]
-    H -->|"score < update threshold"| ADD["➕ ADD Path"]
+    H -->|"score < update threshold"| WIN{"candidate_window:<br/>N corroborators ≥<br/>(update − margin)?"}
+    WIN -->|"Yes (≥ corroboration_count)"| CORR["✏️ UPDATE Path<br/>(corroborated)"]
+    WIN -->|"No"| ADD["➕ ADD Path"]
 
     UPD --> U1["Merge tags (union)"]
+    CORR --> U1
     U1 --> U2["Replace content"]
     U2 --> U3["importance = max(old, new)"]
     U3 --> U4["SQLite UPDATE"]
@@ -1052,9 +1398,9 @@ flowchart TD
 
     class REJECT reject
     class NOOP1,NOOP2 noop
-    class UPD,U1,U2,U3,U4,U5 update
+    class UPD,CORR,U1,U2,U3,U4,U5 update
     class ADD,A1,A2,A3 add
-    class A,B,C,D,E,F,G,H process
+    class A,B,C,D,E,F,G,H,WIN process
 ```
 
 #### Fase 1: Deduplicación Exacta (Checksum)
@@ -1071,12 +1417,23 @@ Si no se encuentra ninguna coincidencia exacta, el contenido se embede y se recu
 
 | Decisión | Condición | Efecto |
 |---|---|---|
-| `NOOP` | Puntuación ≥ umbral noop | El contenido se considera un duplicado; devuelve el ID de la memoria existente sin escribir |
-| `DELETE` | Puntuación ≥ umbral update **y** el contenido invalida explícitamente la coincidencia (p. ej. "ya no es cierto", "corrección:", "olvida eso") | La memoria existente se elimina y el candidato se guarda como una nueva memoria que la referencia mediante `merged_from` |
-| `UPDATE` | Puntuación ≥ umbral update | El contenido es una actualización del existente; fusiona etiquetas, actualiza contenido y checksum, preserva el ID |
-| `ADD` | Puntuación < umbral update | Memoria genuinamente nueva; crea con un nuevo UUID |
+| `NOOP` | Puntuación del candidato más cercano ≥ umbral noop | El contenido se considera un duplicado; devuelve el ID de la memoria existente sin escribir |
+| `DELETE` | Puntuación del candidato más cercano ≥ umbral update **y** el contenido invalida explícitamente la coincidencia (p. ej. "ya no es cierto", "corrección:", "olvida eso") | La memoria existente se elimina y el candidato se guarda como una nueva memoria que la referencia mediante `merged_from` |
+| `DELETE` (opcional) | La puntuación del candidato más cercano está en la banda update, la heurística de frases anterior **no** se activó, `pipeline.contradiction_detection.enabled` es `true`, y una verificación de entailment por LLM clasifica al candidato como `contradict` respecto a la memoria coincidente | Mismo efecto que el `DELETE` activado por frase anterior — la memoria existente se elimina y el candidato se guarda como una nueva memoria que la referencia mediante `merged_from` |
+| `UPDATE` | Puntuación del candidato más cercano ≥ umbral update | El contenido es una actualización del existente; fusiona etiquetas, actualiza contenido y checksum, preserva el ID |
+| `UPDATE` (corroborado) | Puntuación del candidato más cercano < umbral update, **pero** al menos `deduplication.corroboration_count` candidatos dentro de la ventana de los `deduplication.candidate_window` principales (incluido el más cercano) puntúan ≥ `umbral update − deduplication.corroboration_margin` | Varias memorias casi idénticas forman un cúmulo independiente cerca del umbral; se fusiona con el candidato de mayor puntuación, igual que un `UPDATE` directo |
+| `ADD` | Puntuación del candidato más cercano < umbral update y no se encuentra ningún cúmulo corroborado | Memoria genuinamente nueva; crea con un nuevo UUID |
 
-El diagrama anterior muestra las rutas NOOP/UPDATE/ADD; DELETE es una variante de la ruta UPDATE que solo se toma cuando se activa la heurística de invalidación.
+El diagrama anterior muestra las rutas NOOP/UPDATE/ADD; DELETE es una variante de la ruta UPDATE que se toma cuando se activa la heurística de invalidación basada en frases, o (opcional, ver abajo) cuando una verificación de entailment por LLM clasifica un candidato en la banda update como contradictorio respecto a la memoria existente. NOOP y DELETE siempre se deciden únicamente en función del candidato más cercano — la corroboración nunca se les aplica (ver "Ventana de candidatos y corroboración" más abajo).
+
+**Detección de contradicciones (opcional, desactivada por defecto):** la heurística de frases anterior solo detecta candidatos que dicen explícitamente que son una corrección ("ya no es cierto", "corrección:", ...). Un candidato sobre el mismo tema que entra en conflicto sin usar una de esas frases — p. ej. "Migramos a Postgres" llegando cuando el almacén ya tiene "usamos MySQL" — pasa silenciosamente a `UPDATE` y ambos hechos coexisten. Establecer `pipeline.contradiction_detection.enabled: true` cierra esa brecha: para candidatos que caen en la banda update *y* no activan ya la heurística de frases, la pipeline hace una llamada al LLM (reutilizando las credenciales de `pipeline.extraction_model` / `pipeline.extraction_model_env` — sin configuración de modelo o clave de API separada) que clasifica al candidato frente a la memoria coincidente como `agree`, `refine`, o `contradict`. Solo `contradict` cambia el comportamiento, dirigiéndose a la misma ruta de eliminar-y-reemplazar que la heurística de frases; `agree`/`refine` caen ambos al `UPDATE` existente, idéntico al comportamiento actual. La heurística de frases siempre se comprueba primero y corta sin llamada al LLM siempre que coincide, así que las correcciones explícitas siguen siendo gratuitas e instantáneas.
+
+| Campo `pipeline.contradiction_detection.*` | Por defecto | Significado |
+|---|---|---|
+| `enabled` | `false` | Activa la verificación de entailment por LLM para escrituras en la banda update. Desactivado por defecto: sin cambio de comportamiento, sin latencia/coste adicional, hasta que un operador lo active. |
+| `timeout_ms` | `5000` | Límite superior de la llamada de entailment. Ante timeout, error de red, respuesta no-2xx, o una clasificación no analizable/fuera de lista, la pipeline falla de forma segura — procede exactamente como si la función estuviera desactivada para esa escritura — y registra una advertencia `contradiction_check_degraded` en lugar de bloquear o rechazar la escritura. |
+
+**Compensación a considerar antes de activarlo:** la brecha actual es un falso *negativo* (una contradicción real pasa desapercibida; ambas memorias persisten, y una corrección explícita posterior aún lo soluciona). Que el LLM clasifique erróneamente `refine` como `contradict` es un falso *positivo* que elimina silenciosamente una memoria que aún era cierta — y como eliminar-y-reemplazar no preserva el contenido de la memoria eliminada en el historial de revisiones, esa pérdida no es trivialmente recuperable. La verificación se solicita de forma conservadora (temperatura 0, "sin confianza → no contradict") y se distribuye desactivada por defecto por esta razón; actívala teniendo en cuenta esa compensación.
 
 **Umbrales de deduplicación específicos por nivel:**
 
@@ -1089,6 +1446,10 @@ El `similarity_threshold` base (por defecto 0.92) se ajusta por nivel porque las
 | `T2` | 0.98 | base (0.92) |
 | `T3` | 0.95 | max(base, 0.90) |
 
+**Ventana de candidatos y corroboración:**
+
+La búsqueda de similitud en Qdrant ya recupera los 10 candidatos principales, pero por defecto el clasificador solo inspecciona el único más cercano para las decisiones NOOP/DELETE/UPDATE directo. Cuando ese candidato más cercano queda *por debajo* del umbral update, la pipeline además comprueba si varios otros candidatos forman de manera independiente un cúmulo cerca del mismo umbral — varias casi-repeticiones del mismo hecho deberían fusionarse en una sola memoria en lugar de que cada una añada una variante nueva por ADD. En concreto: dentro de los `deduplication.candidate_window` candidatos principales (por defecto 5, con tope 10 — el límite ya recuperado), si al menos `deduplication.corroboration_count` (por defecto 2) de ellos puntúan ≥ `umbral update − deduplication.corroboration_margin` (por defecto 0.03), la escritura clasifica `UPDATE` contra el de mayor puntuación de esos candidatos en lugar de `ADD`. Esto es solo una escalada en un sentido: puede convertir un `ADD` en un `UPDATE`, pero nunca cambia una decisión `NOOP` o `DELETE`, y siempre apunta al candidato de mayor puntuación (sin necesidad de nueva lógica de desempate). Establece `deduplication.corroboration_enabled: false` para desactivar completamente esta ruta y restaurar la clasificación previa al ensanchado (solo candidato único); esto es independiente de `deduplication.enabled`, que desactiva la deduplicación semántica por completo. Cuando la ruta de corroboración se activa, emite un registro de advertencia estructurado `corroborated_dedup` (`targetId`, `topScore`, `corroborators`) para que los operadores puedan monitorear la frecuencia con que se activa y ajustar el margen/conteo.
+
 **Comportamiento de fusión en UPDATE:**
 - Las etiquetas se unen (etiquetas existentes ∪ etiquetas nuevas)
 - El contenido se reemplaza con la nueva versión
@@ -1097,6 +1458,121 @@ El `similarity_threshold` base (por defecto 0.92) se ajusta por nivel porque las
 
 **Comportamiento de reserva:**
 Si el proveedor de embeddings no está disponible y `pipeline.fallback_to_threshold_dedup: true`, el pipeline pasa a una ruta de deduplicación sin vectores en lugar de fallar la escritura. Las coincidencias exactas de checksum siguen resolviéndose directamente como `NOOP`, igual que en la Fase 1. Para el resto, el pipeline usa la búsqueda de texto completo de SQLite sobre el mismo namespace/colección para encontrar la memoria existente más cercana y la puntúa con una similitud determinista de solapamiento de palabras (no la puntuación coseno vectorial); en o por encima del umbral `update` el contenido se fusiona en esa memoria (`UPDATE`, con `vector_synced: false`), de lo contrario se escribe como una nueva memoria solo en SQLite (`ADD`, `vector_synced: false`). En cualquier caso, la memoria estará disponible para búsqueda de texto completo pero no para búsqueda semántica hasta que se restaure la sincronización con Qdrant, y entrar en esta ruta registra una advertencia estructurada `degraded_write`.
+
+---
+
+### Etiquetado Automático
+
+La mayoría de las escrituras no llevan etiquetas proporcionadas por el llamador, lo
+que deja sin efecto el filtro `tags` de `recall`/`search` y la ponderación 2× de
+coincidencias de etiquetas en la búsqueda de texto completo. Cuando
+`pipeline.auto_tag_enabled` es `true` (predeterminado), el pipeline de escritura
+ejecuta un extractor determinista y sin dependencias sobre el contenido normalizado
+de cada candidato — sin llamada a LLM, sin red — y une los resultados con cualquier
+etiqueta proporcionada por el llamador. La extracción ocurre antes de la
+clasificación de deduplicación, por lo que nunca cambia si una escritura se clasifica
+como `ADD`/`UPDATE`/`DELETE`/`NOOP`.
+
+**Categorías de extracción** (en orden de prioridad — las categorías de mayor
+prioridad se conservan primero si el conjunto de etiquetas combinado debe recortarse):
+
+1. **Tokens con forma de código** — spans de código en línea de markdown
+   (`` `useEffect` ``) e identificadores camelCase/PascalCase/`snake_case`/con puntos
+   (`extractionEnabled`, `search.ranking.enabled`), con un mínimo de 5 caracteres
+   para reducir el ruido de coincidencias cortas accidentales.
+2. **Rutas de archivo** — rutas separadas por barras que terminan en una extensión
+   reconocida (`src/pipeline/index.ts`), más un conjunto cerrado de nombres de
+   archivo con punto (`package.json`, `README.md`, `Dockerfile`, ...) reconocidos sin
+   necesidad de directorio.
+3. **Abreviaturas de repositorio** — tokens de dos segmentos con forma
+   `owner/repo` cuyo segmento final no tiene una extensión reconocida
+   (`bhgbrain/core`); un token cuyo segmento final sí tiene extensión se clasifica
+   como ruta de archivo en su lugar.
+4. **@Menciones** — tokens con forma `@handle` no precedidos inmediatamente por un
+   carácter de palabra, excluyendo direcciones de correo electrónico
+   (`jsmith@example.com` no produce etiqueta de mención).
+
+**Slugificación:** cada token coincidente se normaliza para satisfacer el
+`TagSchema` (`^[a-zA-Z0-9-]+$`, máx. 100 caracteres) sin modificarlo — en
+minúsculas, una `@` inicial se mapea a un prefijo `at-` (de modo que `@jsmith` se
+convierte en `at-jsmith` en lugar de colisionar con una etiqueta de palabra normal),
+cada secuencia de otros caracteres se colapsa a un único `-`, se recortan los `-`
+iniciales/finales y se trunca a 100 caracteres. Los candidatos que quedan en menos
+de 2 caracteres tras la slugificación se descartan. Ejemplos:
+`src/pipeline/index.ts` → `src-pipeline-index-ts`, `bhgbrain/core` →
+`bhgbrain-core`, `` `useEffect` `` → `useeffect`.
+
+**Fusión y límites:** las etiquetas auto-derivadas se deduplican y se unen con las
+etiquetas proporcionadas por el llamador (`etiquetas del llamador ∪ etiquetas
+automáticas`, las del llamador siempre primero), luego se recortan al límite
+existente de 20 etiquetas por memoria — el recorte siempre elimina primero las
+etiquetas auto-derivadas, nunca una proporcionada por el llamador. En `UPDATE`, las
+etiquetas auto-derivadas fluyen hacia la fusión de etiquetas existente igual que
+cualquier otra etiqueta candidata.
+
+| Campo de configuración | Predeterminado | Significado |
+|---|---|---|
+| `pipeline.auto_tag_enabled` | `true` | Interruptor de apagado. `false` restaura exactamente el comportamiento previo a esta función: las etiquetas candidatas son exactamente la entrada `tags` proporcionada por el llamador. |
+| `pipeline.auto_tag_max_per_memory` | `6` | Límite superior de etiquetas auto-derivadas añadidas por memoria, aplicado antes de fusionar con las etiquetas proporcionadas por el llamador. |
+
+Sin cambios de esquema ni de almacenamiento: las etiquetas auto-derivadas se
+almacenan como entradas ordinarias en el arreglo `tags` — misma columna, misma
+ponderación 2× de texto completo, mismo push-down del filtro `tags` en
+`recall`/`search`. Tanto `import` como `remember` pasan por el mismo pipeline de
+escritura, así que ambos se benefician sin conexión adicional.
+
+**Imprecisión conocida:** la extracción basada en patrones ocasionalmente etiqueta
+prosa capitalizada ordinaria o nombres de marca que resultan tener forma
+camelCase/PascalCase (p. ej. `GitHub` → `github`) — esto se acepta como inherente a
+un extractor determinista v1, no como comprensión semántica; usa la acción `remove`
+de la herramienta `tag` para corregir casos atípicos, o establece
+`pipeline.auto_tag_enabled: false` para deshabilitar la extracción por completo.
+
+---
+
+### Procedencia del Contenido
+
+Los campos `origin`/`confidence` de `remember` permiten registrar *de dónde proviene
+el contenido de una memoria* y *cuánto confiar en él* — algo distinto de
+`embedding_model` (ver [Migración de Modelo de
+Embedding](#migración-de-modelo-de-embedding)), que registra qué modelo de
+embeddings produjo el *vector*, no de dónde proviene la afirmación.
+
+- **`origin`** (`{ session_id?, tool?, repo?, branch? }`, todos los campos strings
+  libres opcionales) identifica la sesión/herramienta/repositorio/rama que produjo
+  una memoria. `null` cuando el llamador no proporciona nada — el caso común, y
+  siempre el caso para memorias escritas antes de que existiera este campo. No se
+  deriva automáticamente del transporte MCP: no existe una identidad
+  estandarizada de sesión/herramienta entre clientes (Claude CLI, Codex, Gemini,
+  ...), por lo que esto es exclusivamente proporcionado por el llamador.
+- **`confidence`** (`number`, `[0, 1]`) es cuánto confiar en el contenido de una
+  memoria. Cuando una llamada a `remember` lo omite, toma el valor predeterminado
+  por `source` de `pipeline.default_confidence` (configuración, predeterminados
+  `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`) — una afirmación explícita del
+  usuario obtiene confianza total por defecto, una inferencia de un agente obtiene
+  menos por defecto. En un `UPDATE` de deduplicación, `confidence` se fusiona vía
+  `max(existente, entrante)` (una segunda confirmación nunca reduce la confianza,
+  la misma política que `importance`); `origin` solo se reemplaza cuando la llamada
+  entrante proporciona uno, de lo contrario se conserva el `origin` existente.
+
+Ambos campos se exponen en cada ruta de lectura que ya devuelve registros de
+memoria — `recall`, `search`, `memory://{id}`, `memory://list` — sin nueva
+herramienta ni recurso. Ejemplo de llamada a `remember`:
+
+```json
+{
+  "content": "The user said the deploy window is Tuesdays 2-4pm UTC.",
+  "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+  "confidence": 1.0
+}
+```
+
+| Campo de configuración | Predeterminado | Significado |
+|---|---|---|
+| `pipeline.default_confidence.cli` | `1.0` | `confidence` predeterminada para escrituras `source: "cli"` que lo omiten. |
+| `pipeline.default_confidence.api` | `1.0` | `confidence` predeterminada para escrituras `source: "api"` que lo omiten. |
+| `pipeline.default_confidence.agent` | `0.7` | `confidence` predeterminada para escrituras `source: "agent"` que lo omiten. |
+| `pipeline.default_confidence.import` | `0.5` | `confidence` predeterminada para escrituras `source: "import"` que lo omiten. |
 
 ---
 
@@ -1213,7 +1689,7 @@ El servidor ejecuta un trabajo de limpieza programado (por defecto: diariamente 
 
 1. **Identificar memorias expiradas:** Consultar SQLite para todas las memorias donde `decay_eligible = true` Y `expires_at < now()`. Solo `T2`/`T3` son elegibles para archivar-y-eliminar directamente:
    - `T0` siempre se excluye (T0 nunca es elegible para decaimiento).
-   - `T1` nunca se elimina directamente. Las memorias `T1` expiradas o con `review_due` vencido se muestran como **candidatas de revisión** en el resultado de GC, para que un operador decida si promoverlas, volver a guardarlas o eliminarlas manualmente.
+   - `T1` nunca se elimina directamente. Las memorias `T1` expiradas o con `review_due` vencido se muestran como **candidatas de revisión** en el resultado de GC, para que un operador decida si promoverlas, volver a guardarlas o eliminarlas manualmente — o, vía MCP, listarlas y disposicionarlas con la herramienta `review` (`action: "list"` / `"keep"` / `"archive"`; ver [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)).
 
 2. **Archivar antes de eliminar (si está habilitado):** Para cada candidata `T2`/`T3`, se escribe un registro de resumen en la tabla `memory_archive` y se registra un evento de auditoría `ARCHIVE` distinto:
 
@@ -1264,6 +1740,8 @@ memory_revisions {
 
 Solo las memorias T0 tienen historial de revisiones. El embedding vectorial en Qdrant siempre refleja solo el contenido actual.
 
+El historial de revisiones se puede leer con la herramienta `revisions` (`action: "list"`) o el recurso `memory://{id}/revisions`, más reciente primero. `revisions` (`action: "revert"`) restaura el contenido de una memoria a una revisión anterior elegida — re-generando el embedding, re-insertando el vector, y anexando (sin reescribir) el propio revert como una nueva entrada del historial — y registra un evento de auditoría `REVISE` con la revisión de origen. Vea [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp) y [Recursos MCP](#recursos-mcp).
+
 #### Marcado de Obsolescencia (Paso de Consolidación)
 
 El comando `bhgbrain gc --consolidate` (o `RetentionService.runConsolidation()`) realiza un segundo paso que marca memorias como candidatas **obsoletas**:
@@ -1274,7 +1752,7 @@ El comando `bhgbrain gc --consolidate` (o `RetentionService.runConsolidation()`)
 
 #### Búsqueda y Restauración de Archivo
 
-Las memorias eliminadas (cuando `archive_before_delete: true`) pueden inspeccionarse y restaurarse:
+Las memorias eliminadas (cuando `archive_before_delete: true`) pueden inspeccionarse y restaurarse desde la CLI:
 
 ```bash
 bhgbrain archive list                 # Listar resúmenes de memorias archivadas (eliminadas)
@@ -1282,7 +1760,81 @@ bhgbrain archive search <query>       # Buscar en el archivo por texto
 bhgbrain archive restore <memory_id>  # Restaurar una memoria archivada
 ```
 
-**Semántica de restauración:** Una memoria restaurada se recrea como una **nueva** memoria `T2` a partir del texto de resumen archivado. El contenido original (si es más largo que el resumen) no puede recuperarse — el archivo almacena solo el resumen de 120 caracteres. La memoria restaurada recibe marcas de tiempo nuevas y un nuevo UUID, y se re-embede en Qdrant.
+**Semántica de restauración:** Una memoria restaurada se recrea como una **nueva** memoria (en su nivel original) a partir del texto de resumen archivado. El contenido original (si es más largo que el resumen) no puede recuperarse — el archivo almacena solo el resumen de 120 caracteres. La memoria restaurada recibe marcas de tiempo nuevas y un nuevo UUID, y se re-embede en Qdrant. El `archive restore` de la CLI además elimina la fila de archivo tras restaurar.
+
+Los clientes MCP tienen una ruta equivalente: el parámetro `include_archived` de la herramienta `search` encuentra memorias archivadas por coincidencia de términos en resumen/etiquetas (marcadas con `archived: true`, nunca registradas como acceso), y la acción `restore` de la herramienta `review` recrea una memoria activa a partir de un registro archivado — etiquetada como `restored-from-archive`, con la fila de archivo **conservada** (a diferencia de la ruta de la CLI) para que su origen siga siendo inspeccionable. Vea [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp).
+
+---
+
+### Destilación de Memoria
+
+<a id="destilación-de-memoria"></a>
+
+Un trabajo "de sueño" programado que convierte clústeres de memorias episódicas
+`T2`/`T3` relacionadas y aún activas en una única memoria semántica `T1` duradera —
+p. ej., cinco memorias separadas como "desplegado vía GitHub Actions", "CI cambiado
+a Actions", "runner de Actions fijado a node20" se convierten en una memoria:
+"desplegamos vía GitHub Actions." **Desactivada por defecto**
+(`retention.distillation.enabled: false`) — esta es la única función de BHGBrain
+que realiza una llamada LLM saliente, y archivar las fuentes pierde su contenido
+completo de forma irreversible, por lo que requiere una activación deliberada.
+
+**Cómo activarla:**
+
+1. Establecer `retention.distillation.enabled: true` en `config.json`.
+2. Aprovisionar una clave API de extracción: `pipeline.extraction_model_env`
+   (por defecto `BHGBRAIN_EXTRACTION_API_KEY`) debe apuntar a una variable de
+   entorno establecida — no se introduce ninguna variable de entorno nueva;
+   la destilación reutiliza la misma clave ya documentada para
+   `pipeline.extraction_enabled` y `search.rerank`.
+
+**Cómo funciona (en cada ejecución programada, o con `bhgbrain distill`):**
+
+1. **Agrupar (clustering):** Para cada namespace/colección con memorias
+   episódicas `T2`/`T3`, se obtienen sus vectores de Qdrant y se unen mediante
+   union-find codicioso las memorias cuya similitud coseno sea
+   `≥ retention.distillation.similarity_threshold` (por defecto `0.85`) en
+   componentes conexas. Los clústeres más pequeños que `min_cluster_size`
+   (por defecto `3`) se dejan intactos; los más grandes que `max_cluster_size`
+   (por defecto `20`) se dividen en bloques de ese tamaño. Como máximo
+   `max_clusters_per_run` (por defecto `10`) clústeres — los más grandes
+   primero — se procesan por ejecución.
+2. **Destilar:** Para cada clúster calificado, el contenido de sus miembros
+   (del más antiguo al más reciente) se envía al `pipeline.extraction_model`
+   configurado en una única llamada de chat-completion, solicitando un único
+   hecho consolidado. Ante fuentes contradictorias, el prompt pide al modelo
+   preferir la actualizada más recientemente — una mitigación, no detección
+   de contradicción basada en entailment. Un clúster se **omite** (nunca un
+   fallo duro del trabajo) cuando no hay clave API configurada o la llamada
+   LLM falla; las omisiones se cuentan por motivo (`no_key` / `llm_error`).
+3. **Escribir:** El hecho consolidado se escribe a través de la misma
+   pipeline de escritura de `remember` que atraviesa cualquier otra memoria —
+   deduplicación por checksum, embedding, registro de auditoría — con
+   `source: "distillation"`, `type: "semantic"`, `retention_tier: "T1"`, y
+   `derived_from` establecido con los IDs de las memorias fuente del clúster.
+   Un clúster que se vuelve a formar tras una ejecución de destilación previa
+   **actualiza** la memoria destilada anterior (vía la ruta de dedup normal)
+   en lugar de crear un duplicado.
+4. **Archivar fuentes:** Solo después de confirmar que la memoria destilada se
+   escribió de forma duradera se archivan y eliminan las memorias fuente del
+   clúster mediante la misma ruta `memory_archive` que usa GC, con una entrada
+   de auditoría `DISTILL` dedicada (`action: "distill"`) que referencia tanto
+   el ID de la nueva memoria como los IDs de las fuentes archivadas. Si el
+   archivado/eliminación falla tras una escritura destilada exitosa, esta
+   escritura **no** se revierte — las fuentes quedan activas y la ejecución
+   se reporta como degradada (una fuente que sigue activa no es un problema:
+   una ejecución posterior puede volver a agruparla, y la ruta de dedup
+   actualiza en vez de duplicar).
+
+```bash
+bhgbrain distill                      # Ejecutar destilación
+bhgbrain distill --dry-run            # Mostrar clústeres candidatos (IDs + resúmenes) sin llamar al LLM ni escribir/archivar nada
+```
+
+El campo `retention.distillation` de `health://status` reporta `last_run_at`,
+`last_run_degraded`, y contadores acumulados `distilled_total`/`skipped_total`, y
+los contadores/histogramas `bhgbrain_distill_*` siguen la misma convención de
+nombres que `bhgbrain_gc_*` (ver [Salud y Métricas](#salud-y-métricas)).
 
 ---
 
@@ -1361,15 +1913,17 @@ La búsqueda semántica usa embeddings de OpenAI y similitud vectorial de Qdrant
 
 ### Búsqueda de Texto Completo
 
-La búsqueda de texto completo usa la coincidencia de texto interno de SQLite para encontrar memorias que contienen palabras o frases específicas.
+La búsqueda de texto completo usa un índice FTS5 real de SQLite para encontrar memorias que contienen palabras o frases específicas, con lematización (stemming) en inglés y ranking de relevancia BM25.
 
 **Cómo funciona:**
 1. La consulta se divide en términos en minúsculas.
-2. Cada término se compara con la tabla shadow `memories_fts` usando `LIKE %term%` en las columnas `content`, `summary` y `tags`.
-3. Los resultados se ordenan por el número de términos coincidentes (más coincidencias = mayor rango).
-4. El rango se normaliza a una puntuación de 0.0–1.0: `min(1.0, term_count / 10)`.
+2. Cada término se compara como una frase literal con la tabla virtual FTS5 `memories_fts` (columnas `content`/`summary`/`tags`, tokenizador `porter unicode61`), unidos con `AND` — cada término debe coincidir, y la sintaxis de FTS5 incrustada en un término (`NEAR`, `*`, paréntesis, `AND`/`OR`, filtros de columna) se trata como texto literal inerte en lugar de interpretarse como un operador.
+3. El tokenizador `porter` aplica lematización tanto al índice como a la consulta, de modo que un término de consulta coincide con otras formas flexionadas de la misma palabra (p. ej., "runs" coincide con "running"; "deploy" coincide con "deployed") — no solo subcadenas exactas.
+4. Los resultados se ordenan con `bm25()`, ponderando las coincidencias en `summary` y `tags` 2x por encima de las coincidencias en `content` (reflejando la ponderación por frecuencia de términos previa a FTS5).
 5. Las memorias archivadas se excluyen (la tabla FTS se mantiene sincronizada con la tabla principal de memorias — las filas archivadas se eliminan de FTS).
 6. Los metadatos de acceso se actualizan para los resultados devueltos.
+
+**Alternativa (fallback):** si la compilación de SQLite en ejecución no tiene el módulo `fts5` compilado (verificado mediante una prueba de capacidad al inicio, no asumido), la búsqueda de texto completo recurre a un comparador `LIKE '%term%'` heredado con un rango de frecuencia de términos hecho a mano en lugar de fallar. Esto es visible, no silencioso: el componente `sqlite` de `health://status` lleva un `message`, y se registra una advertencia `fts5_unavailable` una vez al inicio. Ver [Endpoint de Salud](#endpoint-de-salud).
 
 **Cuándo usar:** Búsquedas exactas de palabras clave, búsqueda de identificadores específicos (IDs de memoria, nombres de proyectos, nombres de sistemas), cuando conoces la terminología exacta utilizada.
 
@@ -1399,14 +1953,14 @@ flowchart TD
     end
 
     subgraph Fulltext["Fulltext Search"]
-        P2["Tokenize Query"] --> FTS["SQLite FTS<br/>LIKE matching"]
-        FTS --> FR["Ranked Results<br/><i>by term count</i>"]
+        P2["Tokenize Query"] --> FTS["SQLite FTS5<br/>MATCH + porter stemming"]
+        FTS --> FR["Ranked Results<br/><i>by BM25</i>"]
     end
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
     FR --> RRF
-    RRF --> BOOST["T0 Score Boost<br/><i>+0.1 for foundational</i>"]
-    BOOST --> TOP["Return Top N Results"]
+    RRF --> RANK["Composite Ranking<br/><i>relevance x importance/access/decay prior</i>"]
+    RANK --> TOP["Return Top N Results"]
     TOP --> TRACK["Update Access Tracking<br/><i>count++, sliding window reset</i>"]
 
     classDef search fill:#4a90d9,stroke:#2c5f8a,color:#fff
@@ -1414,7 +1968,7 @@ flowchart TD
     classDef result fill:#5ba85b,stroke:#3d7a3d,color:#fff
 
     class P1,QD,SR,P2,FTS,FR search
-    class RRF,BOOST fusion
+    class RRF,RANK fusion
     class TOP,TRACK result
 ```
 
@@ -1434,7 +1988,7 @@ La búsqueda híbrida combina resultados semánticos y de texto completo usando 
 
 4. Los elementos que aparecen en solo una lista reciben `0` de contribución de la otra.
 5. La lista fusionada se ordena por puntuación RRF (descendente).
-6. Las memorias T0 reciben un **impulso de puntuación de +0.1** aplicado después de la fusión RRF, asegurando que el conocimiento fundacional aparezca de forma prominente.
+6. El **ranking compuesto** (ver más abajo) se aplica a los resultados de cada modo, incluida esta puntuación RRF, y la lista se reordena por la puntuación compuesta.
 7. Se devuelven los `limit` resultados superiores.
 
 **Degradación elegante:** Si el proveedor de embeddings no está disponible, la búsqueda híbrida silenciosamente recurre a resultados solo de texto completo en lugar de devolver un error.
@@ -1450,6 +2004,125 @@ La búsqueda híbrida combina resultados semánticos y de texto completo usando 
   "limit": 10
 }
 ```
+
+---
+
+### Ranking Compuesto
+
+Cada modo de búsqueda (`semantic`, `fulltext`, `hybrid`) ordena sus resultados por una puntuación compuesta en lugar de solo por relevancia. La relevancia (similitud coseno, rango FTS o puntuación RRF, según el modo) se multiplica por un **prior** derivado de señales que cada memoria ya posee — `importance`, `access_count` y qué tan recientemente se actualizó — de modo que una memoria confirmada como útil muchas veces, marcada como importante, o editada recientemente supera a un duplicado obsoleto igualmente relevante.
+
+```
+final_score = relevance x (w_base + w_importance x importance + w_access x log1p(access_count) / log1p(access_norm))
+                        x exp(-decay_per_day[tier] x age_days)
+```
+
+- `w_base` es fijo en `1.0` y no es configurable.
+- `age_days` se mide desde `updated_at`, así que un `UPDATE` reinicia la antigüedad efectiva de una memoria — una memoria recién editada vuelve a ser "joven".
+- Las memorias `T0` tienen un `decay_per_day` de `0` por defecto y por lo tanto nunca decaen, dando al conocimiento fundacional una ventaja duradera (esto reemplaza el antiguo impulso plano de `+0.1` para T0).
+- La frecuencia de acceso se amortigua logarítmicamente (`log1p`) para que un puñado de accesos adicionales no pueda dominar el orden, y se normaliza mediante `access_norm` (predeterminado `50`) para que el término de acceso permanezca en una escala comparable al término de importancia.
+
+**Configuración** (`search.ranking` en `config.json`, ver [Configuración](#configuración)):
+
+| Campo | Predeterminado | Significado |
+|---|---|---|
+| `enabled` | `true` | Establecer en `false` para desactivar el ranking compuesto por completo y restaurar el orden por relevancia pura. |
+| `w_importance` | `0.3` | Peso aplicado a la `importance` (0–1) de una memoria. |
+| `w_access` | `0.2` | Peso aplicado al conteo de accesos amortiguado logarítmicamente. |
+| `access_norm` | `50` | Normaliza el término de conteo de accesos; valores más altos requieren más accesos para alcanzar el mismo impulso. |
+| `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Tasa de decadencia exponencial por nivel aplicada a `age_days`. El predeterminado de `T2` da una vida media de aproximadamente 87 días, alineada con su TTL de 90 días. |
+
+**Lo que el ranking compuesto *no* afecta:** los campos crudos `semantic_score` y `fulltext_score` de cada resultado, y el campo al que se aplica el umbral `min_score` de `recall` (`semantic_score`) — ver [Recall vs Search](#recall-vs-search--diferencias). El ranking compuesto cambia el *orden* de los resultados, nunca qué memorias superan el filtro `min_score`.
+
+---
+
+### Rerank
+
+`recall` admite una etapa opcional que vuelve a puntuar su pool de candidatos con un juicio de relevancia del LLM antes del filtrado por `min_score` y el corte a `limit`. Tanto el ranking compuesto como el MMR (arriba) derivan su orden completamente del embedding de la consulta — un proxy tosco que reduce de forma fiable el campo a un top-20 plausible, pero que frecuentemente ordena mal ese top-20. El rerank invierte una llamada adicional al LLM por cada `recall` para juzgar juntos la consulta y el *texto* de cada candidato, a costa de latencia adicional.
+
+**Deshabilitado por defecto.** Las instalaciones estándar nunca hacen la llamada adicional — `recall` permanece exactamente igual hasta que se establece `search.rerank.enabled: true`.
+
+**Orden de la canalización de ranking:** relevancia → prior compuesto → reordenamiento de diversidad MMR → **rerank** (solo `recall`) → filtrado por `min_score` y corte a `limit`.
+
+**Cómo funciona:**
+1. Cuando está activo, `recall` amplía su pool de candidatos obtenidos a al menos `search.rerank.candidate_pool`.
+2. Los `candidate_pool` candidatos principales (según su puntuación previa al rerank) se envían al LLM configurado en una sola llamada agrupada, junto con el texto de la consulta.
+3. El LLM devuelve un juicio de relevancia en `[0, 1]` por candidato. El `score` de cada candidato puntuado con éxito se reemplaza por el juicio recortado (su valor bruto también se expone como `rerank_score` en el resultado), y la lista completa se reordena según el nuevo `score`.
+4. Cualquier candidato que la respuesta omita, o que no se pueda parsear, conserva su puntuación previa al rerank en lugar de ser descartado.
+5. `min_score` y `limit` se aplican después exactamente igual que antes — `min_score` está calibrado contra `semantic_score`, que el rerank nunca toca, por lo que el filtrado y la pertenencia de resultados no se ven afectados por si el rerank se ejecutó o no.
+
+**El fallo siempre degrada con elegancia:** un error del proveedor, un timeout o una respuesta malformada degradan al orden previo al rerank — `recall` nunca falla porque el rerank haya fallado. La degradación es observable mediante el contador de métrica `search_rerank_degraded` y un log de advertencia estructurado `rerank_degraded`.
+
+**Limitado únicamente a `recall`:** `search` y `memory://inject`/`memory://inject/{hint}` no se ven afectados por la configuración de `search.rerank` en esta versión.
+
+**Configuración** (`search.rerank` en `config.json`, ver [Configuración](#configuración)):
+
+| Campo | Predeterminado | Significado |
+|---|---|---|
+| `enabled` | `false` | Establecer `true` para activar la etapa de rerank en `recall`. |
+| `provider` | `"openai"` | Proveedor de rerank. Actualmente el único valor soportado. |
+| `candidate_pool` | `20` | Cuántos de los candidatos ya rankeados de `recall` se envían al LLM por llamada, `1`-`50`. |
+| `model` | `"gpt-4o-mini"` | Modelo de chat-completions usado para puntuar. |
+| `model_env` | `"BHGBRAIN_RERANK_API_KEY"` | Nombre de la variable de entorno con la clave API. **Sin respaldo** a `OPENAI_API_KEY` — ver [Variables de Entorno](#variables-de-entorno). |
+| `timeout_ms` | `3000` | Timeout de la solicitud; un timeout degrada al orden previo al rerank como cualquier otro fallo. |
+
+**Independiente de la canalización de extracción:** el rerank resuelve su propio `search.rerank.model`/`model_env` y nunca lee `pipeline.extraction_model`/`extraction_model_env` — funciona sin importar si `pipeline.extraction_enabled` está activo.
+
+---
+
+### Reordenamiento por Diversidad MMR
+
+`recall` y `search` (en los modos `semantic` e `hybrid`) aplican un paso de reordenamiento adicional después del ranking compuesto: **Maximal Marginal Relevance (MMR)**. El ranking compuesto por sí solo aún puede devolver un top-K dominado por varias memorias casi duplicadas — dos hechos con una similitud coseno de 0.85, por ejemplo, ambos sobreviven a la deduplicación en tiempo de escritura (que solo colapsa ≥ 0.92) y ambos terminan cerca de la cima juntos. MMR intercambia una cantidad configurable de relevancia mejor clasificada por diversidad, de modo que la página devuelta gaste sus posiciones en hechos *distintos* en lugar de repetidos.
+
+**Orden del pipeline de ranking:** relevancia (coseno / rango FTS / RRF) → prior compuesto (importancia/acceso/decadencia) → **reordenamiento por diversidad MMR** → filtrado posterior por `min_score` / tipo / etiquetas y truncamiento al `limit` del llamador.
+
+**Cómo funciona:**
+1. `recall`/`search` obtienen un grupo de candidatos más amplio que `limit`, para que exista margen real de diversificación.
+2. El puntaje compuesto de cada candidato se normaliza min-max sobre el grupo obtenido, de modo que `lambda` significa lo mismo sin importar si los puntajes del grupo están a escala de coseno (modo semántico) o a escala RRF (modo híbrido, típicamente dos órdenes de magnitud menor).
+3. Comenzando desde el candidato mejor puntuado, MMR selecciona voraz mente el siguiente candidato que maximiza `lambda * relevancia_normalizada - (1 - lambda) * similitud_máxima_con_ya_seleccionados`, donde la similitud es la similitud coseno con cada candidato ya seleccionado que tenga un vector.
+4. Esto es un **reordenamiento del grupo completo, nunca un truncamiento** — todo candidato obtenido sigue presente después, solo reordenado. `min_score`, el filtrado por tipo/etiquetas y el truncamiento a `limit` se ejecutan todos después, sin cambios en su mecanismo, por lo que un umbral `min_score` nunca puede devolver menos resultados de los debidos solo porque MMR se ejecutó antes.
+5. Los candidatos sin vector (por ejemplo, una coincidencia solo de texto completo en modo híbrido) nunca son penalizados ni pueden penalizar a otros — aportan una similitud de `0`.
+
+**El modo de texto completo no se ve afectado:** `mode: 'fulltext'` no lleva vectores contra los cuales diversificar, así que MMR nunca se ejecuta, sin importar `search.mmr.enabled`.
+
+**Configuración** (`search.mmr` en `config.json`, ver [Configuración](#configuración)):
+
+| Campo | Predeterminado | Significado |
+|---|---|---|
+| `enabled` | `true` | Establecer `false` para deshabilitar MMR completamente y restaurar exactamente el orden por relevancia compuesta pura. |
+| `lambda` | `0.7` | Compromiso entre relevancia y diversidad, `0`–`1`. Cerca de `1` se aproxima al orden por relevancia compuesta pura; cerca de `0` favorece la disimilitud entre candidatos por encima de la relevancia. |
+| `candidate_pool_multiplier` | `3` | Amplía el grupo obtenido del almacén a `limit * candidate_pool_multiplier` cuando MMR es elegible, dando margen real de diversificación más allá del `limit` del llamador. |
+| `candidate_pool_cap` | `50` | Límite superior del tamaño del grupo ampliado, independientemente de `limit * candidate_pool_multiplier`. |
+
+**No es lo mismo que la supresión de casi-duplicados de `memory://inject/{hint}`:** esa plantilla de recurso (ver [Referencia de Recursos MCP](#recursos-mcp)) ya tiene su propio mecanismo de casi-duplicados, separado — un descarte por umbral duro (reutilizando `deduplication.similarity_threshold`, predeterminado `0.92`) en lugar del compromiso continuo relevancia/diversidad de MMR. Ambos son intencionalmente independientes: la configuración `search.mmr` no tiene efecto sobre `memory://inject/{hint}`, y viceversa.
+
+---
+
+### Expansión de Consultas Múltiples
+
+`recall` y `search` (en los modos `semantic` e `hybrid`) incrustan y buscan más de una representación de la consulta, no solo la cadena literal. Una consulta conversacional como "cómo desplegamos" puede incrustarse lo bastante lejos de una memoria formulada como "el despliegue se ejecuta con `docker-compose up -d`" como para que la similitud coseno caiga por debajo de `min_score`, aunque la memoria responda claramente la pregunta. La expansión de consultas amplía el grupo de candidatos buscado en una sola llamada para que esa memoria siga apareciendo.
+
+**Orden de la canalización de ranking:** expansión de consultas (incrustar/buscar variantes + fusionar) → relevancia (coseno / rango FTS / RRF) → prior compuesto → reordenamiento por diversidad MMR → filtrado posterior por `min_score`/tipo/etiquetas y truncado al `limit` del llamador. La expansión de consultas solo cambia qué candidatos entran a la canalización; cada etapa posterior permanece sin cambios en su mecanismo.
+
+**Dos fases activables de forma independiente:**
+
+1. **Variante sin palabras vacías (activada por defecto, sin modelo).** Junto a la consulta original, se incrusta y busca también una variante determinista con un pequeño conjunto fijo de palabras vacías en inglés eliminadas (p. ej. "how do we deploy" → "deploy"), siempre que difiera del original y no esté vacía. Una consulta compuesta solo de palabras vacías ("is it") o una que ya solo contiene palabras de contenido ("deploy production") no produce una variante adicional. Ambas incrustaciones pasan por una única llamada `embedBatch` agrupada, por lo que esta fase cuesta una consulta extra a Qdrant, no una llamada extra a la API de embeddings.
+2. **Paráfrasis / HyDE con LLM (desactivada por defecto, condicionada al modelo).** Cuando `search.query_expansion.llm_paraphrase.enabled` es `true` *y* se resuelve una clave API (desde `pipeline.extraction_model_env`, con respaldo en `OPENAI_API_KEY`), una llamada de chat-completion genera de 1 a 3 variantes adicionales — ya sea paráfrasis reformuladas de la consulta (`mode: "paraphrase"`, el predeterminado) o un pasaje de respuesta hipotética para incrustar en su lugar (`mode: "hyde"`). HyDE puede mejorar el recall pero arriesga arrastrar la incrustación hacia detalles alucinados (nombres de herramientas, números) que la consulta nunca mencionó, por lo que es opcional en vez de predeterminado. Cualquier fallo — clave faltante, respuesta no-2xx, tiempo agotado — degrada silenciosamente a las variantes de la fase 1; una llamada de búsqueda nunca falla porque la generación de paráfrasis haya fallado.
+
+**Fusión:** los candidatos de cada variante buscada se fusionan por id de memoria, conservando el score **máximo** por id (no sumado ni promediado — una memoria encontrada por dos variantes no se infla respecto a una encontrada solo por su mejor variante), y luego se trunca al `limit` del llamador antes de que continúen el scoring/ranking. Esto significa que `semantic_score` en un resultado ahora representa "el mejor score entre todas las variantes buscadas", en lugar de "el score contra la consulta literal" — un cambio en lo que representa el campo, aunque su rango numérico y su calibración frente a `min_score`/ranking compuesto permanecen sin cambios.
+
+**No se aplica a texto completo:** el `mode: "fulltext"` independiente y la rama de texto completo de hybrid siempre buscan la única consulta original — el índice FTS5/BM25 (ver [Búsqueda de Texto Completo](#búsqueda-de-texto-completo)) aplica lematización a cada término, lo que cierra la mayor parte de la brecha de flexión para la que existe la expansión de consultas, pero no elimina las palabras vacías, por lo que una consulta compuesta solo por palabras vacías sigue sin devolver nada por la rama de texto completo.
+
+**Configuración** (`search.query_expansion` en `config.json`, ver [Configuración](#configuración)):
+
+| Campo | Predeterminado | Significado |
+|---|---|---|
+| `enabled` | `true` | Interruptor general de la función. `false` restaura exactamente el perfil de costo previo a la expansión (una incrustación por consulta). |
+| `max_variants` | `2` | Límite superior del total de variantes (original + sin-palabras-vacías + LLM), independiente de `llm_paraphrase.variant_count`. Las variantes por encima del límite se descartan, no se encolan. |
+| `keyword_stripped` | `true` | Activa la fase 1 (la variante determinista sin modelo). |
+| `llm_paraphrase.enabled` | `false` | Activa la fase 2. Requiere una clave API resoluble o la expansión con LLM se omite silenciosamente (se registra una vez al inicio, no por cada llamada). |
+| `llm_paraphrase.mode` | `"paraphrase"` | `"paraphrase"` reformula la consulta; `"hyde"` genera un pasaje de respuesta hipotética para incrustar. |
+| `llm_paraphrase.variant_count` | `2` | Cuántas variantes de paráfrasis/HyDE se solicitan por llamada (1–3). |
+| `llm_paraphrase.timeout_ms` | `3000` | Tiempo de espera de la solicitud de chat-completion; un tiempo agotado cuenta como fallo y degrada a la fase 1. |
 
 ---
 
@@ -1471,7 +2144,7 @@ BHGBrain expone dos herramientas para la recuperación de memorias con diferente
 | **Llamador previsto** | Agentes de IA durante la ejecución de tareas | Humanos o agentes administrativos haciendo investigación |
 
 **Filtrado por puntuación en recall:**
-El parámetro `min_score` (predeterminado 0.6) actúa como una compuerta de calidad — solo se devuelven memorias con similitud coseno ≥ 0.6. Esto previene resultados irrelevantes. Puedes reducir `min_score` para recuperar más resultados a expensas de la precisión.
+El parámetro `min_score` (predeterminado 0.6) actúa como una compuerta de calidad — se aplica al campo `semantic_score` (similitud coseno), no al `score` de ranking compuesto, ya que `recall` se ejecuta en modo semántico — solo se devuelven memorias con similitud coseno ≥ 0.6. Esto previene resultados irrelevantes. Puedes reducir `min_score` para recuperar más resultados a expensas de la precisión.
 
 ```json
 // Ejemplo de recall — semántico, filtrado por tipo y etiquetas
@@ -1489,7 +2162,7 @@ El parámetro `min_score` (predeterminado 0.6) actúa como una compuerta de cali
 
 ### Filtrado
 
-Tanto `recall` como `search` admiten alcance por namespace y colección. `recall` además admite filtrado por tipo y etiqueta.
+Tanto `recall` como `search` admiten alcance por namespace y colección, además de filtrado por rango temporal (`after`/`before`). `recall` además admite filtrado por tipo y etiqueta.
 
 **Filtrado por namespace:** Siempre aplicado. Todas las búsquedas se limitan a un solo namespace. No hay búsqueda entre namespaces.
 
@@ -1497,19 +2170,21 @@ Tanto `recall` como `search` admiten alcance por namespace y colección. `recall
 - En búsqueda semántica, se busca en la colección de Qdrant `bhgbrain_{namespace}_general` (la colección predeterminada para el namespace).
 - En búsqueda de texto completo, se buscan todas las memorias en el namespace independientemente de la colección.
 
-**Filtrado por tipo (solo `recall`):** Pasa `"type": "episodic"` | `"semantic"` | `"procedural"` para restringir los resultados a un solo tipo de memoria. El filtrado se aplica después de la búsqueda semántica, por lo que el conjunto completo de candidatos se recupera primero de Qdrant.
+**Filtrado por tipo (solo `recall`):** Pasa `"type": "episodic"` | `"semantic"` | `"procedural"` para restringir los resultados a un solo tipo de memoria. El filtro se empuja hacia el almacén (un filtro de payload de Qdrant en la ruta semántica, un predicado SQL en la ruta de texto completo), de modo que `limit` cuenta memorias coincidentes en lugar de gastarse en candidatos no coincidentes antes de que se aplique el filtrado. Una revalidación defensiva posterior a la recuperación sigue ejecutándose y se espera que sea un no-op en estado estable; si alguna vez elimina un resultado devuelto por el almacén, se incrementa un contador `recall_zero_after_filter` para que la inanición de filtros siga siendo observable.
 
-**Filtrado por etiquetas (solo `recall`):** Pasa `"tags": ["auth", "security"]` para restringir los resultados a memorias que tienen al menos una de las etiquetas especificadas. El filtrado se aplica después de la recuperación.
+**Filtrado por etiquetas (solo `recall`):** Pasa `"tags": ["auth", "security"]` para restringir los resultados a memorias que tienen al menos una de las etiquetas especificadas (coincidencia de cualquiera). Al igual que el filtrado por tipo, esto se empuja hacia el almacén en lugar de aplicarse solo después de la recuperación.
+
+**Filtrado por rango temporal (`recall` y `search`):** Pasa `after` y/o `before` (marcas de tiempo ISO 8601) para restringir los resultados a memorias cuyo `created_at` cae dentro de la ventana solicitada — ambos límites son inclusivos, y cualquiera puede omitirse para una ventana abierta. Los límites se comparan contra `created_at` (cuándo se registró la memoria por primera vez), no contra `updated_at` (que impulsa la señal separada de decaimiento por recencia en el ranking compuesto). Al igual que tipo/etiquetas, el filtro se empuja hacia el almacén, de modo que `limit` cuenta coincidencias dentro de la ventana. Una marca de tiempo malformada o un `after` posterior a `before` se rechaza antes de consultar cualquier almacén.
 
 ---
 
-### Umbrales de Puntuación y Bonificaciones por Nivel
+### Umbrales de Puntuación y Ranking Compuesto
 
-**`min_score` (solo recall):** Una puntuación mínima de similitud coseno entre 0 y 1. Las memorias por debajo de este umbral se excluyen de los resultados de `recall`. Predeterminado: 0.6.
+**`min_score` (solo recall):** Una puntuación mínima de similitud coseno entre 0 y 1, aplicada específicamente al campo `semantic_score` — no al `score` de ranking compuesto — ya que `recall` fija el modo semántico y el valor predeterminado de `min_score` está calibrado para un rango de similitud coseno, no para puntuaciones RRF híbridas ni para el prior compuesto. Las memorias por debajo de este umbral se excluyen de los resultados de `recall`. Predeterminado: 0.6.
 
 **Exclusión de memorias expiradas:** El filtro de búsqueda vectorial de Qdrant excluye memorias donde `decay_eligible = true AND expires_at < now()`. Las memorias T0/T1 (decay_eligible = false) nunca son excluidas por el filtro del lado vectorial. En el lado de SQLite, el servicio de ciclo de vida re-verifica la expiración en cualquier memoria devuelta desde el almacén de vectores.
 
-**Impulso de puntuación T0 (búsqueda híbrida):** Después de la fusión RRF, las memorias T0 (fundacionales) reciben un +0.1 adicional añadido a su puntuación. Esto asegura que el contenido arquitectónicamente significativo aparezca en los resultados híbridos incluso si su terminología exacta no coincide bien con la consulta.
+**Ranking compuesto (todos los modos):** `score` es la relevancia multiplicada por un prior de importancia, acceso y antigüedad — ver [Ranking Compuesto](#ranking-compuesto) más arriba. Las memorias T0 (fundacionales) nunca decaen por defecto, asegurando que el contenido arquitectónicamente significativo permanezca bien clasificado de forma duradera a medida que envejece.
 
 ---
 
@@ -1680,6 +2355,8 @@ Devuelve un `HealthSnapshot`:
 
 `components.retention` también pasa a `"degraded"` (con un mensaje) cuando la última ejecución de GC — programada o manual — reportó un fallo parcial (falló un paso de archivado o eliminación), independientemente de la presión de capacidad por nivel. Vuelve a `"healthy"` en la siguiente ejecución de GC limpia.
 
+`components.sqlite` permanece en `"healthy"` pero incluye un `message` cuando la compilación de SQLite en uso no tiene el módulo `fts5`: la búsqueda de texto completo se ejecuta con el comparador heredado basado en `LIKE` (ver [Búsqueda de texto completo](#búsqueda-de-texto-completo)) en lugar de un índice FTS5/BM25. Esto también se registra una vez al iniciar (`event: "fts5_unavailable"`).
+
 **Lógica del estado general:**
 - `unhealthy` — si SQLite o Qdrant no están en buen estado
 - `degraded` — si el embedding está degradado/no disponible, O si la retención está degradada (sobre capacidad o vectores no sincronizados)
@@ -1723,9 +2400,22 @@ con el formato anterior sin etiquetas).
 | `bhgbrain_tool_handler_ms_count` | contador | Número de muestras de latencia del manejador de herramientas, etiquetada con `tool` y `status` |
 | `embedding_embed_batch_ms_p95` | histograma | Percentil 95 de la latencia del lote de embeddings |
 | `search_total_ms_p95` | histograma | Percentil 95 de la latencia de búsqueda de extremo a extremo |
+| `search_result_count_avg` | histograma | Número promedio de resultados devueltos por llamada a `search`/`recall`, etiquetado con `mode` (`semantic`/`fulltext`/`hybrid`). Cuenta solo los resultados específicos del modo - las coincidencias archivadas añadidas por `include_archived` quedan excluidas. |
+| `search_result_count_p50` | histograma | Percentil 50 del número de resultados, etiquetado con `mode` |
+| `search_result_count_p95` | histograma | Percentil 95 del número de resultados, etiquetado con `mode` |
+| `search_result_count_p99` | histograma | Percentil 99 del número de resultados, etiquetado con `mode` |
+| `search_result_count_count` | contador | Número de muestras de `search_result_count`, etiquetado con `mode` |
+| `search_result_score_avg` | histograma | Puntuación compuesta promedio de los resultados por llamada a `search`/`recall`, etiquetado con `mode`. Una muestra por resultado; excluye las coincidencias archivadas, que llevan una puntuación de marcador de posición (no de relevancia). |
+| `search_result_score_p50` | histograma | Percentil 50 de la puntuación compuesta de los resultados, etiquetado con `mode` |
+| `search_result_score_p95` | histograma | Percentil 95 de la puntuación compuesta de los resultados, etiquetado con `mode` |
+| `search_result_score_p99` | histograma | Percentil 99 de la puntuación compuesta de los resultados, etiquetado con `mode` |
+| `search_result_score_count` | contador | Número de muestras de `search_result_score`, etiquetado con `mode` |
 | `bhgbrain_memory_count` | medidor | Recuento total de memorias actual (actualizado en escritura/eliminación) |
 | `bhgbrain_rate_limit_buckets` | medidor | Cubos de seguimiento de límite de tasa activos |
 | `bhgbrain_rate_limited_total` | contador | Total de solicitudes con límite de tasa excedido |
+| `recall_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva de tipo/etiquetas/`after`/`before` posterior a la recuperación de `recall` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
+| `search_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva `after`/`before` posterior a la recuperación de `search` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
+| `search_embedding_degraded` | contador | Se incrementa cuando una búsqueda en modo `hybrid` recae en solo texto completo porque el proveedor de embeddings o el almacén de vectores no está disponible, etiquetado con `namespace` |
 
 Por ejemplo:
 
@@ -1845,8 +2535,25 @@ BHGBrain expone recursos MCP (legibles vía `ReadResource`) además de las herra
 | Plantilla URI | Nombre | Descripción |
 |---|---|---|
 | `memory://{id}` | Detalles de Memoria | Registro completo de memoria por UUID |
+| `memory://{id}/revisions` | Revisiones de Memoria | Historial de revisiones de una memoria, más reciente primero |
+| `memory://inject/{hint}` | Inject de Sesión (con pista) | Bloque de contexto con presupuesto cuya sección de memorias se selecciona por relevancia híbrida a la pista, en lugar de recencia |
 | `category://{name}` | Categoría | Contenido completo de categoría por nombre |
 | `collection://{name}` | Colección | Memorias en una colección específica |
+
+### Notificaciones de Cambio de Lista de Recursos (list_changed)
+
+BHGBrain declara la capacidad MCP `resources.listChanged`. Después de que una
+llamada a `collections` con `action: "create"` o `"delete"`, o una llamada a
+`category` con `action: "set"` o `"delete"`, tenga éxito, el servidor envía una
+notificación `notifications/resources/list_changed` para que un cliente conectado
+sepa que `collection://list` / `category://list` cambió, en lugar de confiar en una
+copia en caché obsoleta. Las acciones de lectura (`list`, `get`) y las mutaciones
+fallidas nunca disparan una notificación; las escrituras de memoria simples
+(`remember`, `forget`, etc.) tampoco — `memory://list` cambia con demasiada
+frecuencia por llamada para que la notificación sea útil ahí. Esta notificación se
+envía solo por el transporte stdio (un único `Server` de larga vida por conexión
+stdio); no está conectada a las conexiones por sesión del transporte Streamable
+HTTP `/mcp`.
 
 ### `memory://list` — Listado Paginado de Memorias
 
@@ -1873,9 +2580,30 @@ La paginación usa cursores compuestos (`created_at|id`) para un orden estable. 
 
 El recurso inject construye un payload de texto con presupuesto para inyectar en una ventana de contexto LLM:
 
-1. Todo el contenido de categorías se antepone primero (contenido completo, en orden).
-2. Las memorias recientes principales se añaden a continuación (contenido o resumen dependiendo del espacio).
-3. El payload se trunca en `auto_inject.max_chars` (predeterminado 30.000 caracteres).
+1. El contenido de categorías se antepone primero (contenido completo, en orden),
+   limitado a su parte reservada del presupuesto:
+   `(1 - auto_inject.memory_budget_fraction) × presupuesto`. Lo que las categorías
+   dejen sin usar pasa a la sección de memorias siguiente (sin desperdicio).
+2. **Las memorias fijadas (pinned) se incluyen siempre a continuación**, antes de
+   la selección por recencia/relevancia, sin importar en qué posición quedarían de
+   otro modo (ver [Fijar Memorias para Inyección Garantizada](#fijar-memorias-para-inyección-garantizada)
+   más abajo).
+3. Las memorias se añaden dentro del presupuesto restante (contenido o resumen
+   según el espacio) — siempre al menos `auto_inject.memory_budget_fraction ×
+   presupuesto` cuando existen memorias, de modo que el contenido de categorías ya
+   no puede dejar sin espacio a la sección de memorias.
+   - `memory://inject` (sin pista): memorias principales por **recencia**, sin
+     cambios respecto a antes de esta opción.
+   - `memory://inject/{hint}`: memorias principales por **relevancia híbrida** a la
+     pista (ver más abajo).
+   - Una memoria que está fijada y además sería seleccionada aquí se excluye de
+     este paso (por ID), de modo que aparece exactamente una vez y no consume un
+     puesto adicional de `auto_inject_limit`.
+4. El payload se trunca en `auto_inject.max_chars`, interpretado según
+   `auto_inject.budget_unit` (predeterminado 30.000 caracteres). Esto también se
+   aplica al contenido fijado: si las memorias fijadas de un namespace por sí solas
+   superan la parte reservada de la sección de memorias, se truncan por elemento
+   como cualquier otro contenido y `truncated` es `true`.
 
 Parámetros de consulta:
 - `namespace` — namespace desde el que inyectar (predeterminado: `global`)
@@ -1893,24 +2621,175 @@ Respuesta:
 
 Acceder a una memoria vía `memory://{id}` incrementa su recuento de accesos y programa un volcado diferido.
 
+### `memory://inject/{hint}` — Inyección de Sesión Condicionada por Relevancia
+
+Una variante parametrizada de `memory://inject` que selecciona la sección de
+memorias por **relevancia híbrida a una pista** proporcionada por el llamador (una
+frase de tarea, nombre de repo o tema) en lugar de por recencia:
+
+- La pista es un segmento de ruta URI: decodificada una vez, recortada y limitada a
+  500 caracteres (el mismo límite que `search`/`recall` aplican a una consulta),
+  antes de dirigir la búsqueda híbrida sobre el namespace resuelto.
+- La selección reutiliza el mismo ranking compuesto/RRF, el mismo filtrado de
+  expiración y el mismo límite top-K (`defaults.auto_inject_limit`) que una llamada
+  normal a `search`/`recall`. A diferencia de la ruta sin pista, una lectura con
+  pista **registra acceso** en las memorias seleccionadas — es un recall en todo
+  sentido relevante.
+- Si el proveedor de embeddings no está disponible, la selección degrada con
+  elegancia a la rama de texto completo — el payload igual se produce, solo sin la
+  contribución semántica.
+- Una pista vacía (en blanco tras recortarla) recae en el comportamiento de
+  recencia descrito arriba.
+- **Supresión de casi-duplicados**: cuando `auto_inject.dedup_suppression` es
+  `true` (predeterminado), se omite un candidato cuya similitud vectorial con una
+  memoria ya seleccionada supere `deduplication.similarity_threshold`, y el
+  presupuesto liberado pasa al siguiente candidato distinto. **Las memorias
+  fijadas están exentas de esto en ambas direcciones**: dos memorias fijadas
+  casi-duplicadas se inyectan ambas (nunca se suprimen entre sí), y una memoria
+  fijada nunca suprime — ni es suprimida por — un candidato seleccionado por
+  relevancia que resulte ser casi-duplicado de ella.
+
+Ejemplo: `memory://inject/deploy%20to%20production` condiciona la selección a
+"deploy to production".
+
+La forma de la respuesta es idéntica a `memory://inject`.
+
+### Fijar Memorias para Inyección Garantizada
+
+Tanto `memory://inject` como `memory://inject/{hint}` seleccionan normalmente su
+sección de memorias por recencia o relevancia, lo que significa que un hecho
+concreto solo llega al contexto inyectado si resulta bien clasificado — una regla
+operativa crítica ("usa siempre pnpm, nunca npm") puede desaparecer silenciosamente
+si nada la ha referenciado recientemente y no coincide con la pista actual. **Fijar
+(pin)** cierra esa brecha: una memoria fijada se incluye siempre en la sección de
+memorias, sin importar su posición por recencia o relevancia.
+
+- **Se establece vía `remember`** en el momento de escribir (`pinned: true`/`false`)
+  — en un `UPDATE` de dedup, omitir `pinned` conserva el estado de fijado existente
+  de la memoria, de modo que una corrección de contenido no la desfija
+  silenciosamente; pásalo explícitamente para cambiarlo.
+- **Se establece vía `tag`** como un interruptor dedicado y ligero
+  (`pinned: true`/`false`) que no toca el contenido ni requiere volver a enviarlo.
+- **Limitado por namespace**: `defaults.pin_limit_per_namespace` (predeterminado
+  `20`) limita cuántas memorias pueden fijarse a la vez, aplicado al escribir.
+  Fijar más allá del límite devuelve `INVALID_INPUT`; desfija una primero para
+  hacer sitio.
+- **Usa el presupuesto de memorias existente** (la parte
+  `auto_inject.memory_budget_fraction`) — no hay una partición aparte. Si el
+  contenido fijado por sí solo supera esa parte, se trunca por elemento como
+  cualquier otro contenido y se establece el flag `truncated` del payload.
+- **Exenta de la supresión de casi-duplicados** en ambas direcciones (ver arriba).
+- **Sin efecto en `search`/`recall`**: `pinned` nunca aparece en `SearchResult` ni
+  influye en el ranking u orden — esto es deliberadamente distinto del nivel de
+  retención `T0`, que solo afecta a la retención/ranking y no ofrece ninguna
+  garantía de inclusión en inject por sí mismo. Una memoria puede ser `T0` y
+  fijada, `T0` y no fijada, o cualquier nivel y fijada — ambos son ortogonales.
+- **Interruptor de apagado**: `auto_inject.pinned_enabled: false` (predeterminado
+  `true`) desactiva por completo el paso de inclusión de fijadas — ambas
+  plantillas de inject se comportan como si ninguna memoria estuviera fijada. El
+  límite por namespace se sigue aplicando al escribir independientemente de este
+  interruptor.
+- **Duradera**: el estado de fijado se persiste en el payload de Qdrant y se
+  restaura mediante `repair --mode from-qdrant` y la sincronización entre
+  dispositivos, de modo que sobrevive a una reconstrucción de SQLite.
+
+### `memory://{id}/revisions` — Historial de Revisiones
+
+Devuelve el historial de revisiones registrado de una memoria, más reciente primero, bajo las mismas reglas de visibilidad que `memory://{id}` (`NOT_FOUND` para una memoria desconocida o excluida por visibilidad). Solo las memorias T0 acumulan revisiones (ver [Historial de Revisiones T0](#historial-de-revisiones-t0)), por lo que otras capas devuelven una lista vacía.
+
+Respuesta:
+```json
+{
+  "id": "<uuid>",
+  "revisions": [
+    { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+Para un cliente stdio sin soporte de recursos, use en su lugar la acción `list` de la herramienta `revisions` (los mismos datos — ver [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)).
+
 ---
 
-## Prompt de Bootstrap
+## Prompts MCP
 
-`BootstrapPrompt.txt` contiene un prompt de entrevista estructurado para construir un **perfil de segundo cerebro de trabajo** con un agente de IA.
+BHGBrain declara la capacidad MCP `prompts` y sirve dos prompts vía
+`ListPrompts`/`GetPrompt`, junto a sus herramientas y recursos:
 
-Úsalo al incorporar un nuevo asistente de IA o cuando quieras poblar BHGBrain con un perfil rico y estructurado de tu contexto de trabajo, entidades, tenants y reglas de desambiguación.
+| Prompt | Argumentos | Descripción |
+|---|---|---|
+| `bootstrap-interview` | `section` (opcional, `1`–`10`) | Guía la entrevista de bootstrap a través de la herramienta `bootstrap`. Omitir `section` da una visión general de todas las secciones; especificarla salta directamente a las preguntas de esa sección. Una `section` fuera de rango o no entera se rechaza como un error JSON-RPC InvalidParams. |
+| `session-context` | `hint` (opcional) | Devuelve el mismo bloque de contexto `memory://inject` (o `memory://inject/{hint}` cuando se da `hint`) con presupuesto, como un único mensaje de prompt, para preparar una nueva sesión. |
 
-### Cómo usarlo
+Ambos prompts devuelven un único mensaje con rol `user`. Para clientes sin soporte
+de prompts, la misma funcionalidad es accesible directamente a través de la
+herramienta `bootstrap` y el recurso `memory://inject` respectivamente — los
+prompts son una capa de descubribilidad, no un comportamiento nuevo.
 
-1. Inicia una conversación nueva con tu asistente de IA (Claude, GPT-4, etc.).
-2. Pega el contenido completo de `BootstrapPrompt.txt` como tu primer mensaje.
-3. Deja que el agente te entreviste sección por sección.
-4. Al final, el agente producirá un perfil estructurado que puedes guardar en BHGBrain vía llamadas `bhgbrain.remember` (o `mcporter call bhgbrain.remember`).
+Ejemplo:
+
+```json
+// Listar los prompts disponibles
+{ "method": "prompts/list" }
+
+// Saltar directamente a la sección 3 de la entrevista de bootstrap
+{ "method": "prompts/get", "params": { "name": "bootstrap-interview", "arguments": { "section": "3" } } }
+
+// Obtener el bloque de contexto de sesión, sesgado hacia un tema
+{ "method": "prompts/get", "params": { "name": "session-context", "arguments": { "hint": "deploy to production" } } }
+```
+
+---
+
+## Incorporación
+
+BHGBrain ofrece tres formas de construir tu perfil de trabajo, desde totalmente guiada hasta importación por lotes.
+
+### Opción 1: Herramienta de Bootstrap Interactiva (Recomendado)
+
+La herramienta MCP `bootstrap` conduce una entrevista con estado de 10 secciones directamente dentro de BHGBrain. Rastrea el progreso, almacena memorias a medida que avanzas, y admite pausar/reanudar entre sesiones.
+
+```json
+// Iniciar (o reanudar) la entrevista
+{ "name": "bootstrap", "arguments": { "action": "start" } }
+
+// Enviar respuestas para una sección
+{ "name": "bootstrap", "arguments": { "action": "submit", "section": 1, "answers": "Jane Doe, CTO at Acme Corp..." } }
+
+// Consultar el progreso
+{ "name": "bootstrap", "arguments": { "action": "status" } }
+
+// Rehacer una sección
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+```
+
+La herramienta devuelve las preguntas de la siguiente sección después de cada envío, para que el agente pueda conducir la conversación de forma natural. Las sesiones persisten en SQLite — puedes cerrar tu cliente y retomar donde lo dejaste.
+
+### Opción 2: Importación de Perfil por Lotes
+
+Si ya tienes un documento de perfil completado (de un bootstrap anterior, una wiki, o notas estructuradas), usa la herramienta `import` para ingerirlo de una sola vez:
+
+```json
+// Importar un perfil de bootstrap de 10 secciones
+{ "name": "import", "arguments": { "format": "profile", "content": "## 1. Identity & Role\n..." } }
+
+// Importar markdown arbitrario como memorias
+{ "name": "import", "arguments": { "format": "freeform", "content": "## Architecture\nWe use microservices..." } }
+
+// Vista previa de lo que se almacenaría sin escribir
+{ "name": "import", "arguments": { "format": "profile", "content": "...", "dry_run": true } }
+```
+
+La herramienta analiza el documento en memorias discretas con la colección, el nivel, el tipo, la importancia y las etiquetas correctas por sección. Se aplica deduplicación — es seguro reimportar después de actualizaciones.
+
+### Opción 3: Prompt de Bootstrap Manual
+
+`BootstrapPrompt.txt` contiene un prompt de entrevista independiente que puedes pegar en cualquier conversación de IA. El agente te entrevista sección por sección y llama a `bhgbrain.remember` para cada dato. Esto funciona con cualquier cliente conectado a MCP sin requerir las herramientas `bootstrap` o `import`.
 
 ### Lo que cubre
 
-La entrevista recorre 10 secciones:
+Los tres métodos recorren las mismas 10 secciones:
 
 | Sección | Lo que captura |
 |---|---|
@@ -1925,9 +2804,7 @@ La entrevista recorre 10 secciones:
 | 9. Mapa de tenant y entorno | Tenants de Azure, dev/staging/prod |
 | 10. Reglas operativas | Convenciones de nombres, desambiguación, supuestos predeterminados |
 
-La salida produce un perfil estructurado limpio con las 10 secciones más una guía de desambiguación — exactamente lo que BHGBrain necesita para responder preguntas sobre tu trabajo de manera confiable.
-
-**Las memorias de bootstrap tienen por defecto T0.** El contenido ingestado vía el flujo de bootstrap debe etiquetarse con `source: import` y `tags: ["bootstrap", "profile"]`. El clasificador heurístico reconoce estas señales y asigna el nivel T0 (fundacional).
+**Las memorias de bootstrap tienen por defecto T0.** El contenido ingestado vía el flujo de bootstrap se etiqueta con el origen apropiado (`agent` para la herramienta bootstrap, `import` para la importación por lotes) y se le asignan niveles según la tabla de mapeo de secciones.
 
 ---
 
@@ -1965,12 +2842,25 @@ bhgbrain gc                           # Ejecutar limpieza
 bhgbrain gc --dry-run                 # Mostrar candidatos y elementos de revisión sin eliminar
 bhgbrain gc --tier T3                 # Limpiar solo memorias T3
 
+# Destilación de memoria (consolida memorias episódicas T2/T3 en memorias
+# semánticas T1 mediante una llamada LLM — ver Destilación de Memoria.
+# Desactivada por defecto; requiere retention.distillation.enabled: true
+# y una clave API de extracción)
+bhgbrain distill                      # Ejecutar destilación
+bhgbrain distill --dry-run            # Mostrar clústeres candidatos sin llamar al LLM ni escribir/archivar nada
+
 # Log de auditoría
 bhgbrain audit                        # Mostrar entradas de auditoría recientes
 
 # Reparación (recuperación multi-dispositivo)
 bhgbrain repair --from-qdrant                # Hidratar SQLite local desde Qdrant (solo memorias del dispositivo actual, por defecto)
 bhgbrain repair --from-qdrant --all-devices  # Hidratar desde las memorias de todos los dispositivos, no solo el actual
+
+# Reparación (migración de modelo de embedding — ver Migración de Modelo de Embedding)
+bhgbrain repair --re-embed                   # Migrar vectores con marca de embedding obsoleta
+bhgbrain repair --re-embed --dry-run         # Previsualizar cuántas filas se re-embeberían
+bhgbrain repair --re-embed --include-legacy  # Incluir también filas sin marca alguna
+bhgbrain repair --re-embed --batch-size 100  # Ajustar el tamaño de lote (por defecto 50)
 
 # Gestión de categorías
 bhgbrain category list                # Listar todas las categorías
@@ -1993,7 +2883,7 @@ bhgbrain server token                 # Generar un nuevo bearer token aleatorio
 
 ## Referencia de Herramientas MCP
 
-BHGBrain expone 9 herramientas MCP. Todas las herramientas validan la entrada con esquemas Zod y devuelven JSON estructurado. Los errores usan un sobre consistente:
+BHGBrain expone 12 herramientas MCP. Todas las herramientas validan la entrada con esquemas Zod y devuelven JSON estructurado. Los errores usan un sobre consistente:
 
 ```json
 {
@@ -2004,6 +2894,25 @@ BHGBrain expone 9 herramientas MCP. Todas las herramientas validan la entrada co
   }
 }
 ```
+
+**Títulos y anotaciones:** cada herramienta declara un `title` legible por humanos y
+`annotations` de comportamiento MCP (`readOnlyHint`, `destructiveHint`,
+`idempotentHint` y `openWorldHint: false` — cada herramienta opera sobre el almacén
+local, nunca sobre un dominio externo abierto). `recall` y `search` son
+`readOnlyHint: true` y omiten `destructiveHint`/`idempotentHint` (sin sentido según
+la especificación una vez que `readOnlyHint` está activo). `forget`, `collections`,
+`category`, `backup` y `revisions` declaran `destructiveHint: true`. Esto significa
+que un cliente conforme a la especificación ya no trata cada lectura como algo tan
+peligroso como una eliminación — que es lo que ocurre bajo los valores
+predeterminados de la especificación MCP (`readOnlyHint: false`,
+`destructiveHint: true`) cuando una herramienta omite las anotaciones por completo.
+
+**outputSchema:** `recall`, `search` y `remember` declaran un `outputSchema` que
+describe la forma de su `structuredContent` (reflejando los tipos
+`SearchResult`/`WriteResult`), de modo que los clientes MCP pueden validar los
+resultados en lugar de solo parsear el bloque de texto como JSON. Las formas de
+resultado de las otras diez herramientas dependen de la acción y aún no están
+descritas por esquema.
 
 ---
 
@@ -2019,11 +2928,16 @@ Almacena contenido en BHGBrain con deduplicación automática, normalización, e
 | `namespace` | `string` | No | `"global"` | Alcance del namespace. Patrón: `^[a-zA-Z0-9/-]{1,200}$` |
 | `collection` | `string` | No | `"general"` | Colección dentro del namespace. Máx. 100 chars. |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | No | `"semantic"` | Tipo de memoria. Influye en la asignación predeterminada de nivel. |
-| `tags` | `string[]` | No | `[]` | Etiquetas para filtrado y clasificación. Máx. 20 etiquetas, cada una máx. 100 chars. Patrón: `^[a-zA-Z0-9-]+$` |
+| `tags` | `string[]` | No | `[]` | Etiquetas para filtrado y clasificación. Máx. 20 etiquetas, cada una máx. 100 chars. Patrón: `^[a-zA-Z0-9-]+$`. La memoria almacenada puede incluir etiquetas adicionales auto-derivadas del contenido — ver [Etiquetado Automático](#etiquetado-automático). |
 | `category` | `string` | No | — | Adjuntar a un slot de categoría (implica nivel T0). Máx. 100 chars. |
 | `importance` | `number (0–1)` | No | `0.5` | Puntuación de importancia. Los valores más altos se priorizan en la limpieza de obsolescencia. |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | No | `"cli"` | Fuente de la memoria. Afecta al nivel predeterminado (p.ej., agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | No | auto-asignado | Anulación explícita del nivel. Tiene precedencia sobre todas las heurísticas. |
+| `pinned` | `boolean` | No | `false` en ADD; se conserva en UPDATE | Fija esta memoria para que siempre se incluya en los payloads de `memory://inject`, limitado por `defaults.pin_limit_per_namespace` (predeterminado 20). En un `UPDATE` de dedup, omitir `pinned` conserva el estado de fijado existente de la memoria — pásalo explícitamente para cambiarlo. Superar el límite por namespace al fijar una memoria nueva devuelve `INVALID_INPUT`. |
+| `origin` | `object` | No | `null` | Procedencia del contenido proporcionada por el llamador: `{ session_id?, tool?, repo?, branch? }`, todos los campos strings libres opcionales (máx. 200/100/200/200 chars respectivamente). Las claves desconocidas se rechazan. Distinto del campo de identidad de vector `embedding_model` — ver [Procedencia del Contenido](#procedencia-del-contenido). En un `UPDATE` de dedup, omitir `origin` conserva la procedencia existente de la memoria; pasarlo la reemplaza. |
+| `confidence` | `number (0–1)` | No | por `source` (ver abajo) | Cuánto confiar en el contenido de esta memoria. Toma el valor predeterminado de `pipeline.default_confidence[source]` (configuración, predeterminados `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`) si se omite. En un `UPDATE` de dedup, el valor fusionado es `max(existente, entrante)` — una segunda confirmación nunca reduce la confianza. Ver [Procedencia del Contenido](#procedencia-del-contenido). |
+
+**El contenido largo se rechaza, no se convierte silenciosamente en un "vector mush":** el contenido más largo que `pipeline.long_content_threshold_chars` (configuración, predeterminado `8.000` caracteres ≈ 1–2 páginas) se rechaza con un error `INVALID_INPUT` que indica el recuento de caracteres, el umbral y la solución: llame a `import` con `format: "freeform"` en su lugar, o divida el contenido en llamadas `remember` más pequeñas. Esto es intencional: incrustar varios miles de palabras como un solo vector produce un "vector mush" de baja calidad que coincide débilmente con muchas consultas no relacionadas en lugar de coincidir fuertemente con una sola. El límite absoluto de 100.000 caracteres de la tabla anterior sigue aplicándose como techo absoluto, pero `long_content_threshold_chars` es el límite que los llamantes alcanzarán primero.
 
 **Salida:**
 
@@ -2037,12 +2951,57 @@ Almacena contenido en BHGBrain con deduplicación automática, normalización, e
 }
 ```
 
+> **Nota sobre el sobre MCP (desde v1.17.0):** el objeto/array mostrado arriba (y en
+> el ejemplo multi-candidato de abajo) es lo que `handleRemember` devuelve
+> internamente, y exactamente lo que `POST /tool/:name` (REST) sigue devolviendo.
+> Sobre el **transporte MCP** (stdio y Streamable HTTP `/mcp`), la respuesta de
+> `CallTool` normaliza un resultado exitoso a `{ "results": [...] }` — un array de un
+> elemento para un solo candidato, varios elementos cuando la extracción
+> multi-candidato divide el contenido — tanto en `structuredContent` como en el
+> bloque de texto JSON, de modo que un único `outputSchema` puede describir ambos
+> casos. Un parser frágil del lado MCP que espere el objeto desnudo debe actualizarse
+> para leer `results[0]` (o iterar sobre `results`); los clientes REST no se ven
+> afectados.
+
 `operation` es uno de:
 - `ADD` — nueva memoria creada
 - `UPDATE` — memoria similar existente fue actualizada (contenido fusionado)
 - `NOOP` — duplicado exacto o casi exacto; se devuelve la memoria existente
 
 Para operaciones `UPDATE`, `merged_with_id` contiene el ID de la memoria que fue actualizada.
+
+**Extracción multi-candidato:** cuando `pipeline.extraction_enabled` es `true`
+(predeterminado `false`) y el contenido tiene al menos `pipeline.extraction_min_chars`
+de longitud, `remember` puede dividir contenido con múltiples hechos en varias
+memorias candidatas atómicas mediante una llamada LLM, cada una deduplicada/clasificada
+de forma independiente. En ese caso la herramienta devuelve un **array JSON** con los
+mismos objetos por candidato mostrados arriba — una entrada por candidato — en lugar
+de un solo objeto:
+
+```json
+[
+  {
+    "id": "3f4a1b2c-...",
+    "summary": "Alice owns the infra repo",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  },
+  {
+    "id": "9c7d2e5f-...",
+    "summary": "Deploys go through GitHub Actions",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  }
+]
+```
+
+Cualquier fallo de extracción (error de red, timeout, respuesta malformada/vacía)
+recurre de forma transparente a la respuesta de objeto único actual — la extracción
+nunca bloquea ni hace fallar una llamada a `remember`. Cualquier llamador que asuma
+que `remember` siempre devuelve un solo objeto debe actualizarse para distinguir entre
+array y objeto antes de habilitar `extraction_enabled`.
 
 **Ejemplos:**
 
@@ -2087,10 +3046,13 @@ Recupera las memorias más relevantes para una consulta usando búsqueda de simi
 | `query` | `string` | **Sí** | — | Consulta de recall. Máx. 500 caracteres. |
 | `namespace` | `string` | No | `"global"` | Namespace en el que buscar. |
 | `collection` | `string` | No | — | Filtrar a una colección específica. Omitir para buscar en la colección predeterminada. |
-| `type` | `"episodic" \| "semantic" \| "procedural"` | No | — | Filtrar resultados a un tipo de memoria específico. Se aplica después de la recuperación. |
-| `tags` | `string[]` | No | — | Filtrar a memorias con al menos una etiqueta coincidente. Se aplica después de la recuperación. |
+| `type` | `"episodic" \| "semantic" \| "procedural"` | No | — | Filtrar resultados a un tipo de memoria específico. Empujado hacia el almacén, de modo que `limit` cuenta memorias coincidentes. |
+| `tags` | `string[]` | No | — | Filtrar a memorias con al menos una etiqueta coincidente (coincidencia de cualquiera). Empujado hacia el almacén, de modo que `limit` cuenta memorias coincidentes. Coincide por igual con etiquetas proporcionadas por el llamador y auto-derivadas — ver [Etiquetado Automático](#etiquetado-automático). |
 | `limit` | `integer (1–20)` | No | `5` | Número máximo de resultados. |
-| `min_score` | `number (0–1)` | No | `0.6` | Puntuación mínima de similitud coseno. Los resultados por debajo de este umbral se excluyen. |
+| `min_score` | `number (0–1)` | No | `0.6` | Puntuación mínima de similitud coseno, aplicada a `semantic_score` (no al `score` fusionado/ajustado). Los resultados por debajo de este umbral se excluyen. |
+| `after` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at >= after` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén para que `limit` cuente memorias coincidentes. |
+| `before` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at <= before` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén para que `limit` cuente memorias coincidentes. |
+| `follow_links` | `boolean` | No | `false` | También devuelve los vecinos a un salto de cada resultado (bordes creados con la herramienta `relate`, en ambas direcciones, todas las relaciones). Las entradas añadidas se marcan con `linked_from`/`link_relation`/`link_direction` para que un cliente distinga un vecino expandido de una coincidencia directamente relevante; véase `relate` más abajo. |
 
 **Salida:**
 
@@ -2109,11 +3071,27 @@ Recupera las memorias más relevantes para una consulta usando búsqueda de simi
       "expires_at": null,
       "expiring_soon": false,
       "created_at": "2026-01-01T00:00:00Z",
-      "last_accessed": "2026-03-15T12:00:00Z"
+      "last_accessed": "2026-03-15T12:00:00Z",
+      "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+      "confidence": 1.0
     }
   ]
 }
 ```
+
+Cada resultado también incluye `origin`/`confidence` (ver [Procedencia del
+Contenido](#procedencia-del-contenido) bajo `remember`) — `origin` es `null` cuando
+la memoria se escribió sin uno; `confidence` toma el valor predeterminado por
+fuente cuando el llamador lo omitió.
+
+Con `follow_links: true`, los vecinos a un salto de cada resultado base se añaden
+después de los resultados base (sin reducir nunca cuántos resultados base permite
+`limit`), deduplicados frente al conjunto base y entre sí, y limitados a `limit`
+entradas añadidas en total. Las entradas añadidas llevan `score: 0` (un marcador de
+posición, no una puntuación de relevancia — la misma convención que usa
+`include_archived` de `search`) además de `linked_from` (el id del resultado base),
+`link_relation` y `link_direction` (`"outgoing"` si el resultado base es el origen del
+borde, `"incoming"` si es el destino). Un vecino ya archivado se omite.
 
 ---
 
@@ -2153,14 +3131,17 @@ Busca memorias usando modos semántico, de texto completo o híbrido. Ofrece má
 | `collection` | `string` | No | — | Filtrar a una colección específica. |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | No | `"hybrid"` | Algoritmo de búsqueda. |
 | `limit` | `integer (1–50)` | No | `10` | Número máximo de resultados. |
+| `include_archived` | `boolean` | No | `false` | También busca en memorias archivadas (ver [Decaimiento, Limpieza y Archivado](#decaimiento-limpieza-y-archivado)) mediante coincidencia de términos en el resumen/etiquetas. Las coincidencias se añaden después de los resultados activos, marcadas con `archived: true`, y nunca reducen cuántos resultados activos permite `limit`. Las coincidencias archivadas no se registran como acceso. |
+| `after` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at >= after` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén vectorial/de texto completo — el primer filtro empujado hacia el almacén en `search`. |
+| `before` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at <= before` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén vectorial/de texto completo. |
 
-**Salida:** Misma estructura que `recall` — `{ "results": [...] }` — pero sin la compuerta `min_score` y admitiendo hasta 50 resultados.
+**Salida:** Misma estructura que `recall` — `{ "results": [...] }` — pero sin la compuerta `min_score` y admitiendo hasta 50 resultados. Las coincidencias archivadas (cuando `include_archived: true`) llevan `archived: true`, usan el resumen conservado como `content` y no tienen un `score` significativo (son coincidencias de términos en metadatos, no resultados clasificados).
 
 ---
 
 ### `tag` — Gestionar Etiquetas
 
-Añade o elimina etiquetas de una memoria. Las etiquetas se fusionan/filtran atómicamente; el contenido y el embedding de la memoria no se ven afectados.
+Añade o elimina etiquetas de una memoria, y/o la fija o desfija. Las etiquetas y el estado de fijado se actualizan atómicamente; el contenido y el embedding de la memoria no se ven afectados.
 
 **Entrada:**
 
@@ -2169,6 +3150,7 @@ Añade o elimina etiquetas de una memoria. Las etiquetas se fusionan/filtran at�
 | `id` | `string (UUID)` | **Sí** | — | Memoria a etiquetar. |
 | `add` | `string[]` | No | `[]` | Etiquetas a añadir. Máx. 20 etiquetas totales tras la fusión. |
 | `remove` | `string[]` | No | `[]` | Etiquetas a eliminar. |
+| `pinned` | `boolean` | No | sin cambios | Fija (`true`) o desfija (`false`) esta memoria, independientemente de las etiquetas — un interruptor dedicado para el fijado de inyección que no requiere volver a enviar el contenido. Omítelo para dejar el estado de fijado sin cambios. Fijar una memoria aún no fijada cuando el namespace ya está en `defaults.pin_limit_per_namespace` devuelve `INVALID_INPUT`. |
 
 **Salida:**
 
@@ -2179,7 +3161,7 @@ Añade o elimina etiquetas de una memoria. Las etiquetas se fusionan/filtran at�
 }
 ```
 
-Devuelve `INVALID_INPUT` si añadir etiquetas excedería el límite de 20 etiquetas.
+Devuelve `INVALID_INPUT` si añadir etiquetas excedería el límite de 20 etiquetas, o si fijar excedería `defaults.pin_limit_per_namespace`.
 
 ---
 
@@ -2329,19 +3311,346 @@ Crea, lista o restaura copias de seguridad de memorias.
 
 ---
 
-### `repair` — Reconstruir SQLite desde Qdrant
+### `bootstrap` — Incorporación Interactiva
 
-Recuperar memorias desde Qdrant a la base de datos SQLite local. Se usa para configuración multi-dispositivo, recuperación de pérdida de datos o incorporación de nuevos dispositivos. Ver [Reparación y Recuperación](#reparación-y-recuperación).
+Conduce una entrevista con estado de 10 secciones para construir tu perfil de trabajo. Admite pausar/reanudar entre sesiones.
 
 **Entrada:**
 
 | Parámetro | Tipo | Requerido | Predeterminado | Descripción |
 |---|---|---|---|---|
-| `dry_run` | `boolean` | No | `false` | Cuando es `true`, reporta lo que se recuperaría sin hacer cambios. |
-| `device_id` | `string` | No | — | Filtrar la recuperación a memorias creadas por un dispositivo específico. Mutuamente excluyente con `all_devices`. |
-| `all_devices` | `boolean` | No | `false` | Recuperar explícitamente memorias de todos los dispositivos. Mutuamente excluyente con `device_id`. Este es también el comportamiento predeterminado cuando no se proporciona ninguno de los dos campos. |
+| `action` | `"start" \| "submit" \| "status" \| "reset"` | **Sí** | - | La acción a realizar. |
+| `section` | `integer (1-10)` | Para submit/reset | - | Número de sección para enviar respuestas o reiniciar. |
+| `answers` | `string` | Para submit | - | Tus respuestas para la sección. Máx. 500,000 caracteres. |
+| `namespace` | `string` | No | `"profile"` | Ámbito de namespace. |
+
+**Acciones:**
+
+- **`start`** — Crea una nueva sesión o reanuda una existente. Devuelve el título, las preguntas y las instrucciones de la primera sección incompleta.
+- **`submit`** — Almacena las respuestas como memorias discretas para la sección dada, la marca como completa, y devuelve la siguiente sección.
+- **`status`** — Devuelve una visión general del progreso: qué secciones están completas, recuentos de memorias, última actualización.
+- **`reset`** — Elimina todas las memorias de una sección y la marca como pendiente para volver a recolectarla.
+
+**Salida (`start`):**
+
+```json
+{
+  "complete": false,
+  "current_section": 1,
+  "title": "Identity & Role",
+  "questions": ["What is your full name...?", "..."],
+  "progress": { "complete": 0, "total": 10 }
+}
+```
+
+**Notas:**
+- Las sesiones se persisten en SQLite — sobreviven a reinicios del cliente.
+- Una sesión por namespace. Llamar a `start` en una sesión existente la reanuda.
+- Enviar respuestas a una sección ya completa devuelve un error; usa `reset` primero.
+
+---
+
+### `import` — Importación de Perfil por Lotes
+
+Importa un perfil estructurado o un documento de formato libre como memorias discretas de una sola vez.
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Predeterminado | Descripción |
+|---|---|---|---|---|
+| `format` | `"profile" \| "freeform"` | **Sí** | - | `"profile"` para la salida de bootstrap de 10 secciones, `"freeform"` para markdown arbitrario. |
+| `content` | `string` | **Sí** | - | El texto del documento a importar. Máx. 500,000 caracteres. |
+| `namespace` | `string` | No | `"profile"` | Ámbito de namespace. |
+| `dry_run` | `boolean` | No | `false` | Cuando es `true`, devuelve una vista previa de lo que se almacenaría sin escribir. |
 
 **Salida:**
+
+```json
+{
+  "dry_run": false,
+  "format": "profile",
+  "memories_created": 24,
+  "duplicates_skipped": 2,
+  "collections": ["identity", "goals", "entities", "..."],
+  "sections_processed": 10
+}
+```
+
+**Notas:**
+- `format: "profile"` reconoce encabezados de sección `## N.` y mapea cada uno a la colección, el nivel, el tipo, la importancia y las etiquetas correctas.
+- `format: "freeform"` divide por encabezados y límites de párrafo con metadatos por defecto (colección: `general`, nivel: `T2`).
+- Se aplica deduplicación vía el pipeline de escritura existente — es seguro reimportar.
+- `dry_run: true` devuelve vistas previas de memorias sin ninguna escritura.
+- Los encabezados numerados fuera de las 10 secciones mapeadas al almacenamiento (p. ej. un documento escrito contra una plantilla de 12 secciones más antigua) no se descartan silenciosamente — sus números se reportan en `sections_ignored` para que sepas que se omitió contenido en lugar de perderlo sin aviso.
+- Si [`remember`](#remember--almacenar-una-memoria) rechazó tu contenido por exceder `pipeline.long_content_threshold_chars`, usa `import` con `format: "freeform"` aquí en su lugar — divide el documento por límites de encabezado/párrafo e incrusta cada fragmento de forma independiente, evitando el problema del vector único y mezclado contra el que protege el umbral de `remember`.
+
+---
+
+### `revisions` — Listar o Revertir Historial de Revisiones de una Memoria
+
+Lista el historial de revisiones de una memoria, o revierte su contenido a una revisión anterior. La visibilidad por namespace se resuelve igual que en `forget` y `tag` (la memoria se busca primero por ID). Solo las memorias T0 acumulan revisiones — ver [Historial de Revisiones T0](#historial-de-revisiones-t0).
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Predeterminado | Descripción |
+|---|---|---|---|---|
+| `action` | `"list" \| "revert"` | **Sí** | - | Operación a realizar. |
+| `id` | `string (UUID)` | **Sí** | - | El ID de la memoria. |
+| `revision` | `number` | Requerido para `revert` | - | El número de revisión al que revertir. |
+
+**Salida (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revisions": [
+    { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+Una memoria sin cambios de contenido devuelve un array `revisions` vacío, no un error.
+
+**Salida (`action: "revert"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revision": 1,
+  "content": "el contenido restaurado"
+}
+```
+
+**Notas:**
+- El revert restaura el contenido de la revisión objetivo por la misma ruta que usa el flujo UPDATE de deduplicación de `remember`: nuevo checksum, vector re-generado, reinsertado en Qdrant. El contenido previo al revert se conserva como una nueva entrada de historial añadida (el historial nunca se reescribe).
+- Un evento de auditoría `REVISE` registra el número de revisión de origen, distinguible del REVISE genérico que el pipeline de escritura registra en cambios de contenido T0 ordinarios.
+- El revert requiere el proveedor de embeddings — si no está disponible, el revert falla con `EMBEDDING_UNAVAILABLE` y la memoria queda completamente sin cambios (sin escritura parcial, sin desincronización del vector).
+- Revertir a un número de revisión que no existe para la memoria devuelve `NOT_FOUND`.
+
+---
+
+### `review` — Cola de Revisión y Recuperación de Archivo
+
+Lista y disposiciona la cola de revisión T1, y restaura memorias archivadas. Cierra el lado de lectura del ciclo de vida por niveles: `review_due` (marcado en memorias T1, ver [Ciclo de Vida por Nivel](#ciclo-de-vida-por-nivel--asignación-promoción-ventana-deslizante)) y `archived_memories` (ver [Decaimiento, Limpieza y Archivado](#decaimiento-limpieza-y-archivado)) tenían ambos una ruta de escritura pero antes no tenían superficie de lectura desde MCP. La revisión de contenido deliberadamente no se duplica aquí — usa la ruta UPDATE de `remember` para eso.
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Predeterminado | Descripción |
+|---|---|---|---|---|
+| `action` | `"list" \| "keep" \| "archive" \| "restore"` | **Sí** | - | Operación a realizar. |
+| `id` | `string (UUID)` | Requerido para `keep`/`archive`/`restore` | - | El ID de la memoria. Para `restore`, el ID de la memoria original, buscado en el archivo. |
+| `days` | `integer (0–3650)` | No | `0` | (solo `list`) Ventana de anticipación en días más allá de "vencido ahora". `0` devuelve solo memorias ya vencidas. |
+| `namespace` | `string` | No | `"global"` | Ámbito de namespace. |
+| `limit` | `integer (1–100)` | No | `20` | (solo `list`) Tamaño de página. |
+| `cursor` | `string` | No | - | (solo `list`) Cursor de paginación devuelto por una llamada `list` anterior. |
+
+**Salida (`action: "list"`):**
+
+```json
+{
+  "items": [
+    {
+      "id": "3f4a1b2c-...",
+      "namespace": "global",
+      "collection": "general",
+      "summary": "Runbook de despliegue para el servicio de pagos",
+      "tags": ["deployment", "runbook"],
+      "retention_tier": "T1",
+      "review_due": "2026-03-01T00:00:00.000Z",
+      "expires_at": "2026-03-01T00:00:00.000Z"
+    }
+  ],
+  "cursor": "2026-03-01T00:00:00.000Z|3f4a1b2c-..."
+}
+```
+
+Los elementos son memorias T1 no archivadas cuyo `review_due` es en o antes de "ahora + `days`", devueltas en orden de vencimiento más antiguo primero. `cursor` es `null` una vez alcanzada la última página; pásalo de vuelta como entrada `cursor` para obtener la siguiente página.
+
+**Salida (`action: "keep"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "review_due": "2027-03-01T00:00:00.000Z",
+  "expires_at": "2027-03-01T00:00:00.000Z"
+}
+```
+
+Confirma que la memoria sigue siendo precisa: extiende tanto `review_due` como `expires_at` según la política de ciclo de vida del nivel de la memoria (reutilizando el mismo cálculo que usan `remember` y la promoción por acceso), sin importar `sliding_window_enabled` — una confirmación humana explícita recibe la extensión completa incluso cuando la renovación pasiva por ventana deslizante está deshabilitada. Registra un evento de auditoría `REVISE` que anota una confirmación de revisión. Devuelve `NOT_FOUND` si la memoria no existe.
+
+**Salida (`action: "archive"`):**
+
+```json
+{ "id": "3f4a1b2c-...", "archived": true }
+```
+
+Enruta la memoria por la misma transición de archivado que usa el GC: su vector se elimina, su fila se mueve a `archived_memories` (se conservan resumen, etiquetas, nivel y estadísticas de acceso; el contenido y el vector no), y se registra un evento de auditoría `ARCHIVE`. Devuelve `NOT_FOUND` si el ID nunca existió, y `CONFLICT` si ya está archivado.
+
+**Salida (`action: "restore"`):**
+
+```json
+{
+  "id": "9c2e5f10-...",
+  "restored_from": "3f4a1b2c-...",
+  "archive_id": 42,
+  "restored": true
+}
+```
+
+Recrea una memoria activa a partir del resumen y las etiquetas conservados en el registro de archivo, en el nivel original — un **stub con procedencia**, no una resurrección: el contenido y el vector originales nunca se conservaron, así que el contenido de la memoria restaurada es su resumen archivado, etiquetado con sus etiquetas originales más una etiqueta marcadora `restored-from-archive`, y re-embebido para que participe en la búsqueda. La fila de archivo se conserva (no se elimina), a diferencia del comando `archive restore` de la CLI. Registra un evento de auditoría `RESTORE` que enlaza el origen del archivo. Devuelve `NOT_FOUND` si no existe un registro de archivo para el ID dado.
+
+---
+
+### `feedback` — Registrar la Utilidad de un Recuerdo
+
+Registra si una memoria previamente devuelta por `recall` o `search` resultó
+realmente útil, como un evento inmutable en una tabla dedicada `recall_feedback`
+vinculada a la memoria. **Esta versión es puramente aditiva**: no tiene efecto sobre
+el ranking, el ciclo de vida, ni sobre ningún resultado de `recall`/`search`/`review`
+— no existe agregación, ni superficie de lectura/listado, ni acoplamiento con el
+ranking o el ciclo de vida. Los eventos se recopilan para que un cambio futuro pueda
+ajustar los pesos de `search.ranking`, las tasas de decaimiento y los umbrales de
+deduplicación con base en evidencia en lugar de valores por defecto elegidos por
+inspección.
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Predeterminado | Descripción |
+|---|---|---|---|---|
+| `id` | `string (UUID)` | **Sí** | - | El ID de la memoria de un resultado previo de `recall`/`search`. |
+| `useful` | `boolean` | **Sí** | - | Si el resultado fue útil. |
+| `query` | `string (máx. 500 caracteres)` | No | - | La consulta que produjo este resultado, conservada para análisis futuro. No se valida contra ninguna llamada previa. |
+| `score` | `number (0-1)` | No | - | El score observado por quien llama para este resultado, conservado para análisis futuro. |
+
+**Salida:**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "useful": true,
+  "recorded_at": "2026-03-01T00:00:00.000Z"
+}
+```
+
+Busca la memoria de la misma manera que `tag`/`forget` (solo filas activas) y
+devuelve `NOT_FOUND` si no existe, incluyendo un ID que solo existe en el archivo.
+`query`/`score` se almacenan exactamente como se proporcionan — `null` cuando se
+omiten, nunca un valor predeterminado inventado — y no se contrastan contra ninguna
+llamada real previa de `recall`/`search`, el mismo modelo de confianza que `tag`/
+`forget` ya extienden a cualquier `id` proporcionado por quien llama. Múltiples
+eventos de feedback para la misma memoria se conservan cada uno como fila distinta;
+ninguno sobrescribe uno anterior. Registrar feedback nunca modifica los campos
+propios de la memoria referenciada (`access_count`, `importance`, `retention_tier`,
+`review_due`, `updated_at` permanecen inalterados).
+
+---
+
+### `relate` — Conectar Memorias con Bordes Tipados
+
+Conecta memorias con bordes tipados y dirigidos — una relación general, autorada por
+quien llama, junto al puntero automático de reemplazo `merged_from` de la pipeline de
+escritura (que `relate` deja intacto). Se admiten cinco relaciones: `refines`,
+`contradicts`, `derived_from`, `about_same_entity`, `follows`. Los bordes se almacenan
+dirigidos (`from_id` → `to_id`), pero `list` y `follow_links` de `recall` (véase arriba)
+recorren ambas direcciones, así que las relaciones conceptualmente simétricas
+(`contradicts`, `about_same_entity`) se comportan de forma simétrica en la práctica.
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Predeterminado | Descripción |
+|---|---|---|---|---|
+| `action` | `"add" \| "list" \| "remove"` | **Sí** | — | La operación a realizar. |
+| `from_id` | `string (UUID)` | Requerido para `add`/`remove` | — | ID de la memoria origen. |
+| `to_id` | `string (UUID)` | Requerido para `add`/`remove` | — | ID de la memoria destino. Debe diferir de `from_id`. |
+| `relation` | `"refines" \| "contradicts" \| "derived_from" \| "about_same_entity" \| "follows"` | Requerido para `add`/`remove` | — | Tipo de borde. |
+| `id` | `string (UUID)` | Requerido para `list` | — | La memoria cuyos bordes se listan. |
+| `direction` | `"from" \| "to" \| "both"` | No | `"both"` | (solo `list`) Filtra bordes por dirección relativa a `id`. |
+
+**Salida (`action: "add"`):**
+
+```json
+{
+  "id": 42,
+  "namespace": "global",
+  "from_id": "3f4a1b2c-...",
+  "to_id": "9c2e5f10-...",
+  "relation": "refines",
+  "created_at": "2026-03-01T00:00:00.000Z",
+  "created": true
+}
+```
+
+Idempotente: volver a añadir un borde idéntico a uno ya existente (mismos `from_id`,
+`to_id` y `relation`) devuelve la fila existente con `created: false` en lugar de dar
+error o crear un duplicado. Devuelve `NOT_FOUND` si alguna de las dos memorias no
+existe, e `INVALID_INPUT` si `from_id === to_id` o si las dos memorias pertenecen a
+namespaces distintos (los enlaces entre colecciones dentro del mismo namespace están
+permitidos).
+
+**Salida (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "links": [
+    {
+      "id": 42,
+      "from_id": "3f4a1b2c-...",
+      "to_id": "9c2e5f10-...",
+      "relation": "refines",
+      "direction": "outgoing",
+      "created_at": "2026-03-01T00:00:00.000Z",
+      "created_by": "c1"
+    }
+  ]
+}
+```
+
+Devuelve todos los bordes que tocan a `id`, en cualquier dirección salvo que
+`direction` la restrinja, cada uno marcado `outgoing` (`id` es `from_id`) o `incoming`
+(`id` es `to_id`). Usa la búsqueda que incluye archivados, así que los bordes de una
+memoria a punto de archivarse siguen siendo listables. Devuelve `NOT_FOUND` si `id` no
+existe.
+
+**Salida (`action: "remove"`):**
+
+```json
+{ "removed": true, "from_id": "3f4a1b2c-...", "to_id": "9c2e5f10-...", "relation": "refines" }
+```
+
+Elimina el borde nombrado. Devuelve `NOT_FOUND` si no existe.
+
+Eliminar una memoria (mediante `forget`, o la acción `archive` de `review`) elimina en
+cascada cada borde que la referenciaba, de modo que `memory_links` nunca conserva una
+referencia colgante a una memoria inexistente. No se registra ninguna nueva
+`AuditOperation` para `relate` — la propia tabla de bordes, con `created_at`/
+`created_by` en cada fila, es el registro duradero.
+
+---
+
+### `repair` — Reconstruir SQLite desde Qdrant, o migrar marcas de embedding obsoletas
+
+Repara el estado local desde fuentes externas. `mode: "from-qdrant"` (predeterminado)
+recupera memorias desde Qdrant a la base de datos SQLite local — se usa para
+configuración multi-dispositivo, recuperación de pérdida de datos o incorporación de
+nuevos dispositivos. `mode: "re-embed"` migra memorias cuya marca de embedding
+difiere del `embedding.provider`/`embedding.model` activo — ver
+[Migración de Modelo de Embedding](#migración-de-modelo-de-embedding). Ver también
+[Reparación y Recuperación](#reparación-y-recuperación).
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Predeterminado | Descripción |
+|---|---|---|---|---|
+| `mode` | `"from-qdrant" \| "re-embed"` | No | `"from-qdrant"` | Qué operación de reparación ejecutar. |
+| `dry_run` | `boolean` | No | `false` | Cuando es `true`, reporta lo que cambiaría sin hacer cambios. |
+| `device_id` | `string` | No | — | (solo `from-qdrant`) Filtrar la recuperación a memorias creadas por un dispositivo específico. Mutuamente excluyente con `all_devices`. |
+| `all_devices` | `boolean` | No | `false` | (solo `from-qdrant`) Recuperar explícitamente memorias de todos los dispositivos. Mutuamente excluyente con `device_id`. Este es también el comportamiento predeterminado cuando no se proporciona ninguno de los dos campos. |
+| `include_legacy` | `boolean` | No | `false` | (solo `re-embed`) Incluir también filas heredadas sin marca de embedding alguna, no solo filas con un modelo distinto. |
+| `batch_size` | `number` | No | `50` | (solo `re-embed`) Memorias re-embebidas por lote (1-500). |
+
+**Salida (`mode: "from-qdrant"`):**
 
 ```json
 {
@@ -2360,12 +3669,237 @@ Recuperar memorias desde Qdrant a la base de datos SQLite local. Se usa para con
 **Notas:**
 - Solo los puntos con `content` en su payload de Qdrant pueden recuperarse. Las memorias pre-1.3 sin contenido en Qdrant se reportan como `skipped_no_content`.
 - Las memorias recuperadas preservan su `device_id` original del payload de Qdrant. Si no existe `device_id` en el payload, se usa el ID del dispositivo local.
+- Las memorias recuperadas también preservan la identidad de embedding (si existe) que su vector de origen ya tenía marcada, en lugar de reclamar la identidad de la configuración activa — la recuperación reconstruye metadatos para un vector existente, no produce uno nuevo.
 - Pasar tanto `device_id` como `all_devices: true` se rechaza como entrada inválida.
 - Después de la recuperación, ejecuta `npm run build` y reinicia el servidor si es necesario. Las memorias recuperadas están inmediatamente disponibles para búsqueda y recall.
+
+**Salida (`mode: "re-embed"`):**
+
+```json
+{
+  "mode": "re-embed",
+  "dry_run": false,
+  "active_identity": "openai/text-embedding-3-small@1536",
+  "include_legacy": false,
+  "updated": 118,
+  "failed": 0,
+  "remaining": 0,
+  "bound_reached": false,
+  "converged": true
+}
+```
+
+**Notas:**
+- La selección se basa en la propia marca, por lo que una ejecución interrumpida se reanuda de forma segura — las filas ya re-marcadas con la identidad activa simplemente dejan de coincidir en la siguiente llamada.
+- Un fallo de embed/upsert por memoria se aísla (se cuenta en `failed`, se deja para una ejecución futura) en lugar de abortar todo el lote.
+- `converged: true` significa que no quedan filas con marca obsoleta (dentro del alcance de `include_legacy` solicitado); la identidad esperada del almacén se actualiza y la degradación de salud `embedding` se resuelve de inmediato, sin reinicio.
+- También disponible desde la CLI: `bhgbrain repair --re-embed [--include-legacy] [--batch-size <n>] [--dry-run]`.
+
+---
+
+### `consolidate` — Descubrimiento y fusión de clústeres de duplicados
+
+Descubre y fusiona memorias *existentes* casi duplicadas — cierra la brecha del lado de lectura que la deduplicación en tiempo de escritura deja abierta. La deduplicación (ver [Deduplicación](#deduplicación)) solo compara una escritura entrante con lo ya almacenado; nada mira *hacia atrás* entre las memorias que ya existen. Las importaciones y las escrituras durante una ventana degradada (una interrupción del proveedor de embeddings que recurre a una heurística de checksum/Jaccard más laxa) suelen dejar casi duplicados que la deduplicación en tiempo de escritura no puede detectar después del hecho, estructuralmente. `action: "list"` explora un namespace/colección en busca de clústeres de memorias casi duplicadas usando una consulta de similitud por punto acotada y paginada (nunca una comparación exhaustiva por pares); `action: "merge"` consolida un clúster explícito, elegido por un humano, en una memoria objetivo, reutilizando la misma transición de archivado que usa la herramienta `review` por cada origen. No existe una ruta de fusión automática o programada — `merge` siempre requiere un `target_id` y `source_ids` explícitos.
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Por defecto | Descripción |
+|---|---|---|---|---|
+| `action` | `"list" \| "merge"` | **Sí** | - | Qué operación realizar. |
+| `namespace` | `string` | No | `"global"` | Alcance de namespace. |
+| `collection` | `string` | No | `"general"` | Alcance de colección. Los clústeres nunca abarcan varias colecciones. |
+| `cursor` | `string` | No | - | (solo `list`) Cursor de paginación devuelto por una llamada `list` anterior. |
+| `min_cluster_size` | `integer (>= 2)` | No | `2` | (solo `list`) Los clústeres más pequeños que este valor se descartan del resultado. |
+| `target_id` | `string (UUID)` | Requerido para `merge` | - | La memoria en la que se fusiona cada origen. El contenido y el embedding quedan sin cambios. |
+| `source_ids` | `array<string (UUID)>` | Requerido para `merge` | - | IDs de memoria que se fusionan en `target_id` y se archivan. No debe incluir `target_id`. |
+
+**Salida (`action: "list"`):**
+
+```json
+{
+  "clusters": [
+    {
+      "members": [
+        {
+          "id": "3f4a1b2c-...",
+          "summary": "Runbook de despliegue del servicio de pagos",
+          "tags": ["deployment", "runbook"],
+          "importance": 0.7,
+          "access_count": 4,
+          "updated_at": "2026-02-01T00:00:00.000Z"
+        },
+        {
+          "id": "9c2e5f10-...",
+          "summary": "Runbook de despliegue del servicio de pagos (v2)",
+          "tags": ["deployment"],
+          "importance": 0.5,
+          "access_count": 1,
+          "updated_at": "2026-01-15T00:00:00.000Z"
+        }
+      ],
+      "suggested_target": "3f4a1b2c-..."
+    }
+  ],
+  "cursor": null
+}
+```
+
+Las memorias se agrupan en un clúster cuando están conectadas, dentro de la página explorada, por una arista de similitud igual o superior a `consolidation.similarity_threshold` (por defecto `0.9` — deliberadamente por debajo de los umbrales de UPDATE de la deduplicación en tiempo de escritura, de modo que `list` muestra candidatos que la propia deduplicación no habría fusionado automáticamente). `suggested_target` es **solo una sugerencia**: el miembro con mayor `importance` (los empates se resuelven por `access_count`, y luego por el `updated_at` más reciente). `merge` nunca infiere `target_id` a partir de ella — quien llama debe indicarla explícitamente. `cursor` es `null` en cuanto la página explorada es menor que `consolidation.max_scan_per_call`; devuélvelo para continuar la exploración a través de varias llamadas.
+
+**Salida (`action: "merge"`):**
+
+```json
+{ "target_id": "3f4a1b2c-...", "merged": ["9c2e5f10-..."], "failed": [] }
+```
+
+Si tiene éxito, los `tags` del objetivo pasan a ser la unión de sus propias etiquetas y las de todos los orígenes, su `importance` pasa a ser el máximo entre el objetivo y todos los orígenes, y su campo `merged_from` registra cada id de origen fusionado (separados por comas, añadidos a cualquier valor previo — una memoria puede ser objetivo de más de una consolidación a lo largo de su vida). Cada origen se archiva mediante la misma transición que usa la acción `archive` de `review`: se elimina el vector, la fila se traslada a `archived_memories`, y se registra un evento de auditoría `ARCHIVE` con `action: "consolidate"` y `merged_into` señalando el objetivo. Se rechaza con `INVALID_INPUT` si `target_id` aparece en `source_ids` o si un origen pertenece a un namespace/colección distinto al del objetivo (en ese caso no se archiva nada), y con `NOT_FOUND` si un id de origen nunca existió. Un origen ya archivado se omite silenciosamente en lugar de rechazarse, de modo que reintentar una llamada `merge` que tuvo éxito parcial es seguro. Si el archivado de un origen falla a mitad de camino, los arrays `merged`/`failed` de la respuesta distinguen qué tuvo éxito y qué no — el origen fallido queda activo, no archivado y sin eliminar a la vez.
+
+---
+
+## Docker
+
+BHGBrain proporciona soporte oficial de Docker con dos modos de despliegue: Qdrant autoalojado (contenedor sidecar) y Qdrant Cloud (externo).
+
+### Inicio Rápido
+
+```bash
+# 1. Copia y configura el entorno (opcional — un .env faltante ya no aborta
+#    el inicio; aún necesitas OPENAI_API_KEY para los embeddings).
+cp .env.example .env
+# Edita .env con tu OPENAI_API_KEY y otras configuraciones
+
+# 2a. Qdrant autoalojado (incluye el sidecar de Qdrant)
+docker compose --profile self-hosted up
+
+# 2b. Qdrant Cloud (sin sidecar, configura BHGBRAIN_QDRANT_URL en .env)
+docker compose up
+```
+
+El servidor está disponible en `http://localhost:3721` (publicado solo en el
+loopback del host por defecto). Verifica la salud con:
+
+```bash
+curl http://localhost:3721/health
+```
+
+### Valores de Seguridad por Defecto
+
+El contenedor vincula la API a `0.0.0.0` para que el puerto publicado sea alcanzable, y
+está **autenticado por defecto**:
+
+- Si `BHGBRAIN_TOKEN` no está definido, el entrypoint **genera un token bearer** en
+  el primer inicio, lo persiste en `/data/bhgbrain-token`, y lo imprime en los logs.
+  Recupéralo con:
+
+  ```bash
+  docker compose logs bhgbrain | grep token
+  # o
+  docker compose exec bhgbrain cat /data/bhgbrain-token
+  ```
+
+- Provee tu propio token estable configurando `BHGBRAIN_TOKEN` en `.env`:
+
+  ```bash
+  echo "BHGBRAIN_TOKEN=$(openssl rand -hex 24)" >> .env
+  ```
+
+- El puerto publicado se mapea al loopback del host (`127.0.0.1:3721:3721`), por lo que la API
+  no es alcanzable por LAN de forma predeterminada. Cambia el mapeo en `docker-compose.yml` para
+  exponerla externamente.
+
+- Para ejecutar intencionalmente **sin** autenticación, configura
+  `BHGBRAIN_ALLOW_UNAUTHENTICATED=true` (el servidor registra una advertencia; no
+  recomendado para vinculaciones que no sean loopback).
+
+El contenedor también se ejecuta como un usuario no root (`node`).
+
+### Perfiles de Compose
+
+| Comando | Qué se ejecuta |
+|---------|-----------|
+| `docker compose --profile self-hosted up` | BHGBrain + sidecar de Qdrant (puerto 6333) |
+| `docker compose up` | Solo BHGBrain (conéctate a Qdrant Cloud vía variables de entorno) |
+
+### Variables de Entorno de Docker
+
+Estas variables de entorno `BHGBRAIN_*` sobrescriben los valores de `config.json` cuando están definidas:
+
+| Variable | Campo de configuración | Valor por defecto en el contenedor | Descripción |
+|----------|-------------|---------------------|-------------|
+| `BHGBRAIN_DATA_DIR` | `data_dir` | `/data` | Ruta del volumen del contenedor |
+| `BHGBRAIN_HTTP_HOST` | `transport.http.host` | `0.0.0.0` | Dirección de vinculación |
+| `BHGBRAIN_HTTP_PORT` | `transport.http.port` | `3721` | Puerto HTTP |
+| `BHGBRAIN_QDRANT_MODE` | `qdrant.mode` | `embedded` | `embedded` o `external` |
+| `BHGBRAIN_QDRANT_URL` | `qdrant.external_url` | — | URL del endpoint de Qdrant |
+| `BHGBRAIN_REQUIRE_LOOPBACK` | `security.require_loopback_http` | `false` | Restricción de loopback |
+| `BHGBRAIN_ALLOW_UNAUTHENTICATED` | `security.allow_unauthenticated_http` | `false` | Omitir verificación de autenticación |
+| `BHGBRAIN_LOG_LEVEL` | `observability.log_level` | `info` | Verbosidad de logs |
+
+Además de las variables de entorno de ejecución existentes: `OPENAI_API_KEY`, `BHGBRAIN_TOKEN`, `QDRANT_API_KEY`, `BHGBRAIN_DEVICE_ID`.
+
+### Volumen
+
+El volumen `/data` persiste la base de datos SQLite, el `config.json` resuelto, y las copias de seguridad entre reinicios del contenedor. Esto se mapea a `BHGBRAIN_DATA_DIR`.
+
+### Bootstrap en el Primer Inicio
+
+Cuando un contenedor inicia con un volumen `/data` vacío y se conecta a una instancia de Qdrant que ya tiene memorias, BHGBrain hidrata automáticamente la base de datos SQLite local desde Qdrant vía `bootstrapFromQdrant()`. No se necesita ningún paso manual de `repair`. Esta hidratación automática es intencionalmente no acotada por dispositivo — recupera las memorias de todos los dispositivos hacia la base de datos nueva y vacía. Ejecutar `bhgbrain repair --from-qdrant` manualmente después de esto, por defecto, solo recupera las memorias del dispositivo actual (pasa `--all-devices` para ampliarlo); ver [Referencia de la CLI](#referencia-de-la-cli).
+
+### Construcción de la Imagen
+
+```bash
+docker build -t bhgbrain .
+```
+
+La imagen usa una compilación multi-etapa sobre `node:22-slim` (~200MB de tamaño final). El healthcheck usa el `fetch()` nativo de Node.js — no se requiere `curl`.
 
 ---
 
 ## Actualización
+
+### 1.3 → 1.4 (Resiliencia y Observabilidad)
+
+**No se requiere migración manual.** Todas las funciones nuevas usan valores por defecto retrocompatibles.
+
+Novedades:
+
+- **Circuit breakers** para OpenAI y Qdrant. Cuando los fallos consecutivos superan el umbral (5 por defecto), el circuit breaker se abre y corta las solicitudes en cortocircuito durante 30 segundos antes de sondear la recuperación. Los estados son visibles en el endpoint de salud (campo `circuitBreakers`). Configúralo vía `resilience.circuit_breaker` en `config.json`.
+- **Proveedor de embedding Azure.** Se añadió soporte para Azure AI Foundry (endpoint de embeddings compatible con Azure OpenAI). Configura `embedding.provider: "azure-foundry"` y provee `embedding.azure.resource_name` y la variable de entorno `AZURE_FOUNDRY_API_KEY`.
+- **Guía de despliegue de Azure.** Trata `embedding.model` como el nombre del despliegue de Azure, valida la calidad de recuperación en un namespace o colección canario antes de la transición, y revierte cambiando `embedding.provider` de vuelta a `"openai"` y reiniciando el proceso.
+- **Métricas de percentiles.** Las métricas de histograma ahora emiten sufijos `_p50`, `_p95` y `_p99` junto a los `_avg` y `_count` existentes.
+- **Fortalecimiento de la reconciliación post-restauración.** `backup.restore` ahora adquiere una protección a prueba de fallos vía `beginRestoreOperation()`, aísla los errores de reconciliación de vectores por paso, y vuelca el progreso incrementalmente. Un fallo del almacén de vectores durante la reconciliación devuelve una disponibilidad degradada en lugar de un fallo total de la restauración.
+- **Enrutamiento de logs en stdio.** Los logs estructurados de pino se redirigen a stderr cuando `--stdio` está activo, previniendo la corrupción del handshake JSON-RPC de MCP en stdout.
+- **Seguridad de tipos.** Los casts internos `as any` fueron reemplazados por interfaces tipadas y `SqlParams` en todo el código base.
+- **Cobertura de pruebas.** Nuevas suites de pruebas para los módulos de embedding, transporte HTTP, métricas, logger, salud y CLI.
+
+**Nueva sección de configuración**:
+```jsonc
+{
+  "resilience": {
+    "circuit_breaker": {
+      "failure_threshold": 5,       // fallos consecutivos para abrir
+      "open_window_ms": 30000,      // ms antes de la sonda de half-open
+      "half_open_probe_count": 1    // sondas para cerrar
+    }
+  }
+}
+```
+
+**Configuración de embedding de Azure** (añade `embedding.azure`):
+```jsonc
+{
+  "embedding": {
+    "provider": "azure-foundry",
+    "model": "my-embedding-deployment",
+    "dimensions": 1536,
+    "azure": {
+      "resource_name": "my-foundry-resource"
+    }
+  }
+}
+```
+
+---
 
 ### 1.2 → 1.3 (Memoria Multi-Dispositivo y Resiliencia de Datos)
 
@@ -2470,7 +4004,7 @@ Una vez que termina la comprobación de drift, se libera el bloqueo — la reinc
 
 - Las respuestas de llamadas a herramientas incluyen payloads JSON estructurados.
 - Las respuestas de error establecen `isError: true` en el protocolo MCP para el enrutamiento del lado del cliente.
-- Los recursos parametrizados (`memory://{id}`, `category://{name}`, `collection://{name}`) se exponen como plantillas de recursos MCP vía `resources/templates/list`.
+- Los recursos parametrizados (`memory://{id}`, `memory://inject/{hint}`, `category://{name}`, `collection://{name}`) se exponen como plantillas de recursos MCP vía `resources/templates/list`.
 
 ### Búsqueda y Paginación
 
@@ -2493,6 +4027,20 @@ Cuando se actualiza una memoria T0 (fundacional), la versión anterior se captur
 ### Compatibilidad del Modelo de Embedding
 
 Las colecciones bloquean su modelo de embedding y dimensiones al momento de la creación. Si cambias `embedding.model` o `embedding.dimensions` en la configuración, las nuevas memorias en colecciones existentes serán rechazadas con un error `CONFLICT` hasta que crees una nueva colección. Esto previene mezclar espacios de embedding incompatibles en el mismo índice de Qdrant.
+
+**Notas específicas por proveedor:**
+- **OpenAI**: El campo `embedding.model` especifica el nombre del modelo de OpenAI (p. ej., `text-embedding-3-small`).
+- **Azure Foundry**: El campo `embedding.model` especifica el nombre del despliegue de Azure. `embedding.dimensions` debe coincidir con las dimensiones de salida configuradas para ese despliegue.
+
+Asegúrate de establecer `embedding.provider` en `"openai"` o `"azure-foundry"` según corresponda.
+
+### Enrutamiento de Logs en stdio
+
+En el modo de transporte stdio (`--stdio`), los logs estructurados de pino se escriben en **stderr** en lugar de stdout. Esto es innegociable para la corrección del protocolo MCP: el SDK de MCP usa stdout exclusivamente para el framing JSON-RPC. Cualquier salida que no sea JSON en stdout (como líneas de log) hará que los clientes MCP fallen el handshake de inicialización.
+
+- En modo HTTP, los logs continúan escribiéndose en stdout normalmente.
+- La función `createLogger()` acepta un stream `destination` opcional; `index.ts` pasa `process.stderr` cuando se detecta `isStdio`.
+- Para capturar los logs del modo stdio en un archivo: `node dist/index.js --stdio 2>bhgbrain.log`
 
 ### Detección de Secretos
 

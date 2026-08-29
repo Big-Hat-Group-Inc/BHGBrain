@@ -1,0 +1,2627 @@
+[
+  {
+    "id": "corpus-0001",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Prefer TypeScript generic constraints with extends over unbounded type parameters so a function like function pick<T extends object, K extends keyof T>(obj: T, key: K) narrows correctly at call sites.",
+    "summary": "Use extends to constrain TS generics",
+    "tags": [
+      "typescript",
+      "generics"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0002",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Default generic type parameters in TypeScript should only be used when the default is genuinely the common case, e.g. class Cache<T = string>, otherwise callers silently get the wrong type.",
+    "summary": "When to use default generic type parameters",
+    "tags": [
+      "typescript",
+      "generics"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0003",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Avoid using any as a generic fallback in TypeScript; use unknown and narrow instead so callers cannot bypass type checking.",
+    "summary": "Avoid any as a generic fallback",
+    "tags": [
+      "typescript",
+      "generics"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0004",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "TypeScript conditional types like T extends U ? X : Y are useful for mapped utility types but hurt readability past two levels of nesting.",
+    "summary": "Limit nesting of TS conditional types",
+    "tags": [
+      "typescript",
+      "generics"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0005",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Generic interfaces in TypeScript should be named with a single capital letter (T, K, V) only when their meaning is obvious from context, otherwise use a descriptive name like TItem.",
+    "summary": "Naming convention for TS generic parameters",
+    "tags": [
+      "typescript",
+      "generics"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0006",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Variance issues with TypeScript generics show up most often in callback parameter types; prefer readonly arrays to avoid accidental covariant mutation bugs.",
+    "summary": "TS generic variance and readonly arrays",
+    "tags": [
+      "typescript",
+      "generics"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0007",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Utility types like Partial, Pick, and Omit compose better than hand-rolled generic helper types for TypeScript DTOs.",
+    "summary": "Prefer built-in TS utility types over custom ones",
+    "tags": [
+      "typescript",
+      "generics"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0008",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Standard procedure for a new Python service: create a virtual environment with python -m venv .venv, activate it, then pip install -r requirements.txt before running anything.",
+    "summary": "Python venv setup procedure",
+    "tags": [
+      "python",
+      "virtualenv"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0009",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Always pin exact versions in requirements.txt for Python services (package==1.2.3, not package>=1.2.3) so a fresh venv install is reproducible across machines.",
+    "summary": "Pin exact versions in Python requirements.txt",
+    "tags": [
+      "python",
+      "virtualenv"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0010",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Use pyenv to manage multiple Python interpreter versions on a dev machine instead of relying on the system python3.",
+    "summary": "Use pyenv for Python version management",
+    "tags": [
+      "python",
+      "virtualenv"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0011",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Never commit a .venv directory to git; add it to .gitignore alongside __pycache__ and *.pyc.",
+    "summary": "Do not commit .venv to git",
+    "tags": [
+      "python",
+      "virtualenv"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0012",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Prefer pip-tools (pip-compile) over hand-editing requirements.txt so transitive dependency pins are generated, not guessed.",
+    "summary": "Use pip-tools to generate requirements.txt",
+    "tags": [
+      "python",
+      "virtualenv"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0013",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "For Python services with native extensions, document the required system packages (e.g. libpq-dev) in the README, not just requirements.txt.",
+    "summary": "Document native system deps for Python builds",
+    "tags": [
+      "python",
+      "virtualenv"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0014",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "CI should recreate the Python virtual environment from scratch every run rather than caching site-packages, to catch missing pins early.",
+    "summary": "CI rebuilds Python venv from scratch",
+    "tags": [
+      "python",
+      "virtualenv"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0015",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "In Go, wrap errors with fmt.Errorf(\"doing X: %w\", err) so callers can unwrap with errors.Is/errors.As instead of string-matching error messages.",
+    "summary": "Wrap Go errors with %w for unwrapping",
+    "tags": [
+      "go",
+      "error-handling"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0016",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Sentinel errors in Go should be package-level vars like var ErrNotFound = errors.New(\"not found\"), compared with errors.Is, never with ==.",
+    "summary": "Go sentinel errors and errors.Is",
+    "tags": [
+      "go",
+      "error-handling"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0017",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Do not use panic/recover for ordinary error handling in Go; reserve panic for truly unrecoverable programmer errors.",
+    "summary": "Reserve Go panic for unrecoverable errors",
+    "tags": [
+      "go",
+      "error-handling"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0018",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Go functions returning (T, error) should always check err first before touching T, even if T looks like a safe zero value.",
+    "summary": "Check Go error before using the value",
+    "tags": [
+      "go",
+      "error-handling"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0019",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Group multiple Go errors from a batch operation with errors.Join instead of only returning the first failure.",
+    "summary": "Use errors.Join for batched Go errors",
+    "tags": [
+      "go",
+      "error-handling"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0020",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Log Go errors once at the boundary where they are handled, not at every layer they pass through, to avoid duplicate log spam.",
+    "summary": "Log Go errors once at the handling boundary",
+    "tags": [
+      "go",
+      "error-handling"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0021",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Custom Go error types should implement Unwrap() error, not just Error() string, so they compose with errors.Is/As chains.",
+    "summary": "Custom Go error types should implement Unwrap",
+    "tags": [
+      "go",
+      "error-handling"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0022",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "When a Rust function only needs to read data, take a borrowed reference (&T) rather than taking ownership (T), so the caller keeps using the value afterward.",
+    "summary": "Prefer borrowing over ownership in Rust when reading",
+    "tags": [
+      "rust",
+      "ownership"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0023",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Use Rc<RefCell<T>> in Rust only for single-threaded shared mutable state; reach for Arc<Mutex<T>> once the data crosses a thread boundary.",
+    "summary": "Rc/RefCell vs Arc/Mutex in Rust",
+    "tags": [
+      "rust",
+      "ownership"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0024",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Clone in Rust is not free; profile before reaching for .clone() to silence a borrow checker error.",
+    "summary": "Do not clone in Rust just to silence the borrow checker",
+    "tags": [
+      "rust",
+      "ownership"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0025",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Lifetime elision in Rust covers most function signatures; only annotate lifetimes explicitly when the compiler cannot infer them.",
+    "summary": "Rely on Rust lifetime elision where possible",
+    "tags": [
+      "rust",
+      "ownership"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0026",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Prefer Rust iterators and combinators over manual index loops; the compiler optimizes iterator chains as well as hand-written loops.",
+    "summary": "Prefer Rust iterator combinators over index loops",
+    "tags": [
+      "rust",
+      "ownership"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0027",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Unsafe Rust blocks must carry a comment explaining the invariant that makes them sound, per our internal style guide.",
+    "summary": "Comment the invariant for every unsafe Rust block",
+    "tags": [
+      "rust",
+      "ownership"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0028",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Rust trait objects (dyn Trait) have runtime dispatch cost; prefer generics with trait bounds on hot paths.",
+    "summary": "Prefer generics over dyn Trait on hot paths in Rust",
+    "tags": [
+      "rust",
+      "ownership"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0029",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "useEffect cleanup functions in React must cancel in-flight requests or subscriptions, otherwise a fast-unmounting component leaks the effect.",
+    "summary": "React useEffect must clean up in-flight work",
+    "tags": [
+      "react",
+      "hooks"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0030",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Custom React hooks should always start with the word use and follow the rules of hooks (no conditional calls) so lint-plugin-react-hooks can check them.",
+    "summary": "Naming and rules for custom React hooks",
+    "tags": [
+      "react",
+      "hooks"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0031",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "useMemo in React is for expensive recomputation, not for referential stability alone; useCallback is the right tool for stable function identity.",
+    "summary": "useMemo vs useCallback in React",
+    "tags": [
+      "react",
+      "hooks"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0032",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Avoid putting objects or arrays literal in a React useEffect dependency array; they create a new reference every render and cause infinite loops.",
+    "summary": "Avoid literal objects in React effect deps",
+    "tags": [
+      "react",
+      "hooks"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0033",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "useReducer is preferred over multiple useState calls in React when state transitions are interrelated, e.g. a form with derived validation state.",
+    "summary": "Prefer useReducer for interrelated React state",
+    "tags": [
+      "react",
+      "hooks"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0034",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "React context should not be used for high-frequency updates (like mouse position); it re-renders every consumer on every change.",
+    "summary": "React context is a poor fit for high-frequency updates",
+    "tags": [
+      "react",
+      "hooks"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0035",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Server components in React cannot use useState or useEffect; keep those in a nested client component boundary.",
+    "summary": "React server components cannot use client-only hooks",
+    "tags": [
+      "react",
+      "hooks"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0036",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Vue composables should return refs, not raw values, so callers keep reactivity when destructuring the composable result.",
+    "summary": "Vue composables must return refs for reactivity",
+    "tags": [
+      "vue",
+      "composition-api"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0037",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Use watchEffect in Vue when the dependency set is dynamic and derived automatically; use watch with an explicit source when you need the previous value.",
+    "summary": "watchEffect vs watch in Vue composition API",
+    "tags": [
+      "vue",
+      "composition-api"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0038",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Avoid deeply nested reactive() objects in Vue; prefer flatter state shapes so change detection stays cheap.",
+    "summary": "Prefer flat reactive state shapes in Vue",
+    "tags": [
+      "vue",
+      "composition-api"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0039",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Vue provide/inject should be typed with InjectionKey<T> so consumers get type safety instead of any.",
+    "summary": "Type Vue provide/inject with InjectionKey",
+    "tags": [
+      "vue",
+      "composition-api"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0040",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Script setup syntax in Vue 3 removes the need for a separate setup() return statement and is our default for new single-file components.",
+    "summary": "Vue 3 script setup is the default SFC style",
+    "tags": [
+      "vue",
+      "composition-api"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0041",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Vue computed properties must stay side-effect free; move any mutation into a watcher or method instead.",
+    "summary": "Keep Vue computed properties side-effect free",
+    "tags": [
+      "vue",
+      "composition-api"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0042",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Pinia stores replace Vuex for new Vue projects; define state as a function returning the initial object, not a plain object literal.",
+    "summary": "Pinia replaces Vuex for new Vue projects",
+    "tags": [
+      "vue",
+      "composition-api"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0043",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Use a multi-stage Dockerfile: build the app in a full SDK image, then copy only the compiled artifact into a slim runtime base image to shrink the final image size.",
+    "summary": "Multi-stage Dockerfile keeps runtime images slim",
+    "tags": [
+      "docker",
+      "build"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0044",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Pin base images in Dockerfiles by digest (node:20-slim@sha256:...) for production builds, not just by tag, so a base image republish cannot silently change behavior.",
+    "summary": "Pin Docker base images by digest for production",
+    "tags": [
+      "docker",
+      "build"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0045",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Order Dockerfile layers from least to most frequently changing (dependencies before source code) to maximize build cache reuse.",
+    "summary": "Order Dockerfile layers for cache reuse",
+    "tags": [
+      "docker",
+      "build"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0046",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Run containers as a non-root user by default; add a USER directive near the end of the Dockerfile after installing dependencies as root.",
+    "summary": "Docker containers should run as non-root",
+    "tags": [
+      "docker",
+      "build"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0047",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Use a .dockerignore file to exclude node_modules, .git, and test fixtures from the build context so builds stay fast.",
+    "summary": "Use .dockerignore to keep Docker build context small",
+    "tags": [
+      "docker",
+      "build"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0048",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Health checks in Docker images (HEALTHCHECK instruction) should hit a lightweight internal endpoint, not the full readiness probe used by Kubernetes.",
+    "summary": "Docker HEALTHCHECK should be lightweight",
+    "tags": [
+      "docker",
+      "build"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0049",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Avoid installing build-essential and other compiler toolchains in the final Docker image stage; keep them only in the builder stage.",
+    "summary": "Keep compiler toolchains out of final Docker stage",
+    "tags": [
+      "docker",
+      "build"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0050",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "semantic",
+    "category": null,
+    "content": "Every Kubernetes deployment must set both resources.requests and resources.limits for CPU and memory; unset limits let one pod starve the node.",
+    "summary": "Kubernetes pods must set resource requests and limits",
+    "tags": [
+      "kubernetes",
+      "resources"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0051",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "semantic",
+    "category": null,
+    "content": "Set Kubernetes memory limits equal to memory requests to avoid OOM-kill surprises from burstable QoS; only CPU is safe to leave burstable.",
+    "summary": "Kubernetes memory limits should equal requests",
+    "tags": [
+      "kubernetes",
+      "resources"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0052",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "semantic",
+    "category": null,
+    "content": "Horizontal Pod Autoscaler in Kubernetes should target 60-70% CPU utilization, not 90%, to leave headroom for scale-up latency.",
+    "summary": "Kubernetes HPA target CPU utilization",
+    "tags": [
+      "kubernetes",
+      "resources"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0053",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "semantic",
+    "category": null,
+    "content": "Use PodDisruptionBudgets in Kubernetes for any deployment that must stay available during node drains or cluster upgrades.",
+    "summary": "Use PodDisruptionBudgets for availability during drains",
+    "tags": [
+      "kubernetes",
+      "resources"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0054",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "semantic",
+    "category": null,
+    "content": "Liveness probes in Kubernetes should never depend on downstream services; only readiness probes should.",
+    "summary": "Kubernetes liveness probes must not depend on downstream services",
+    "tags": [
+      "kubernetes",
+      "resources"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0055",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "semantic",
+    "category": null,
+    "content": "Namespace-level ResourceQuotas in Kubernetes prevent one team from exhausting cluster capacity for everyone else.",
+    "summary": "Use ResourceQuotas to cap namespace resource usage",
+    "tags": [
+      "kubernetes",
+      "resources"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0056",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "semantic",
+    "category": null,
+    "content": "Prefer Kubernetes Deployments over bare Pods for anything long-running, even single-replica services, for the built-in restart policy.",
+    "summary": "Prefer Kubernetes Deployments over bare Pods",
+    "tags": [
+      "kubernetes",
+      "resources"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0057",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Add a PostgreSQL composite index matching the exact column order used in WHERE clauses; a mismatched column order makes the index unusable for that query.",
+    "summary": "PostgreSQL composite index column order matters",
+    "tags": [
+      "postgresql",
+      "indexing"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0058",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Use a partial PostgreSQL index (CREATE INDEX ... WHERE deleted_at IS NULL) when most queries only ever touch active rows.",
+    "summary": "Use partial PostgreSQL indexes for active-row queries",
+    "tags": [
+      "postgresql",
+      "indexing"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0059",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Run EXPLAIN ANALYZE on any PostgreSQL query before assuming an index will help; sequential scans can beat an index on small tables.",
+    "summary": "Run EXPLAIN ANALYZE before adding PostgreSQL indexes",
+    "tags": [
+      "postgresql",
+      "indexing"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0060",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "GIN indexes in PostgreSQL are the right choice for JSONB containment queries and full-text search columns.",
+    "summary": "Use GIN indexes for PostgreSQL JSONB and full-text search",
+    "tags": [
+      "postgresql",
+      "indexing"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0061",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Rebuild bloated PostgreSQL indexes with REINDEX CONCURRENTLY to avoid locking writes during the rebuild.",
+    "summary": "Use REINDEX CONCURRENTLY for bloated PostgreSQL indexes",
+    "tags": [
+      "postgresql",
+      "indexing"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0062",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Too many PostgreSQL indexes slow down writes; audit unused indexes with pg_stat_user_indexes periodically.",
+    "summary": "Audit unused PostgreSQL indexes with pg_stat_user_indexes",
+    "tags": [
+      "postgresql",
+      "indexing"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0063",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Foreign key columns in PostgreSQL are not automatically indexed; add the index explicitly or joins and cascading deletes will be slow.",
+    "summary": "PostgreSQL foreign keys need explicit indexes",
+    "tags": [
+      "postgresql",
+      "indexing"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0064",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "In MongoDB, embed data that is always read together and rarely updated independently; reference data that grows unboundedly or is shared across many parents.",
+    "summary": "MongoDB embed-vs-reference rule of thumb",
+    "tags": [
+      "mongodb",
+      "schema-design"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0065",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "MongoDB documents should stay well under the 16MB limit in practice; anything approaching a few MB is a sign the schema needs to reference, not embed.",
+    "summary": "Keep MongoDB documents well under the size limit",
+    "tags": [
+      "mongodb",
+      "schema-design"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0066",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Use MongoDB schema validation (jsonSchema) on collections that accept writes from multiple services, so a bad write fails loudly.",
+    "summary": "Use MongoDB schema validation for multi-writer collections",
+    "tags": [
+      "mongodb",
+      "schema-design"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0067",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Compound indexes in MongoDB should follow the ESR rule: Equality fields, then Sort fields, then Range fields.",
+    "summary": "MongoDB compound indexes follow the ESR rule",
+    "tags": [
+      "mongodb",
+      "schema-design"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0068",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Avoid unbounded arrays inside a single MongoDB document; a growing array field is usually a sign it should be its own collection.",
+    "summary": "Avoid unbounded arrays in a single MongoDB document",
+    "tags": [
+      "mongodb",
+      "schema-design"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0069",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Use MongoDB change streams instead of polling when a downstream service needs near-real-time notification of writes.",
+    "summary": "Use MongoDB change streams over polling",
+    "tags": [
+      "mongodb",
+      "schema-design"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0070",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Shard MongoDB collections on a key with high cardinality and even write distribution, never on a monotonically increasing field alone.",
+    "summary": "Choose a high-cardinality MongoDB shard key",
+    "tags": [
+      "mongodb",
+      "schema-design"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0071",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Set a Redis TTL on every cache key by default; a cache without expiry silently turns into a second source of truth that drifts from the database.",
+    "summary": "Every Redis cache key needs a default TTL",
+    "tags": [
+      "redis",
+      "caching"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0072",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Use Redis cache-aside (lazy loading) for read-heavy, write-light data; use write-through caching only when staleness is unacceptable.",
+    "summary": "Redis cache-aside vs write-through caching",
+    "tags": [
+      "redis",
+      "caching"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0073",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Avoid the Redis KEYS command in production; use SCAN with a cursor to iterate keys without blocking the event loop.",
+    "summary": "Use Redis SCAN instead of KEYS in production",
+    "tags": [
+      "redis",
+      "caching"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0074",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Namespace Redis keys with a colon-delimited prefix (service:entity:id) so different services never collide in a shared cluster.",
+    "summary": "Namespace Redis keys by service and entity",
+    "tags": [
+      "redis",
+      "caching"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0075",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Use Redis Pub/Sub for fire-and-forget notifications, not for anything that needs delivery guarantees; a stream or queue is the right tool for that.",
+    "summary": "Redis Pub/Sub has no delivery guarantees",
+    "tags": [
+      "redis",
+      "caching"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0076",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Pick eviction policy allkeys-lru for a pure cache Redis instance, and noeviction for a Redis instance used as a durable queue or store.",
+    "summary": "Pick Redis eviction policy based on use case",
+    "tags": [
+      "redis",
+      "caching"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0077",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Cache stampedes against Redis are mitigated with a short jittered TTL or a single-flight lock around the recompute.",
+    "summary": "Mitigate Redis cache stampedes with jitter or single-flight",
+    "tags": [
+      "redis",
+      "caching"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0078",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Schema stitching combines multiple GraphQL schemas at the gateway; federation instead lets each subgraph own its types and the gateway composes them at build time.",
+    "summary": "GraphQL schema stitching vs federation",
+    "tags": [
+      "graphql",
+      "schema"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0079",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "GraphQL resolvers should never trigger N+1 database queries; use DataLoader to batch and cache per-request lookups.",
+    "summary": "Use DataLoader to avoid GraphQL N+1 queries",
+    "tags": [
+      "graphql",
+      "schema"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0080",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Version GraphQL schemas by deprecating fields with @deprecated and a reason, never by breaking existing queries outright.",
+    "summary": "Deprecate GraphQL fields instead of breaking changes",
+    "tags": [
+      "graphql",
+      "schema"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0081",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Depth-limit and complexity-limit incoming GraphQL queries to prevent a single malicious or buggy client from overloading the server.",
+    "summary": "Depth and complexity limit incoming GraphQL queries",
+    "tags": [
+      "graphql",
+      "schema"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0082",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Use GraphQL input types, not loose scalar arguments, for any mutation taking more than two or three fields.",
+    "summary": "Use GraphQL input types for multi-field mutations",
+    "tags": [
+      "graphql",
+      "schema"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0083",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Persisted queries reduce GraphQL request payload size and let the server allow-list exactly which queries clients can run.",
+    "summary": "GraphQL persisted queries reduce payload and allow-list queries",
+    "tags": [
+      "graphql",
+      "schema"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0084",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "GraphQL subscriptions should be reserved for genuinely real-time data; polling a query is simpler and fine for anything under a few seconds of staleness.",
+    "summary": "Reserve GraphQL subscriptions for genuinely real-time data",
+    "tags": [
+      "graphql",
+      "schema"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0085",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Version REST APIs in the URL path (/v1/, /v2/) rather than a custom header, so the version is visible in logs and easy for clients to pin.",
+    "summary": "Version REST APIs in the URL path",
+    "tags": [
+      "rest",
+      "api-design"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0086",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Never remove a field from a REST API response in a minor version; only additive changes are allowed without bumping the major version.",
+    "summary": "REST API minor versions must be additive only",
+    "tags": [
+      "rest",
+      "api-design"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0087",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "REST endpoints should return 429 with a Retry-After header when rate limiting a client, not a bare 403.",
+    "summary": "REST rate limiting should return 429 with Retry-After",
+    "tags": [
+      "rest",
+      "api-design"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0088",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Use PATCH with a JSON Merge Patch or JSON Patch body for partial REST updates, not a full-resource PUT for a one-field change.",
+    "summary": "Use PATCH for partial REST updates",
+    "tags": [
+      "rest",
+      "api-design"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0089",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Pagination on REST list endpoints should use an opaque cursor, not raw offset/limit, so results stay stable while the underlying data changes.",
+    "summary": "Use cursor pagination on REST list endpoints",
+    "tags": [
+      "rest",
+      "api-design"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0090",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "REST error responses should follow a single consistent envelope shape across every endpoint, including the error code and a human-readable message.",
+    "summary": "Use a consistent REST error response envelope",
+    "tags": [
+      "rest",
+      "api-design"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0091",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Idempotency keys are required on REST POST endpoints that create billing or payment records, to survive client retries safely.",
+    "summary": "Require idempotency keys on REST payment POST endpoints",
+    "tags": [
+      "rest",
+      "api-design"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0092",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Jest test files should co-locate with the source file (foo.ts + foo.test.ts) rather than living in a separate top-level tests directory, so they move together during refactors.",
+    "summary": "Co-locate Jest test files with source",
+    "tags": [
+      "jest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0093",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Mock only the boundary a Jest unit test actually needs (network, filesystem, clock); mocking internal collaborators too aggressively makes the test assert its own mocks.",
+    "summary": "Mock boundaries, not internal collaborators, in Jest tests",
+    "tags": [
+      "jest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0094",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Use Jest fake timers (jest.useFakeTimers) for anything testing debounce, throttle, or setTimeout-driven retry logic.",
+    "summary": "Use Jest fake timers for time-driven logic",
+    "tags": [
+      "jest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0095",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Snapshot tests in Jest are appropriate for stable serialized output, not for UI components that change frequently and get blindly re-approved.",
+    "summary": "Use Jest snapshots only for stable output",
+    "tags": [
+      "jest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0096",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Every Jest describe block should share one behavior under test; splitting unrelated assertions into the same block makes failures hard to read.",
+    "summary": "Keep one Jest describe block per behavior",
+    "tags": [
+      "jest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0097",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Reset Jest mocks between tests with clearMocks in config rather than manual afterEach boilerplate in every file.",
+    "summary": "Reset Jest mocks via clearMocks config, not manual afterEach",
+    "tags": [
+      "jest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0098",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Coverage thresholds in Jest should gate CI on statements and branches, not just line coverage, to catch untested conditional paths.",
+    "summary": "Gate Jest coverage on branches, not just lines",
+    "tags": [
+      "jest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0099",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Pytest fixtures with database setup should use function scope by default; only widen to session scope once you have proven test isolation is not needed.",
+    "summary": "Pytest fixture scope defaults to function-level",
+    "tags": [
+      "pytest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0100",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Parametrize pytest tests with @pytest.mark.parametrize instead of writing a loop inside a single test function, so each case reports independently.",
+    "summary": "Use pytest.mark.parametrize instead of loops in tests",
+    "tags": [
+      "pytest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0101",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Use pytest conftest.py fixtures for cross-cutting setup shared by a whole directory, not by importing helper functions into every test file.",
+    "summary": "Use pytest conftest.py for shared fixtures",
+    "tags": [
+      "pytest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0102",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Mark slow or integration pytest tests with a custom marker and exclude them from the fast default test run via pytest.ini.",
+    "summary": "Mark and exclude slow pytest tests by default",
+    "tags": [
+      "pytest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0103",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Prefer pytest monkeypatch over unittest.mock.patch for simple attribute/env var overrides; it auto-reverts and needs less boilerplate.",
+    "summary": "Prefer pytest monkeypatch for simple overrides",
+    "tags": [
+      "pytest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0104",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Assert pytest exceptions with pytest.raises as a context manager, and check the message with match= rather than a bare except in the test.",
+    "summary": "Use pytest.raises with match for exception tests",
+    "tags": [
+      "pytest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0105",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "procedural",
+    "category": null,
+    "content": "Factory fixtures in pytest (fixtures that return a function) are the right pattern when a test needs several differently-configured instances.",
+    "summary": "Use pytest factory fixtures for multiple configured instances",
+    "tags": [
+      "pytest",
+      "testing"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0106",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "GitHub Actions workflows should cache npm/pip dependencies with actions/cache keyed on the lockfile hash, not on a fixed key, so a dependency bump invalidates the cache correctly.",
+    "summary": "GitHub Actions cache keyed on lockfile hash",
+    "tags": [
+      "github-actions",
+      "ci"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0107",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Split GitHub Actions CI into separate lint, test, and build jobs that run in parallel rather than one long sequential job, to shorten feedback time.",
+    "summary": "Run GitHub Actions lint/test/build jobs in parallel",
+    "tags": [
+      "github-actions",
+      "ci"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0108",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Pin third-party GitHub Actions to a commit SHA, not a floating tag like @v3, to avoid a supply-chain surprise from an upstream Action update.",
+    "summary": "Pin third-party GitHub Actions to a commit SHA",
+    "tags": [
+      "github-actions",
+      "ci"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0109",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Use GitHub Actions matrix builds to test against multiple Node/Python versions in one workflow definition instead of duplicating jobs.",
+    "summary": "Use GitHub Actions matrix builds for multi-version testing",
+    "tags": [
+      "github-actions",
+      "ci"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0110",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Secrets in GitHub Actions should be scoped to the minimum required environment, not exposed to every job in the workflow.",
+    "summary": "Scope GitHub Actions secrets to the minimum environment",
+    "tags": [
+      "github-actions",
+      "ci"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0111",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Fail GitHub Actions workflows fast with fail-fast: true on matrix builds during development, but disable it before a release branch build.",
+    "summary": "Use fail-fast appropriately on GitHub Actions matrices",
+    "tags": [
+      "github-actions",
+      "ci"
+    ],
+    "source": "cli",
+    "importance": 0.3
+  },
+  {
+    "id": "corpus-0112",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Upload GitHub Actions build artifacts with a short retention period for PR builds and a longer one for main branch builds.",
+    "summary": "Set retention period for GitHub Actions artifacts",
+    "tags": [
+      "github-actions",
+      "ci"
+    ],
+    "source": "cli",
+    "importance": 0.3
+  },
+  {
+    "id": "corpus-0113",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Jenkins deployment pipelines should be defined as a Jenkinsfile checked into the repo, not configured through the classic web UI, so pipeline changes go through code review.",
+    "summary": "Jenkins pipelines defined as code, not UI config",
+    "tags": [
+      "jenkins",
+      "deployment"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0114",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Jenkins deployment stages should require manual approval before promoting to production, but can auto-promote through staging.",
+    "summary": "Jenkins requires manual approval before production deploy",
+    "tags": [
+      "jenkins",
+      "deployment"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0115",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Store Jenkins credentials in the built-in credentials store, never as plaintext environment variables in a Jenkinsfile.",
+    "summary": "Store Jenkins credentials in the credentials store",
+    "tags": [
+      "jenkins",
+      "deployment"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0116",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Use Jenkins shared libraries to de-duplicate common pipeline steps across repositories instead of copy-pasting Jenkinsfile stages.",
+    "summary": "Use Jenkins shared libraries to de-duplicate pipeline steps",
+    "tags": [
+      "jenkins",
+      "deployment"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0117",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Archive Jenkins build logs and test reports as artifacts so a failed deployment can be diagnosed after the agent is recycled.",
+    "summary": "Archive Jenkins build logs and test reports",
+    "tags": [
+      "jenkins",
+      "deployment"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0118",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Jenkins agents used for deployment should be ephemeral (spun up per build) rather than long-lived, to avoid state drift between runs.",
+    "summary": "Use ephemeral Jenkins agents for deployment",
+    "tags": [
+      "jenkins",
+      "deployment"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0119",
+    "namespace": "global",
+    "collection": "ops",
+    "type": "procedural",
+    "category": null,
+    "content": "Rollback in the Jenkins deployment pipeline should redeploy the previous known-good artifact, not attempt to revert code and rebuild under pressure.",
+    "summary": "Jenkins rollback redeploys the previous known-good artifact",
+    "tags": [
+      "jenkins",
+      "deployment"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0120",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "We use trunk-based development with short-lived feature branches merged via squash-merge, not long-running gitflow release branches.",
+    "summary": "Trunk-based development with squash-merge feature branches",
+    "tags": [
+      "git",
+      "branching"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0121",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Never force-push to main or a shared branch; force-push is only acceptable on a personal feature branch after a rebase.",
+    "summary": "Never force-push to main or shared branches",
+    "tags": [
+      "git",
+      "branching"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0122",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Delete a git branch immediately after it is merged; stale branches accumulate and make `git branch` noise for everyone.",
+    "summary": "Delete git branches immediately after merge",
+    "tags": [
+      "git",
+      "branching"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0123",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Rebase feature branches onto main before opening a PR, but never rebase a branch other people have already pulled.",
+    "summary": "Rebase before opening a PR, never rebase shared history",
+    "tags": [
+      "git",
+      "branching"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0124",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Git commit messages should follow conventional commits (feat:, fix:, chore:) so changelogs can be generated automatically.",
+    "summary": "Use conventional commits for git commit messages",
+    "tags": [
+      "git",
+      "branching"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0125",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Protect the main git branch with required status checks and at least one required review before merge is allowed.",
+    "summary": "Protect main git branch with required checks and review",
+    "tags": [
+      "git",
+      "branching"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0126",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Tag git releases with semantic version tags (v1.4.0) immediately after the release branch merges to main.",
+    "summary": "Tag git releases with semantic version numbers",
+    "tags": [
+      "git",
+      "branching"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0127",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Code review comments should distinguish blocking issues from optional nits, e.g. by prefixing nits with \"nit:\" so authors know what must be fixed before merge.",
+    "summary": "Distinguish blocking code review comments from nits",
+    "tags": [
+      "code-review",
+      "process"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0128",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "A pull request should have a single clear purpose; reviewers can ask the author to split an unrelated change into a separate PR.",
+    "summary": "Keep each pull request to a single clear purpose",
+    "tags": [
+      "code-review",
+      "process"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0129",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Code review turnaround target is one business day; a PR sitting longer than that should be pinged in the team channel.",
+    "summary": "Target one business day for code review turnaround",
+    "tags": [
+      "code-review",
+      "process"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0130",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Reviewers should pull down and run a PR locally for anything touching data migrations, not just read the diff.",
+    "summary": "Run migration PRs locally, do not just read the diff",
+    "tags": [
+      "code-review",
+      "process"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0131",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Approve a code review with a comment explaining what you checked, not a bare thumbs-up, so future readers understand the review depth.",
+    "summary": "Explain what was checked when approving a code review",
+    "tags": [
+      "code-review",
+      "process"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0132",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Large refactor PRs should be reviewed commit-by-commit rather than as one giant diff, when the author split the work into logical commits.",
+    "summary": "Review large refactors commit-by-commit",
+    "tags": [
+      "code-review",
+      "process"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0133",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Author self-review (reading your own diff before requesting review) catches a large share of avoidable review comments.",
+    "summary": "Self-review your diff before requesting review",
+    "tags": [
+      "code-review",
+      "process"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0134",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "We decided against splitting the billing module into a separate microservice this quarter; the team is too small to carry the added operational overhead yet.",
+    "summary": "Decision: billing stays in the monolith this quarter",
+    "tags": [
+      "architecture",
+      "microservices"
+    ],
+    "source": "cli",
+    "importance": 0.8
+  },
+  {
+    "id": "corpus-0135",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "The notifications module was split out into its own service because its scaling profile (bursty, high-volume) was fundamentally different from the rest of the monolith.",
+    "summary": "Decision: notifications split out due to different scaling profile",
+    "tags": [
+      "architecture",
+      "microservices"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0136",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "Extracting a service should be justified by an independent scaling, deployment, or team-ownership need, not by architectural taste alone.",
+    "summary": "Service extraction needs a concrete justification",
+    "tags": [
+      "architecture",
+      "microservices"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0137",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "Every new microservice adds an on-call rotation burden; we track that cost explicitly before approving a split.",
+    "summary": "New microservices add on-call burden to weigh",
+    "tags": [
+      "architecture",
+      "microservices"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0138",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "We prefer a modular monolith with clear internal module boundaries over premature microservices for a team our size.",
+    "summary": "Prefer a modular monolith at our current team size",
+    "tags": [
+      "architecture",
+      "microservices"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0139",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "Shared database access across services was explicitly ruled out; each service that does get split owns its own datastore.",
+    "summary": "No shared database access across split services",
+    "tags": [
+      "architecture",
+      "microservices"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0140",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "A service boundary is easier to draw along a bounded context from domain modeling than along an org chart line.",
+    "summary": "Draw service boundaries along bounded contexts",
+    "tags": [
+      "architecture",
+      "microservices"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0141",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "semantic",
+    "category": null,
+    "content": "Use an event-driven architecture with a message queue for workflows that can tolerate eventual consistency; keep synchronous request/response for anything the caller needs to confirm immediately.",
+    "summary": "Event-driven messaging for eventually-consistent workflows",
+    "tags": [
+      "architecture",
+      "messaging"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0142",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "semantic",
+    "category": null,
+    "content": "Every published event on our message queue must be versioned and backward compatible for at least one deprecation cycle before a breaking change ships.",
+    "summary": "Published events must stay backward compatible",
+    "tags": [
+      "architecture",
+      "messaging"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0143",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "semantic",
+    "category": null,
+    "content": "Consumers of our message queue must be idempotent, because at-least-once delivery means a message can be redelivered.",
+    "summary": "Message queue consumers must be idempotent",
+    "tags": [
+      "architecture",
+      "messaging"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0144",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "semantic",
+    "category": null,
+    "content": "Use a dead-letter queue for messages that fail processing repeatedly, rather than dropping them or retrying forever.",
+    "summary": "Use a dead-letter queue for repeatedly failing messages",
+    "tags": [
+      "architecture",
+      "messaging"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0145",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "semantic",
+    "category": null,
+    "content": "Event payloads should carry enough context to be processed independently; avoid forcing consumers to call back to the producer for details.",
+    "summary": "Event payloads should be self-contained",
+    "tags": [
+      "architecture",
+      "messaging"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0146",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "semantic",
+    "category": null,
+    "content": "Choose a message broker based on delivery and ordering guarantees you actually need, not on popularity alone.",
+    "summary": "Choose a message broker based on actual delivery needs",
+    "tags": [
+      "architecture",
+      "messaging"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0147",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "semantic",
+    "category": null,
+    "content": "Trace correlation IDs must propagate through every hop of an event-driven workflow so a failure can be followed end to end.",
+    "summary": "Propagate correlation IDs through event-driven workflows",
+    "tags": [
+      "architecture",
+      "messaging"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0148",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "We adopted CQRS for the reporting module only, keeping a separate read model updated asynchronously from the write model, because reporting queries were degrading write-path latency.",
+    "summary": "Decision: CQRS adopted for reporting module only",
+    "tags": [
+      "architecture",
+      "cqrs"
+    ],
+    "source": "cli",
+    "importance": 0.8
+  },
+  {
+    "id": "corpus-0149",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "CQRS was explicitly rejected for the core order-processing module; the added complexity was not justified by its read/write load profile.",
+    "summary": "Decision: CQRS rejected for order-processing module",
+    "tags": [
+      "architecture",
+      "cqrs"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0150",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "A CQRS read model can lag the write model; any UI relying on it must communicate eventual consistency to the user.",
+    "summary": "CQRS read models can lag and must communicate that",
+    "tags": [
+      "architecture",
+      "cqrs"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0151",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "CQRS is not a prerequisite for event sourcing, and we are not adopting event sourcing alongside it at this time.",
+    "summary": "CQRS adopted without event sourcing",
+    "tags": [
+      "architecture",
+      "cqrs"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0152",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "Command handlers in our CQRS module validate business rules; the read side never performs validation, only projection.",
+    "summary": "CQRS command handlers own validation, not the read side",
+    "tags": [
+      "architecture",
+      "cqrs"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0153",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "Rebuilding a CQRS read model from the event log must be possible from scratch, as a disaster-recovery guarantee.",
+    "summary": "CQRS read models must be rebuildable from scratch",
+    "tags": [
+      "architecture",
+      "cqrs"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0154",
+    "namespace": "global",
+    "collection": "architecture",
+    "type": "episodic",
+    "category": null,
+    "content": "We revisit the CQRS decision for a module whenever its read and write load profiles diverge significantly, not on a fixed schedule.",
+    "summary": "Revisit CQRS decisions when load profiles diverge",
+    "tags": [
+      "architecture",
+      "cqrs"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0155",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Access JWTs are short-lived (15 minutes) and refresh tokens are long-lived but rotated on every use, so a stolen refresh token is detectable via reuse.",
+    "summary": "Short-lived access JWTs, rotated refresh tokens",
+    "tags": [
+      "authentication",
+      "jwt"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0156",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "JWTs are never used to carry authorization decisions directly; the token only proves identity, and permission checks always hit the authorization service.",
+    "summary": "JWTs prove identity only, not authorization",
+    "tags": [
+      "authentication",
+      "jwt"
+    ],
+    "source": "cli",
+    "importance": 0.7
+  },
+  {
+    "id": "corpus-0157",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Validate JWT signature, issuer, audience, and expiry on every request; never trust a decoded-but-unverified payload.",
+    "summary": "Fully validate JWTs on every request",
+    "tags": [
+      "authentication",
+      "jwt"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0158",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Store JWTs in an httpOnly, Secure cookie for browser clients, never in localStorage, to reduce XSS token theft risk.",
+    "summary": "Store browser JWTs in httpOnly cookies, not localStorage",
+    "tags": [
+      "authentication",
+      "jwt"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0159",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Rotate the JWT signing key on a schedule and support two active keys during the rotation window via a key ID (kid) header.",
+    "summary": "Rotate JWT signing keys with overlapping validity",
+    "tags": [
+      "authentication",
+      "jwt"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0160",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "JWT claims should be minimal; do not embed a user's full profile in the token just to avoid a database lookup.",
+    "summary": "Keep JWT claims minimal",
+    "tags": [
+      "authentication",
+      "jwt"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0161",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Revoking a single compromised JWT before its expiry requires a deny-list check, which is why access token lifetime is kept short.",
+    "summary": "Short JWT lifetime avoids needing a deny-list for revocation",
+    "tags": [
+      "authentication",
+      "jwt"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0162",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "All customer PII at rest is encrypted with AES-256, with keys managed by the cloud KMS, never hardcoded or checked into the repo.",
+    "summary": "PII at rest encrypted with AES-256 via cloud KMS",
+    "tags": [
+      "security",
+      "encryption"
+    ],
+    "source": "cli",
+    "importance": 0.8
+  },
+  {
+    "id": "corpus-0163",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Database backups inherit the same at-rest encryption as the primary database; an unencrypted backup would undermine the whole policy.",
+    "summary": "Database backups must inherit at-rest encryption",
+    "tags": [
+      "security",
+      "encryption"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0164",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Encryption keys are rotated annually at minimum, and immediately after any suspected key compromise.",
+    "summary": "Encryption keys rotated at least annually",
+    "tags": [
+      "security",
+      "encryption"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0165",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Field-level encryption is applied to the most sensitive columns (SSNs, payment tokens) in addition to whole-disk encryption.",
+    "summary": "Field-level encryption on the most sensitive columns",
+    "tags": [
+      "security",
+      "encryption"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0166",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Access to decryption keys is logged and alerts on any access outside the expected service accounts.",
+    "summary": "Decryption key access is logged and alerted on",
+    "tags": [
+      "security",
+      "encryption"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0167",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Data in transit between internal services uses mTLS, which is a separate control from at-rest encryption but equally required.",
+    "summary": "Internal service traffic uses mTLS in addition to at-rest encryption",
+    "tags": [
+      "security",
+      "encryption"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0168",
+    "namespace": "global",
+    "collection": "engineering",
+    "type": "semantic",
+    "category": null,
+    "content": "Encryption at rest does not replace access control; both are required layers per our security policy.",
+    "summary": "Encryption at rest is not a substitute for access control",
+    "tags": [
+      "security",
+      "encryption"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0169",
+    "namespace": "global",
+    "collection": "team",
+    "type": "episodic",
+    "category": null,
+    "content": "The engineering team moved standup from daily to three times a week after feedback that daily standups were mostly status theater for a team this small.",
+    "summary": "Standup reduced from daily to three times a week",
+    "tags": [
+      "team",
+      "meetings"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0170",
+    "namespace": "global",
+    "collection": "team",
+    "type": "episodic",
+    "category": null,
+    "content": "Sprint planning happens every other Monday and is capped at 60 minutes; anything needing more discussion gets a separate follow-up.",
+    "summary": "Sprint planning is biweekly, capped at 60 minutes",
+    "tags": [
+      "team",
+      "meetings"
+    ],
+    "source": "cli",
+    "importance": 0.6
+  },
+  {
+    "id": "corpus-0171",
+    "namespace": "global",
+    "collection": "team",
+    "type": "episodic",
+    "category": null,
+    "content": "Retro is held at the end of every sprint and always ends with at most three concrete action items, not an open-ended list.",
+    "summary": "Retro caps action items at three per sprint",
+    "tags": [
+      "team",
+      "meetings"
+    ],
+    "source": "cli",
+    "importance": 0.5
+  },
+  {
+    "id": "corpus-0172",
+    "namespace": "global",
+    "collection": "team",
+    "type": "episodic",
+    "category": null,
+    "content": "One-on-ones between engineers and their manager are scheduled weekly by default, but can drop to biweekly if both sides agree.",
+    "summary": "One-on-ones default weekly, can drop to biweekly",
+    "tags": [
+      "team",
+      "meetings"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0173",
+    "namespace": "global",
+    "collection": "team",
+    "type": "episodic",
+    "category": null,
+    "content": "Meetings without a written agenda sent in advance are discouraged; the team can decline to attend an agenda-less meeting.",
+    "summary": "Meetings need a written agenda sent in advance",
+    "tags": [
+      "team",
+      "meetings"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  },
+  {
+    "id": "corpus-0174",
+    "namespace": "global",
+    "collection": "team",
+    "type": "episodic",
+    "category": null,
+    "content": "All-hands meetings are recorded and posted with notes for anyone in a different timezone who could not attend live.",
+    "summary": "All-hands meetings are recorded for other timezones",
+    "tags": [
+      "team",
+      "meetings"
+    ],
+    "source": "cli",
+    "importance": 0.3
+  },
+  {
+    "id": "corpus-0175",
+    "namespace": "global",
+    "collection": "team",
+    "type": "episodic",
+    "category": null,
+    "content": "Design review meetings are scheduled only once a written design doc exists; there is no design review of a verbal idea alone.",
+    "summary": "Design review requires a written doc first",
+    "tags": [
+      "team",
+      "meetings"
+    ],
+    "source": "cli",
+    "importance": 0.4
+  }
+]

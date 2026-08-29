@@ -2,10 +2,16 @@ import { v4 as uuidv4 } from 'uuid';
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
-import type { MemoryType, MemorySource, WriteOperation, MemoryRecord, WriteResult, RetentionTier } from '../domain/types.js';
+import type { MetricsCollector } from '../health/metrics.js';
+import type { MemoryType, MemorySource, WriteOperation, MemoryRecord, MemoryOrigin, WriteResult, RetentionTier } from '../domain/types.js';
 import { normalizeContent, computeChecksum, generateSummary, containsSecret, detectsInvalidation } from '../domain/normalize.js';
+import { extractAutoTags } from '../domain/auto-tag.js';
+import { summarizeContent } from '../domain/summarize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { invalidInput, internal } from '../errors/index.js';
+import { checkEntailment } from './entailment.js';
+import { NoopExtractionProvider, type ExtractionProvider } from './extraction.js';
+import type { SummarizationProvider } from '../summarization/index.js';
 
 interface MemoryCandidate {
   content: string;
@@ -14,16 +20,39 @@ interface MemoryCandidate {
   importance?: number;
 }
 
+/**
+ * Reconciles an UPDATE target's existing `derived_from` with the incoming
+ * write's value (see `process()`'s `derived_from` doc comment). `undefined`
+ * means "this caller doesn't set derived_from" — the field is left
+ * untouched (returning `undefined` here makes `SqliteStore.updateMemory`
+ * skip the column entirely). An explicit array unions with whatever the
+ * target already carries, deduped, so a memory re-distilled from a
+ * re-forming cluster accumulates lineage instead of losing the prior run's.
+ */
+function mergeDerivedFrom(
+  existing: string[] | null | undefined,
+  incoming: string[] | null | undefined,
+): string[] | null | undefined {
+  if (incoming === undefined) return undefined;
+  if (incoming === null) return existing ?? null;
+  return [...new Set([...(existing ?? []), ...incoming])];
+}
+
 export class WritePipeline {
   private lifecycle: MemoryLifecycleService;
+  private extraction: ExtractionProvider;
 
   constructor(
     private config: BrainConfig,
     private storage: StorageManager,
     private embedding: EmbeddingProvider,
     private logger?: { warn: (obj: Record<string, unknown>) => void },
+    extraction?: ExtractionProvider,
+    private metrics?: MetricsCollector,
+    private summarizer?: SummarizationProvider,
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
+    this.extraction = extraction ?? new NoopExtractionProvider();
   }
 
   async process(input: {
@@ -38,6 +67,23 @@ export class WritePipeline {
     clientId?: string;
     retention_tier?: RetentionTier;
     device_id?: string | null;
+    // Explicit-set-wins on UPDATE (preserves existing pin state when
+    // omitted); defaults to false on ADD when omitted. See add-inject-pinning.
+    pinned?: boolean;
+    // Caller-supplied content provenance and trust. `confidence` omitted
+    // resolves per-source from `pipeline.default_confidence` inside
+    // `decide`. See add-memory-provenance-metadata.
+    origin?: MemoryOrigin;
+    confidence?: number;
+    // Set only by `DistillationService`: the archived source memory ids this
+    // write consolidates. On ADD, stamped directly. On UPDATE (a re-forming
+    // cluster distilled a second time — see design.md Decision #7), unioned
+    // with the target's existing `derived_from` rather than replacing it, so
+    // lineage accumulates across repeated distillation runs instead of being
+    // clobbered. Omitted (undefined) for every non-distillation caller,
+    // leaving this parameter's behavior a no-op for them. See
+    // add-memory-distillation.
+    derived_from?: string[] | null;
   }): Promise<WriteResult[]> {
     const normalized = normalizeContent(input.content);
 
@@ -46,37 +92,92 @@ export class WritePipeline {
     }
 
     // Phase A: Extraction
-    const candidates = this.extract(normalized, input);
+    const candidates = await this.extract(normalized, input);
 
-    // Phase B: Decision per candidate
+    // Phase B: Decision per candidate. A candidate that throws is logged and
+    // counted, then skipped — it must not lose already-persisted sibling
+    // writes to an unhandled rejection (see add-multi-candidate-extraction).
     const results: WriteResult[] = [];
-    for (const candidate of candidates) {
-      const result = await this.decide(candidate, input);
-      results.push(result);
+    let lastError: unknown;
+    let attempted = 0;
+    for (const [index, candidate] of candidates.entries()) {
+      attempted += 1;
+      try {
+        const result = await this.decide(candidate, input);
+        results.push(result);
+      } catch (err) {
+        lastError = err;
+        this.logger?.warn({
+          event: 'candidate_write_failed',
+          namespace: input.namespace,
+          collection: input.collection,
+          candidate_index: index,
+          error: (err as Error).message,
+        });
+        this.metrics?.incCounter('extraction_candidate_failed_total');
+      }
+    }
+
+    if (results.length === 0 && attempted > 0) {
+      throw lastError;
     }
 
     return results;
   }
 
-  private extract(
+  private async extract(
     normalized: string,
     input: { type?: MemoryType; tags: string[]; importance?: number },
-  ): MemoryCandidate[] {
-    // v1 extraction is deterministic and single-candidate only, regardless of
-    // `pipeline.extraction_enabled` — the config knob is reserved for a future
-    // model-backed extraction stage but has no effect on candidate count today.
-    // TODO(bootstrap-memory-core): implement LLM-backed multi-candidate
-    // extraction using `config.pipeline.extraction_model` to split multi-fact
-    // content into atomic candidates, or retire `extraction_enabled` /
-    // `extraction_model` if multi-candidate extraction stays out of scope.
-    // The multi-candidate scenario is de-scoped for v1 in
-    // `write-decision-pipeline/spec.md` until this lands.
-    return [{
+  ): Promise<MemoryCandidate[]> {
+    const singleCandidate: MemoryCandidate[] = [{
       content: normalized,
       type: input.type,
-      tags: input.tags,
+      tags: this.deriveTags(normalized, input.tags),
       importance: input.importance,
     }];
+
+    if (normalized.length < this.config.pipeline.extraction_min_chars) {
+      return singleCandidate;
+    }
+
+    try {
+      const raw = await this.extraction.extractCandidates(normalized);
+      if (!raw || raw.length === 0) {
+        return singleCandidate;
+      }
+
+      return raw.map(candidate => ({
+        content: candidate.content,
+        type: candidate.type ?? input.type,
+        tags: this.deriveTags(candidate.content, input.tags),
+        importance: candidate.importance ?? input.importance,
+      }));
+    } catch (err) {
+      // Extraction must never block or fail a `remember` call: any
+      // unexpected throw (not just a `null` return) falls back to the
+      // deterministic single-candidate path.
+      this.logger?.warn({
+        event: 'extraction_failed',
+        error: (err as Error).message,
+      });
+      return singleCandidate;
+    }
+  }
+
+  /**
+   * Unions caller-supplied tags with deterministic, content-derived tags
+   * (see `src/domain/auto-tag.ts`, add-auto-tagging). Caller tags are listed
+   * first so a subsequent trim to `TagsSchema`'s 20-tag cap
+   * (`src/domain/schemas.ts:15`) never evicts a caller-supplied tag in favor
+   * of an auto-derived one. `auto_tag_enabled: false` returns `callerTags`
+   * unchanged — byte-identical to pre-feature behavior.
+   */
+  private deriveTags(content: string, callerTags: string[]): string[] {
+    if (!this.config.pipeline.auto_tag_enabled) {
+      return callerTags;
+    }
+    const autoTags = extractAutoTags(content, this.config.pipeline.auto_tag_max_per_memory);
+    return [...new Set([...callerTags, ...autoTags])].slice(0, 20);
   }
 
   private async decide(
@@ -89,10 +190,21 @@ export class WritePipeline {
       clientId?: string;
       retention_tier?: RetentionTier;
       device_id?: string | null;
+      pinned?: boolean;
+      origin?: MemoryOrigin;
+      confidence?: number;
+      derived_from?: string[] | null;
     },
   ): Promise<WriteResult> {
     const checksum = computeChecksum(candidate.content);
     const now = new Date().toISOString();
+    // Resolved once, available on every branch below (NOOP/UPDATE/DELETE-then-ADD/ADD).
+    // `distillation` isn't a key in `pipeline.default_confidence` (see the
+    // comment there); a distilled memory consolidating already-trusted
+    // sources defaults to full confidence.
+    const confidence = input.confidence ?? (
+      input.source === 'distillation' ? 1.0 : this.config.pipeline.default_confidence[input.source]
+    );
     const tier = this.lifecycle.assignTier({
       category: input.category,
       source: input.source,
@@ -115,11 +227,22 @@ export class WritePipeline {
       };
     }
 
-    // Step 2: Get embedding
-    let vector: number[];
-    try {
-      vector = await this.embedding.embed(candidate.content);
-    } catch (err) {
+    // Step 2: Get embedding, started concurrently with summarization — both
+    // depend only on `candidate.content` and neither needs the other's
+    // result, so kicking them off together caps the added latency of the
+    // (optional, config-gated) LLM summarization tier at
+    // max(embed_latency, summarize_latency) instead of their sum. Embed's
+    // rejection is re-thrown/handled exactly as before this change;
+    // summarization's rejection is never observed here since
+    // `summarizeContent` itself never rejects (it catches internally and
+    // falls back to the extractive tier).
+    const [embedResult, summaryResult] = await Promise.allSettled([
+      this.embedding.embed(candidate.content),
+      summarizeContent(candidate.content, this.config, this.summarizer, this.logger),
+    ]);
+
+    if (embedResult.status === 'rejected') {
+      const err = embedResult.reason;
       if (this.config.pipeline.fallback_to_threshold_dedup) {
         this.logger?.warn({
           event: 'degraded_write',
@@ -131,6 +254,7 @@ export class WritePipeline {
       }
       throw err;
     }
+    const vector = embedResult.value;
 
     // Step 3: Similarity search for near-dedup
     const similar = await this.storage.qdrant.searchSimilar(
@@ -140,9 +264,12 @@ export class WritePipeline {
       10,
     );
 
-    const operation = this.classifyOperation(candidate.content, similar, tier);
+    const operation = await this.classifyOperation(candidate.content, similar, tier, input.namespace, input.collection);
     const resolvedType = candidate.type ?? 'semantic';
-    const summary = generateSummary(candidate.content);
+    // `summarizeContent` never rejects (it catches internally), so this
+    // branch is unreachable in practice; kept as a truncation-safe fallback
+    // for type-safety against `Promise.allSettled`'s union result type.
+    const summary = summaryResult.status === 'fulfilled' ? summaryResult.value : generateSummary(candidate.content);
     const importance = candidate.importance ?? 0.5;
 
     if (operation.op === 'NOOP' && operation.targetId) {
@@ -179,6 +306,16 @@ export class WritePipeline {
         decay_eligible: lifecycleMetadata.decay_eligible,
         review_due: lifecycleMetadata.review_due,
         last_operation: 'UPDATE',
+        // Explicit-set-wins: an explicit `pinned` on this remember call
+        // overrides; omitted preserves the existing memory's pin state.
+        pinned: input.pinned !== undefined ? input.pinned : existing.pinned,
+        derived_from: mergeDerivedFrom(existing.derived_from, input.derived_from),
+        // A second confirmation should never lower trust (mirrors
+        // `importance`'s Math.max policy). `origin` isn't ordered, so it's
+        // replaced only when this call supplies one, otherwise the prior
+        // origin survives the merge.
+        confidence: Math.max(existing.confidence, confidence),
+        origin: input.origin ?? existing.origin ?? null,
         updated_at: now,
       }, vector);
 
@@ -226,9 +363,13 @@ export class WritePipeline {
         access_count: 0,
         last_operation: 'DELETE',
         merged_from: operation.targetId,
+        derived_from: input.derived_from ?? null,
         archived: false,
         vector_synced: true,
+        pinned: input.pinned ?? false,
         device_id: input.device_id ?? null,
+        origin: input.origin ?? null,
+        confidence,
         created_at: now,
         updated_at: now,
         last_accessed: now,
@@ -268,9 +409,13 @@ export class WritePipeline {
       access_count: 0,
       last_operation: 'ADD',
       merged_from: null,
+      derived_from: input.derived_from ?? null,
       archived: false,
       vector_synced: true,
+      pinned: input.pinned ?? false,
       device_id: input.device_id ?? null,
+      origin: input.origin ?? null,
+      confidence,
       created_at: now,
       updated_at: now,
       last_accessed: now,
@@ -288,19 +433,25 @@ export class WritePipeline {
     };
   }
 
-  private classifyOperation(
+  private async classifyOperation(
     candidateContent: string,
     similar: Array<{ id: string; score: number }>,
     tier: RetentionTier,
-  ): { op: WriteOperation; targetId?: string } {
+    namespace: string,
+    collection: string,
+  ): Promise<{ op: WriteOperation; targetId?: string }> {
     if (similar.length === 0) return { op: 'ADD' };
 
-    const top = similar[0]!;
+    const window = similar.slice(0, this.config.deduplication.candidate_window);
+    const top = window[0]!;
     const thresholds = this.lifecycle.dedupThresholdFor(tier, this.config.deduplication.similarity_threshold);
 
     // An explicit invalidation ("no longer true", "correction:", ...) tied to
     // a sufficiently similar prior memory takes DELETE over NOOP/UPDATE — see
     // "Candidate invalidation results in DELETE" in write-decision-pipeline/spec.md.
+    // This regex fast path is checked first and always short-circuits: it is
+    // free/instant/zero-dependency, and the LLM entailment check below never
+    // runs (and never overrides) when it already matched.
     if (top.score >= thresholds.update && detectsInvalidation(candidateContent)) {
       return { op: 'DELETE', targetId: top.id };
     }
@@ -308,9 +459,71 @@ export class WritePipeline {
       return { op: 'NOOP', targetId: top.id };
     }
     if (top.score >= thresholds.update) {
+      if (this.config.pipeline.contradiction_detection.enabled) {
+        const contradicted = await this.checkContradiction(candidateContent, top.id, namespace, collection);
+        if (contradicted) {
+          return { op: 'DELETE', targetId: top.id };
+        }
+      }
       return { op: 'UPDATE', targetId: top.id };
     }
+
+    // Corroboration: the single closest candidate didn't independently clear
+    // the UPDATE threshold, but several members of the window cluster near it.
+    // This only ever escalates ADD -> UPDATE; it never invents a NOOP or DELETE,
+    // and always targets the highest-scoring (first) window member. See
+    // widen-dedup-candidate-window.
+    if (this.config.deduplication.corroboration_enabled) {
+      const corroborators = window.filter(
+        candidate => candidate.score >= thresholds.update - this.config.deduplication.corroboration_margin,
+      );
+      if (corroborators.length >= this.config.deduplication.corroboration_count) {
+        this.logger?.warn({
+          event: 'corroborated_dedup',
+          targetId: top.id,
+          topScore: top.score,
+          corroborators: corroborators.length,
+        });
+        return { op: 'UPDATE', targetId: top.id };
+      }
+    }
+
     return { op: 'ADD' };
+  }
+
+  /**
+   * Opt-in LLM entailment check for UPDATE-band candidates that didn't
+   * already trip `detectsInvalidation`. Fails open on any error: logs a
+   * degraded-path warning (mirroring the `fallback_to_threshold_dedup`
+   * pattern above) and returns `false` so the caller proceeds with the
+   * existing UPDATE merge, exactly as if `contradiction_detection` were
+   * disabled for this write. Never throws.
+   */
+  private async checkContradiction(
+    candidateContent: string,
+    targetId: string,
+    namespace: string,
+    collection: string,
+  ): Promise<boolean> {
+    const existing = this.storage.sqlite.getMemoryById(targetId);
+    if (!existing) {
+      // Nothing to compare against (drifted store) — let the caller's
+      // existing UPDATE-target-not-found handling deal with it downstream.
+      return false;
+    }
+
+    try {
+      const label = await checkEntailment(existing.content, candidateContent, this.config);
+      return label === 'contradict';
+    } catch (err) {
+      this.logger?.warn({
+        event: 'contradiction_check_degraded',
+        namespace,
+        collection,
+        error: (err as Error).message,
+      });
+      return false;
+    }
   }
 
   /**
@@ -344,6 +557,9 @@ export class WritePipeline {
       clientId?: string;
       retention_tier?: RetentionTier;
       device_id?: string | null;
+      pinned?: boolean;
+      origin?: MemoryOrigin;
+      confidence?: number;
     },
     checksum: string,
     now: string,
@@ -356,8 +572,12 @@ export class WritePipeline {
     // "Below-threshold candidate yields ADD in fallback mode" in
     // write-decision-pipeline/spec.md.
     const resolvedType = candidate.type ?? 'semantic';
-    const summary = generateSummary(candidate.content);
+    const summary = await summarizeContent(candidate.content, this.config, this.summarizer, this.logger);
     const importance = candidate.importance ?? 0.5;
+    // Mirrors `decide`'s resolution (see the comment there).
+    const confidence = input.confidence ?? (
+      input.source === 'distillation' ? 1.0 : this.config.pipeline.default_confidence[input.source]
+    );
     const tier = this.lifecycle.assignTier({
       category: input.category,
       source: input.source,
@@ -401,6 +621,11 @@ export class WritePipeline {
         review_due: lifecycleMetadata.review_due,
         last_operation: 'UPDATE',
         vector_synced: false,
+        // Explicit-set-wins: an explicit `pinned` on this remember call
+        // overrides; omitted preserves the existing memory's pin state.
+        pinned: input.pinned !== undefined ? input.pinned : existing.pinned,
+        confidence: Math.max(existing.confidence, confidence),
+        origin: input.origin ?? existing.origin ?? null,
         updated_at: now,
       });
 
@@ -439,7 +664,10 @@ export class WritePipeline {
       merged_from: null,
       archived: false,
       vector_synced: false,
+      pinned: input.pinned ?? false,
       device_id: input.device_id ?? null,
+      origin: input.origin ?? null,
+      confidence,
       created_at: now,
       updated_at: now,
       last_accessed: now,

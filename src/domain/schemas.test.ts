@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   RememberInputSchema, RecallInputSchema, ForgetInputSchema,
   SearchInputSchema, TagInputSchema, CollectionsInputSchema,
-  CategoryInputSchema,
+  CategoryInputSchema, FeedbackInputSchema,
 } from './schemas.js';
 
 describe('RememberInputSchema', () => {
@@ -58,6 +58,35 @@ describe('RememberInputSchema', () => {
     const result = RememberInputSchema.parse({ content: 'hello\x00world' });
     expect(result.content).toBe('helloworld');
   });
+
+  // add-memory-provenance-metadata, task 8.1
+  it('accepts valid origin/confidence and defaults both to absent when omitted', () => {
+    const withDefaults = RememberInputSchema.parse({ content: 'x' });
+    expect(withDefaults.origin).toBeUndefined();
+    expect(withDefaults.confidence).toBeUndefined();
+
+    const result = RememberInputSchema.parse({
+      content: 'x',
+      origin: { session_id: 'sess-1', tool: 'claude-code', repo: 'BHGBrain', branch: 'main' },
+      confidence: 0.9,
+    });
+    expect(result.origin).toEqual({ session_id: 'sess-1', tool: 'claude-code', repo: 'BHGBrain', branch: 'main' });
+    expect(result.confidence).toBe(0.9);
+  });
+
+  it('accepts a partial origin object (all fields optional)', () => {
+    const result = RememberInputSchema.parse({ content: 'x', origin: { tool: 'codex' } });
+    expect(result.origin).toEqual({ tool: 'codex' });
+  });
+
+  it('rejects out-of-range confidence', () => {
+    expect(() => RememberInputSchema.parse({ content: 'x', confidence: -0.1 })).toThrow();
+    expect(() => RememberInputSchema.parse({ content: 'x', confidence: 1.1 })).toThrow();
+  });
+
+  it('rejects unknown origin keys (.strict())', () => {
+    expect(() => RememberInputSchema.parse({ content: 'x', origin: { session_id: 'a', bogus: 'nope' } })).toThrow();
+  });
 });
 
 describe('RecallInputSchema', () => {
@@ -70,6 +99,36 @@ describe('RecallInputSchema', () => {
 
   it('rejects query over 500 chars', () => {
     expect(() => RecallInputSchema.parse({ query: 'x'.repeat(501) })).toThrow();
+  });
+
+  it('accepts after-only', () => {
+    const result = RecallInputSchema.parse({ query: 'test', after: '2026-01-01T00:00:00Z' });
+    expect(result.after).toBe('2026-01-01T00:00:00Z');
+    expect(result.before).toBeUndefined();
+  });
+
+  it('accepts before-only', () => {
+    const result = RecallInputSchema.parse({ query: 'test', before: '2026-01-01T00:00:00Z' });
+    expect(result.before).toBe('2026-01-01T00:00:00Z');
+    expect(result.after).toBeUndefined();
+  });
+
+  it('rejects after later than before', () => {
+    expect(() => RecallInputSchema.parse({
+      query: 'test', after: '2026-06-01T00:00:00Z', before: '2026-01-01T00:00:00Z',
+    })).toThrow();
+  });
+
+  it('accepts after equal to before', () => {
+    const result = RecallInputSchema.parse({
+      query: 'test', after: '2026-01-01T00:00:00Z', before: '2026-01-01T00:00:00Z',
+    });
+    expect(result.after).toBe(result.before);
+  });
+
+  it('rejects a non-ISO-8601 timestamp', () => {
+    expect(() => RecallInputSchema.parse({ query: 'test', after: '2026-01-01' })).toThrow();
+    expect(() => RecallInputSchema.parse({ query: 'test', before: 'not-a-date' })).toThrow();
   });
 });
 
@@ -100,6 +159,38 @@ describe('SearchInputSchema', () => {
 
   it('rejects limit > 50', () => {
     expect(() => SearchInputSchema.parse({ query: 'test', limit: 51 })).toThrow();
+  });
+
+  it('defaults include_archived to false', () => {
+    const result = SearchInputSchema.parse({ query: 'test' });
+    expect(result.include_archived).toBe(false);
+  });
+
+  it('accepts an explicit include_archived: true', () => {
+    const result = SearchInputSchema.parse({ query: 'test', include_archived: true });
+    expect(result.include_archived).toBe(true);
+  });
+
+  it('accepts after-only', () => {
+    const result = SearchInputSchema.parse({ query: 'test', after: '2026-01-01T00:00:00Z' });
+    expect(result.after).toBe('2026-01-01T00:00:00Z');
+    expect(result.before).toBeUndefined();
+  });
+
+  it('accepts before-only', () => {
+    const result = SearchInputSchema.parse({ query: 'test', before: '2026-01-01T00:00:00Z' });
+    expect(result.before).toBe('2026-01-01T00:00:00Z');
+    expect(result.after).toBeUndefined();
+  });
+
+  it('rejects after later than before', () => {
+    expect(() => SearchInputSchema.parse({
+      query: 'test', after: '2026-06-01T00:00:00Z', before: '2026-01-01T00:00:00Z',
+    })).toThrow();
+  });
+
+  it('rejects a non-ISO-8601 timestamp', () => {
+    expect(() => SearchInputSchema.parse({ query: 'test', after: '2026-01-01' })).toThrow();
   });
 });
 
@@ -134,5 +225,43 @@ describe('CategoryInputSchema', () => {
     for (const slot of ['company-values', 'architecture', 'coding-requirements', 'custom']) {
       expect(() => CategoryInputSchema.parse({ action: 'set', slot, name: 'test', content: 'test' })).not.toThrow();
     }
+  });
+});
+
+describe('FeedbackInputSchema', () => {
+  const validId = '123e4567-e89b-12d3-a456-426614174000';
+
+  it('accepts valid minimal input (id + useful only)', () => {
+    const result = FeedbackInputSchema.parse({ id: validId, useful: true });
+    expect(result.id).toBe(validId);
+    expect(result.useful).toBe(true);
+    expect(result.query).toBeUndefined();
+    expect(result.score).toBeUndefined();
+  });
+
+  it('accepts full input with query and score', () => {
+    const result = FeedbackInputSchema.parse({
+      id: validId, useful: false, query: 'search text', score: 0.75,
+    });
+    expect(result.query).toBe('search text');
+    expect(result.score).toBe(0.75);
+  });
+
+  it('rejects a non-UUID id', () => {
+    expect(() => FeedbackInputSchema.parse({ id: 'not-a-uuid', useful: true })).toThrow();
+  });
+
+  it('rejects score outside [0,1]', () => {
+    expect(() => FeedbackInputSchema.parse({ id: validId, useful: true, score: 1.5 })).toThrow();
+    expect(() => FeedbackInputSchema.parse({ id: validId, useful: true, score: -0.1 })).toThrow();
+  });
+
+  it('rejects unknown keys', () => {
+    expect(() => FeedbackInputSchema.parse({ id: validId, useful: true, extra: 'nope' })).toThrow();
+  });
+
+  it('rejects query over 500 chars', () => {
+    const longQuery = 'a'.repeat(501);
+    expect(() => FeedbackInputSchema.parse({ id: validId, useful: true, query: longQuery })).toThrow();
   });
 });

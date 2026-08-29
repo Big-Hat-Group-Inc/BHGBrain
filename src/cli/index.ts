@@ -9,10 +9,13 @@ import { QdrantStore } from '../storage/qdrant.js';
 import { StorageManager } from '../storage/index.js';
 import { createEmbeddingProvider, getEmbeddingBreakerKey } from '../embedding/index.js';
 import { WritePipeline } from '../pipeline/index.js';
+import { createExtractionProvider } from '../pipeline/extraction.js';
 import { SearchService } from '../search/index.js';
 import { BackupService } from '../backup/index.js';
 import { HealthService } from '../health/index.js';
 import { RetentionService } from '../backup/retention.js';
+import { DistillationService } from '../pipeline/distillation.js';
+import { DistillationLLMClient } from '../pipeline/distillation-llm.js';
 import { MetricsCollector } from '../health/metrics.js';
 import { createLogger } from '../health/logger.js';
 import { CircuitBreaker } from '../resilience/index.js';
@@ -33,18 +36,20 @@ async function createContext(): Promise<ToolContext> {
   };
   const embeddingBreaker = new CircuitBreaker(breakerOptions);
   const qdrantBreaker = new CircuitBreaker(breakerOptions);
+  const extractionBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
   const metrics = new MetricsCollector(config);
   const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
-  const storage = new StorageManager(sqlite, qdrant, embedding);
+  const extraction = createExtractionProvider(config, { breaker: extractionBreaker, metrics, logger });
+  const storage = new StorageManager(sqlite, qdrant, embedding, undefined, config);
 
-  const pipeline = new WritePipeline(config, storage, embedding);
+  const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics);
   const searchService = new SearchService(config, storage, embedding, metrics, logger);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {
     [getEmbeddingBreakerKey(config.embedding.provider)]: embeddingBreaker,
     qdrant: qdrantBreaker,
-  });
+  }, logger);
 
   return { config, storage, embedding, pipeline, search: searchService, backup: backupService, health: healthService, metrics, logger };
 }
@@ -239,6 +244,19 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     });
 
   program
+    .command('distill')
+    .description('Run memory distillation (clusters T2/T3 episodic memories into T1 semantic memories)')
+    .option('--dry-run', 'Report candidate clusters without calling the LLM or writing/archiving anything')
+    .action(async (opts) => {
+      const ctx = await createContextImpl();
+      const llmClient = new DistillationLLMClient(ctx.config, undefined, ctx.metrics);
+      const distillation = new DistillationService(ctx.config, ctx.storage, ctx.pipeline, llmClient, ctx.logger, ctx.metrics);
+      const result = await distillation.runOnce({ dryRun: Boolean(opts.dryRun) });
+      console.log(JSON.stringify(result, null, 2));
+      ctx.storage.sqlite.close();
+    });
+
+  program
     .command('stats')
     .description('Show memory statistics')
     .option('--by-tier', 'Include tier breakdown')
@@ -379,9 +397,27 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .description('Repair local state from external sources')
     .option('--from-qdrant', 'Hydrate local SQLite from Qdrant Cloud payloads')
     .option('--all-devices', 'Hydrate memories from every device, not just the current one (default: current device only)')
+    .option('--re-embed', 'Migrate memories whose embedding stamp differs from the active embedding.provider/model to the active identity')
+    .option('--include-legacy', 'With --re-embed, also re-embed legacy rows that predate provenance stamping (no stamp at all)')
+    .option('--batch-size <n>', 'With --re-embed, memories re-embedded per batch', '50')
+    .option('--dry-run', 'With --re-embed, report what would change without making changes')
     .action(async (opts) => {
+      if (opts.reEmbed) {
+        const ctx = await createContextImpl();
+        console.log('[repair] re-embed: scanning for stale embedding stamps...');
+        const result = await handleTool(ctx, 'repair', {
+          mode: 're-embed',
+          include_legacy: Boolean(opts.includeLegacy),
+          batch_size: parseInt(opts.batchSize, 10),
+          dry_run: Boolean(opts.dryRun),
+        });
+        console.log(JSON.stringify(result, null, 2));
+        ctx.storage.sqlite.close();
+        return;
+      }
+
       if (!opts.fromQdrant) {
-        console.error('Please specify a repair source. Available: --from-qdrant');
+        console.error('Please specify a repair source. Available: --from-qdrant, --re-embed');
         process.exitCode = 1;
         return;
       }

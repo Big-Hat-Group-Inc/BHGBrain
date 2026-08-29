@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import initSqlJs from 'sql.js';
 import { SqliteStore } from '../storage/sqlite.js';
 import { BootstrapSessionManager } from './session.js';
 import { TOTAL_SECTIONS } from './sections.js';

@@ -11,6 +11,7 @@ import {
   validateExternalAuthBinding,
   deriveTrustedClientId,
 } from './middleware.js';
+import { McpSessionManager } from './mcp-http.js';
 import type { MetricEntry } from '../health/metrics.js';
 import type pino from 'pino';
 
@@ -49,12 +50,17 @@ export function renderPrometheusText(metrics: MetricEntry[]): string {
   return lines.join('\n');
 }
 
+export interface HttpServerHandle {
+  app: express.Express;
+  mcpSessions: McpSessionManager;
+}
+
 export function createHttpServer(
   config: BrainConfig,
   ctx: ToolContext,
   resources: ResourceHandler,
   logger: pino.Logger,
-) {
+): HttpServerHandle {
   validateLoopbackBinding(config);
   validateExternalAuthBinding(config, logger);
 
@@ -78,6 +84,24 @@ export function createHttpServer(
   app.use(createAuthMiddleware(config, logger));
   app.use(createRateLimitMiddleware(config, logger, ctx.metrics));
   app.use(createSizeLimitMiddleware(config));
+
+  // Real MCP over HTTP (Streamable HTTP transport): per-session `Server` +
+  // `StreamableHTTPServerTransport` pairs registered/looked up through
+  // `mcpSessions`, sitting behind the auth/rate-limit/size-limit middleware
+  // registered just above — same security posture as the REST endpoints.
+  const mcpSessions = new McpSessionManager(ctx, resources, logger);
+
+  app.post('/mcp', async (req, res) => {
+    await mcpSessions.handlePost(req, res);
+  });
+
+  app.get('/mcp', async (req, res) => {
+    await mcpSessions.handleGet(req, res);
+  });
+
+  app.delete('/mcp', async (req, res) => {
+    await mcpSessions.handleDelete(req, res);
+  });
 
   // Tool endpoint
   app.post('/tool/:name', async (req, res) => {
@@ -113,5 +137,5 @@ export function createHttpServer(
     });
   }
 
-  return app;
+  return { app, mcpSessions };
 }

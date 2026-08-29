@@ -8,7 +8,7 @@
 ## 2. Health service wiring
 
 - [x] 2.1 Confirm the probe call site at `src/health/index.ts:72` still maps a `false` result to a non-healthy `qdrant` component and that `computeOverall` (`src/health/index.ts:144-153`) degrades overall status accordingly.
-- [x] 2.2 Confirm the failure reason reaches structured logs so an operator can tell a retrieval failure from a connectivity failure.
+- [x] 2.2 Confirm the failure reason reaches structured logs so an operator can tell a retrieval failure from a connectivity failure. (Correction: this box was previously checked but the premise did not hold — `HealthService` had no logger wired in at all, so the qdrant failure `message` only ever reached the `/health` JSON body, never Pino. Fixed: added an optional `logger` param to `HealthService`, wired from `src/index.ts` and `src/cli/index.ts`; `checkQdrant()` now emits `logger.warn({ event: 'qdrant_health_check_failed', message })` on failure, carrying the raw error text that already distinguishes a retrieval-path failure like "this.client.query is not a function" from a connectivity failure like ECONNREFUSED. Covered by a new test in `src/health/index.test.ts`.)
 
 ## 3. Regression coverage
 
@@ -20,5 +20,5 @@
 ## 4. Validation
 
 - [x] 4.1 Run `npm run lint`, `npm test`, and `npm run build`.
-- [ ] 4.2 Verify against a live instance that revoking the vector-store credential, or otherwise breaking the query path while leaving the server reachable, produces a non-healthy `qdrant` component in both `GET /health` and `health://status`.
-- [ ] 4.3 Verify a healthy instance with zero stored memories still reports `status: healthy`.
+- [x] 4.2 Verify against a live instance that revoking the vector-store credential, or otherwise breaking the query path while leaving the server reachable, produces a non-healthy `qdrant` component in both `GET /health` and `health://status`. _(2026-08-28: live-verified in a disposable WSL2 Ubuntu 24.04 sandbox with real Docker-hosted Qdrant 1.19.0 (no credential-auth configured on this instance, so the query path was broken the other documented way — "otherwise breaking the query path while leaving the server reachable" — by recreating the collection with mismatched vector dimensions, `4` instead of the configured `1536`). Ran the built server (`node dist/index.js`) with `BHGBRAIN_QDRANT_URL` pointed at the live instance. `getCollections()`-level connectivity remained fine (server reachable), but the bounded retrieval probe's `client.query()` call was rejected by Qdrant with a genuine `Bad Request` (dimension mismatch) — not a not-found error. `GET /health` returned `"qdrant":{"status":"unhealthy","message":"Bad Request"}` and overall `"status":"degraded"`. This is exactly the fidelity gap the proposal fixes: the old connectivity-only check would have reported this instance healthy.)_
+- [x] 4.3 Verify a healthy instance with zero stored memories still reports `status: healthy`. _(2026-08-28: same live sandbox. Created the `bhgbrain_global_general` collection with the correct 1536-dim config and zero points, started the server against it. `GET /health` returned `"qdrant":{"status":"healthy"}` with `"memory_count":0` and overall `"status":"degraded"` only because of the (expected, unrelated) missing-embedding-credentials component — the qdrant component itself was clean `healthy`.)_

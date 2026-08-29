@@ -31,9 +31,11 @@
 
 ## 3. Pin base and sidecar images
 
-- [ ] 3.1 Pin the Dockerfile base image by digest (e.g. `node:20-slim@sha256:...`)
-  for both stages. _(2026-06-05: left as the major-pinned `node:20-slim` tag — a digest could not
-  be resolved offline in this environment. Resolve and pin the digest before release. Remaining.)_
+- [x] 3.1 Pin the Dockerfile base image by digest (e.g. `node:20-slim@sha256:...`)
+  for both stages. _(2026-08-27: resolved via Docker Hub registry API —
+  `node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0`
+  (multi-arch manifest-list digest, current as of this date). Pinned on both the
+  `builder` and runtime `FROM` lines with a comment on how to bump it.)_
 - [x] 3.2 Pin the `qdrant/qdrant` image in `docker-compose.yml` to a fixed version
   instead of `:latest`. _(pinned to `qdrant/qdrant:v1.12.4` — **verify/adjust the tag** for your
   deployment; this service is opt-in via the `self-hosted` profile.)_
@@ -53,8 +55,16 @@
 
 ## 6. Validation
 
-- [ ] 6.1 Run `npm run lint`, `npm test`, and `npm run build`; build the image and
-  verify a default `docker compose up` starts securely. _(2026-06-06: lint clean, 259 tests
-  pass, build OK; **entrypoint shell + compose validated by syntax check, but the image build /
-  `docker compose up` could NOT be run — Docker is unavailable in this environment.** Remaining:
-  build-verify before release.)_
+- [x] 6.1 Run `npm run lint`, `npm test`, and `npm run build`; build the image and
+  verify a default `docker compose up` starts securely. _(2026-08-28: build-verified live in a
+  fresh WSL2 Ubuntu 24.04 instance with real Docker Engine 29.7.2 + Compose v5.5.0 (this repo
+  ships no Docker in its native environment, so a disposable sandbox was provisioned for this
+  check). `docker compose build bhgbrain` succeeded on the digest-pinned `node:20-slim` base
+  (both stages). `docker compose up -d bhgbrain` with no `.env` present (first-run scenario) came
+  up `Up (healthy)` with no crash-loop: auto-provisioned a `BHGBRAIN_TOKEN`, printed it once,
+  persisted it to `/data/bhgbrain-token`, and bound only to `127.0.0.1:3721` (confirmed via `ss
+  -tlnp`, not `0.0.0.0`). With Qdrant/embedding credentials both absent it degraded gracefully
+  (`status: degraded`, no crash) rather than failing closed destructively. `curl -H "Authorization:
+  Bearer <token>"` against `/health` returned 200 with the expected component breakdown. Prior
+  `npm run lint`/`npm test`/`npm run build` results (all green) reconfirmed on both Node 20 and
+  Node 22 in the same sandbox. Nothing remains unverified for this change.)_

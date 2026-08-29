@@ -127,14 +127,17 @@ export class BackupService {
         throw invalidInput('Backup integrity check failed: checksum mismatch');
       }
 
-      // Write restored DB atomically
-      const dbPath = this.storage.sqlite.getDatabasePath();
-      atomicWriteFileSync(dbPath, dbData);
+      // Activate the restored image through the store: this closes the live
+      // native connection, clears stale WAL/SHM sidecars, atomically writes
+      // `dbData` onto `brain.db`, and reopens — required on Windows, where
+      // writing onto a file the store still has open natively fails (EPERM).
+      // See migrate-sqlite-to-native-engine design.md "Restore must
+      // close-before-overwrite".
       this.logger?.info({ event: 'backup_restore_write', path: backupPath, bytes: dbData.length });
 
       try {
         this.logger?.info({ event: 'backup_restore_activate_start', path: backupPath });
-        await this.storage.reloadSqliteFromDisk();
+        await this.storage.activateSqliteImage(dbData);
       } catch (err) {
         this.logger?.error({
           event: 'backup_restore_activate_failed',

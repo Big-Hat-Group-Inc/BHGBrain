@@ -21,6 +21,7 @@ BHGBrain 将记忆存储在 SQLite（元数据 + 全文搜索）和 Qdrant（语
    - [设备身份解析](#设备身份解析)
    - [共享 Qdrant，本地 SQLite](#共享-qdrant本地-sqlite)
    - [修复与恢复](#修复与恢复)
+   - [嵌入模型迁移](#嵌入模型迁移)
 10. [记忆管理](#记忆管理)
     - [记忆数据模型](#记忆数据模型)
     - [记忆类型](#记忆类型)
@@ -28,10 +29,13 @@ BHGBrain 将记忆存储在 SQLite（元数据 + 全文搜索）和 Qdrant（语
     - [保留层级](#保留层级)
     - [层级生命周期——分配、晋升与滑动窗口](#层级生命周期分配晋升与滑动窗口)
     - [去重](#去重)
+    - [自动标记](#自动标记)
+    - [内容溯源](#内容溯源)
     - [内容规范化](#内容规范化)
     - [重要性评分](#重要性评分)
     - [类别——持久化策略槽](#类别持久化策略槽)
     - [衰减、清理与归档](#衰减清理与归档)
+    - [记忆蒸馏](#记忆蒸馏)
     - [到期前警告](#到期前警告)
     - [资源限制与容量预算](#资源限制与容量预算)
 11. [搜索](#搜索)
@@ -45,11 +49,13 @@ BHGBrain 将记忆存储在 SQLite（元数据 + 全文搜索）和 Qdrant（语
 13. [健康状态与指标](#健康状态与指标)
 14. [安全性](#安全性)
 15. [MCP 资源](#mcp-资源)
-16. [引导提示词](#引导提示词)
-17. [CLI 参考](#cli-参考)
-18. [MCP 工具参考](#mcp-工具参考)
-19. [升级](#升级)
-20. [行为说明](#行为说明)
+16. [MCP 提示词](#mcp-提示词)
+17. [引导提示词](#引导提示词)
+18. [CLI 参考](#cli-参考)
+19. [MCP 工具参考](#mcp-工具参考)
+20. [Docker](#docker)
+21. [升级](#升级)
+22. [行为说明](#行为说明)
 
 ---
 
@@ -72,7 +78,7 @@ graph TD
         RH["Resource Handler<br/><i>memory:// URIs</i>"]
 
         subgraph Storage["Storage Manager"]
-            subgraph SQLite["SQLite (sql.js)"]
+            subgraph SQLite["SQLite (node:sqlite)"]
                 S1["metadata"]
                 S2["fulltext (FTS)"]
                 S3["categories"]
@@ -108,7 +114,7 @@ graph TD
     class OpenAI external
 ```
 
-- **SQLite**（通过 `sql.js`，以内存方式运行并定期原子性刷写到磁盘）是所有记忆元数据、全文搜索索引、类别、审计追踪、版本历史及归档记录的**权威数据源**。
+- **SQLite**（通过 `node:sqlite` 的原生 `DatabaseSync`，采用 WAL 日志记录，提交级持久性）是所有记忆元数据、全文搜索索引、类别、审计追踪、版本历史及归档记录的**权威数据源**。
 - **Qdrant** 存储用于相似度搜索的语义向量嵌入。Qdrant 的写入始终在 SQLite 写入成功后进行；写入失败通过 `vector_synced` 标志追踪，并在健康检查端点中呈现。
 - **OpenAI text-embedding-3-small**（默认，可配置）为每条记忆生成 1536 维嵌入向量。
 - **原子写入**确保数据库文件不会被部分写入——所有磁盘 I/O 均采用"先写临时文件再重命名"的方式。
@@ -120,7 +126,7 @@ graph TD
 
 | 要求 | 版本 | 说明 |
 |---|---|---|
-| Node.js | ≥ 20.0.0 | 推荐使用 LTS 版本 |
+| Node.js | ≥ 22.0.0 | 推荐使用 LTS 版本 |
 | Qdrant | ≥ 1.10 | 必须在启动 BHGBrain 之前运行。内置客户端（`@qdrant/js-client-rest` `~1.19.0`）调用 Qdrant 1.10 引入的 `query` API；较旧的服务器在语义搜索时会失败。 |
 | OpenAI API key | — | 用于嵌入（默认使用 `text-embedding-3-small`）。如果缺失，服务器将以降级模式启动。 |
 
@@ -186,6 +192,12 @@ volumes:
 }
 ```
 
+对于 Azure，`embedding.model` 是发送到上游的部署名称（deployment name），而非公开的模型系列名称。Azure 凭据仅在启动时从 `AZURE_FOUNDRY_API_KEY` 加载一次；轮换该密钥需要重启服务器或显式重新加载配置。
+
+`embedding.model` 必须是受支持的模型之一——`text-embedding-ada-002`、`text-embedding-3-small` 或 `text-embedding-3-large`——这一要求对 `openai` 和 `azure-foundry` **两种**提供商均适用。此项在启动时强制校验：不受支持或拼写错误的模型（对 Azure 而言，即部署名称与任何受支持的模型系列都不匹配）会立即导致配置校验失败，并返回列出受支持模型的错误信息，而不是启动后静默产出维度错误的向量。
+
+> **从零开始配置？** [`scripts/azure/`](./scripts/azure/README.md) 中的 PowerShell 脚本可以创建 Azure AI Foundry / Azure OpenAI 资源、部署一个嵌入模型（按要求将部署名称设置为与模型名称一致），并为你写好 BHGBrain 的 `config.json` 与 `AZURE_FOUNDRY_API_KEY`——只需一个 Azure 订阅即可从零开始。
+
 ---
 
 ## 安装
@@ -232,17 +244,42 @@ BHGBrain 从以下位置加载配置文件：
 
   // 嵌入提供商配置
   "embedding": {
-    // 目前仅支持 "openai"
+    // 提供商："openai" 或 "azure-foundry"
     "provider": "openai",
-    // 用于嵌入的 OpenAI 模型。必须是受支持的模型之一："text-embedding-ada-002"、
-    // "text-embedding-3-small"、"text-embedding-3-large"。不受支持的模型会在启动时
-    // 导致配置校验失败。
+    // 模型名称（OpenAI）或 Azure 部署名称（Azure）。
+    // 必须是受支持的模型之一："text-embedding-ada-002"、
+    // "text-embedding-3-small"、"text-embedding-3-large"。任一提供商
+    // 使用不受支持的值都会在启动时导致配置校验失败。
     "model": "text-embedding-3-small",
-    // 保存 OpenAI API key 的环境变量名称
-    "api_key_env": "OPENAI_API_KEY",
     // 模型输出的向量维度，必须与模型输出匹配。
     // 重要：在集合创建后更改此项需要重建集合。
-    "dimensions": 1536
+    "dimensions": 1536,
+    // 请求超时时间（毫秒）
+    "request_timeout_ms": 30000,
+    // 单次嵌入请求的最大输入数量（分块阈值）
+    "max_batch_inputs": 2048,
+    // 瞬时故障的重试配置
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 1000
+    },
+    // 每个向量在写入时都会打上带提供方限定的身份标记
+    // （`<provider>/<model>@<dimensions>`）。如果存储层记录的期望身份
+    // （在启动后首次写入时被采纳）与当前配置不一致——例如更换了提供方或
+    // 模型——`embedding` 健康组件会降级，并且只要该开关为 true，产生向量的
+    // 写入操作就会被拒绝，并返回一个指明 `repair` 工具 re-embed 模式的错误。
+    // 只有在你确实想让写入混用嵌入空间时才将其设为 false。参见下方的
+    // “嵌入模型迁移”。
+    "refuse_writes_on_model_mismatch": true,
+    // 保存 OpenAI API key 的环境变量名称（Azure 时忽略）
+    "api_key_env": "OPENAI_API_KEY",
+    // Azure 专用配置（当 provider = "azure-foundry" 时必填）
+    "azure": {
+      // 用于构造终结点 URL 的 Azure 资源名称
+      "resource_name": "my-foundry-resource",
+      // 保存 Azure API key 的环境变量名称
+      "api_key_env": "AZURE_FOUNDRY_API_KEY"
+    }
   },
 
   // Qdrant 连接配置
@@ -290,7 +327,10 @@ BHGBrain 从以下位置加载配置文件：
     // 自动注入载荷中包含的最大记忆数量
     "auto_inject_limit": 10,
     // 工具响应载荷的最大字符数
-    "max_response_chars": 50000
+    "max_response_chars": 50000,
+    // 每个命名空间中 pinned: true 记忆数量的上限
+    // （参见 remember/tag 与 memory://inject 文档）
+    "pin_limit_per_namespace": 20
   },
 
   // 记忆保留与生命周期设置
@@ -341,7 +381,34 @@ BHGBrain 从以下位置加载配置文件：
     "pre_expiry_warning_days": 7,
 
     // Qdrant 分段压缩阈值（当某分段中已删除数据占比超过此比例时触发压缩）
-    "compaction_deleted_threshold": 0.10
+    "compaction_deleted_threshold": 0.10,
+
+    // 定时记忆蒸馏：将相关且仍处于活跃状态的 T2/T3 情景记忆聚类，并通过 LLM
+    // 调用将每个符合条件的簇合并为一条持久的 T1 语义记忆，同时保留来源关系
+    // 归档源记忆（参见下方"记忆蒸馏"）。默认关闭；未配置提取 API 密钥时不生效。
+    "distillation": {
+      // 总开关。false（默认）：调度器永不启动，且 `bhgbrain distill` 会跳过
+      // 每个簇（no_key），除非配置了提取 API 密钥。
+      "enabled": false,
+
+      // 后台蒸馏任务的 cron 计划（UTC）。默认在 cleanup_schedule 之后一小时，
+      // 避免刚被 GC 归档的存储在同一时刻又被蒸馏。
+      "schedule": "0 3 * * *",
+
+      // 两条 T2/T3 情景记忆被归入同一簇所需的余弦相似度下限。刻意保守——
+      // 一旦来源被归档，错误的合并将无法撤销。
+      "similarity_threshold": 0.85,
+
+      // 小于该大小的簇将被忽略（信号太弱）。
+      "min_cluster_size": 3,
+
+      // 大于该大小的簇会被确定性地拆分为若干 max_cluster_size 大小的块，
+      // 而不是作为一个整体被蒸馏。
+      "max_cluster_size": 20,
+
+      // 每次定时运行最多蒸馏（即调用 LLM）的簇数上限。
+      "max_clusters_per_run": 10
+    }
   },
 
   // 去重设置
@@ -350,7 +417,18 @@ BHGBrain 从以下位置加载配置文件：
     "enabled": true,
     // 余弦相似度阈值，超过此值时新内容被认为是对现有内容的更新。
     // 各层级有额外调整（详见下方去重章节）。
-    "similarity_threshold": 0.92
+    "similarity_threshold": 0.92,
+    // 分类器为佐证判断评估已获取的 10 个相似度候选中的多少个
+    // （1-10；NOOP/DELETE/直接 UPDATE 始终只使用最接近的一个）。
+    "candidate_window": 5,
+    // 下方佐证路径的独立开关；设为 false 会恢复到扩展前
+    // 仅单候选的分类方式，与此处其他三项设置无关。
+    "corroboration_enabled": true,
+    // 窗口内候选（包括最接近的那个）中，分数需落在更新阈值的
+    // corroboration_margin 范围内的最少数量，才能将 ADD 升级为 UPDATE。
+    "corroboration_count": 2,
+    // 候选分数可以低于更新阈值多少，仍计入佐证。
+    "corroboration_margin": 0.03
   },
 
   // 搜索配置
@@ -360,6 +438,70 @@ BHGBrain 从以下位置加载配置文件：
     "hybrid_weights": {
       "semantic": 0.7,
       "fulltext": 0.3
+    },
+    // 复合排名：按相关性 x 一个由重要性、访问频率和分层感知的时效衰减
+    // 共同决定的先验值对结果排序（详见下方"复合排名"）。
+    // enabled 设为 false 可恢复纯相关性排序。
+    "ranking": {
+      "enabled": true,
+      "w_importance": 0.3,
+      "w_access": 0.2,
+      "access_norm": 50,
+      // 每个保留层级的每日指数衰减率。T0 为 0（永不衰减）。
+      "decay_per_day": {
+        "T0": 0,
+        "T1": 0.002,
+        "T2": 0.008,
+        "T3": 0.02
+      }
+    },
+    // 可选的 LLM 重排序阶段，仅用于 `recall`（详见下方"重排序"）。
+    // 默认禁用：启用后，会将查询和每个候选项的文本发送给配置的 LLM
+    // 进行相关性判断，替换 `score`（不影响 `semantic_score`，因此
+    // min_score 过滤不受影响）。需要单独配置 BHGBRAIN_RERANK_API_KEY。
+    "rerank": {
+      "enabled": false,
+      "provider": "openai",
+      // 每次调用发送给 LLM 的 recall 已排名候选项数量。1-50。
+      "candidate_pool": 20,
+      "model": "gpt-4o-mini",
+      "model_env": "BHGBRAIN_RERANK_API_KEY",
+      // 任何失败（超时、非 2xx 响应、格式错误的响应）都会降级为
+      // 重排序前的顺序，而不会导致 recall 调用失败。
+      "timeout_ms": 3000
+    },
+    // 最大边际相关性（MMR）多样性重排序，在复合排名之后应用
+    // （详见下方"MMR 多样性重排序"）。enabled 设为 false 可精确恢复
+    // 纯复合相关性排序。
+    "mmr": {
+      "enabled": true,
+      "lambda": 0.7,
+      "candidate_pool_multiplier": 3,
+      "candidate_pool_cap": 50
+    },
+    // 多查询扩展：语义搜索/recall 对查询的多种表示形式进行嵌入和搜索，
+    // 在排名之前按 id 合并候选项（取最高分）（详见下方"多查询扩展"）。
+    "query_expansion": {
+      "enabled": true,
+      // 搜索的变体总数上限（原始 + 去停用词 + LLM 生成），
+      // 与 llm_paraphrase.variant_count 相互独立。
+      "max_variants": 2,
+      // 确定性、无需模型的变体：去除英文停用词后的查询，只要与原始
+      // 查询不同且非空，就与原始查询一起被搜索。
+      "keyword_stripped": true,
+      // 可选的、基于模型的变体生成。默认关闭：这是首个实时路径上的
+      // LLM 对话依赖，每次调用都会增加延迟/成本。
+      "llm_paraphrase": {
+        "enabled": false,
+        // "paraphrase"：改写查询。"hyde"：生成一段假设性答案并改为
+        // 嵌入该段落（可能提升召回率，但代价是可能产生幻觉细节——
+        // 详见下方 README 说明）。
+        "mode": "paraphrase",
+        "variant_count": 2,
+        // 对话补全请求的超时时间；任何失败（超时、非 2xx 响应、
+        // 缺少 key）都会静默降级为上面的无模型变体。
+        "timeout_ms": 3000
+      }
     }
   },
 
@@ -380,12 +522,28 @@ BHGBrain 从以下位置加载配置文件：
     "trust_proxy": false
   },
 
-  // 自动注入载荷预算（用于 memory://inject 资源）
+  // 自动注入载荷预算（用于 memory://inject 和 memory://inject/{hint}）
   "auto_inject": {
-    // 注入载荷中包含的最大字符数
+    // 预算数值，依据下方 budget_unit 解释
     "max_chars": 30000,
     // Token 预算（null = 无限制，使用字符预算）
-    "max_tokens": null
+    "max_tokens": null,
+    // 为记忆部分保留的预算比例，使类别内容不再能在注入任何一条记忆之前
+    // 就耗尽整个载荷预算。设为 0 可恢复此前类别可占用全部预算的行为。
+    "memory_budget_fraction": 0.4,
+    // 'chars'（默认）：max_chars 为字符预算，与引入此选项前完全一致。
+    // 'tokens'：将 max_chars 视为估算的 token 预算（字符数/4，无需依赖
+    // 分词器），使每个部分的有效字符预算按 4 倍放大。
+    "budget_unit": "chars",
+    // 在按提示选出的记忆部分内进行贪心近重复抑制：若某候选与已选记忆的
+    // 相似度超过 deduplication.similarity_threshold，则跳过该候选。
+    // 已固定（pinned）的记忆在两个方向上都不受此影响。
+    "dedup_suppression": true,
+    // 是否始终在记忆部分中包含已固定的记忆（参见
+    // defaults.pin_limit_per_namespace 以及 remember/tag 的 `pinned`
+    // 参数）。设为 false 会完全禁用此步骤；无论此开关如何，固定数量上限
+    // 仍会在写入时强制执行。
+    "pinned_enabled": true
   },
 
   // 可观测性设置
@@ -400,17 +558,51 @@ BHGBrain 从以下位置加载配置文件：
 
   // 数据摄入管道设置
   "pipeline": {
-    // 启用提取阶段（当前运行确定性单候选提取）
-    "extraction_enabled": true,
-    // 用于基于 LLM 提取的模型（计划用于未来功能）
+    // 启用基于 LLM 的多候选提取：在去重/写入之前，将包含多个事实的 `remember`
+    // 内容拆分为原子候选记忆。默认值为 false——需要主动启用，因为启用后每次
+    // 足够长的 `remember` 都会消耗一次 LLM 调用（成本 + 延迟）。为 false 时，
+    // 或未能解析出 API key 时，提取始终只生成一个候选（当前行为）。
+    "extraction_enabled": false,
+    // 用于提取的 chat-completions 模型
     "extraction_model": "gpt-4o-mini",
-    // 提取模型 API key 的环境变量名称
+    // 提取模型 API key 的环境变量名称；回退到 OPENAI_API_KEY
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // 短于此长度（字符数）的内容会跳过 LLM 调用，直接进入单候选提取
+    "extraction_min_chars": 120,
+    // 超过此上限的候选会被丢弃（而非合并），并记录日志和计数
+    "extraction_max_candidates": 6,
+    // 提取请求超时（毫秒），通过 AbortController 强制执行
+    "extraction_timeout_ms": 4000,
     // 为 true 时，若嵌入不可用则回退到校验和 + 全文相似度去重
-    "fallback_to_threshold_dedup": true
+    "fallback_to_threshold_dedup": true,
+    // 启用可选的 LLM 摘要层：用一次低成本的 chat-completion 调用生成记忆的
+    // `summary` 字段，取代免费的内置抽取式摘要器。默认值为 false——与提取
+    // 功能一样，这是一次新的外部调用，涉及成本/延迟影响，需要主动启用。任何
+    // 失败（缺少 key、非 2xx 响应、超时、网络错误）都会在本次写入时回退到
+    // 抽取式摘要层；摘要生成永远不会阻塞或导致 `remember`/`revert` 调用失败。
+    "summarization_enabled": false,
+    // 用于摘要的 chat-completions 模型
+    "summarization_model": "gpt-4o-mini",
+    // 摘要模型 API key 的环境变量名称。默认与 extraction_model_env 相同
+    // （两者都是针对同一 OpenAI 账户的低成本写入路径模型调用）——如需使用
+    // 独立的 key，可指向另一个变量。
+    "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // 摘要请求超时（毫秒），通过 AbortController 强制执行
+    "summarization_timeout_ms": 3000,
+    // 确定性、无依赖的内容标记：从规范化内容中的代码形态标记、文件路径、仓库简写
+    // （owner/repo）和 @提及 中派生额外标签，并与调用方提供的标签合并。不调用
+    // LLM，不访问网络。`false` 会精确恢复此功能之前的行为。详见下方"自动标记"。
+    "auto_tag_enabled": true,
+    // 每条记忆自动派生标签数量的上限，在与调用方提供的标签合并、并裁剪到每条
+    // 记忆 20 个标签的上限之前应用（裁剪时始终优先保留调用方提供的标签）。
+    "auto_tag_max_per_memory": 6
   },
 
-  // 摄入时自动摘要记忆内容
+  // 控制用于生成每条记忆 `summary` 字段的质量层级。true（默认）：一个无依赖
+  // 的抽取式摘要器按词频对内容中的每个句子打分，并选出最具代表性的句子
+  // （当 pipeline.summarization_enabled 为 true 且请求成功时，会进一步回退到
+  // 上面的 LLM 层）。false：最低成本的路径——summary 仅为内容的第一行，
+  // 截断至 120 字符——与 pipeline.summarization_enabled 无关。
   "auto_summarize": true
 }
 ```
@@ -421,11 +613,13 @@ BHGBrain 从以下位置加载配置文件：
 
 | 变量 | 是否必需 | 默认值 | 说明 |
 |---|---|---|---|
-| `OPENAI_API_KEY` | 是（用于嵌入） | — | OpenAI API key。缺失时服务器以**降级模式**启动——语义搜索和数据摄入将失败，但全文搜索和类别读取仍正常工作。 |
+| `OPENAI_API_KEY` | 是（用于 OpenAI 提供商） | — | OpenAI API key。缺失时服务器以**降级模式**启动——语义搜索和数据摄入将失败，但全文搜索和类别读取仍正常工作。 |
+| `AZURE_FOUNDRY_API_KEY` | 是（用于 Azure 提供商） | — | 用于 Azure OpenAI 兼容嵌入端点的 Azure API key。当 `embedding.provider = "azure-foundry"` 时必需。 |
 | `BHGBRAIN_TOKEN` | 非回环 HTTP 时必需 | — | HTTP 认证的 Bearer token。若主机地址为非回环且此变量未设置，服务器**拒绝启动**（除非 `allow_unauthenticated_http: true`）。 |
 | `QDRANT_API_KEY` | Qdrant Cloud 时必需 | — | 在配置中将 `qdrant.api_key_env` 设置为此变量名称。默认配置字段名为 `QDRANT_API_KEY`。 |
 | `BHGBRAIN_DEVICE_ID` | 否 | 从主机名自动生成 | 覆盖多设备设置的设备标识符。参见[设备身份解析](#设备身份解析)。 |
-| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key（用于未来功能）。 |
+| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key，在 `pipeline.extraction_enabled` 为 `true` 时使用。也是 `pipeline.summarization_model_env` 的默认值（在 `pipeline.summarization_enabled` 为 `true` 时使用）——如需为摘要使用独立的 key，可将该字段指向其他变量。多查询扩展的 LLM 改写/HyDE 阶段（`search.query_expansion.llm_paraphrase.enabled`，详见[多查询扩展](#多查询扩展)）也会读取此变量，其解析方式与此相同：先读取 `pipeline.extraction_model_env`，未设置时回退到 `OPENAI_API_KEY`。 |
+| `BHGBRAIN_RERANK_API_KEY` | 否 | 无（**不会**回退到 `OPENAI_API_KEY`） | 可选的 `recall` 重排序阶段使用的 API key，在 `search.rerank.enabled` 为 `true` 时使用。与 `BHGBRAIN_EXTRACTION_API_KEY` 不同，它没有隐式回退——启用重排序是一次刻意的、使用独立 key 的选择，绝不会悄悄消耗嵌入或提取的 key/预算。详见[重排序](#重排序)。 |
 
 生成安全的 Bearer token：
 
@@ -456,8 +650,10 @@ node dist/index.js --stdio --config=/path/to/config.json
 
 ### HTTP 模式
 
-> 该传输是供脚本、健康探针和 CLI 使用的普通 REST API，**未**实现 MCP Streamable HTTP。
-> MCP 客户端请改用 stdio（参见「MCP 客户端配置」）。
+> 该传输在 `/mcp` 上提供真正的 MCP over HTTP —— **Streamable HTTP** 传输，使多个 MCP
+> 客户端可以共享同一个长期运行的服务器进程 —— 同时也提供供脚本、健康探针和 CLI 使用的
+> 普通 REST 便捷 API（`POST /tool/:name`、`GET /resource`）。参见「MCP 客户端配置」，
+> 了解如何让支持 Streamable HTTP 的客户端连接 `/mcp`。
 
 HTTP 默认在 `127.0.0.1:3721` 上启用。如需认证访问，启动前请设置 `BHGBRAIN_TOKEN`：
 
@@ -472,9 +668,15 @@ node dist/index.js
 | 端点 | 是否需要认证 | 说明 |
 |---|---|---|
 | `GET /health` | 否 | 健康检查（不需认证，兼容探针） |
-| `POST /tool/:name` | 是 | 调用指定 MCP 工具 |
-| `GET /resource?uri=...` | 是 | 通过 URI 读取 MCP 资源 |
+| `POST /mcp` | 是 | MCP Streamable HTTP：JSON-RPC 请求；`initialize` 请求会创建新会话 |
+| `GET /mcp` | 是 | MCP Streamable HTTP：既有会话的独立 SSE 通道 |
+| `DELETE /mcp` | 是 | MCP Streamable HTTP：终止会话 |
+| `POST /tool/:name` | 是 | REST 便捷层：直接调用指定 MCP 工具 |
+| `GET /resource?uri=...` | 是 | REST 便捷层：直接通过 URI 读取 MCP 资源 |
 | `GET /metrics` | 是 | Prometheus 格式的指标（需 `metrics_enabled: true`） |
+
+每个 `/mcp` 会话都是一个全新的内存态 MCP 服务器，与其他会话及 REST 端点共享同一底层
+存储 —— 重启进程会丢弃所有会话，符合规范的客户端会自动重新初始化。
 
 健康检查示例：
 
@@ -527,11 +729,35 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter（stdio 传输）
+### OpenClaw / mcporter（Streamable HTTP 传输）
 
-BHGBrain **仅通过 stdio** 提供 MCP 服务。「HTTP 模式」一节描述的 HTTP 服务器是普通的
-REST API（`POST /tool/:name`、`GET /resource`），**不是** MCP Streamable HTTP 端点，
-因此 MCP 客户端无法连接它。请改为指向 `bhgbrain-server` 可执行文件：
+BHGBrain 的 HTTP 服务器通过 **Streamable HTTP** 传输在 `/mcp` 上提供真正的 MCP 服务
+（参见「HTTP 模式」）—— 启动服务器一次，让每个 MCP 客户端都连接同一个 URL，从而共享
+同一个长期运行的进程和同一个 SQLite/Qdrant 后端，而不是每个客户端各自启动一个孤立的
+`--stdio` 子进程：
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "http",
+      "url": "http://127.0.0.1:3721/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    }
+  }
+}
+```
+
+先启动服务器（`node dist/index.js` 或 `bhgbrain server start`），并将 `BHGBRAIN_TOKEN`
+设置为与上方请求头中相同的值。
+
+#### stdio 传输（每个客户端一个进程的替代方案）
+
+只支持 stdio（或不能共享正在运行的服务器）的客户端仍可以启动自己的
+`bhgbrain-server --stdio` 子进程。此方式完全受支持，但这样做的每个客户端都会得到
+各自独立的进程 —— 在状态被写入 SQLite/Qdrant 之前，不会与其他客户端共享。
 
 ```json
 {
@@ -567,9 +793,11 @@ REST API（`POST /tool/:name`、`GET /resource`），**不是** MCP Streamable H
 }
 ```
 
-> **在 WSL 或容器中运行 OpenClaw？** BHGBrain 必须安装在同一环境中。stdio 意味着客户端
-> 将服务器作为子进程启动，因此服务器不能位于另一个发行版或容器中。若要跨环境共享记忆，
-> 请让每个安装拥有各自的 SQLite，并将它们全部指向同一个 Qdrant 集群（参见「多设备记忆」）。
+> **在 WSL 或容器中以 stdio 传输运行 OpenClaw？** BHGBrain 必须安装在同一环境中。stdio
+> 意味着客户端将服务器作为子进程启动，因此服务器不能位于另一个发行版或容器中。上面的
+> Streamable HTTP 传输可以完全避免这个问题 —— 让任意环境中的客户端都连接同一个
+> `http://host:3721/mcp` URL。若要在多个独立的服务器实例之间共享记忆，请让每个安装
+> 拥有各自的 SQLite，并将它们全部指向同一个 Qdrant 集群（参见「多设备记忆」）。
 
 ---
 
@@ -706,6 +934,56 @@ repair 工具：
 
 **注意**：在内容存入 Qdrant 功能添加之前存储的记忆（1.3 之前）在 Qdrant payload 中没有内容，无法通过 repair 恢复。这些条目只有元数据（标签、类型、重要性）能保留。
 
+### 嵌入模型迁移
+
+每个向量在写入时都会打上带提供方限定的身份标记 —
+`<provider>/<model>@<dimensions>`（例如 `openai/text-embedding-3-small@1536`）——
+同时记录在 SQLite 行和 Qdrant payload 中。存储层还会把该身份记为期望值，在启动后
+首次写入时被采纳。
+
+之所以这样做，是因为混用嵌入空间是一种静默的数据损坏：如果在维度不变的情况下更改
+`config.json` 中的 `embedding.provider` 或 `embedding.model`（例如切换到同一模型
+系列的 Azure 部署），Qdrant 层面不会检测到任何异常——新向量会混入与旧向量相同的
+集合，两个空间之间的余弦相似度毫无意义，召回相关性和去重（最接近候选与候选窗口的
+分数会输入到 0.92/0.98 阈值中）都会悄悄劣化。维度变化则会在 Qdrant 层直接报出一个含糊
+的错误而失败；来源标记让这两类问题都变得显而易见且可操作。
+
+**模型更改后会发生什么：**
+
+1. 在下一次启动（或健康检查）时，存储层记录的期望身份将不再与当前配置匹配。
+   `embedding` 健康组件会降级，并给出同时指出两个身份的说明，同时记录一条结构化的
+   `embedding_identity_mismatch` 警告。
+2. 只要 `embedding.refuse_writes_on_model_mismatch` 为 `true`（默认值），产生向量
+   的写入操作（remember、由标签触发的重新嵌入、恢复时的一致性校验）都会失败，
+   并返回一个指明 re-embed 路径的可操作 `CONFLICT` 错误。读取操作仍可正常工作——
+   recall 和 search 会继续使用旧向量，只是健康状态会降级。
+3. 运行迁移：
+
+   ```bash
+   bhgbrain repair --re-embed              # 迁移标记过期的行
+   bhgbrain repair --re-embed --dry-run    # 预览将有多少行会被重新嵌入
+   bhgbrain repair --re-embed --include-legacy   # 同时纳入完全没有标记的旧行
+   ```
+
+   或者通过 `repair` MCP 工具并传入 `mode: "re-embed"`（参见
+   [MCP 工具参考](#mcp-工具参考)）。迁移会以有界、可恢复的批次重新嵌入不匹配的
+   记忆——标记本身就是进度标记，因此被中断的运行可以安全地续跑而不会重复处理已
+   完成的行，单条记忆的 embed/upsert 失败也会被隔离，而不会中止整个批次。
+4. 一旦不再有标记过期的行，存储层的期望身份会自动更新，`embedding` 健康降级也会
+   立即消失——无需重启。
+
+**说明：**
+- 在来源标记功能上线之前写入的旧行没有任何标记（`null`），会被视为“未知”——除非
+  显式传入 `--include-legacy` / `include_legacy: true`，否则默认不会纳入
+  re-embed，这样首次升级不会意外触发对整个语料库的重新嵌入（及其嵌入 API 费用）。
+- 重新嵌入始终由运维人员主动发起——绝不会自动触发，因为它会为每条被迁移的记忆
+  调用一次付费的嵌入 API。
+- 只有在你确实希望写入继续并混用嵌入空间时（例如一次刻意且受监控的迁移窗口），
+  才将 `embedding.refuse_writes_on_model_mismatch` 设为 `false`——标记仍会如实
+  记录发生了什么。
+- 已归档的记忆永远不会被重新嵌入；按照设计，它们的向量已经被移除（参见
+  [衰减、清理与归档](#衰减清理与归档)）。
+
 ### 多设备配置示例
 
 **设备 A**（`config.json`）：
@@ -753,8 +1031,8 @@ BHGBrain 中存储的每条记忆都是一个 `MemoryRecord`，包含以下字�
 | `category` | `string \| null` | 若该记忆附加到持久化策略类别，则为类别名称 |
 | `content` | `string` | 记忆的完整内容（最多 100,000 字符） |
 | `summary` | `string` | 自动生成的首行摘要（最多 120 字符） |
-| `tags` | `string[]` | 自由格式标签（字母数字 + 连字符，最多 20 个，每个最多 100 字符） |
-| `source` | `"cli" \| "api" \| "agent" \| "import"` | 记忆的创建方式 |
+| `tags` | `string[]` | 自由格式标签（字母数字 + 连字符，最多 20 个，每个最多 100 字符）。既包含调用方提供的标签，也可能包含内容自动派生的标签——详见[自动标记](#自动标记)。 |
+| `source` | `"cli" \| "api" \| "agent" \| "import" \| "distillation"` | 记忆的创建方式。`"distillation"` 仅由定时蒸馏任务写入（参见[记忆蒸馏](#记忆蒸馏)） |
 | `checksum` | `string` | 规范化内容的 SHA-256 哈希（用于精确去重） |
 | `embedding` | `number[]` | 向量嵌入（不存储在 SQLite 中，存在 Qdrant 里） |
 | `importance` | `number (0–1)` | 重要性评分（默认 0.5） |
@@ -766,8 +1044,10 @@ BHGBrain 中存储的每条记忆都是一个 `MemoryRecord`，包含以下字�
 | `last_accessed` | `string (ISO 8601)` | 最近一次检索的时间戳 |
 | `last_operation` | `"ADD" \| "UPDATE" \| "DELETE" \| "NOOP"` | 最近一次应用的写操作 |
 | `merged_from` | `string \| null` | 该记忆合并自的来源记忆 ID（去重 UPDATE 路径） |
+| `derived_from` | `string[] \| null` | 该记忆蒸馏自的已归档 T2/T3 情景来源记忆 ID 列表。仅由蒸馏任务设置；普通写入始终为 `null`（参见[记忆蒸馏](#记忆蒸馏)） |
 | `archived` | `boolean` | 该记忆是否已软归档（从搜索/召回中排除） |
 | `vector_synced` | `boolean` | Qdrant 向量是否与 SQLite 状态同步 |
+| `pinned` | `boolean` | 该记忆是否始终包含在 `memory://inject` 载荷中，受 `defaults.pin_limit_per_namespace` 限制；对 `search`/`recall` 没有影响 |
 | `device_id` | `string \| null` | 创建此记忆的 BHGBrain 实例标识符（参见[多设备记忆](#多设备记忆)） |
 | `created_at` | `string (ISO 8601)` | 创建时间戳 |
 | `updated_at` | `string (ISO 8601)` | 最后更新时间戳 |
@@ -788,6 +1068,7 @@ CREATE INDEX idx_memories_expiry      ON memories(decay_eligible, expires_at);
 CREATE INDEX idx_memories_review_due  ON memories(retention_tier, review_due);
 CREATE INDEX idx_memories_archived    ON memories(archived);
 CREATE INDEX idx_memories_vector_sync ON memories(vector_synced);
+CREATE INDEX idx_memories_pinned      ON memories(namespace, pinned);
 ```
 
 #### Qdrant Payload 索引
@@ -859,7 +1140,7 @@ CREATE INDEX idx_memories_vector_sync ON memories(vector_synced);
 
 **各层级的关键属性：**
 
-- **T0**：`expires_at` 始终为 `null`。`decay_eligible` 始终为 `false`。T0 记忆无法被自动清理。T0 记忆的更新会在应用更新之前在 `memory_revisions` 表中创建版本快照（只追加历史）。T0 记忆在混合搜索结果中获得 +0.1 的得分加权。
+- **T0**：`expires_at` 始终为 `null`。`decay_eligible` 始终为 `false`。T0 记忆无法被自动清理。T0 记忆的更新会在应用更新之前在 `memory_revisions` 表中创建版本快照（只追加历史）。T0 记忆在复合排名中永不衰减（`decay_per_day.T0` 默认为 `0`），使其在所有搜索模式下都保持持久的排名优势。
 
 - **T1**：`review_due` 设置为 `created_at + 365 天`，每次访问时重置。接近 `expires_at` 的记忆在搜索结果中标记 `expiring_soon: true`。
 
@@ -1026,9 +1307,12 @@ flowchart TD
     G --> H{"Highest Cosine<br/>Similarity Score"}
     H -->|"score ≥ noop threshold"| NOOP2["🔄 NOOP<br/>Near-duplicate found"]
     H -->|"score ≥ update threshold"| UPD["✏️ UPDATE Path"]
-    H -->|"score < update threshold"| ADD["➕ ADD Path"]
+    H -->|"score < update threshold"| WIN{"candidate_window:<br/>N corroborators ≥<br/>(update − margin)?"}
+    WIN -->|"Yes (≥ corroboration_count)"| CORR["✏️ UPDATE Path<br/>(corroborated)"]
+    WIN -->|"No"| ADD["➕ ADD Path"]
 
     UPD --> U1["Merge tags (union)"]
+    CORR --> U1
     U1 --> U2["Replace content"]
     U2 --> U3["importance = max(old, new)"]
     U3 --> U4["SQLite UPDATE"]
@@ -1046,9 +1330,9 @@ flowchart TD
 
     class REJECT reject
     class NOOP1,NOOP2 noop
-    class UPD,U1,U2,U3,U4,U5 update
+    class UPD,CORR,U1,U2,U3,U4,U5 update
     class ADD,A1,A2,A3 add
-    class A,B,C,D,E,F,G,H process
+    class A,B,C,D,E,F,G,H,WIN process
 ```
 
 #### 第一阶段：精确去重（校验和）
@@ -1065,12 +1349,23 @@ checksum = SHA-256(normalizeContent(content))
 
 | 决策 | 条件 | 效果 |
 |---|---|---|
-| `NOOP` | 得分 ≥ noop 阈值 | 内容被视为重复；返回现有记忆的 ID 而不写入 |
-| `DELETE` | 得分 ≥ update 阈值**且**内容明确使匹配项失效（例如"不再正确"、"更正："、"忘记那个"） | 删除现有记忆，候选内容作为新记忆存储，并通过 `merged_from` 引用被删除的记忆 |
-| `UPDATE` | 得分 ≥ update 阈值 | 内容是对现有内容的更新；合并标签、更新内容和校验和，保留 ID |
-| `ADD` | 得分 < update 阈值 | 全新记忆；使用新 UUID 创建 |
+| `NOOP` | 最接近候选的得分 ≥ noop 阈值 | 内容被视为重复；返回现有记忆的 ID 而不写入 |
+| `DELETE` | 最接近候选的得分 ≥ update 阈值**且**内容明确使匹配项失效（例如"不再正确"、"更正："、"忘记那个"） | 删除现有记忆，候选内容作为新记忆存储，并通过 `merged_from` 引用被删除的记忆 |
+| `DELETE`（可选启用） | 最接近候选的得分处于 update 区间内，上述短语启发式规则**未**触发，`pipeline.contradiction_detection.enabled` 为 `true`，且 LLM 蕴含检查将候选内容相对于匹配记忆分类为 `contradict` | 与上方短语触发的 `DELETE` 效果相同——删除现有记忆，候选内容作为新记忆存储，并通过 `merged_from` 引用被删除的记忆 |
+| `UPDATE` | 最接近候选的得分 ≥ update 阈值 | 内容是对现有内容的更新；合并标签、更新内容和校验和，保留 ID |
+| `UPDATE`（经佐证） | 最接近候选的得分 < update 阈值，**但**在最靠前的 `deduplication.candidate_window` 个候选窗口内（含最接近的那个），至少有 `deduplication.corroboration_count` 个候选的得分 ≥ `update 阈值 − deduplication.corroboration_margin` | 多条几乎相同的记忆各自独立地聚集在阈值附近；合并到得分最高的候选中，效果与直接 `UPDATE` 相同 |
+| `ADD` | 最接近候选的得分 < update 阈值，且未发现可佐证的聚集 | 全新记忆；使用新 UUID 创建 |
 
-上图展示的是 NOOP/UPDATE/ADD 路径；DELETE 是 UPDATE 路径的一个变体，仅在失效启发式规则触发时才会走这条路径。
+上图展示的是 NOOP/UPDATE/ADD 路径；DELETE 是 UPDATE 路径的一个变体，当基于短语的失效启发式规则触发时，或者（可选启用，见下文）当 LLM 蕴含检查将 update 区间内的候选内容分类为与现有记忆矛盾时，都会走这条路径。NOOP 和 DELETE 始终只依据最接近的候选来判定——佐证机制永远不适用于它们（见下方"候选窗口与佐证"）。
+
+**矛盾检测（可选启用，默认关闭）：** 上述短语启发式规则仅能识别明确表明自己是更正的候选内容（"不再正确"、"更正："等）。如果同一话题的候选内容在不使用这些短语的情况下产生冲突——例如存储中已有"我们使用 MySQL"，此时到达"我们已迁移到 Postgres"——就会悄悄落入 `UPDATE`，两条事实并存。将 `pipeline.contradiction_detection.enabled` 设为 `true` 可以弥补这一缺口：对于落在 update 区间内、且尚未触发短语启发式规则的候选内容，管道会发起一次 LLM 调用（复用 `pipeline.extraction_model` / `pipeline.extraction_model_env` 的凭据——无需单独配置模型或 API 密钥），将候选内容相对于匹配记忆分类为 `agree`、`refine` 或 `contradict`。只有 `contradict` 会改变行为，走向与短语启发式规则相同的删除并替换路径；`agree`/`refine` 都会落入现有的 `UPDATE` 合并逻辑，与当前行为完全一致。短语启发式规则始终优先检查，一旦匹配就会短路，不发起 LLM 调用，因此明确的更正仍然是免费且即时的。
+
+| `pipeline.contradiction_detection.*` 字段 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `false` | 为 update 区间内的写入开启 LLM 蕴含检查。默认关闭：在运维人员主动启用之前，行为零变化、延迟/成本零增加。 |
+| `timeout_ms` | `5000` | 蕴含检查调用的上限。遇到超时、网络错误、非 2xx 响应，或无法解析/不在列表内的分类结果时，管道会优雅降级——效果与该次写入禁用此功能完全一致——并记录 `contradiction_check_degraded` 警告，而不是阻塞或拒绝写入。 |
+
+**启用前需权衡的取舍：** 目前的缺口是一种假*阴性*（真实的矛盾未被检测到；两条记忆都会保留，后续明确的更正仍能修复它）。而 LLM 将 `refine` 误判为 `contradict` 则是假*阳性*，会悄悄删除一条仍然正确的记忆——由于删除并替换不会在修订历史中保留被删除记忆的内容，这种损失并非轻易可恢复。该检查采用保守的提示词设计（温度为 0，"不确定则不判为 contradict"），并因此默认关闭；启用时请充分考虑这一取舍。
 
 **各层级的去重阈值：**
 
@@ -1083,6 +1378,10 @@ checksum = SHA-256(normalizeContent(content))
 | `T2` | 0.98 | base (0.92) |
 | `T3` | 0.95 | max(base, 0.90) |
 
+**候选窗口与佐证：**
+
+Qdrant 相似度搜索已经获取了前 10 个候选，但分类器默认只检查最接近的那一个来做出 NOOP/DELETE/直接 UPDATE 决策。当最接近的候选低于 update 阈值时，管道会额外检查是否有其他多个候选各自独立地聚集在同一阈值附近——同一事实的多条近似复述应当合并为一条记忆，而不是每条都通过 ADD 产生一个新变体。具体来说：在最靠前的 `deduplication.candidate_window` 个候选中（默认 5，上限为 10——即已获取的上限），如果至少有 `deduplication.corroboration_count`（默认 2）个候选的得分 ≥ `update 阈值 − deduplication.corroboration_margin`（默认 0.03），则该次写入会对这些候选中得分最高的那个分类为 `UPDATE`，而不是 `ADD`。这只是单向升级：它可以把 `ADD` 变成 `UPDATE`，但永远不会改变 `NOOP` 或 `DELETE` 的判定，并且总是以得分最高的候选为目标（无需新的排序逻辑）。将 `deduplication.corroboration_enabled` 设为 `false` 可完全禁用此路径，恢复到扩展前仅单候选的分类方式；这与 `deduplication.enabled`（完全关闭语义去重）相互独立。当佐证路径被触发时，会记录一条结构化的 `corroborated_dedup` 警告日志（`targetId`、`topScore`、`corroborators`），便于运维人员监控其触发频率并调整边界值/数量阈值。
+
 **UPDATE 合并行为：**
 - 标签取并集（现有标签 ∪ 新标签）
 - 内容替换为新版本
@@ -1091,6 +1390,95 @@ checksum = SHA-256(normalizeContent(content))
 
 **回退行为：**
 如果嵌入提供商不可用且 `pipeline.fallback_to_threshold_dedup: true`，管道会降级到无向量的去重路径，而不是让写入失败。精确校验和匹配仍会像第一阶段一样直接短路为 `NOOP`。对于其他情况，管道使用 SQLite 全文搜索在同一命名空间/集合内查找最接近的现有记忆，并用确定性的词汇重叠相似度（而非向量余弦得分）为其打分；达到或超过 `update` 阈值时，内容会合并到该记忆中（`UPDATE`，`vector_synced: false`），否则会作为新记忆仅写入 SQLite（`ADD`，`vector_synced: false`）。无论哪种情况，该记忆在 Qdrant 同步恢复之前都可用于全文搜索，但不可用于语义搜索，并且进入此路径会记录一条结构化的 `degraded_write` 警告。
+
+---
+
+### 自动标记
+
+大多数写入操作都没有调用方提供的标签，这使得 `recall`/`search` 的 `tags` 过滤器和
+全文搜索中标签匹配的 2× 权重无从发挥作用。当 `pipeline.auto_tag_enabled` 为 `true`
+（默认值）时，写入管道会对每个候选项的规范化内容运行一个确定性、无依赖的提取器——
+不调用 LLM，不访问网络——并将结果与任何调用方提供的标签合并。提取发生在去重分类
+之前，因此永远不会改变写入被分类为 `ADD`/`UPDATE`/`DELETE`/`NOOP` 的结果。
+
+**提取类别**（按优先级顺序排列——如果合并后的标签集合必须被裁剪，优先级更高的类别
+会被优先保留）：
+
+1. **代码形态标记** —— Markdown 行内代码片段（`` `useEffect` ``）以及
+   camelCase/PascalCase/`snake_case`/点号标识符（`extractionEnabled`、
+   `search.ranking.enabled`），设有 5 字符下限以减少偶然短匹配带来的噪音。
+2. **文件路径** —— 以斜杠分隔、以已识别扩展名结尾的路径
+   （`src/pipeline/index.ts`），加上一组封闭的裸文件名（`package.json`、
+   `README.md`、`Dockerfile` 等），即使不带目录也能识别。
+3. **仓库简写** —— 两段式 `owner/repo` 形态的斜杠标记，其末段不带已识别的扩展名
+   （`bhgbrain/core`）；末段带有扩展名的标记会被归类为文件路径。
+4. **@提及** —— `@handle` 形态的标记，前面不能紧跟单词字符，且排除电子邮件地址
+   （`jsmith@example.com` 不会产生提及标签）。
+
+**Slug 化：** 每个匹配到的标记都会被规范化，以便不加修改地满足 `TagSchema`
+（`^[a-zA-Z0-9-]+$`，最多 100 字符）——转为小写，开头的 `@` 映射为 `at-` 前缀
+（这样 `@jsmith` 会变为 `at-jsmith`，而不是与普通单词标签冲突），其余字符的连续序列
+折叠为单个 `-`，去除首尾的 `-`，并截断至 100 字符。Slug 化后短于 2 字符的候选项会
+被丢弃。示例：`src/pipeline/index.ts` → `src-pipeline-index-ts`、`bhgbrain/core` →
+`bhgbrain-core`、`` `useEffect` `` → `useeffect`。
+
+**合并与上限：** 自动派生的标签会去重，并与调用方提供的标签合并（"调用方标签 ∪
+自动标签"，调用方标签始终排在前面），然后裁剪到现有的每条记忆 20 个标签的上限——
+裁剪时始终先移除自动派生的标签，绝不会移除调用方提供的标签。在 `UPDATE` 时，自动
+派生的标签会像其他任何候选标签一样并入现有的标签合并逻辑。
+
+| 配置字段 | 默认值 | 含义 |
+|---|---|---|
+| `pipeline.auto_tag_enabled` | `true` | 总开关。`false` 会精确恢复此功能之前的行为：候选标签就是调用方提供的 `tags` 输入本身。 |
+| `pipeline.auto_tag_max_per_memory` | `6` | 每条记忆自动派生标签数量的上限，在与调用方提供的标签合并之前应用。 |
+
+无需模式或存储变更：自动派生的标签作为普通条目存储在 `tags` 数组中——相同的列、
+相同的全文 2× 权重、相同的 `recall`/`search` `tags` 过滤器下推。`import` 和
+`remember` 都通过同一条写入管道，因此两者都无需额外接线即可受益。
+
+**已知的不精确性：** 基于模式的提取偶尔会将普通的大写散文或恰好呈
+camelCase/PascalCase 形态的品牌名称标记为标签（例如 `GitHub` → `github`）——这被
+视为确定性 v1 提取器固有的特性，而非语义理解；可使用 `tag` 工具的 `remove`
+操作修正异常项，或设置 `pipeline.auto_tag_enabled: false` 以完全禁用提取。
+
+---
+
+### 内容溯源
+
+`remember` 的 `origin`/`confidence` 字段用于记录*一条记忆的内容来自哪里*以及*应该
+在多大程度上信任它*——这与 `embedding_model`（见[嵌入模型迁移](#嵌入模型迁移)）不
+同：后者记录的是哪个嵌入模型生成了*向量*，而不是这条陈述来自哪里。
+
+- **`origin`**（`{ session_id?, tool?, repo?, branch? }`，所有字段均为可选的自由
+  文本字符串）标识产生该记忆的会话/工具/仓库/分支。如果调用方未提供任何内容，则
+  为 `null`——这是常见情况，也是此字段引入之前所写记忆的固定情况。不会从 MCP
+  传输层自动推导：不同客户端（Claude CLI、Codex、Gemini……）之间没有标准化的会
+  话/工具身份，因此该字段仅由调用方提供。
+- **`confidence`**（`number`，`[0, 1]`）表示应在多大程度上信任一条记忆的内容。当
+  `remember` 调用省略该字段时，会按 `source` 从 `pipeline.default_confidence`
+  取默认值（配置项，默认值为 `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`）——用
+  户的明确陈述默认获得完全信任，而智能体的推断默认信任度更低。在去重
+  `UPDATE` 时，`confidence` 通过 `max(现有值, 新值)` 合并（二次确认永远不会降低
+  信任度，与 `importance` 采用相同策略）；`origin` 仅在传入调用提供了新值时才会
+  被替换，否则保留现有的 `origin`。
+
+这两个字段会出现在所有已经返回记忆记录的读取路径上——`recall`、`search`、
+`memory://{id}`、`memory://list`——无需新增工具或资源。`remember` 调用示例：
+
+```json
+{
+  "content": "The user said the deploy window is Tuesdays 2-4pm UTC.",
+  "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+  "confidence": 1.0
+}
+```
+
+| 配置字段 | 默认值 | 含义 |
+|---|---|---|
+| `pipeline.default_confidence.cli` | `1.0` | `source: "cli"` 写入省略时的默认 `confidence`。 |
+| `pipeline.default_confidence.api` | `1.0` | `source: "api"` 写入省略时的默认 `confidence`。 |
+| `pipeline.default_confidence.agent` | `0.7` | `source: "agent"` 写入省略时的默认 `confidence`。 |
+| `pipeline.default_confidence.import` | `0.5` | `source: "import"` 写入省略时的默认 `confidence`。 |
 
 ---
 
@@ -1207,7 +1595,7 @@ checksum = SHA-256(normalizeContent(content))
 
 1. **识别过期记忆：** 查询 SQLite 中所有满足 `decay_eligible = true` 且 `expires_at < now()` 的记忆。只有 `T2`/`T3` 有资格被直接归档并删除：
    - `T0` 始终被排除（T0 永远不具备衰减资格）。
-   - `T1` 永远不会被直接删除。已过期或 `review_due` 已超期的 `T1` 记忆会在 GC 结果中作为**待审核候选项**列出，由操作者决定是晋升、重新保存还是手动删除。
+   - `T1` 永远不会被直接删除。已过期或 `review_due` 已超期的 `T1` 记忆会在 GC 结果中作为**待审核候选项**列出，由操作者决定是晋升、重新保存还是手动删除——或者通过 MCP 使用 `review` 工具（`action: "list"` / `"keep"` / `"archive"`；参见 [MCP 工具参考](#mcp-工具参考)）列出并处置它们。
 
 2. **删除前归档（若已启用）：** 对每条 `T2`/`T3` 候选记忆，将摘要记录写入 `memory_archive` 表，并记录一条独立的 `ARCHIVE` 审计事件：
 
@@ -1258,6 +1646,8 @@ memory_revisions {
 
 只有 T0 记忆有版本历史。Qdrant 中的向量嵌入始终反映当前内容。
 
+可以通过 `revisions` 工具（`action: "list"`）或 `memory://{id}/revisions` 资源读取版本历史，按最新优先排列。`revisions`（`action: "revert"`）会将记忆内容恢复到所选的历史版本——重新生成嵌入、重新写入向量存储，并将回退操作本身作为一条新的历史记录追加（而非覆盖历史）——同时记录一条携带来源版本号的 `REVISE` 审计事件。参见[MCP 工具参考](#mcp-工具参考)和[MCP 资源](#mcp-资源)。
+
 #### 过期标记（整合阶段）
 
 `bhgbrain gc --consolidate` 命令（或 `RetentionService.runConsolidation()`）执行一个辅助阶段，将记忆标记为**过期**候选：
@@ -1268,7 +1658,7 @@ memory_revisions {
 
 #### 归档搜索与恢复
 
-已删除的记忆（当 `archive_before_delete: true` 时）可以被检查和恢复：
+已删除的记忆（当 `archive_before_delete: true` 时）可以通过 CLI 检查和恢复：
 
 ```bash
 bhgbrain archive list                 # 列出最近归档的记忆
@@ -1276,7 +1666,67 @@ bhgbrain archive search <query>       # 按文本搜索归档摘要
 bhgbrain archive restore <memory_id>  # 恢复已归档的记忆
 ```
 
-**恢复语义：** 恢复的记忆从归档摘要文本作为**新的** `T2` 记忆重新创建。原始内容（如果比摘要更长）无法恢复——归档仅存储 120 字符的摘要。恢复的记忆获得全新的时间戳和新 UUID，并在 Qdrant 中重新嵌入。
+**恢复语义：** 恢复的记忆从归档摘要文本重新创建为一条**新的**记忆（沿用其原始层级）。原始内容（如果比摘要更长）无法恢复——归档仅存储 120 字符的摘要。恢复的记忆获得全新的时间戳和新 UUID，并在 Qdrant 中重新嵌入。CLI 的 `archive restore` 在恢复后还会删除该归档记录行。
+
+MCP 客户端也有对应的路径：`search` 工具的 `include_archived` 参数可按摘要/标签词条匹配找到已归档的记忆（标记为 `archived: true`，从不记录访问），而 `review` 工具的 `restore` 动作可根据归档记录重新创建一条活跃记忆——标记为 `restored-from-archive`，且归档记录行会被**保留**（这与 CLI 路径不同），以便其来源始终可追溯。参见 [MCP 工具参考](#mcp-工具参考)。
+
+---
+
+### 记忆蒸馏
+
+<a id="记忆蒸馏"></a>
+
+一项定时的"睡眠"任务，将相关且仍处于活跃状态的 `T2`/`T3` `episodic`（情景）记忆
+簇合并为一条持久的 `T1` `semantic`（语义）记忆——例如"通过 GitHub Actions 部署"、
+"CI 切换到了 Actions"、"Actions runner 固定为 node20" 这五条独立记忆，会变成一条
+记忆："我们通过 GitHub Actions 部署。"**默认关闭**
+（`retention.distillation.enabled: false`）——这是 BHGBrain 中唯一会发起出站 LLM
+调用的功能，且归档来源会不可逆地丢失其完整内容，因此需要主动开启。
+
+**启用方法：**
+
+1. 在 `config.json` 中设置 `retention.distillation.enabled: true`。
+2. 配置提取 API 密钥：`pipeline.extraction_model_env`（默认为
+   `BHGBRAIN_EXTRACTION_API_KEY`）必须指向一个已设置的环境变量——无需引入新的
+   环境变量；蒸馏复用的正是为 `pipeline.extraction_enabled` 和 `search.rerank`
+   已记录的同一密钥。
+
+**工作原理（每次定时运行，或执行 `bhgbrain distill` 时）：**
+
+1. **聚类：** 对每个存在 `T2`/`T3` `episodic` 记忆的命名空间/集合，从 Qdrant
+   取出其向量，并使用贪心并查集，将余弦相似度 `≥
+   retention.distillation.similarity_threshold`（默认 `0.85`）的记忆合并为
+   连通分量。小于 `min_cluster_size`（默认 `3`）的簇不予处理；大于
+   `max_cluster_size`（默认 `20`）的簇会被拆分为若干同等大小的块。每次运行
+   最多处理 `max_clusters_per_run`（默认 `10`）个簇——优先处理最大的。
+2. **蒸馏：** 对每个符合条件的簇，将其成员内容（从最旧到最新）通过一次
+   聊天补全调用发送给配置的 `pipeline.extraction_model`，要求其生成一条
+   合并后的事实。若来源存在冲突，提示词会要求模型优先采用最近更新的来源——
+   这只是一种缓解手段，而非基于蕴含关系的矛盾检测。当未配置 API 密钥或 LLM
+   调用失败时，该簇会被**跳过**（绝不会导致任务硬失败）；跳过情况会按原因
+   计数（`no_key` / `llm_error`）。
+3. **写入：** 合并后的事实会通过与其他所有记忆相同的 `remember` 写入流水线
+   写入——校验和去重、嵌入、审计日志——并带有 `source: "distillation"`、
+   `type: "semantic"`、`retention_tier: "T1"`，以及设置为该簇来源记忆 ID 的
+   `derived_from`。若某个簇在此前蒸馏之后重新形成，会**更新**（通过正常的
+   去重路径）此前的蒸馏记忆，而不是产生重复记录。
+4. **归档来源：** 只有在确认蒸馏出的记忆已持久写入之后，才会通过与 GC 相同的
+   `memory_archive` 路径归档并删除该簇的来源记忆，并记录一条专属的
+   `DISTILL` 审计条目（`action: "distill"`），同时引用新记忆的 ID 与被归档
+   来源的 ID。若在成功写入蒸馏记忆之后，归档/删除步骤失败，该写入**不会**
+   被回滚——来源记忆保持活跃，本次运行会被标记为降级状态（仍处于活跃状态
+   的来源是安全的：后续运行可能重新将其聚类，且去重路径会执行更新而非
+   产生重复）。
+
+```bash
+bhgbrain distill                      # 运行蒸馏
+bhgbrain distill --dry-run            # 显示候选簇（ID + 摘要），不调用 LLM 也不写入/归档任何内容
+```
+
+`health://status` 的 `retention.distillation` 字段会报告 `last_run_at`、
+`last_run_degraded`，以及累计的 `distilled_total`/`skipped_total` 计数，
+`bhgbrain_distill_*` 计数器/直方图遵循与 `bhgbrain_gc_*` 相同的命名约定
+（参见[健康状态与指标](#健康状态与指标)）。
 
 ---
 
@@ -1355,15 +1805,17 @@ BHGBrain 支持三种搜索模式，可以独立使用或组合使用。
 
 ### 全文搜索
 
-全文搜索使用 SQLite 内部文本匹配来查找包含特定词语或短语的记忆。
+全文搜索使用真正的 SQLite FTS5 索引来查找包含特定词语或短语的记忆，具备英文词干提取（stemming）和 BM25 相关性排名。
 
 **工作原理：**
 1. 将查询拆分为小写词语。
-2. 每个词语通过 `LIKE %term%` 在 `memories_fts` 影子表的 `content`、`summary` 和 `tags` 列中进行匹配。
-3. 结果按匹配词语数量排序（匹配越多 = 排名越高）。
-4. 排名归一化为 0.0–1.0 的得分：`min(1.0, term_count / 10)`。
+2. 每个词语作为字面短语与 FTS5 虚拟表 `memories_fts`（`content`/`summary`/`tags` 列，`porter unicode61` 分词器）匹配，词语之间以 `AND` 连接——每个词语都必须匹配，且词语中嵌入的 FTS5 语法（`NEAR`、`*`、括号、`AND`/`OR`、列过滤器）会被当作惰性字面文本处理，而不会被解析为操作符。
+3. `porter` 分词器同时对索引和查询进行词干提取，因此查询词语可以匹配同一单词的其他变形形式（例如 "runs" 匹配 "running"；"deploy" 匹配 "deployed"）——不仅仅是精确子串。
+4. 结果通过 `bm25()` 排名，`summary` 和 `tags` 中的匹配权重是 `content` 匹配的 2 倍（沿用 FTS5 之前基于词频的权重）。
 5. 已归档记忆被排除（FTS 表与主记忆表保持同步——已归档行从 FTS 中移除）。
 6. 更新返回结果的访问元数据。
+
+**回退：** 如果正在运行的 SQLite 版本未编译 `fts5` 模块（通过启动时的能力探测验证，而非假定），全文搜索会回退到旧版 `LIKE '%term%'` 匹配器，使用手写的词频排名，而不是报错。这一过程是可见的，而非静默的：`health://status` 的 `sqlite` 组件会携带一条 `message`，并在启动时记录一次 `fts5_unavailable` 警告。参见[健康端点](#健康端点)。
 
 **适用场景：** 精确关键词搜索、搜索特定标识符（记忆 ID、项目名称、系统名称）、知道确切术语时。
 
@@ -1393,14 +1845,14 @@ flowchart TD
     end
 
     subgraph Fulltext["Fulltext Search"]
-        P2["Tokenize Query"] --> FTS["SQLite FTS<br/>LIKE matching"]
-        FTS --> FR["Ranked Results<br/><i>by term count</i>"]
+        P2["Tokenize Query"] --> FTS["SQLite FTS5<br/>MATCH + porter stemming"]
+        FTS --> FR["Ranked Results<br/><i>by BM25</i>"]
     end
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
     FR --> RRF
-    RRF --> BOOST["T0 Score Boost<br/><i>+0.1 for foundational</i>"]
-    BOOST --> TOP["Return Top N Results"]
+    RRF --> RANK["Composite Ranking<br/><i>relevance x importance/access/decay prior</i>"]
+    RANK --> TOP["Return Top N Results"]
     TOP --> TRACK["Update Access Tracking<br/><i>count++, sliding window reset</i>"]
 
     classDef search fill:#4a90d9,stroke:#2c5f8a,color:#fff
@@ -1408,7 +1860,7 @@ flowchart TD
     classDef result fill:#5ba85b,stroke:#3d7a3d,color:#fff
 
     class P1,QD,SR,P2,FTS,FR search
-    class RRF,BOOST fusion
+    class RRF,RANK fusion
     class TOP,TRACK result
 ```
 
@@ -1428,7 +1880,7 @@ flowchart TD
 
 4. 仅出现在一个列表中的条目从另一个列表获得 `0` 贡献。
 5. 合并后的列表按 RRF 得分降序排序。
-6. T0 记忆在 RRF 融合后获得 **+0.1 得分加权**，确保基础知识在结果中突出呈现。
+6. **复合排名**（详见下文）应用于每种模式的结果，包括这个 RRF 得分，并按复合得分重新排序。
 7. 返回前 `limit` 条结果。
 
 **优雅降级：** 如果嵌入提供商不可用，混合搜索会静默回退到仅全文搜索结果，而不是报错。
@@ -1444,6 +1896,125 @@ flowchart TD
   "limit": 10
 }
 ```
+
+---
+
+### 复合排名
+
+每种搜索模式（`semantic`、`fulltext`、`hybrid`）都按复合得分而不仅仅是相关性对结果排序。相关性（余弦相似度、FTS 排名或 RRF 得分，取决于模式）乘以一个**先验值**，该先验值由每条记忆已经携带的信号——`importance`、`access_count` 以及最近更新的时间——共同决定，因此被多次确认有用、标记为重要或最近编辑过的记忆会超过同等相关但已过时的相似记忆。
+
+```
+final_score = relevance x (w_base + w_importance x importance + w_access x log1p(access_count) / log1p(access_norm))
+                        x exp(-decay_per_day[tier] x age_days)
+```
+
+- `w_base` 固定为 `1.0`，不可配置。
+- `age_days` 从 `updated_at` 开始计算，因此 `UPDATE` 会重置记忆的有效年龄——刚编辑过的记忆会重新变"新"。
+- `T0` 记忆默认 `decay_per_day` 为 `0`，因此永不衰减，使基础知识获得持久优势（这取代了旧的固定 `+0.1` T0 加权）。
+- 访问频率通过对数阻尼（`log1p`）处理，使得少量额外访问无法主导排序结果，并通过 `access_norm`（默认 `50`）归一化，使访问项与重要性项保持相当的量级。
+
+**配置**（`config.json` 中的 `search.ranking`，参见[配置](#配置)）：
+
+| 字段 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `true` | 设为 `false` 可完全禁用复合排名，恢复纯相关性排序。 |
+| `w_importance` | `0.3` | 应用于记忆 `importance`（0–1）的权重。 |
+| `w_access` | `0.2` | 应用于对数阻尼后访问次数的权重。 |
+| `access_norm` | `50` | 归一化访问次数项；值越大，达到同等加权所需的访问次数越多。 |
+| `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | 应用于 `age_days` 的各层级指数衰减率。`T2` 的默认值给出约 87 天的半衰期，与其 90 天 TTL 相吻合。 |
+
+**复合排名*不*影响的内容：** 每条结果上原始的 `semantic_score` 和 `fulltext_score` 字段，以及 `recall` 的 `min_score` 阈值所作用的字段（`semantic_score`）——参见 [Recall 与 Search 的区别](#recall-与-search-的区别)。复合排名改变的是结果的*排序*，绝不会改变哪些记忆能通过 `min_score` 关卡。
+
+---
+
+### 重排序
+
+`recall` 支持一个可选阶段，在 `min_score` 过滤和截断到 `limit` 之前，用 LLM 相关性判断对候选池重新打分。上文的复合排名和 MMR 都完全依据查询嵌入来决定排序——这是一个粗略的代理，能可靠地把候选范围收窄到一个合理的前 20，但经常把这前 20 的顺序排错。重排序为每次 `recall` 多付出一次 LLM 调用，把查询和每个候选项的*文本*放在一起判断，代价是额外的延迟。
+
+**默认禁用。** 标准安装永远不会发起这次额外调用——在设置 `search.rerank.enabled: true` 之前，`recall` 与此前完全一致，逐字节不变。
+
+**排名流水线顺序：** 相关性 → 复合先验 → MMR 多样性重排序 → **重排序**（仅 `recall`）→ `min_score` 过滤和截断到 `limit`。
+
+**工作原理：**
+1. 启用后，`recall` 会将其获取的候选池扩大到至少 `search.rerank.candidate_pool`。
+2. 排名靠前的 `candidate_pool` 个候选项（按重排序前的分数）与查询文本一起，通过一次批量调用发送给配置的 LLM。
+3. LLM 为每个候选项返回一个 `[0, 1]` 范围的相关性判断。每个成功打分的候选项的 `score` 会被替换为限幅后的判断值（其原始值同时作为 `rerank_score` 暴露在结果中），整个列表按新的 `score` 重新排序。
+4. 响应中遗漏的候选项，或无法解析的候选项，会保留其重排序前的分数，而不会被丢弃。
+5. 之后 `min_score` 和 `limit` 的应用方式与之前完全相同——`min_score` 是针对 `semantic_score` 校准的，重排序从不改动它，因此无论是否运行了重排序，过滤和结果归属都不受影响。
+
+**失败总是优雅降级：** 提供方错误、超时或格式错误的响应都会降级为重排序前的顺序——`recall` 绝不会因重排序失败而失败。这种降级可通过 `search_rerank_degraded` 指标计数器和结构化的 `rerank_degraded` 警告日志观察到。
+
+**仅限于 `recall`：** 在此版本中，`search` 以及 `memory://inject`/`memory://inject/{hint}` 不受 `search.rerank` 配置影响。
+
+**配置**（`config.json` 中的 `search.rerank`，参见[配置](#配置)）：
+
+| 字段 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `false` | 设为 `true` 以为 `recall` 启用重排序阶段。 |
+| `provider` | `"openai"` | 重排序提供方。目前唯一支持的值。 |
+| `candidate_pool` | `20` | 每次调用发送给 LLM 的 recall 已排名候选项数量，`1`-`50`。 |
+| `model` | `"gpt-4o-mini"` | 用于打分的 chat-completions 模型。 |
+| `model_env` | `"BHGBRAIN_RERANK_API_KEY"` | 持有 API key 的环境变量名称。**不会**回退到 `OPENAI_API_KEY`——参见[环境变量](#环境变量)。 |
+| `timeout_ms` | `3000` | 请求超时时间；超时和其他任何失败一样会降级为重排序前的顺序。 |
+
+**独立于提取流水线：** 重排序解析自己的 `search.rerank.model`/`model_env`，绝不会读取 `pipeline.extraction_model`/`extraction_model_env`——无论 `pipeline.extraction_enabled` 是否设置，它都能正常工作。
+
+---
+
+### MMR 多样性重排序
+
+`recall` 和 `search`（在 `semantic` 和 `hybrid` 模式下）在复合排名之后应用了进一步的重排序步骤：**最大边际相关性（Maximal Marginal Relevance，MMR）**。仅靠复合排名，返回的 top-K 结果仍可能被多条近似重复的记忆占据——例如两条余弦相似度为 0.85 的事实，都能挺过写入时的去重（该机制仅合并 ≥ 0.92 的相似项），并双双排在前列。MMR 用可配置比例的最高相关性换取多样性，使返回的结果页面把名额留给*不同*的事实，而不是重复的事实。
+
+**排名流水线顺序：** 相关性（余弦相似度 / FTS 排名 / RRF）→ 复合先验（重要性/访问/衰减）→ **MMR 多样性重排序** → 下游的 `min_score` / 类型 / 标签过滤以及截断到调用方的 `limit`。
+
+**工作原理：**
+1. `recall`/`search` 会获取一个比 `limit` 更大的候选池，以确保有真正的多样化空间。
+2. 每个候选项的复合得分会在获取到的候选池内进行 min-max 归一化，这样无论池中的分数是余弦尺度（语义模式）还是 RRF 尺度（混合模式，通常比余弦尺度小两个数量级），`lambda` 的含义都保持一致。
+3. 从得分最高的候选项开始，MMR 贪婪地选择使 `lambda * 归一化相关性 - (1 - lambda) * 与已选项的最大相似度` 最大化的下一个候选项，其中相似度是指与每个已选且携带向量的候选项之间的余弦相似度。
+4. 这是对**整个候选池的重排序，而不是截断**——重排序前获取到的每个候选项之后依然存在，只是顺序被调整。`min_score`、类型/标签过滤以及截断到 `limit` 都在下游执行，机制不受影响，因此 `min_score` 阈值绝不会因为 MMR 先运行过而导致返回结果不足。
+5. 没有向量的候选项（例如混合模式下仅通过全文匹配命中的结果）永远不会被惩罚，也不会惩罚其他候选项——它们贡献的相似度为 `0`。
+
+**全文模式不受影响：** `mode: 'fulltext'` 没有可供多样化比较的向量，因此无论 `search.mmr.enabled` 为何值，MMR 都不会运行。
+
+**配置**（`config.json` 中的 `search.mmr`，参见[配置](#配置)）：
+
+| 字段 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `true` | 设为 `false` 可完全禁用 MMR，精确恢复纯复合相关性排序。 |
+| `lambda` | `0.7` | 相关性与多样性之间的权衡，取值 `0`–`1`。接近 `1` 时近似纯复合相关性排序；接近 `0` 时更倾向于候选项之间的差异性而非相关性。 |
+| `candidate_pool_multiplier` | `3` | 当 MMR 可用时，将从存储中获取的候选池扩大到 `limit * candidate_pool_multiplier`，从而在调用方的 `limit` 之外提供真正的多样化空间。 |
+| `candidate_pool_cap` | `50` | 无论 `limit * candidate_pool_multiplier` 结果如何，扩大后的候选池大小的上限。 |
+
+**与 `memory://inject/{hint}` 的近似重复抑制并不相同：** 该资源模板（参见 [MCP 资源参考](#mcp-资源)）已经拥有自己独立的近似重复机制——一种硬阈值丢弃规则（复用 `deduplication.similarity_threshold`，默认值 `0.92`），而不是 MMR 那种连续的相关性/多样性权衡。二者刻意保持独立：`search.mmr` 配置对 `memory://inject/{hint}` 没有任何影响，反之亦然。
+
+---
+
+### 多查询扩展
+
+`recall` 和 `search`（在 `semantic` 和 `hybrid` 模式下）会对查询的多种表示形式进行嵌入和搜索，而不仅仅是字面字符串。像"我们怎么部署"这样的口语化查询，其嵌入可能与表述为"部署通过 `docker-compose up -d` 运行"的记忆相距甚远，以至于余弦相似度落在 `min_score` 之下——尽管这条记忆明明回答了这个问题。多查询扩展扩大了单次调用所搜索的候选池，使这样的记忆仍能浮现出来。
+
+**排名流水线顺序：** 查询扩展（变体嵌入/搜索 + 合并）→ 相关性（余弦相似度 / FTS 排名 / RRF）→ 复合先验 → MMR 多样性重排序 → 下游的 `min_score` / 类型 / 标签过滤以及截断到调用方的 `limit`。查询扩展只改变哪些候选项进入流水线；之后的每个阶段在机制上都不受影响。
+
+**两个可独立开关的阶段：**
+
+1. **去停用词变体（默认开启，无需模型）。** 除原始查询外，还会嵌入并搜索一个确定性变体——去除一小组固定的英文停用词后的查询（例如 "how do we deploy" → "deploy"），前提是该变体与原始查询不同且非空。全是停用词的查询（"is it"）或本身就只含实词的查询（"deploy production"）不会产生额外变体。两次嵌入都通过一次批量的 `embedBatch` 调用完成，因此这一阶段只多耗费一次额外的 Qdrant 往返，而不是额外的嵌入 API 调用。
+2. **LLM 改写 / HyDE（默认关闭，依赖模型）。** 当 `search.query_expansion.llm_paraphrase.enabled` 为 `true` 且能解析出 API key（来自 `pipeline.extraction_model_env`，未设置时回退到 `OPENAI_API_KEY`）时，会发起一次对话补全调用，生成 1-3 个额外变体——可以是查询的改写版本（`mode: "paraphrase"`，默认），也可以是一段假设性答案文本、改为嵌入该文本（`mode: "hyde"`）。HyDE 可能提升召回率，但也有可能把嵌入拉向查询中从未提及的幻觉细节（工具名、数字等），因此它是可选项而非默认项。任何失败——缺少 key、非 2xx 响应、超时——都会静默降级为第一阶段的变体；搜索调用绝不会因为改写生成失败而失败。
+
+**合并方式：** 每个被搜索变体返回的候选项按记忆 id 合并，同一 id 保留**最高**分（而不是求和或平均——被两个变体同时匹配到的记忆不会相对于仅被其最佳变体匹配到的记忆被夸大），随后截断到调用方的 `limit`，再继续后续的评分/排名。这意味着结果上的 `semantic_score` 现在表示"所有被搜索变体中的最高分"，而不再是"针对字面查询的分数"——这是该字段含义上的变化，尽管其数值范围以及相对于 `min_score`/复合排名的校准都保持不变。
+
+**不应用于全文搜索：** 独立的 `mode: "fulltext"` 以及 hybrid 模式的全文检索分支，始终只搜索唯一的原始查询字符串——FTS5/BM25 索引（参见[全文搜索](#全文搜索)）会对每个词语进行词干提取，这消除了查询扩展所针对的大部分词形变化差距，但它不会去除停用词，因此纯停用词查询在全文检索分支中仍然不会返回任何结果。
+
+**配置**（`config.json` 中的 `search.query_expansion`，参见[配置](#配置)）：
+
+| 字段 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `true` | 整个功能的总开关。设为 `false` 可精确恢复扩展之前的成本配置（每次查询一次嵌入）。 |
+| `max_variants` | `2` | 搜索的变体总数上限（原始 + 去停用词 + LLM），与 `llm_paraphrase.variant_count` 相互独立。超出上限的变体会被丢弃，而不是排队等待。 |
+| `keyword_stripped` | `true` | 启用第一阶段（确定性、无需模型的变体）。 |
+| `llm_paraphrase.enabled` | `false` | 启用第二阶段。需要能解析出 API key，否则 LLM 扩展会被静默跳过（仅在启动时记录一次日志，不会针对每次调用记录）。 |
+| `llm_paraphrase.mode` | `"paraphrase"` | `"paraphrase"` 改写查询；`"hyde"` 生成一段假设性答案文本用于嵌入。 |
+| `llm_paraphrase.variant_count` | `2` | 每次调用请求多少个改写/HyDE 变体（1-3）。 |
+| `llm_paraphrase.timeout_ms` | `3000` | 对话补全请求的超时时间；超时视为失败，降级为第一阶段。 |
 
 ---
 
@@ -1465,7 +2036,7 @@ BHGBrain 提供两种具有不同语义的记忆检索工具：
 | **预期调用方** | 执行任务时的 AI 智能体 | 进行调查的人类或管理智能体 |
 
 **recall 中的得分过滤：**
-`min_score` 参数（默认 0.6）作为质量关卡——只有余弦相似度 ≥ 0.6 的记忆才会被返回。这防止了不相关的结果。你可以降低 `min_score` 以获取更多结果，但会牺牲精确性。
+`min_score` 参数（默认 0.6）作为质量关卡——它作用于 `semantic_score` 字段（余弦相似度），而不是复合排名后的 `score`，因为 `recall` 运行在语义模式下——只有余弦相似度 ≥ 0.6 的记忆才会被返回。这防止了不相关的结果。你可以降低 `min_score` 以获取更多结果，但会牺牲精确性。
 
 ```json
 // Recall 示例——语义搜索，按类型和标签过滤
@@ -1483,7 +2054,7 @@ BHGBrain 提供两种具有不同语义的记忆检索工具：
 
 ### 过滤
 
-`recall` 和 `search` 都支持命名空间和集合作用域。`recall` 还额外支持类型和标签过滤。
+`recall` 和 `search` 都支持命名空间和集合作用域，以及时间范围过滤（`after`/`before`）。`recall` 还额外支持类型和标签过滤。
 
 **命名空间过滤：** 始终应用。所有搜索都限定在单个命名空间内。不支持跨命名空间搜索。
 
@@ -1491,19 +2062,21 @@ BHGBrain 提供两种具有不同语义的记忆检索工具：
 - 在语义搜索中，搜索 Qdrant 集合 `bhgbrain_{namespace}_general`（命名空间的默认集合）。
 - 在全文搜索中，搜索命名空间内的所有记忆，不限集合。
 
-**类型过滤（仅 `recall`）：** 传入 `"type": "episodic"` | `"semantic"` | `"procedural"` 以将结果限制为单一记忆类型。过滤在语义搜索后应用，因此从 Qdrant 先检索完整候选集。
+**类型过滤（仅 `recall`）：** 传入 `"type": "episodic"` | `"semantic"` | `"procedural"` 以将结果限制为单一记忆类型。过滤条件被下推到存储层（语义路径上是 Qdrant 负载过滤器，全文路径上是 SQL 谓词），因此 `limit` 计算的是匹配的记忆数量，而不是在过滤生效前被不匹配的候选项消耗掉。检索后仍会运行一次防御性复查，稳态下应为空操作；一旦它移除了存储层已返回的结果，`recall_zero_after_filter` 计数器就会递增，使过滤饥饿问题保持可观测。
 
-**标签过滤（仅 `recall`）：** 传入 `"tags": ["auth", "security"]` 以将结果限制为具有至少一个指定标签的记忆。过滤在检索后应用。
+**标签过滤（仅 `recall`）：** 传入 `"tags": ["auth", "security"]` 以将结果限制为具有至少一个指定标签的记忆（任意匹配）。与类型过滤一样，这也被下推到存储层，而不是仅在检索后应用。
+
+**时间范围过滤（`recall` 和 `search`）：** 传入 `after` 和/或 `before`（ISO 8601 时间戳），将结果限制为 `created_at` 落在所请求窗口内的记忆——两个边界都是含边界的，任一都可省略以表示开放端。边界比较的是 `created_at`（记忆首次被记录的时间），而非 `updated_at`（后者驱动复合排名中另一个独立的近因衰减信号）。与类型/标签一样，该过滤条件被下推到存储层，使 `limit` 计算窗口内的匹配数量。格式错误的时间戳或 `after` 晚于 `before` 会在查询任何存储层之前被拒绝。
 
 ---
 
-### 得分阈值与层级加权
+### 得分阈值与复合排名
 
-**`min_score`（仅 recall）：** 0 到 1 之间的最低余弦相似度得分。低于此阈值的记忆从 `recall` 结果中排除。默认：0.6。
+**`min_score`（仅 recall）：** 0 到 1 之间的最低余弦相似度得分，专门作用于 `semantic_score` 字段——而非复合排名后的 `score`——因为 `recall` 固定使用语义模式，且 `min_score` 的默认值是针对余弦相似度范围校准的，而非混合 RRF 得分或复合先验值。低于此阈值的记忆从 `recall` 结果中排除。默认：0.6。
 
 **过期记忆排除：** Qdrant 的向量搜索过滤器排除满足 `decay_eligible = true AND expires_at < now()` 的记忆。T0/T1 记忆（decay_eligible = false）永远不会被向量侧过滤器排除。在 SQLite 侧，生命周期服务对从向量库返回的任何记忆重新检查过期状态。
 
-**T0 得分加权（混合搜索）：** 在 RRF 融合后，T0（基础层）记忆额外获得 +0.1 的得分加成。这确保架构上重要的内容即使其确切术语与查询匹配不佳，也能在混合结果中浮现。
+**复合排名（所有模式）：** `score` 是相关性乘以由重要性、访问和时效性构成的先验值——参见上方[复合排名](#复合排名)。T0（基础层）记忆默认永不衰减，确保架构上重要的内容随着时间推移仍能持久保持良好排名。
 
 ---
 
@@ -1674,6 +2247,8 @@ bhgbrain health
 
 当最近一次 GC 运行（定时或手动）报告部分失败（某个归档或删除步骤失败）时，`components.retention` 也会变为 `"degraded"`（附带说明信息），与层级容量压力无关。下一次干净的 GC 运行会将其恢复为 `"healthy"`。
 
+当运行中的 SQLite 编译版本没有 `fts5` 模块时，`components.sqlite` 仍保持 `"healthy"`，但会附带一条 `message`：全文搜索此时运行的是旧版基于 `LIKE` 的匹配器（参见[全文搜索](#全文搜索)），而不是 FTS5/BM25 索引。启动时也会记录一次相应日志（`event: "fts5_unavailable"`）。
+
 **整体状态逻辑：**
 - `unhealthy`——如果 SQLite 或 Qdrant 不健康
 - `degraded`——如果嵌入已降级/不健康，或保留系统已降级（超容量或向量未同步）
@@ -1716,9 +2291,22 @@ GET /metrics
 | `bhgbrain_tool_handler_ms_count` | counter | 工具处理程序延迟样本数量，带有 `tool` 和 `status` 标签 |
 | `embedding_embed_batch_ms_p95` | histogram | 嵌入批处理延迟的第 95 百分位 |
 | `search_total_ms_p95` | histogram | 端到端搜索延迟的第 95 百分位 |
+| `search_result_count_avg` | histogram | 每次 `search`/`recall` 调用返回结果数量的平均值，按 `mode`（`semantic`/`fulltext`/`hybrid`）分类。仅统计模式特定的结果——`include_archived` 附加的已归档匹配项不计入。 |
+| `search_result_count_p50` | histogram | 结果数量的第 50 百分位，按 `mode` 分类 |
+| `search_result_count_p95` | histogram | 结果数量的第 95 百分位，按 `mode` 分类 |
+| `search_result_count_p99` | histogram | 结果数量的第 99 百分位，按 `mode` 分类 |
+| `search_result_count_count` | counter | `search_result_count` 样本数量，按 `mode` 分类 |
+| `search_result_score_avg` | histogram | 每次 `search`/`recall` 调用结果综合得分的平均值，按 `mode` 分类。每个结果一个样本；已归档匹配项因携带占位得分（而非相关性得分）而被排除。 |
+| `search_result_score_p50` | histogram | 结果综合得分的第 50 百分位，按 `mode` 分类 |
+| `search_result_score_p95` | histogram | 结果综合得分的第 95 百分位，按 `mode` 分类 |
+| `search_result_score_p99` | histogram | 结果综合得分的第 99 百分位，按 `mode` 分类 |
+| `search_result_score_count` | counter | `search_result_score` 样本数量，按 `mode` 分类 |
 | `bhgbrain_memory_count` | gauge | 当前总记忆数量（写入/删除时更新） |
 | `bhgbrain_rate_limit_buckets` | gauge | 活跃的速率限制追踪桶 |
 | `bhgbrain_rate_limited_total` | counter | 被速率限制的请求总数 |
+| `recall_zero_after_filter` | counter | 当 `recall` 检索后的类型/标签/`after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
+| `search_zero_after_filter` | counter | 当 `search` 检索后的 `after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
+| `search_embedding_degraded` | counter | 当 `hybrid` 模式搜索因嵌入提供方或向量存储不可用而降级为仅全文搜索时递增，按 `namespace` 分类 |
 
 例如：
 
@@ -1836,8 +2424,22 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 | URI 模板 | 名称 | 说明 |
 |---|---|---|
 | `memory://{id}` | 记忆详情 | 通过 UUID 获取完整记忆记录 |
+| `memory://{id}/revisions` | 记忆版本历史 | 某条记忆的版本历史，最新优先 |
+| `memory://inject/{hint}` | 会话注入（带提示） | 预算上下文块，其记忆部分依据与提示的混合相关性而非最近程度来选取 |
 | `category://{name}` | 类别 | 通过名称获取完整类别内容 |
 | `collection://{name}` | 集合 | 特定集合中的记忆 |
+
+### 资源列表变更通知（list_changed）
+
+BHGBrain 声明了 `resources.listChanged` MCP 能力。当 `collections` 调用的
+`action: "create"` 或 `"delete"`，或 `category` 调用的 `action: "set"` 或
+`"delete"` 成功后，服务器会发送 `notifications/resources/list_changed` 通知，
+使已连接的客户端知道 `collection://list` / `category://list` 已发生变化，
+而不必依赖过期的缓存副本。只读操作（`list`、`get`）和失败的变更操作
+永远不会触发通知；普通的记忆写入（`remember`、`forget` 等）也不会——因为
+`memory://list` 每次调用变动过于频繁，通知在那里没有意义。该通知仅通过
+stdio 传输发送（每个 stdio 连接对应一个长期存活的 `Server`）；它没有接入
+基于会话的 Streamable HTTP `/mcp` 连接。
 
 ### `memory://list`——分页记忆列表
 
@@ -1864,9 +2466,23 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 
 注入资源构建一个预算文本载荷，用于注入到 LLM 上下文窗口：
 
-1. 所有类别内容优先插入（完整内容，按顺序）。
-2. 顶部近期记忆随后附加（根据空间决定使用内容或摘要）。
-3. 载荷在 `auto_inject.max_chars`（默认 30,000 字符）处截断。
+1. 类别内容优先插入（完整内容，按顺序），并限制在其保留的预算份额内：
+   `(1 - auto_inject.memory_budget_fraction) × 预算`。类别未用完的部分会滚入
+   下方的记忆部分（不浪费）。
+2. **已固定的记忆接下来始终会被包含**，排在按最近程度/相关性选取之前，
+   无论它们本应排在什么位置（详见下文的
+   [固定记忆以确保注入](#固定记忆以确保注入)）。
+3. 记忆在剩余预算内附加（根据空间决定使用内容或摘要）——只要存在记忆，
+   记忆部分始终至少能获得 `auto_inject.memory_budget_fraction × 预算`，
+   使类别内容不再能耗尽记忆部分的空间。
+   - `memory://inject`（无提示）：按**最近程度**选取顶部记忆，与引入此选项前一致。
+   - `memory://inject/{hint}`：按与提示的**混合相关性**选取顶部记忆（见下文）。
+   - 既已固定又会被此步骤独立选中的记忆会（按 ID）从此步骤中排除，因此它
+     只会出现一次，也不会额外占用 `auto_inject_limit` 的名额。
+4. 载荷在 `auto_inject.max_chars` 处截断，依据 `auto_inject.budget_unit` 解释
+   （默认 30,000 字符）。这同样适用于固定内容：若某命名空间的固定记忆
+   本身就超过了记忆部分的保留份额，会像其他内容一样按条目截断，
+   且 `truncated` 为 `true`。
 
 查询参数：
 - `namespace`——要注入的命名空间（默认：`global`）
@@ -1884,24 +2500,159 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 
 通过 `memory://{id}` 访问记忆会增加其访问次数并安排延迟刷写。
 
+### `memory://inject/{hint}`——相关性条件会话注入
+
+`memory://inject` 的参数化变体，依据调用方提供的**提示**（任务短语、仓库名或
+主题）与记忆的混合相关性选取记忆部分，而非按最近程度：
+
+- 提示是一个 URI 路径片段：先解码一次，再去除首尾空白并截断到 500 字符
+  （与 `search`/`recall` 对查询施加的限制相同），然后据此在已解析的命名空间上
+  驱动混合搜索。
+- 选取复用与普通 `search`/`recall` 调用相同的复合/RRF 排序、过期过滤和
+  Top-K 限制（`defaults.auto_inject_limit`）。与无提示路径不同，带提示的读取
+  会**记录访问**——在各方面意义上它都是一次 recall。
+- 若嵌入提供方不可用，选取会优雅降级到全文检索分支——载荷仍会生成，
+  只是没有语义部分的贡献。
+- 空提示（去除首尾空白后为空）会回退到上述最近程度行为。
+- **近重复抑制**：当 `auto_inject.dedup_suppression` 为 `true`（默认）时，
+  若某候选与已选记忆的向量相似度超过 `deduplication.similarity_threshold`，
+  则跳过该候选，释放出的预算用于下一个不同的候选。**已固定的记忆在两个
+  方向上都不受此影响**：两条互为近重复的固定记忆会同时被注入（彼此之间
+  不会被抑制），且固定记忆既不会抑制、也不会被恰好与其近重复的按相关性
+  选出的候选所抑制。
+
+示例：`memory://inject/deploy%20to%20production` 将选取条件设为
+"deploy to production"。
+
+响应结构与 `memory://inject` 相同。
+
+### 固定记忆以确保注入
+
+`memory://inject` 与 `memory://inject/{hint}` 通常按最近程度或相关性选取
+记忆部分，这意味着某个具体事实只有在排名靠前时才会进入被注入的上下文——
+一条关键的运行规则（例如"始终使用 pnpm，绝不使用 npm"）如果近期没有被
+引用过，且与当前提示不匹配，就可能悄无声息地被排除在外。**固定（pin）**
+弥补了这一缺口：被固定的记忆始终会包含在记忆部分中，无论其按最近程度或
+相关性本应排在何处。
+
+- **通过 `remember` 设置**，在写入时指定（`pinned: true`/`false`）——在去重
+  `UPDATE` 时，省略 `pinned` 会保留该记忆现有的固定状态，因此一次内容修正
+  不会悄悄取消固定；需显式传入才能更改。
+- **通过 `tag` 设置**，作为一个专用的轻量开关（`pinned: true`/`false`），
+  不涉及内容，也无需重新提交内容。
+- **按命名空间限量**：`defaults.pin_limit_per_namespace`（默认 `20`）限制了
+  单个命名空间可同时固定的记忆数量，在写入时强制执行。超过上限进行固定会
+  返回 `INVALID_INPUT`；先取消固定一条以腾出空间。
+- **使用现有的记忆部分预算**（`auto_inject.memory_budget_fraction` 份额）——
+  没有单独的预留空间。若固定内容本身就超过该份额，会像其他内容一样按
+  条目截断，并设置载荷的 `truncated` 标志。
+- **在两个方向上都不受近重复抑制影响**（见上文）。
+- **对 `search`/`recall` 没有影响**：`pinned` 从不出现在 `SearchResult` 中，
+  也不影响排序或顺序——这与 `T0` 保留层级刻意区分开来：`T0` 只影响
+  保留/排序，本身并不提供注入包含的保证。一条记忆可以是 `T0` 且固定、
+  `T0` 且未固定，或任意层级且固定——二者相互正交。
+- **总开关**：`auto_inject.pinned_enabled: false`（默认 `true`）会完全禁用
+  固定记忆的包含步骤——两种注入模板都会表现得就像没有任何记忆被固定一样。
+  无论此开关如何，每命名空间的固定上限仍会在写入时强制执行。
+- **持久化**：固定状态会持久化到 Qdrant 载荷中，并由 `repair --mode
+  from-qdrant` 和跨设备同步恢复，因此能在 SQLite 重建后依然保留。
+
+### `memory://{id}/revisions`——版本历史
+
+返回某条记忆记录的版本历史，最新优先，遵循与 `memory://{id}` 相同的可见性规则（未知或因可见性规则被排除的记忆返回 `NOT_FOUND`）。只有 T0 记忆会累积版本（参见 [T0 版本历史](#t0-版本历史)），其他层级返回空列表。
+
+响应：
+```json
+{
+  "id": "<uuid>",
+  "revisions": [
+    { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+对于不支持资源的 stdio 客户端，可改用 `revisions` 工具的 `list` 动作读取相同数据（参见 [MCP 工具参考](#mcp-工具参考)）。
+
+---
+
+## MCP 提示词
+
+除了工具与资源之外，BHGBrain 还声明了 `prompts` MCP 能力，并通过
+`ListPrompts`/`GetPrompt` 提供两个提示词：
+
+| 提示词 | 参数 | 说明 |
+|---|---|---|
+| `bootstrap-interview` | `section`（可选，`1`–`10`） | 通过 `bootstrap` 工具引导完成引导访谈。省略 `section` 会返回所有环节的概览；指定后会直接跳转到该环节的问题。超出范围或非整数的 `section` 会被拒绝，并返回 JSON-RPC InvalidParams 错误。 |
+| `session-context` | `hint`（可选） | 以单条提示消息的形式返回与 `memory://inject`（提供 `hint` 时为 `memory://inject/{hint}`）相同的预算上下文块，用于为新会话预热上下文。 |
+
+两个提示词都返回一条 `user` 角色的消息。对于不支持提示词的客户端，可以直接
+通过 `bootstrap` 工具和 `memory://inject` 资源获得相同的功能——提示词只是一层
+可发现性封装，并非新增行为。
+
+示例：
+
+```json
+// 列出可用提示词
+{ "method": "prompts/list" }
+
+// 直接跳转到引导访谈的第 3 环节
+{ "method": "prompts/get", "params": { "name": "bootstrap-interview", "arguments": { "section": "3" } } }
+
+// 获取偏向某个主题的会话上下文块
+{ "method": "prompts/get", "params": { "name": "session-context", "arguments": { "hint": "deploy to production" } } }
+```
+
 ---
 
 ## 引导提示词
 
-`BootstrapPrompt.txt` 包含一个结构化的访谈提示词，用于与 AI 智能体共同构建**工作第二大脑档案**。
+BHGBrain 提供三种构建你的工作档案的方式，从全程引导到批量导入均可。
 
-在引导新 AI 助手时，或当你想用丰富的、结构化的工作上下文、实体、租户和消歧义规则填充 BHGBrain 时，使用它。
+### 方案 1：交互式引导工具（推荐）
 
-### 使用方法
+`bootstrap` MCP 工具直接在 BHGBrain 内部驱动一个有状态的 10 节访谈。它会跟踪进度、边访谈边存储记忆，并支持跨会话暂停/恢复。
 
-1. 与你的 AI 助手（Claude、GPT-4 等）开始一次全新对话。
-2. 将 `BootstrapPrompt.txt` 的全部内容作为第一条消息粘贴。
-3. 让智能体逐节访谈你。
-4. 最后，智能体会生成一个结构化档案，你可以通过 `bhgbrain.remember` 调用（或 `mcporter call bhgbrain.remember`）将其保存到 BHGBrain。
+```json
+// 开始（或恢复）访谈
+{ "name": "bootstrap", "arguments": { "action": "start" } }
+
+// 提交某一节的答案
+{ "name": "bootstrap", "arguments": { "action": "submit", "section": 1, "answers": "Jane Doe, CTO at Acme Corp..." } }
+
+// 查看进度
+{ "name": "bootstrap", "arguments": { "action": "status" } }
+
+// 重做某一节
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+```
+
+每次提交后，该工具会返回下一节的问题，方便智能体自然地推进对话。会话持久化在 SQLite 中——你可以关闭客户端，之后从中断处继续。
+
+### 方案 2：批量档案导入
+
+如果你已经有一份完成的档案文档（来自之前的引导流程、维基页面或结构化笔记），可以使用 `import` 工具一次性导入：
+
+```json
+// 导入一份 10 节的引导档案
+{ "name": "import", "arguments": { "format": "profile", "content": "## 1. Identity & Role\n..." } }
+
+// 将任意 Markdown 导入为记忆
+{ "name": "import", "arguments": { "format": "freeform", "content": "## Architecture\nWe use microservices..." } }
+
+// 预览将被存储的内容而不实际写入
+{ "name": "import", "arguments": { "format": "profile", "content": "...", "dry_run": true } }
+```
+
+该工具将文档解析为离散记忆，并为每一节赋予正确的集合、层级、类型、重要性和标签。去重逻辑同样适用——更新后重新导入是安全的。
+
+### 方案 3：手动引导提示词
+
+`BootstrapPrompt.txt` 包含一个可粘贴到任意 AI 对话中的独立访谈提示词。智能体会逐节访谈你，并为每个事实调用 `bhgbrain.remember`。这种方式适用于任何已连接 MCP 的客户端，无需 `bootstrap` 或 `import` 工具。
 
 ### 涵盖内容
 
-访谈涵盖 10 个部分：
+三种方式都会走完相同的 10 个部分：
 
 | 部分 | 捕获内容 |
 |---|---|
@@ -1916,9 +2667,7 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 | 9. 租户与环境图谱 | Azure 租户、开发/预发布/生产环境 |
 | 10. 操作规则 | 命名约定、消歧义、默认假设 |
 
-输出生成一个包含所有 10 个部分及消歧义指南的简洁结构化档案——正是 BHGBrain 可靠回答工作相关问题所需的内容。
-
-**引导记忆默认为 T0。** 通过引导流程摄入的内容应标记 `source: import` 和 `tags: ["bootstrap", "profile"]`。启发式分类器识别这些信号并分配 T0（基础层）层级。
+**引导记忆默认为 T0。** 通过引导流程摄入的内容会被标记为相应的来源（`bootstrap` 工具对应 `agent`，批量导入对应 `import`），并按照章节映射表分配层级。
 
 ---
 
@@ -1954,12 +2703,23 @@ bhgbrain gc                           # 运行清理
 bhgbrain gc --dry-run                 # 显示候选项与待审核项，不实际删除
 bhgbrain gc --tier T3                 # 仅清理 T3 记忆
 
+# 记忆蒸馏（通过 LLM 调用将 T2/T3 情景记忆合并为 T1 语义记忆——参见记忆蒸馏。
+# 默认关闭；需要 retention.distillation.enabled: true 以及提取 API 密钥）
+bhgbrain distill                      # 运行蒸馏
+bhgbrain distill --dry-run            # 显示候选簇，不调用 LLM 也不写入/归档任何内容
+
 # 审计日志
 bhgbrain audit                        # 显示最近的审计条目
 
 # 修复（多设备恢复）
 bhgbrain repair --from-qdrant                # 从 Qdrant 恢复本地 SQLite（默认仅恢复当前设备的记忆）
 bhgbrain repair --from-qdrant --all-devices  # 恢复所有设备的记忆，而不仅仅是当前设备
+
+# 修复（嵌入模型迁移——参见嵌入模型迁移）
+bhgbrain repair --re-embed                   # 迁移带有过期嵌入标记的向量
+bhgbrain repair --re-embed --dry-run         # 预览将有多少行会被重新嵌入
+bhgbrain repair --re-embed --include-legacy  # 同时纳入完全没有标记的行
+bhgbrain repair --re-embed --batch-size 100  # 调整批次大小（默认 50）
 
 # 类别管理
 bhgbrain category list                # 列出所有类别
@@ -1982,7 +2742,7 @@ bhgbrain server token                 # 生成新的随机 Bearer token
 
 ## MCP 工具参考
 
-BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并返回结构化 JSON。错误使用统一的信封格式：
+BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入并返回结构化 JSON。错误使用统一的信封格式：
 
 ```json
 {
@@ -1993,6 +2753,21 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
   }
 }
 ```
+
+**标题与标注：** 每个工具都声明了一个人类可读的 `title` 以及 MCP 行为
+`annotations`（`readOnlyHint`、`destructiveHint`、`idempotentHint` 与
+`openWorldHint: false`——每个工具都只操作本地存储，从不涉及开放的外部域）。
+`recall` 与 `search` 为 `readOnlyHint: true`，并省略 `destructiveHint`/
+`idempotentHint`（根据规范，一旦设置了 `readOnlyHint`，这两项即无意义）。
+`forget`、`collections`、`category`、`backup` 与 `revisions` 声明了
+`destructiveHint: true`。这意味着符合规范的客户端不会再把每一次读取都当作
+与删除同等危险——而这正是当某个工具完全省略标注时，MCP 规范默认值
+（`readOnlyHint: false`、`destructiveHint: true`）所导致的结果。
+
+**outputSchema：** `recall`、`search` 与 `remember` 声明了描述其
+`structuredContent` 形状的 `outputSchema`（对应 `SearchResult`/`WriteResult`
+类型），使 MCP 客户端可以校验结果，而不必只依赖对文本块做 JSON 解析。
+其余十个工具的结果形状取决于具体动作，目前尚未提供 schema 描述。
 
 ---
 
@@ -2008,11 +2783,16 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 | `namespace` | `string` | 否 | `"global"` | 命名空间作用域。格式：`^[a-zA-Z0-9/-]{1,200}$` |
 | `collection` | `string` | 否 | `"general"` | 命名空间内的集合。最多 100 字符。 |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | 否 | `"semantic"` | 记忆类型。影响默认层级分配。 |
-| `tags` | `string[]` | 否 | `[]` | 用于过滤和分类的标签。最多 20 个标签，每个最多 100 字符。格式：`^[a-zA-Z0-9-]+$` |
+| `tags` | `string[]` | 否 | `[]` | 用于过滤和分类的标签。最多 20 个标签，每个最多 100 字符。格式：`^[a-zA-Z0-9-]+$`。存储的记忆可能包含内容自动派生的额外标签——详见[自动标记](#自动标记)。 |
 | `category` | `string` | 否 | — | 附加到类别槽（意味着 T0 层级）。最多 100 字符。 |
 | `importance` | `number (0–1)` | 否 | `0.5` | 重要性评分。较高值在过期清理中优先保留。 |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | 否 | `"cli"` | 记忆来源。影响默认层级（例如 agent+procedural → T1）。 |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | 否 | 自动分配 | 显式层级覆盖。优先于所有启发式规则。 |
+| `pinned` | `boolean` | 否 | ADD 时为 `false`；UPDATE 时保留 | 固定该记忆，使其始终包含在 `memory://inject` 载荷中，受 `defaults.pin_limit_per_namespace`（默认 20）限制。在去重 `UPDATE` 时，省略 `pinned` 会保留该记忆现有的固定状态——需显式传入才能更改。新固定记忆时超过每命名空间上限会返回 `INVALID_INPUT`。 |
+| `origin` | `object` | 否 | `null` | 调用方提供的内容溯源信息：`{ session_id?, tool?, repo?, branch? }`，所有字段均为可选的自由文本字符串（分别最多 200/100/200/200 字符）。未知键会被拒绝。与表示向量身份的 `embedding_model` 字段不同——详见[内容溯源](#内容溯源)。在去重 `UPDATE` 时，省略 `origin` 会保留该记忆现有的溯源信息；传入则会替换它。 |
+| `confidence` | `number (0–1)` | 否 | 按 `source` 而定（见下文） | 应在多大程度上信任该记忆的内容。省略时按 `pipeline.default_confidence[source]`（配置项，默认值为 `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`）取默认值。在去重 `UPDATE` 时，合并后的值为 `max(现有值, 新值)`——二次确认永远不会降低信任度。详见[内容溯源](#内容溯源)。 |
+
+**超长内容会被拒绝，而不是被静默嵌入为低质量的"糊状向量"：** 超过 `pipeline.long_content_threshold_chars`（配置项，默认 `8,000` 字符，约 1–2 页）的内容会被拒绝，并返回 `INVALID_INPUT` 错误，其中说明了实际字符数、配置的阈值以及解决方法：改用 `format: "freeform"` 调用 `import` 工具，或将内容拆分为多次较小的 `remember` 调用。这是有意为之：将数千字的文本嵌入为单个向量会产生低质量的"糊状向量"，它会与许多不相关的查询产生弱匹配，而不是与某一个查询产生强匹配。上表中 100,000 字符的硬性上限仍然适用，作为绝对上限，但调用者实际会先触及 `long_content_threshold_chars` 这一限制。
 
 **输出：**
 
@@ -2026,12 +2806,50 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 }
 ```
 
+> **MCP 信封说明（自 v1.17.0 起）：** 上面（以及下方多候选示例中）展示的
+> 对象/数组，是 `handleRemember` 内部实际返回的内容，也正是 `POST
+> /tool/:name`（REST）目前仍然返回的内容。而在 **MCP 传输**（stdio 与
+> Streamable HTTP `/mcp`）上，`CallTool` 响应会将成功结果规范化为
+> `{ "results": [...] }`——单个候选对应一个元素的数组，多候选提取拆分内容时
+> 则包含多个元素——`structuredContent` 与 JSON 文本块均如此，从而使单一的
+> `outputSchema` 能同时描述这两种情况。若某个 MCP 侧的解析器脆弱地假定为
+> 裸对象，需要更新为读取 `results[0]`（或遍历 `results`）；REST 客户端不受
+> 影响。
+
 `operation` 为以下之一：
 - `ADD`——创建了新记忆
 - `UPDATE`——现有相似记忆已更新（内容已合并）
 - `NOOP`——精确或近似重复；返回现有记忆的 ID
 
 对于 `UPDATE` 操作，`merged_with_id` 包含被更新记忆的 ID。
+
+**多候选提取：** 当 `pipeline.extraction_enabled` 为 `true`（默认 `false`）且内容长度
+达到 `pipeline.extraction_min_chars` 时，`remember` 可能通过一次 LLM 调用将包含多个
+事实的内容拆分为若干条原子候选记忆，每条候选都会独立去重/分类。此时该工具返回一个
+**JSON 数组**，包含与上文相同的逐候选对象——每个候选一条——而不是单个对象：
+
+```json
+[
+  {
+    "id": "3f4a1b2c-...",
+    "summary": "Alice owns the infra repo",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  },
+  {
+    "id": "9c7d2e5f-...",
+    "summary": "Deploys go through GitHub Actions",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  }
+]
+```
+
+任何类型的提取失败（网络错误、超时、格式错误/空响应）都会透明地回退到当前的单对象
+响应——提取永远不会阻塞或导致 `remember` 调用失败。任何假设 `remember` 始终返回单个
+对象的调用方，都需要在启用 `extraction_enabled` 之前更新为区分数组与对象。
 
 **示例：**
 
@@ -2076,10 +2894,13 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 | `query` | `string` | **是** | — | 召回查询。最多 500 字符。 |
 | `namespace` | `string` | 否 | `"global"` | 要搜索的命名空间。 |
 | `collection` | `string` | 否 | — | 过滤到特定集合。省略则搜索默认集合。 |
-| `type` | `"episodic" \| "semantic" \| "procedural"` | 否 | — | 将结果过滤到特定记忆类型。在检索后应用。 |
-| `tags` | `string[]` | 否 | — | 过滤到具有至少一个匹配标签的记忆。在检索后应用。 |
+| `type` | `"episodic" \| "semantic" \| "procedural"` | 否 | — | 将结果过滤到特定记忆类型。下推到存储层，因此 `limit` 计算的是匹配的记忆数量。 |
+| `tags` | `string[]` | 否 | — | 过滤到具有至少一个匹配标签的记忆（任意匹配）。下推到存储层，因此 `limit` 计算的是匹配的记忆数量。对调用方提供的标签和自动派生的标签一视同仁——详见[自动标记](#自动标记)。 |
 | `limit` | `integer (1–20)` | 否 | `5` | 最大结果数量。 |
-| `min_score` | `number (0–1)` | 否 | `0.6` | 最低余弦相似度得分。低于此阈值的结果被排除。 |
+| `min_score` | `number (0–1)` | 否 | `0.6` | 最低余弦相似度得分，作用于 `semantic_score`（而非融合/调整后的 `score`）。低于此阈值的结果被排除。 |
+| `after` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at >= after`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到存储层，使 `limit` 计算匹配的记忆数量。 |
+| `before` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at <= before`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到存储层，使 `limit` 计算匹配的记忆数量。 |
+| `follow_links` | `boolean` | 否 | `false` | 同时返回每条结果的单跳关联记忆（通过 `relate` 工具创建的边，双向，所有关系类型）。附加条目会标记 `linked_from`/`link_relation`/`link_direction`，便于客户端区分扩展出的关联记忆与直接相关的命中结果；参见下文的 `relate`。 |
 
 **输出：**
 
@@ -2098,11 +2919,24 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
       "expires_at": null,
       "expiring_soon": false,
       "created_at": "2026-01-01T00:00:00Z",
-      "last_accessed": "2026-03-15T12:00:00Z"
+      "last_accessed": "2026-03-15T12:00:00Z",
+      "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+      "confidence": 1.0
     }
   ]
 }
 ```
+
+每条结果还携带 `origin`/`confidence`（详见 `remember` 下的[内容溯源](#内容溯源)）——
+如果写入该记忆时未提供 `origin`，则为 `null`；如果调用方省略了 `confidence`，则
+使用按来源确定的默认值。
+
+当 `follow_links: true` 时，每条基础结果的单跳关联记忆会追加在基础结果之后（不会
+减少 `limit` 允许的基础结果数量），并对基础结果集及彼此之间去重，追加条目总数上限
+为 `limit`。追加的条目携带 `score: 0`（占位符，而非相关性得分——与 `search` 的
+`include_archived` 采用相同约定），以及 `linked_from`（基础结果的 id）、
+`link_relation` 和 `link_direction`（若基础结果是该边的源端则为 `"outgoing"`，若是
+目标端则为 `"incoming"`）。已归档的关联记忆会被跳过。
 
 ---
 
@@ -2142,14 +2976,17 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 | `collection` | `string` | 否 | — | 过滤到特定集合。 |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | 否 | `"hybrid"` | 搜索算法。 |
 | `limit` | `integer (1–50)` | 否 | `10` | 最大结果数量。 |
+| `include_archived` | `boolean` | 否 | `false` | 同时搜索已归档的记忆（参见[衰减、清理与归档](#衰减清理与归档)），按摘要/标签进行词条匹配。归档命中会追加在活跃结果之后，标记为 `archived: true`，且从不减少 `limit` 允许的活跃结果数量。归档命中不会记录访问。 |
+| `after` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at >= after`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到向量/全文存储层——这是 `search` 的第一个下推过滤条件。 |
+| `before` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at <= before`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到向量/全文存储层。 |
 
-**输出：** 与 `recall` 相同的结构——`{ "results": [...] }`——但没有 `min_score` 关卡，支持最多 50 条结果。
+**输出：** 与 `recall` 相同的结构——`{ "results": [...] }`——但没有 `min_score` 关卡，支持最多 50 条结果。归档命中（当 `include_archived: true` 时）带有 `archived: true`，使用保留的摘要作为 `content`，且没有有意义的 `score`（它们是元数据词条匹配，而非排序结果）。
 
 ---
 
 ### `tag`——管理标签
 
-向记忆添加或移除标签。标签原子性地合并/过滤；记忆内容和嵌入不受影响。
+向记忆添加或移除标签，和/或对其进行固定/取消固定。标签与固定状态会原子性地更新；记忆内容和嵌入不受影响。
 
 **输入：**
 
@@ -2158,6 +2995,7 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 | `id` | `string (UUID)` | **是** | — | 要打标签的记忆。 |
 | `add` | `string[]` | 否 | `[]` | 要添加的标签。合并后总计最多 20 个标签。 |
 | `remove` | `string[]` | 否 | `[]` | 要移除的标签。 |
+| `pinned` | `boolean` | 否 | 保持不变 | 固定（`true`）或取消固定（`false`）该记忆，与标签无关——为注入固定提供的专用轻量开关，无需重新提交内容。省略该参数则固定状态保持不变。在命名空间已达到 `defaults.pin_limit_per_namespace` 时固定一个尚未固定的记忆会返回 `INVALID_INPUT`。 |
 
 **输出：**
 
@@ -2168,7 +3006,7 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 }
 ```
 
-如果添加标签会超过 20 个标签的限制，返回 `INVALID_INPUT`。
+如果添加标签会超过 20 个标签的限制，或固定操作会超过 `defaults.pin_limit_per_namespace`，则返回 `INVALID_INPUT`。
 
 ---
 
@@ -2318,19 +3156,331 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 
 ---
 
-### `repair`——从 Qdrant 重建 SQLite
+### `bootstrap`——交互式引导
 
-从 Qdrant 恢复记忆到本地 SQLite 数据库。用于多设备设置、数据丢失恢复或新设备接入。参见[修复与恢复](#修复与恢复)。
+驱动一个有状态的 10 节访谈来构建你的工作档案。支持跨会话暂停/恢复。
 
 **输入：**
 
 | 参数 | 类型 | 是否必需 | 默认值 | 说明 |
 |---|---|---|---|---|
-| `dry_run` | `boolean` | 否 | `false` | 为 `true` 时，报告将恢复的内容但不做任何更改。 |
-| `device_id` | `string` | 否 | — | 过滤恢复范围到由特定设备创建的记忆。与 `all_devices` 互斥。 |
-| `all_devices` | `boolean` | 否 | `false` | 显式恢复所有设备的记忆。与 `device_id` 互斥。这也是两个字段都未提供时的默认行为。 |
+| `action` | `"start" \| "submit" \| "status" \| "reset"` | **是** | - | 要执行的操作。 |
+| `section` | `integer (1-10)` | submit/reset 时需要 | - | 要提交答案或重置的节号。 |
+| `answers` | `string` | submit 时需要 | - | 该节的答案。最多 500,000 个字符。 |
+| `namespace` | `string` | 否 | `"profile"` | 命名空间范围。 |
+
+**动作：**
+
+- **`start`** —— 创建新会话或恢复现有会话。返回第一个未完成节的标题、问题和说明。
+- **`submit`** —— 将答案作为离散记忆存储到给定节，将其标记为已完成，并返回下一节。
+- **`status`** —— 返回进度概览：哪些节已完成、记忆数量、最后更新时间。
+- **`reset`** —— 删除某一节的所有记忆，并将其标记为待重新采集。
+
+**输出（start）：**
+
+```json
+{
+  "complete": false,
+  "current_section": 1,
+  "title": "Identity & Role",
+  "questions": ["What is your full name...?", "..."],
+  "progress": { "complete": 0, "total": 10 }
+}
+```
+
+**说明：**
+- 会话持久化在 SQLite 中——客户端重启后依然存在。
+- 每个命名空间一个会话。对已有会话调用 `start` 会恢复它。
+- 向已完成的节提交答案会返回错误；请先使用 `reset`。
+
+---
+
+### `import`——批量档案导入
+
+一次性将结构化档案或自由格式文档导入为离散记忆。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `format` | `"profile" \| "freeform"` | **是** | - | `"profile"` 用于 10 节引导输出，`"freeform"` 用于任意 Markdown。 |
+| `content` | `string` | **是** | - | 要导入的文档文本。最多 500,000 个字符。 |
+| `namespace` | `string` | 否 | `"profile"` | 命名空间范围。 |
+| `dry_run` | `boolean` | 否 | `false` | 为 `true` 时，返回将被存储内容的预览而不实际写入。 |
 
 **输出：**
+
+```json
+{
+  "dry_run": false,
+  "format": "profile",
+  "memories_created": 24,
+  "duplicates_skipped": 2,
+  "collections": ["identity", "goals", "entities", "..."],
+  "sections_processed": 10
+}
+```
+
+**说明：**
+- `format: "profile"` 识别 `## N.` 节标题，并将每一节映射到正确的集合、层级、类型、重要性和标签。
+- `format: "freeform"` 按标题和段落边界拆分，使用默认元数据（集合：`general`，层级：`T2`）。
+- 去重通过现有写入管道生效——重新导入是安全的。
+- `dry_run: true` 返回记忆预览且不产生任何写入。
+- 编号超出 10 个存储映射节范围的标题（例如按旧的 12 节模板编写的文档）不会被静默丢弃——其编号会记录在 `sections_ignored` 中，让你知道内容被跳过而不是在毫无提示的情况下丢失。
+- 如果 [`remember`](#remember存储记忆) 因内容超过 `pipeline.long_content_threshold_chars` 而拒绝了你的内容，改用 `format: "freeform"` 的 `import`——它会按标题/段落边界拆分文档并独立嵌入每个片段，从而避开 `remember` 的阈值所防范的单一混合向量问题。
+
+---
+
+### `revisions`——列出或回退记忆版本历史
+
+列出某条记忆的版本历史，或将其内容回退到某个历史版本。命名空间可见性的解析方式与 `forget`、`tag` 相同（先按 ID 查找该记忆）。只有 T0 记忆会累积版本——参见 [T0 版本历史](#t0-版本历史)。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `action` | `"list" \| "revert"` | **是** | - | 要执行的操作。 |
+| `id` | `string (UUID)` | **是** | - | 记忆 ID。 |
+| `revision` | `number` | `revert` 时必需 | - | 要回退到的版本号。 |
+
+**输出（`action: "list"`）：**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revisions": [
+    { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+从未发生过内容变更的记忆会返回空的 `revisions` 数组，而不是错误。
+
+**输出（`action: "revert"`）：**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revision": 1,
+  "content": "恢复后的内容"
+}
+```
+
+**说明：**
+- 回退通过与 `remember` 的 UPDATE 去重路径相同的流程恢复目标版本的内容：生成新的校验和、重新嵌入向量、重新写入 Qdrant。回退前的内容会作为一条新的历史记录追加保留（历史记录只追加，不会被覆盖）。
+- `REVISE` 审计事件会记录来源版本号，与写入管道在普通 T0 内容变更时记录的通用 REVISE 事件相区分。
+- 回退需要嵌入提供方可用——如果不可用，回退会以 `EMBEDDING_UNAVAILABLE` 失败，且记忆保持完全不变（不会发生部分写入，也不会造成向量不同步）。
+- 回退到该记忆不存在的版本号会返回 `NOT_FOUND`。
+
+---
+
+### `review`——审阅队列与归档找回
+
+列出并处置 T1 审阅队列，并恢复已归档的记忆。补上分层生命周期的读取侧：`review_due`（写在 T1 记忆上，参见[层级生命周期](#层级生命周期分配晋升与滑动窗口)）和 `archived_memories`（参见[衰减、清理与归档](#衰减清理与归档)）此前都只有写入路径，没有面向 MCP 的读取接口。内容修订功能有意不在此处重复实现——请使用 `remember` 的 UPDATE 路径。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `action` | `"list" \| "keep" \| "archive" \| "restore"` | **是** | - | 要执行的操作。 |
+| `id` | `string (UUID)` | `keep`/`archive`/`restore` 时必需 | - | 记忆 ID。对 `restore` 而言，是用于在归档中查找的原始记忆 ID。 |
+| `days` | `integer (0–3650)` | 否 | `0` | （仅 `list`）超出"现在到期"之外的提前提醒天数窗口。`0` 表示仅返回已到期的记忆。 |
+| `namespace` | `string` | 否 | `"global"` | 命名空间范围。 |
+| `limit` | `integer (1–100)` | 否 | `20` | （仅 `list`）分页大小。 |
+| `cursor` | `string` | 否 | - | （仅 `list`）上一次 `list` 调用返回的分页游标。 |
+
+**输出（`action: "list"`）：**
+
+```json
+{
+  "items": [
+    {
+      "id": "3f4a1b2c-...",
+      "namespace": "global",
+      "collection": "general",
+      "summary": "支付服务的部署手册",
+      "tags": ["deployment", "runbook"],
+      "retention_tier": "T1",
+      "review_due": "2026-03-01T00:00:00.000Z",
+      "expires_at": "2026-03-01T00:00:00.000Z"
+    }
+  ],
+  "cursor": "2026-03-01T00:00:00.000Z|3f4a1b2c-..."
+}
+```
+
+返回的是 `review_due` 在"现在 + `days`"或之前的未归档 T1 记忆，按到期时间从早到晚排列。到达最后一页时 `cursor` 为 `null`；将其作为 `cursor` 输入传回可获取下一页。
+
+**输出（`action: "keep"`）：**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "review_due": "2027-03-01T00:00:00.000Z",
+  "expires_at": "2027-03-01T00:00:00.000Z"
+}
+```
+
+确认该记忆仍然准确：按该记忆所在层级的生命周期策略（复用 `remember` 与访问驱动晋升所用的同一套计算）同时延长 `review_due` 和 `expires_at`，无论 `sliding_window_enabled` 如何设置——显式的人工确认会获得完整的延长，即便被动的滑动窗口续期已被禁用。记录一条注明"审阅确认"的 `REVISE` 审计事件。若记忆不存在则返回 `NOT_FOUND`。
+
+**输出（`action: "archive"`）：**
+
+```json
+{ "id": "3f4a1b2c-...", "archived": true }
+```
+
+让该记忆经过与 GC 相同的归档转换：删除其向量，将其记录行移入 `archived_memories`（保留摘要、标签、层级和访问统计；不保留内容和向量），并记录一条 `ARCHIVE` 审计事件。若该 ID 从未存在过则返回 `NOT_FOUND`，若已被归档则返回 `CONFLICT`。
+
+**输出（`action: "restore"`）：**
+
+```json
+{
+  "id": "9c2e5f10-...",
+  "restored_from": "3f4a1b2c-...",
+  "archive_id": 42,
+  "restored": true
+}
+```
+
+根据归档记录中保留的摘要和标签，在原始层级重新创建一条活跃记忆——这是一个**带溯源信息的存根**，而非原样复活：原始内容和向量从未被保留，因此恢复后记忆的内容就是其归档摘要，标签为原始标签加上一个 `restored-from-archive` 标记标签，并重新生成嵌入以便参与搜索。归档记录行会被保留（不会删除），这与 CLI 的 `archive restore` 不同。记录一条关联归档来源的 `RESTORE` 审计事件。若给定 ID 没有对应的归档记录则返回 `NOT_FOUND`。
+
+---
+
+### `feedback`——记录召回结果的有用程度
+
+记录之前由 `recall` 或 `search` 返回的某条记忆是否真正有用，作为一条不可变事件写入
+与该记忆关联的专用 `recall_feedback` 表。**此版本纯粹是附加性的**：它不会影响排序、
+生命周期，也不会影响任何 `recall`/`search`/`review` 的结果——目前没有聚合、没有读取
+/列表接口，也没有与排序或生命周期的耦合。收集这些事件是为了让未来的变更可以依据实际
+证据而非凭观察选定的默认值来调整 `search.ranking` 的权重、衰减速率和去重阈值。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `id` | `string (UUID)` | **是** | - | 来自先前 `recall`/`search` 结果的记忆 ID。 |
+| `useful` | `boolean` | **是** | - | 该结果是否有用。 |
+| `query` | `string`（最多 500 字符） | 否 | - | 产生该结果的查询文本，保留供未来分析使用，不会与任何先前的调用进行校验。 |
+| `score` | `number (0-1)` | 否 | - | 调用方观察到的该结果的分数，保留供未来分析使用。 |
+
+**输出：**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "useful": true,
+  "recorded_at": "2026-03-01T00:00:00.000Z"
+}
+```
+
+以与 `tag`/`forget` 相同的方式查找记忆（仅活跃行），若不存在则返回 `NOT_FOUND`，
+包括仅存在于归档中的 ID。`query`/`score` 会按原样存储——省略时为 `null`，绝不会
+使用虚构的默认值——并且不会与任何真实的先前 `recall`/`search` 调用进行交叉校验，
+这与 `tag`/`forget` 对调用方提供的任意 `id` 所采用的信任模型相同。同一条记忆的多次
+反馈事件会各自作为独立的行保留；不会有任何一次覆盖更早的记录。记录反馈永远不会
+修改被引用记忆自身的字段（`access_count`、`importance`、`retention_tier`、
+`review_due`、`updated_at` 均保持不变）。
+
+---
+
+### `relate`——用类型化的边连接记忆
+
+用类型化、有向的边连接记忆——这是与写入流水线自动生成的 `merged_from` 替换指针
+（`relate` 不会改动它）并存的一种通用、由调用方声明的关系。支持五种关系类型：
+`refines`、`contradicts`、`derived_from`、`about_same_entity`、`follows`。边以有向
+方式存储（`from_id` → `to_id`），但 `list` 和 `recall` 的 `follow_links`（见上文）
+都会遍历两个方向，因此概念上对称的关系（`contradicts`、`about_same_entity`）在实践
+中表现为对称。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `action` | `"add" \| "list" \| "remove"` | **是** | — | 要执行的操作。 |
+| `from_id` | `string (UUID)` | `add`/`remove` 必需 | — | 源记忆 ID。 |
+| `to_id` | `string (UUID)` | `add`/`remove` 必需 | — | 目标记忆 ID，必须与 `from_id` 不同。 |
+| `relation` | `"refines" \| "contradicts" \| "derived_from" \| "about_same_entity" \| "follows"` | `add`/`remove` 必需 | — | 边的类型。 |
+| `id` | `string (UUID)` | `list` 必需 | — | 要列出其边的记忆。 |
+| `direction` | `"from" \| "to" \| "both"` | 否 | `"both"` | （仅 `list`）按相对于 `id` 的方向过滤边。 |
+
+**输出（`action: "add"`）：**
+
+```json
+{
+  "id": 42,
+  "namespace": "global",
+  "from_id": "3f4a1b2c-...",
+  "to_id": "9c2e5f10-...",
+  "relation": "refines",
+  "created_at": "2026-03-01T00:00:00.000Z",
+  "created": true
+}
+```
+
+幂等：重复添加与已存在的边完全相同（相同的 `from_id`、`to_id` 和 `relation`）的边，
+会返回已存在的那一行并附带 `created: false`，而不是报错或创建重复项。若两条记忆中
+任一不存在则返回 `NOT_FOUND`；若 `from_id === to_id` 或两条记忆属于不同的命名空间，
+则返回 `INVALID_INPUT`（同一命名空间内跨集合建立链接是允许的）。
+
+**输出（`action: "list"`）：**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "links": [
+    {
+      "id": 42,
+      "from_id": "3f4a1b2c-...",
+      "to_id": "9c2e5f10-...",
+      "relation": "refines",
+      "direction": "outgoing",
+      "created_at": "2026-03-01T00:00:00.000Z",
+      "created_by": "c1"
+    }
+  ]
+}
+```
+
+返回涉及 `id` 的所有边，除非 `direction` 加以限制，否则两个方向都会返回，每条边标
+记为 `outgoing`（`id` 是 `from_id`）或 `incoming`（`id` 是 `to_id`）。使用包含已归
+档记忆的查找方式，因此即将被归档的记忆的边仍然可以被列出。若 `id` 不存在则返回
+`NOT_FOUND`。
+
+**输出（`action: "remove"`）：**
+
+```json
+{ "removed": true, "from_id": "3f4a1b2c-...", "to_id": "9c2e5f10-...", "relation": "refines" }
+```
+
+删除指定的边。若该边不存在则返回 `NOT_FOUND`。
+
+删除一条记忆（通过 `forget`，或 `review` 的 `archive` 操作）会级联删除所有引用它的
+边，因此 `memory_links` 中不会留下指向已不存在记忆的悬空引用。`relate` 不会记录新的
+`AuditOperation`——边表本身，配合每一行的 `created_at`/`created_by`，就是持久化的
+记录。
+
+---
+
+### `repair`——从 Qdrant 重建 SQLite，或迁移过期的嵌入标记
+
+从外部来源修复本地状态。`mode: "from-qdrant"`（默认）从 Qdrant 恢复记忆到本地
+SQLite 数据库——用于多设备设置、数据丢失恢复或新设备接入。`mode: "re-embed"`
+迁移那些嵌入标记与当前 `embedding.provider`/`embedding.model` 不一致的记忆——参见
+[嵌入模型迁移](#嵌入模型迁移)。另参见[修复与恢复](#修复与恢复)。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `mode` | `"from-qdrant" \| "re-embed"` | 否 | `"from-qdrant"` | 要执行的修复操作。 |
+| `dry_run` | `boolean` | 否 | `false` | 为 `true` 时，报告将发生的变化但不做任何更改。 |
+| `device_id` | `string` | 否 | — | （仅 `from-qdrant`）过滤恢复范围到由特定设备创建的记忆。与 `all_devices` 互斥。 |
+| `all_devices` | `boolean` | 否 | `false` | （仅 `from-qdrant`）显式恢复所有设备的记忆。与 `device_id` 互斥。这也是两个字段都未提供时的默认行为。 |
+| `include_legacy` | `boolean` | 否 | `false` | （仅 `re-embed`）同时重新嵌入完全没有嵌入标记的旧行，而不仅仅是标记为不同模型的行。 |
+| `batch_size` | `number` | 否 | `50` | （仅 `re-embed`）每批重新嵌入的记忆数（1-500）。 |
+
+**输出（`mode: "from-qdrant"`）：**
 
 ```json
 {
@@ -2349,12 +3499,229 @@ BHGBrain 暴露 9 个 MCP 工具。所有工具使用 Zod schema 验证输入并
 **注意事项：**
 - 只有 Qdrant payload 中包含 `content` 的点才能被恢复。1.3 之前不包含 Qdrant 内容的记忆会被报告为 `skipped_no_content`。
 - 恢复的记忆保留其 Qdrant payload 中的原始 `device_id`。如果 payload 中不存在 `device_id`，则使用本地设备的 ID。
+- 恢复的记忆还会保留其源向量原本携带的嵌入身份（如果有），而不会声称自己拥有当前配置的身份——恢复操作是为已有向量重建元数据，而不是生成新向量。
 - 同时传入 `device_id` 和 `all_devices: true` 将被拒绝，视为无效输入。
 - 恢复后，如需要请运行 `npm run build` 并重启服务器。恢复的记忆可立即用于搜索和召回。
+
+**输出（`mode: "re-embed"`）：**
+
+```json
+{
+  "mode": "re-embed",
+  "dry_run": false,
+  "active_identity": "openai/text-embedding-3-small@1536",
+  "include_legacy": false,
+  "updated": 118,
+  "failed": 0,
+  "remaining": 0,
+  "bound_reached": false,
+  "converged": true
+}
+```
+
+**注意事项：**
+- 选择依据是标记本身，因此被中断的运行可以安全续跑——已经用当前身份重新标记的行在下一次调用时会自动不再匹配。
+- 单条记忆的 embed/upsert 失败会被隔离（计入 `failed`，留待后续运行处理），而不会中止整个批次。
+- `converged: true` 表示（在请求的 `include_legacy` 范围内）已不再有标记过期的行；存储层的期望身份会随之更新，`embedding` 健康降级会立即解除，无需重启。
+- 也可通过 CLI 使用：`bhgbrain repair --re-embed [--include-legacy] [--batch-size <n>] [--dry-run]`。
+
+---
+
+### `consolidate`——发现并合并重复记忆簇
+
+发现并合并近似重复的**已存在**记忆——弥补写入时去重留下的读取侧缺口。去重（参见[去重](#去重)）只会将新写入的内容与已存储的内容比较；从不回头审视已经存在的记忆之间的关系。导入操作，以及降级窗口期的写入（嵌入服务提供方故障时回退到更宽松的校验和/Jaccard 启发式算法），都会在结构上留下写入时去重无法事后捕获的近似重复项。`action: "list"` 使用有界、分页的逐点相似度查询（绝不进行完整的两两全量扫描）在单个命名空间/集合内扫描近似重复记忆簇；`action: "merge"` 将一个由人工明确挑选的簇合并到一条目标记忆，逐条来源复用 `review` 工具归档动作所使用的同一归档转换逻辑。不存在自动或计划性的合并路径——`merge` 始终要求显式提供 `target_id` 和 `source_ids`。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `action` | `"list" \| "merge"` | **是** | - | 要执行的操作。 |
+| `namespace` | `string` | 否 | `"global"` | 命名空间范围。 |
+| `collection` | `string` | 否 | `"general"` | 集合范围。簇永远不会跨集合。 |
+| `cursor` | `string` | 否 | - | （仅 `list`）上一次 `list` 调用返回的分页游标。 |
+| `min_cluster_size` | `integer (>= 2)` | 否 | `2` | （仅 `list`）小于此值的簇会从结果中剔除。 |
+| `target_id` | `string (UUID)` | `merge` 必需 | - | 所有来源记忆将合并入的目标记忆。内容和嵌入向量保持不变。 |
+| `source_ids` | `array<string (UUID)>` | `merge` 必需 | - | 将被合并入 `target_id` 并归档的记忆 ID 列表。不得包含 `target_id`。 |
+
+**输出（`action: "list"`）：**
+
+```json
+{
+  "clusters": [
+    {
+      "members": [
+        {
+          "id": "3f4a1b2c-...",
+          "summary": "支付服务的部署手册",
+          "tags": ["deployment", "runbook"],
+          "importance": 0.7,
+          "access_count": 4,
+          "updated_at": "2026-02-01T00:00:00.000Z"
+        },
+        {
+          "id": "9c2e5f10-...",
+          "summary": "支付服务部署手册（v2）",
+          "tags": ["deployment"],
+          "importance": 0.5,
+          "access_count": 1,
+          "updated_at": "2026-01-15T00:00:00.000Z"
+        }
+      ],
+      "suggested_target": "3f4a1b2c-..."
+    }
+  ],
+  "cursor": null
+}
+```
+
+在被扫描的这一页内，只要两条记忆之间的相似度边达到或超过 `consolidation.similarity_threshold`（默认 `0.9`——刻意低于写入时去重的 UPDATE 阈值，因此 `list` 会呈现出那些去重机制本身不会自动合并的候选项），就会被归入同一个簇。`suggested_target` **仅是提示**：取 `importance` 最高的成员（若相同则比较 `access_count`，再相同则取 `updated_at` 最新的一个）。`merge` 从不据此自动推断 `target_id`——调用方必须显式指定。当被扫描的这一页小于 `consolidation.max_scan_per_call` 时，`cursor` 为 `null`；否则将其传回以便跨多次调用继续扫描。
+
+**输出（`action: "merge"`）：**
+
+```json
+{ "target_id": "3f4a1b2c-...", "merged": ["9c2e5f10-..."], "failed": [] }
+```
+
+成功后，目标记忆的 `tags` 会变为其自身标签与所有来源标签的并集，其 `importance` 会变为目标与所有来源中的最大值，其 `merged_from` 字段会记录每一个被合并的来源 ID（以逗号连接，并追加在此前已有的值之后——一条记忆在其生命周期内可以多次成为合并目标）。每个来源都会通过与 `review` 工具 `archive` 动作相同的转换流程归档：移除向量，行迁移至 `archived_memories`，并记录一条 `ARCHIVE` 审计事件，其中 `action: "consolidate"`，`merged_into` 指向目标记忆。如果 `target_id` 出现在 `source_ids` 中，或某个来源与目标不属于同一命名空间/集合，请求会以 `INVALID_INPUT` 被拒绝（此时不会归档任何内容）；如果某个来源 ID 从未存在过，则返回 `NOT_FOUND`。已归档的来源会被静默跳过而非拒绝，因此对部分成功的合并重试是安全的。若某个来源在归档过程中途失败，响应中的 `merged`/`failed` 数组会区分成功与失败的部分——失败的来源保持存活状态，不会出现既归档又未删除的情况。
+
+---
+
+## Docker
+
+BHGBrain 提供官方 Docker 支持，具有两种部署模式：自托管 Qdrant（sidecar 容器）和 Qdrant Cloud（外部模式）。
+
+### 快速开始
+
+```bash
+# 1. 复制并配置环境变量（可选——缺少 .env 不再会导致启动中止；
+#    但嵌入功能仍需要 OPENAI_API_KEY）。
+cp .env.example .env
+# 编辑 .env，填入 OPENAI_API_KEY 及其他设置
+
+# 2a. 自托管 Qdrant（包含 Qdrant sidecar）
+docker compose --profile self-hosted up
+
+# 2b. Qdrant Cloud（无 sidecar，在 .env 中配置 BHGBRAIN_QDRANT_URL）
+docker compose up
+```
+
+服务器默认监听 `http://localhost:3721`（默认仅发布到宿主机回环地址）。使用以下命令检查健康状态：
+
+```bash
+curl http://localhost:3721/health
+```
+
+### 安全默认值
+
+容器将 API 绑定到 `0.0.0.0` 以便发布的端口可访问，并且**默认启用认证**：
+
+- 如果未设置 `BHGBRAIN_TOKEN`，入口脚本会在首次运行时**生成一个 Bearer token**，将其持久化到 `/data/bhgbrain-token`，并打印到日志中。可通过以下方式获取：
+
+  ```bash
+  docker compose logs bhgbrain | grep token
+  # 或
+  docker compose exec bhgbrain cat /data/bhgbrain-token
+  ```
+
+- 通过在 `.env` 中设置 `BHGBRAIN_TOKEN` 来提供你自己的稳定 token：
+
+  ```bash
+  echo "BHGBRAIN_TOKEN=$(openssl rand -hex 24)" >> .env
+  ```
+
+- 发布的端口映射到宿主机回环地址（`127.0.0.1:3721:3721`），因此默认情况下 API 无法从局域网访问。要对外暴露，请修改 `docker-compose.yml` 中的映射。
+
+- 若要刻意在**不启用认证**的情况下运行，设置 `BHGBRAIN_ALLOW_UNAUTHENTICATED=true`（服务器会记录警告；不建议用于非回环绑定）。
+
+容器同时以非 root 用户（`node`）运行。
+
+### Compose 配置文件
+
+| 命令 | 运行内容 |
+|---------|-----------|
+| `docker compose --profile self-hosted up` | BHGBrain + Qdrant sidecar（端口 6333） |
+| `docker compose up` | 仅 BHGBrain（通过环境变量连接 Qdrant Cloud） |
+
+### Docker 环境变量
+
+以下 `BHGBRAIN_*` 环境变量在设置时会覆盖 `config.json` 中的值：
+
+| 变量 | 配置字段 | 容器内默认值 | 说明 |
+|----------|-------------|---------------------|-------------|
+| `BHGBRAIN_DATA_DIR` | `data_dir` | `/data` | 容器卷路径 |
+| `BHGBRAIN_HTTP_HOST` | `transport.http.host` | `0.0.0.0` | 绑定地址 |
+| `BHGBRAIN_HTTP_PORT` | `transport.http.port` | `3721` | HTTP 端口 |
+| `BHGBRAIN_QDRANT_MODE` | `qdrant.mode` | `embedded` | `embedded` 或 `external` |
+| `BHGBRAIN_QDRANT_URL` | `qdrant.external_url` | — | Qdrant 端点 URL |
+| `BHGBRAIN_REQUIRE_LOOPBACK` | `security.require_loopback_http` | `false` | 回环限制 |
+| `BHGBRAIN_ALLOW_UNAUTHENTICATED` | `security.allow_unauthenticated_http` | `false` | 跳过认证检查 |
+| `BHGBRAIN_LOG_LEVEL` | `observability.log_level` | `info` | 日志详细程度 |
+
+此外还有现有的运行时变量：`OPENAI_API_KEY`、`BHGBRAIN_TOKEN`、`QDRANT_API_KEY`、`BHGBRAIN_DEVICE_ID`。
+
+### 卷
+
+`/data` 卷在容器重启之间持久化 SQLite 数据库、解析后的 `config.json` 和备份。它对应 `BHGBRAIN_DATA_DIR`。
+
+### 首次运行时的引导
+
+当容器以空的 `/data` 卷启动，并连接到一个已经存有记忆的 Qdrant 实例时，BHGBrain 会通过 `bootstrapFromQdrant()` 自动将本地 SQLite 数据库从 Qdrant 中回填。无需手动执行 `repair` 步骤。这种自动回填有意不按设备限定范围——它会将每台设备的记忆都恢复到这个全新的空数据库中。之后手动运行 `bhgbrain repair --from-qdrant` 默认只针对当前设备的记忆（传入 `--all-devices` 可扩大范围）；参见 [CLI 参考](#cli-参考)。
+
+### 构建镜像
+
+```bash
+docker build -t bhgbrain .
+```
+
+该镜像使用基于 `node:22-slim` 的多阶段构建（最终大小约 200MB）。健康检查使用 Node.js 原生的 `fetch()`——无需 `curl`。
 
 ---
 
 ## 升级
+
+### 1.3 → 1.4（弹性与可观测性）
+
+**无需手动迁移。** 所有新功能均使用向后兼容的默认值。
+
+新增内容：
+
+- **熔断器**，用于 OpenAI 和 Qdrant。当连续失败次数超过阈值（默认 5 次）时，熔断器会打开并在 30 秒内短路请求，之后再探测是否恢复。状态可在健康端点中查看（`circuitBreakers` 字段）。可通过 `config.json` 中的 `resilience.circuit_breaker` 配置。
+- **Azure 嵌入提供商。** 新增对 Azure AI Foundry（兼容 Azure OpenAI 的嵌入端点）的支持。配置 `embedding.provider: "azure-foundry"`，并提供 `embedding.azure.resource_name` 及 `AZURE_FOUNDRY_API_KEY` 环境变量。
+- **Azure 上线指引。** 将 `embedding.model` 视为 Azure 部署名称，在切换前先在金丝雀命名空间或集合中验证检索质量，回滚方式是将 `embedding.provider` 切回 `"openai"` 并重启进程。
+- **百分位指标。** 直方图指标现在除了已有的 `_avg` 和 `_count` 后缀外，还会发出 `_p50`、`_p95` 和 `_p99` 后缀。
+- **恢复后协调加固。** `backup.restore` 现在通过 `beginRestoreOperation()` 获取故障保护锁，将向量协调错误按步骤隔离，并增量刷新进度。协调过程中的向量存储故障会返回降级就绪状态，而不是完整的恢复失败。
+- **stdio 日志路由。** 当 `--stdio` 处于激活状态时，Pino 结构化日志会被重定向到 stderr，防止破坏标准输出上的 MCP JSON-RPC 握手。
+- **类型安全。** 内部的 `as any` 类型转换在整个代码库中被替换为带类型的接口和 `SqlParams`。
+- **测试覆盖率。** 为嵌入、HTTP 传输、指标、日志记录器、健康检查和 CLI 模块新增了测试套件。
+
+**新配置部分**：
+```jsonc
+{
+  "resilience": {
+    "circuit_breaker": {
+      "failure_threshold": 5,       // 触发打开所需的连续失败次数
+      "open_window_ms": 30000,      // 半开探测前等待的毫秒数
+      "half_open_probe_count": 1    // 关闭所需的探测次数
+    }
+  }
+}
+```
+
+**Azure 嵌入配置**（新增 `embedding.azure`）：
+```jsonc
+{
+  "embedding": {
+    "provider": "azure-foundry",
+    "model": "my-embedding-deployment",
+    "dimensions": 1536,
+    "azure": {
+      "resource_name": "my-foundry-resource"
+    }
+  }
+}
+```
+
+---
 
 ### 1.2 → 1.3（多设备记忆与数据弹性）
 
@@ -2459,7 +3826,7 @@ bhgbrain backup create
 
 - 工具调用响应包含结构化 JSON 载荷。
 - 错误响应在 MCP 协议中设置 `isError: true` 以便客户端路由。
-- 参数化资源（`memory://{id}`、`category://{name}`、`collection://{name}`）通过 `resources/templates/list` 作为 MCP 资源模板暴露。
+- 参数化资源（`memory://{id}`、`memory://inject/{hint}`、`category://{name}`、`collection://{name}`）通过 `resources/templates/list` 作为 MCP 资源模板暴露。
 
 ### 搜索与分页
 
@@ -2470,7 +3837,7 @@ bhgbrain backup create
 ### 操作可观测性
 
 - **有界指标：** 直方图值使用有界循环缓冲区（最后 1000 个样本）。
-- **指标语义：** 直方图指标发出 `_avg` 和 `_count` 后缀。
+- **指标语义：** 直方图指标发出 `_avg`、`_p50`、`_p95`、`_p99` 和 `_count` 后缀。
 - **原子写入：** 数据库和备份文件写入使用先写临时文件再重命名的方式，防止崩溃时出现截断的部分文件。
 - **延迟刷写：** 读路径的访问元数据（触摸计数）使用有界异步批处理（5 秒窗口），而非每次请求都进行同步的全数据库刷写。
 - **跨存储一致性：** 如果相应的 Qdrant 操作失败，SQLite 更新会回滚。
@@ -2483,7 +3850,26 @@ bhgbrain backup create
 
 集合在创建时锁定其嵌入模型和维度。如果你在配置中更改 `embedding.model` 或 `embedding.dimensions`，现有集合中的新记忆将被拒绝并返回 `CONFLICT` 错误，直到你创建新集合。这防止了在同一 Qdrant 索引中混用不兼容的嵌入空间。
 
-**受支持的模型与启动时校验：** `embedding.model` 会在启动时针对固定的受支持模型集合进行校验——`text-embedding-ada-002`（固定 1536 维）、`text-embedding-3-small`（最多 1536 维）、`text-embedding-3-large`（最多 3072 维）。不受支持的模型，或超出所选模型上限的 `dimensions`，会在服务器启动前导致配置校验失败，错误信息会指出配置的模型并列出受支持的模型集合。
+**特定提供商说明：**
+- **OpenAI**：`embedding.model` 字段指定 OpenAI 模型名称（例如 `text-embedding-3-small`）。
+- **Azure Foundry**：`embedding.model` 字段指定 Azure 部署名称。`embedding.dimensions` 必须与该部署配置的输出维度一致。
+
+请确保相应地将 `embedding.provider` 设置为 `"openai"` 或 `"azure-foundry"`。
+
+**受支持的模型与启动时校验：** 对于这两个提供商，`embedding.model` 都会在启动时针对固定的受支持模型集合进行校验——`text-embedding-ada-002`（固定 1536 维）、`text-embedding-3-small`（最多 1536 维）、`text-embedding-3-large`（最多 3072 维）。不受支持的模型，或超出所选模型上限的 `dimensions`，会在服务器启动前导致配置校验失败，错误信息会指出配置的模型并列出受支持的模型集合。对于 Azure，`embedding.model` 中配置的部署名称必须匹配这些受支持模型系列之一；以不受支持模型命名的部署将无法启动。这取代了此前的静默行为——无法识别的模型可能会针对 Qdrant 集合生成维度错误的向量。
+
+**迁移指引：**
+- 在将生产流量切换到 Azure 之前，先使用金丝雀命名空间或集合进行验证。
+- 回滚方式是将 `embedding.provider` 切回 `"openai"` 并重启 BHGBrain。
+- 只有当模型系列和配置的维度保持兼容时才复用现有集合；否则应创建新集合以避免混用嵌入空间。
+
+### stdio 日志路由
+
+在 stdio 传输模式（`--stdio`）下，Pino 结构化日志会写入 **stderr** 而非 stdout。这对 MCP 协议的正确性是不可妥协的：MCP SDK 专门使用 stdout 进行 JSON-RPC 分帧。stdout 上任何非 JSON 的输出（例如日志行）都会导致 MCP 客户端的初始化握手失败。
+
+- 在 HTTP 模式下，日志照常写入 stdout。
+- `createLogger()` 函数接受一个可选的 `destination` 流；当检测到 `isStdio` 时，`index.ts` 会传入 `process.stderr`。
+- 要将 stdio 模式的日志捕获到文件：`node dist/index.js --stdio 2>bhgbrain.log`
 
 ### 密钥检测
 

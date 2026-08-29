@@ -14,14 +14,22 @@ embedding providers and how config/env resolve), testing, and common gotchas.
 
 **Tools** — schemas live in `src/tools/schemas.ts` (plus `bootstrap.ts` / `import.ts`),
 handlers in `src/tools/index.ts`. Registered: `remember`, `recall`, `forget`, `search`,
-`tag`, `collections`, `category`, `backup`, `bootstrap`, `import`, `repair`.
+`tag`, `collections`, `category`, `backup`, `bootstrap`, `import`, `repair`, `revisions`,
+`review`, `feedback`, `relate`, `consolidate`.
 
 **Resources** — `src/resources/index.ts`. Static: `memory://list`, `memory://inject`,
 `category://list`, `collection://list`, `health://status`. Templates: `memory://{id}`,
-`category://{name}`, `collection://{name}`.
+`memory://{id}/revisions`, `memory://inject/{hint}`, `category://{name}`, `collection://{name}`.
 
-Changing either surface means updating the schema/handler *and* `README.md`
-(§ "MCP Tools Reference") in the same change.
+**Prompts** — `src/prompts/index.ts` (`MCP_PROMPT_DEFINITIONS` + `handleGetPrompt`),
+registered via `ListPromptsRequestSchema`/`GetPromptRequestSchema` in
+`src/transport/mcp-server.ts`. Registered: `bootstrap-interview` (optional `section`
+arg), `session-context` (optional `hint` arg, delegates to the `memory://inject`
+resource path).
+
+Changing any of these three surfaces means updating the schema/handler *and*
+`README.md` (§ "MCP Tools Reference" for tools, § "MCP Resources" for resources,
+§ "MCP Prompts" for prompts) in the same change.
 
 ## Verification
 
@@ -29,6 +37,27 @@ Changing either surface means updating the schema/handler *and* `README.md`
 `@typescript-eslint/no-explicit-any` as an **error** — casting through `any` will fail
 the build, so model the types properly (see the `eliminate-any-type-casting` change).
 Run `npm run lint && npm test` before declaring work done.
+
+## Live Qdrant / Docker verification
+
+No Docker or live Qdrant here by default, which leaves proposal tasks like "verify
+against a live instance" or "docker compose up" stuck unchecked (hit repeatedly, e.g.
+`fix-qdrant-client-search-removal`, `fix-vector-store-health-fidelity`,
+`secure-container-default-binding`). Unblock by provisioning a disposable WSL2 Ubuntu
+sandbox: `wsl --install -d Ubuntu-24.04 --no-launch`, install Docker Engine + Node 22
+(nvm) inside it, `git clone` the **local working tree** (not GitHub) into the
+WSL native filesystem so unpushed commits carry over and npm/tsc stay fast.
+- `@qdrant/js-client-rest@1.19.0` needs Node **>=22** (`EBADENGINE` on 20).
+  `package.json` `engines.node` now correctly declares `>=22.0.0` (raised by
+  `refresh-dependency-and-node-baseline`) — Node 22 is the only supported floor for
+  this repo, including anything touching the Qdrant client or `node:sqlite`
+  directly.
+- From PowerShell/git-bash, set `MSYS_NO_PATHCONV=1` before any `wsl -d ... --` call,
+  and hardcode values instead of `$(...)` or exported variables inside nested
+  `wsl -- bash -c '...'` scripts — both silently break across that boundary.
+- A background process inside WSL needs the Bash tool's own `run_in_background: true`
+  on the `wsl` invocation itself; `nohup cmd &` inside `wsl -- bash -c` still dies when
+  that call returns.
 
 ## Docs to keep in sync when behavior changes
 
@@ -38,7 +67,10 @@ Run `npm run lint && npm test` before declaring work done.
   edits `README.md` must land in all five, or none.
 - `.env.example` — environment variables.
 - `AGENTS.md` — developer guide.
-- `package.json` `version` — bump on user-visible changes.
+- `package.json` `version` — bump on user-visible changes, via `npm version
+  <patch|minor>` (never hand-edit) so `package-lock.json`'s root `version` is
+  updated atomically and cannot drift from the manifest — see AGENTS.md's
+  "Versioning" section.
 
 ## OpenSpec workflow
 
@@ -92,6 +124,15 @@ other's edits.
 
 Note the `openspec` CLI is **not** on PATH here, so read task state from
 `openspec/changes/<change-id>/tasks.md` directly rather than via `openspec status`.
+
+A survey agent that fills a proposal's `blocked` field — even just to say "effectively
+already resolved" — gets that proposal filtered out of the build loop and skipped
+entirely; it never reaches Linear. Check the workflow's `skipped` list and finish those
+by hand (happened to `align-restore-response-docs`).
+
+The `Workflow` tool's `args` parameter did not reliably reach the script as an object
+in this environment (`args.changes` came back `undefined` twice in a row) — prefer
+hardcoding the target list as a literal in the script body over passing it via `args`.
 
 ## Repo layout notes
 

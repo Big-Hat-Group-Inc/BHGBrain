@@ -1,0 +1,252 @@
+[
+  {
+    "id": "golden-001",
+    "query": "what did we decide about constraining generic type parameters in typescript",
+    "expected_corpus_id": "corpus-0001"
+  },
+  {
+    "id": "golden-002",
+    "query": "guidance on default generic type parameters in typescript",
+    "expected_corpus_id": "corpus-0002"
+  },
+  {
+    "id": "golden-003",
+    "query": "how do we set up a python virtual environment for a new service",
+    "expected_corpus_id": "corpus-0008"
+  },
+  {
+    "id": "golden-004",
+    "query": "why do we pin exact package versions in python requirements files",
+    "expected_corpus_id": "corpus-0009"
+  },
+  {
+    "id": "golden-005",
+    "query": "how should errors be wrapped in go so callers can check the cause",
+    "expected_corpus_id": "corpus-0015"
+  },
+  {
+    "id": "golden-006",
+    "query": "convention for defining sentinel errors in go",
+    "expected_corpus_id": "corpus-0016"
+  },
+  {
+    "id": "golden-007",
+    "query": "when should a rust function borrow instead of taking ownership",
+    "expected_corpus_id": "corpus-0022"
+  },
+  {
+    "id": "golden-008",
+    "query": "difference between rc refcell and arc mutex for shared state in rust",
+    "expected_corpus_id": "corpus-0023"
+  },
+  {
+    "id": "golden-009",
+    "query": "why does our react useEffect need a cleanup function",
+    "expected_corpus_id": "corpus-0029"
+  },
+  {
+    "id": "golden-010",
+    "query": "naming convention for custom react hooks",
+    "expected_corpus_id": "corpus-0030"
+  },
+  {
+    "id": "golden-011",
+    "query": "why should a vue composable return refs instead of plain values",
+    "expected_corpus_id": "corpus-0036"
+  },
+  {
+    "id": "golden-012",
+    "query": "when to use watcheffect versus watch in vue",
+    "expected_corpus_id": "corpus-0037"
+  },
+  {
+    "id": "golden-013",
+    "query": "how do multi stage docker builds keep our runtime image small",
+    "expected_corpus_id": "corpus-0043"
+  },
+  {
+    "id": "golden-014",
+    "query": "why do production dockerfiles pin the base image by digest",
+    "expected_corpus_id": "corpus-0044"
+  },
+  {
+    "id": "golden-015",
+    "query": "do we require resource requests and limits on every kubernetes deployment",
+    "expected_corpus_id": "corpus-0050"
+  },
+  {
+    "id": "golden-016",
+    "query": "should kubernetes memory limits equal memory requests",
+    "expected_corpus_id": "corpus-0051"
+  },
+  {
+    "id": "golden-017",
+    "query": "why does postgresql composite index column order matter for a query",
+    "expected_corpus_id": "corpus-0057"
+  },
+  {
+    "id": "golden-018",
+    "query": "when should we use a partial index in postgresql",
+    "expected_corpus_id": "corpus-0058"
+  },
+  {
+    "id": "golden-019",
+    "query": "rule of thumb for embedding versus referencing data in mongodb",
+    "expected_corpus_id": "corpus-0064"
+  },
+  {
+    "id": "golden-020",
+    "query": "how big should a single mongodb document realistically get",
+    "expected_corpus_id": "corpus-0065"
+  },
+  {
+    "id": "golden-021",
+    "query": "why does every redis cache key need a default ttl",
+    "expected_corpus_id": "corpus-0071"
+  },
+  {
+    "id": "golden-022",
+    "query": "when should we use cache aside versus write through with redis",
+    "expected_corpus_id": "corpus-0072"
+  },
+  {
+    "id": "golden-023",
+    "query": "difference between graphql schema stitching and federation",
+    "expected_corpus_id": "corpus-0078"
+  },
+  {
+    "id": "golden-024",
+    "query": "how do we avoid n plus one queries in graphql resolvers",
+    "expected_corpus_id": "corpus-0079"
+  },
+  {
+    "id": "golden-025",
+    "query": "why do we version our rest apis in the url path",
+    "expected_corpus_id": "corpus-0085"
+  },
+  {
+    "id": "golden-026",
+    "query": "what changes are allowed in a rest api minor version",
+    "expected_corpus_id": "corpus-0086"
+  },
+  {
+    "id": "golden-027",
+    "query": "where should jest test files live relative to the source",
+    "expected_corpus_id": "corpus-0092"
+  },
+  {
+    "id": "golden-028",
+    "query": "how much should we mock in a jest unit test",
+    "expected_corpus_id": "corpus-0093"
+  },
+  {
+    "id": "golden-029",
+    "query": "what scope should pytest database fixtures default to",
+    "expected_corpus_id": "corpus-0099"
+  },
+  {
+    "id": "golden-030",
+    "query": "why use pytest parametrize instead of a loop in the test",
+    "expected_corpus_id": "corpus-0100"
+  },
+  {
+    "id": "golden-031",
+    "query": "how should github actions cache dependencies correctly",
+    "expected_corpus_id": "corpus-0106"
+  },
+  {
+    "id": "golden-032",
+    "query": "should github actions ci jobs run in parallel or sequentially",
+    "expected_corpus_id": "corpus-0107"
+  },
+  {
+    "id": "golden-033",
+    "query": "why do we define jenkins pipelines as a jenkinsfile in the repo",
+    "expected_corpus_id": "corpus-0113"
+  },
+  {
+    "id": "golden-034",
+    "query": "does jenkins require manual approval before deploying to production",
+    "expected_corpus_id": "corpus-0114"
+  },
+  {
+    "id": "golden-035",
+    "query": "what git branching strategy do we use for feature work",
+    "expected_corpus_id": "corpus-0120"
+  },
+  {
+    "id": "golden-036",
+    "query": "is it okay to force push to a shared git branch",
+    "expected_corpus_id": "corpus-0121"
+  },
+  {
+    "id": "golden-037",
+    "query": "how should we mark optional nitpicks in a code review",
+    "expected_corpus_id": "corpus-0127"
+  },
+  {
+    "id": "golden-038",
+    "query": "should a pull request bundle multiple unrelated changes",
+    "expected_corpus_id": "corpus-0128"
+  },
+  {
+    "id": "golden-039",
+    "query": "did we decide to split billing into its own microservice",
+    "expected_corpus_id": "corpus-0134"
+  },
+  {
+    "id": "golden-040",
+    "query": "why was the notifications service split out from the monolith",
+    "expected_corpus_id": "corpus-0135"
+  },
+  {
+    "id": "golden-041",
+    "query": "when do we choose event driven messaging over a synchronous call",
+    "expected_corpus_id": "corpus-0141"
+  },
+  {
+    "id": "golden-042",
+    "query": "do our published events need to stay backward compatible",
+    "expected_corpus_id": "corpus-0142"
+  },
+  {
+    "id": "golden-043",
+    "query": "why did we adopt cqrs for the reporting module",
+    "expected_corpus_id": "corpus-0148"
+  },
+  {
+    "id": "golden-044",
+    "query": "did we decide against using cqrs for order processing",
+    "expected_corpus_id": "corpus-0149"
+  },
+  {
+    "id": "golden-045",
+    "query": "how long do our access jwts and refresh tokens last",
+    "expected_corpus_id": "corpus-0155"
+  },
+  {
+    "id": "golden-046",
+    "query": "do our jwts carry the authorization decision or just identity",
+    "expected_corpus_id": "corpus-0156"
+  },
+  {
+    "id": "golden-047",
+    "query": "what encryption do we use for customer pii at rest",
+    "expected_corpus_id": "corpus-0162"
+  },
+  {
+    "id": "golden-048",
+    "query": "are our database backups encrypted the same as the primary database",
+    "expected_corpus_id": "corpus-0163"
+  },
+  {
+    "id": "golden-049",
+    "query": "how often does the engineering team do standup now",
+    "expected_corpus_id": "corpus-0169"
+  },
+  {
+    "id": "golden-050",
+    "query": "how often is sprint planning and how long does it run",
+    "expected_corpus_id": "corpus-0170"
+  }
+]

@@ -15,6 +15,7 @@ type MockClient = {
   getCollection?: Mock<QdrantClient['getCollection']>;
   createCollection?: Mock<QdrantClient['createCollection']>;
   createPayloadIndex?: Mock<QdrantClient['createPayloadIndex']>;
+  upsert?: Mock<QdrantClient['upsert']>;
 };
 
 function createStore(
@@ -104,6 +105,171 @@ describe('QdrantStore.search collection fan-out', () => {
     const store = createStore(client);
     const results = await store.search('global', 'work', [1, 2, 3], 10);
     expect(results).toEqual([{ id: 'w1', score: 0.9, payload: { namespace: 'global' } }]);
+  });
+});
+
+describe('QdrantStore namespace/collection name encoding (slash safety)', () => {
+  // fix-namespace-slash-collection-naming: `namespace` values may legally
+  // contain `/` per the tool schema pattern (`^[a-zA-Z0-9/-]{1,200}$`), but a
+  // raw `/` breaks Qdrant's REST client because the collection name is used
+  // as a literal URL path segment (qdrant/qdrant-client#807). These guard the
+  // fix's three required properties: it works, it can't collide two distinct
+  // namespaces onto the same collection, and it can't make a short namespace
+  // false-positive prefix-match a longer, related one during fan-out search.
+  it('resolves a slash-containing namespace to a valid collection name on write', async () => {
+    const upsert = vi.fn<QdrantClient['upsert']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => ({}) as never),
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex: vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never),
+      upsert,
+    };
+    const store = createStore(client);
+
+    await store.upsert('test/mcp-verify', 'general', 'id-1', [1, 2, 3], { content: 'x' });
+
+    expect(upsert).toHaveBeenCalledWith(
+      'bhgbrain_test.mcp-verify_general',
+      expect.objectContaining({ points: expect.any(Array) }),
+    );
+  });
+
+  it('does not collide a literal-hyphen namespace with a slash-containing one', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+
+    await store.searchSimilar('a-b', 'work', [1, 2, 3], 5);
+    await store.searchSimilar('a/b', 'work', [1, 2, 3], 5);
+
+    const [nameForLiteralHyphen, nameForSlash] = client.query.mock.calls.map(c => c[0]);
+    expect(nameForLiteralHyphen).not.toBe(nameForSlash);
+  });
+
+  it('does not let a namespace false-positive prefix-match a longer, related namespace during fan-out', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(async () => ({
+        collections: [
+          { name: 'bhgbrain_a_general' }, // namespace "a"
+          { name: 'bhgbrain_a.b_general' }, // namespace "a/b" — must stay distinct
+        ],
+      })),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+
+    await store.search('a', undefined, [1, 2, 3], 10);
+
+    const searched = client.query.mock.calls.map(c => c[0]);
+    expect(searched).toContain('bhgbrain_a_general');
+    expect(searched).not.toContain('bhgbrain_a.b_general');
+  });
+});
+
+describe('QdrantStore.search type/tags filter pushdown', () => {
+  // push-down-recall-filters: type/tags filters are translated to a Qdrant
+  // `must` clause so they narrow the candidate set inside the store, rather
+  // than being discovered only after `limit` results are already spent.
+  it('translates a type filter into a must-match clause', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10, { type: 'procedural' });
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    expect(call.filter?.must).toEqual(expect.arrayContaining([
+      { key: 'type', match: { value: 'procedural' } },
+    ]));
+  });
+
+  it('translates a tags filter into a match-any clause', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10, { tags: ['urgent', 'billing'] });
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    expect(call.filter?.must).toEqual(expect.arrayContaining([
+      { key: 'tags', match: { any: ['urgent', 'billing'] } },
+    ]));
+  });
+
+  it('omits type/tags clauses when no filter is provided', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10);
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    const keys = call.filter?.must.map(m => m.key);
+    expect(keys).not.toContain('type');
+    expect(keys).not.toContain('tags');
+  });
+});
+
+describe('QdrantStore.search created_at (after/before) filter pushdown', () => {
+  // add-time-scoped-recall: after/before are translated to a Qdrant `must`
+  // range clause on the created_at payload field so the store narrows the
+  // candidate set instead of the caller discarding out-of-window results
+  // after `limit` is already spent.
+  it('translates an after-only bound into a range clause with gte only', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10, { after: '2026-01-01T00:00:00Z' });
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    expect(call.filter?.must).toEqual(expect.arrayContaining([
+      { key: 'created_at', range: { gte: '2026-01-01T00:00:00Z', lte: undefined } },
+    ]));
+  });
+
+  it('translates a before-only bound into a range clause with lte only', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10, { before: '2026-06-01T00:00:00Z' });
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    expect(call.filter?.must).toEqual(expect.arrayContaining([
+      { key: 'created_at', range: { gte: undefined, lte: '2026-06-01T00:00:00Z' } },
+    ]));
+  });
+
+  it('translates both bounds into a single range clause', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10, {
+      after: '2026-01-01T00:00:00Z', before: '2026-06-01T00:00:00Z',
+    });
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    expect(call.filter?.must).toEqual(expect.arrayContaining([
+      { key: 'created_at', range: { gte: '2026-01-01T00:00:00Z', lte: '2026-06-01T00:00:00Z' } },
+    ]));
+  });
+
+  it('omits the created_at clause when neither bound is passed', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10);
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    const keys = call.filter?.must.map(m => m.key);
+    expect(keys).not.toContain('created_at');
   });
 });
 
@@ -215,6 +381,79 @@ describe('QdrantStore.searchSimilar', () => {
   });
 });
 
+describe('QdrantStore.findNeighborsById', () => {
+  // add-duplicate-cluster-consolidation: per-point ANN neighbor discovery for
+  // the `consolidate list` action.
+  it('queries by point id and excludes the self-hit from the mapped results', async () => {
+    const query = vi.fn<QdrantClient['query']>(async () => ({
+      points: [
+        { id: 'p1', score: 1.0, version: 0 }, // self-hit at score 1.0
+        { id: 'dup-1', score: 0.95, version: 0 },
+        { id: 'dup-2', score: 0.91, version: 0 },
+      ],
+    }));
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query,
+    };
+    const store = createStore(client);
+
+    const results = await store.findNeighborsById('global', 'work', 'p1', 20, 0.9);
+
+    expect(results).toEqual([{ id: 'dup-1', score: 0.95 }, { id: 'dup-2', score: 0.91 }]);
+    const call = query.mock.calls[0]!;
+    expect(call[0]).toBe('bhgbrain_global_work');
+    expect(call[1]).toEqual(expect.objectContaining({
+      query: 'p1',
+      limit: 21,
+      score_threshold: 0.9,
+      with_payload: false,
+    }));
+  });
+
+  it('returns an empty array for a collection that has never been written to, not a thrown error', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => {
+        const err = new Error('Collection `bhgbrain_global_work` doesn\'t exist!') as Error & { status?: number };
+        err.status = 404;
+        throw err;
+      }),
+    };
+    const store = createStore(client);
+    const results = await store.findNeighborsById('global', 'work', 'p1', 20, 0.9);
+    expect(results).toEqual([]);
+  });
+
+  it('propagates a genuine transport failure instead of reporting no neighbors', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => {
+        throw new Error('transport failure');
+      }),
+    };
+    const store = createStore(client);
+    await expect(store.findNeighborsById('global', 'work', 'p1', 20, 0.9)).rejects.toThrow('transport failure');
+  });
+
+  it('routes calls through the circuit breaker', async () => {
+    const query = vi.fn<QdrantClient['query']>(async () => {
+      throw new Error('transport failure');
+    });
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query };
+    const breaker = new CircuitBreaker({ failureThreshold: 1, openWindowMs: 60_000, halfOpenProbeCount: 1 });
+    const store = createStore(client, { breaker });
+
+    await expect(store.findNeighborsById('global', 'work', 'p1', 20, 0.9)).rejects.toThrow('transport failure');
+    expect(breaker.getState()).toBe('open');
+
+    await expect(store.findNeighborsById('global', 'work', 'p1', 20, 0.9)).rejects.toThrow(
+      'Qdrant circuit breaker is open',
+    );
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('QdrantStore.ensureCollection device_id index migration', () => {
   // Regression guard: the index was originally created only inside the
   // collection-not-found branch, so a collection that already exists (the
@@ -297,6 +536,70 @@ describe('QdrantStore.ensureCollection device_id index migration', () => {
     await expect(store.ensureCollection('global', 'general')).rejects.toThrow(
       'this.client.createPayloadIndex is not a function',
     );
+  });
+});
+
+describe('QdrantStore.ensureCollection created_at datetime index migration', () => {
+  // add-time-scoped-recall: same retroactive-indexing rationale as the
+  // device_id migration above — collections created before this change
+  // shipped still need the created_at datetime index applied.
+  it('creates the created_at datetime index when the collection already exists', async () => {
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => ({}) as never),
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await store.ensureCollection('global', 'general');
+
+    expect(createPayloadIndex).toHaveBeenCalledWith(
+      'bhgbrain_global_general',
+      { field_name: 'created_at', field_schema: 'datetime' },
+    );
+  });
+
+  it('still creates the created_at index (plus the rest) when the collection is newly created', async () => {
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => {
+        const err = new Error('Collection `bhgbrain_global_general` doesn\'t exist!') as Error & { status?: number };
+        err.status = 404;
+        throw err;
+      }),
+      createCollection: vi.fn<QdrantClient['createCollection']>(async () => ({}) as never),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await store.ensureCollection('global', 'general');
+
+    const createdAtCalls = createPayloadIndex.mock.calls.filter(c => c[1]?.field_name === 'created_at');
+    expect(createdAtCalls).toHaveLength(1);
+    expect(createdAtCalls[0]![1]).toEqual({ field_name: 'created_at', field_schema: 'datetime' });
+  });
+
+  it('is idempotent: tolerates an already-exists conflict from a repeat call', async () => {
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => {
+      const err = new Error('Index already exists') as Error & { status?: number };
+      err.status = 409;
+      throw err;
+    });
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => ({}) as never),
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await expect(store.ensureCollection('global', 'general')).resolves.toBeUndefined();
   });
 });
 

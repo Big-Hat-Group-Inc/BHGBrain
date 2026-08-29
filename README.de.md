@@ -21,6 +21,7 @@ BHGBrain speichert Erinnerungen in SQLite (Metadaten + Volltextsuche) und Qdrant
    - [Geräteidentitätsauflösung](#geräteidentitätsauflösung)
    - [Gemeinsames Qdrant, lokales SQLite](#gemeinsames-qdrant-lokales-sqlite)
    - [Reparatur und Wiederherstellung](#reparatur-und-wiederherstellung)
+   - [Migration des Einbettungsmodells](#migration-des-einbettungsmodells)
 10. [Speicherverwaltung](#speicherverwaltung)
     - [Speicher-Datenmodell](#speicher-datenmodell)
     - [Speichertypen](#speichertypen)
@@ -28,10 +29,13 @@ BHGBrain speichert Erinnerungen in SQLite (Metadaten + Volltextsuche) und Qdrant
     - [Aufbewahrungsstufen](#aufbewahrungsstufen)
     - [Stufenlebenszyklus – Zuweisung, Beförderung, Gleitendes Fenster](#stufenlebenszyklus--zuweisung-beförderung-gleitendes-fenster)
     - [Deduplizierung](#deduplizierung)
+    - [Automatisches Taggen](#automatisches-taggen)
+    - [Inhaltsherkunft](#inhaltsherkunft)
     - [Inhaltsnormalisierung](#inhaltsnormalisierung)
     - [Wichtigkeitsbewertung](#wichtigkeitsbewertung)
     - [Kategorien – Persistente Richtlinien-Slots](#kategorien--persistente-richtlinien-slots)
     - [Verfall, Bereinigung und Archivierung](#verfall-bereinigung-und-archivierung)
+    - [Gedächtnis-Destillation](#gedächtnis-destillation)
     - [Warnungen vor Ablauf](#warnungen-vor-ablauf)
     - [Ressourcenlimits und Kapazitätsbudgets](#ressourcenlimits-und-kapazitätsbudgets)
 11. [Suche](#suche)
@@ -45,11 +49,13 @@ BHGBrain speichert Erinnerungen in SQLite (Metadaten + Volltextsuche) und Qdrant
 13. [Gesundheitszustand & Metriken](#gesundheitszustand--metriken)
 14. [Sicherheit](#sicherheit)
 15. [MCP-Ressourcen](#mcp-ressourcen)
-16. [Bootstrap-Prompt](#bootstrap-prompt)
-17. [CLI-Referenz](#cli-referenz)
-18. [MCP-Tools-Referenz](#mcp-tools-referenz)
-19. [Upgrade](#upgrade)
-20. [Verhaltenshinweise](#verhaltenshinweise)
+16. [MCP-Prompts](#mcp-prompts)
+17. [Onboarding](#onboarding)
+18. [CLI-Referenz](#cli-referenz)
+19. [MCP-Tools-Referenz](#mcp-tools-referenz)
+20. [Docker](#docker)
+21. [Upgrade](#upgrade)
+22. [Verhaltenshinweise](#verhaltenshinweise)
 
 ---
 
@@ -72,7 +78,7 @@ graph TD
         RH["Resource Handler<br/><i>memory:// URIs</i>"]
 
         subgraph Storage["Storage Manager"]
-            subgraph SQLite["SQLite (sql.js)"]
+            subgraph SQLite["SQLite (node:sqlite)"]
                 S1["metadata"]
                 S2["fulltext (FTS)"]
                 S3["categories"]
@@ -108,7 +114,7 @@ graph TD
     class OpenAI external
 ```
 
-- **SQLite** (über `sql.js`, im Arbeitsspeicher mit periodischem atomarem Flush auf die Festplatte) ist das **System of Record** für alle Speicher-Metadaten, den Volltextsuchindex, Kategorien, das Audit-Protokoll, den Revisionsverlauf und Archivdatensätze.
+- **SQLite** (über das native `DatabaseSync` von `node:sqlite`, WAL-journalgeführt mit Persistenz auf Commit-Ebene) ist das **System of Record** für alle Speicher-Metadaten, den Volltextsuchindex, Kategorien, das Audit-Protokoll, den Revisionsverlauf und Archivdatensätze.
 - **Qdrant** enthält semantische Vektoreinbettungen für die Ähnlichkeitssuche. Qdrant wird stets nach einem erfolgreichen SQLite-Schreibvorgang beschrieben; Fehler werden über das Flag `vector_synced` verfolgt und im Health-Endpunkt angezeigt.
 - **OpenAI text-embedding-3-small** (Standard, konfigurierbar) erzeugt 1536-dimensionale Einbettungen für jede Erinnerung.
 - **Atomare Schreibvorgänge** stellen sicher, dass Datenbankdateien niemals teilweise geschrieben werden – alle Festplatten-I/O-Vorgänge nutzen das Prinzip Schreiben-in-Temp-dann-Umbenennen.
@@ -120,7 +126,7 @@ graph TD
 
 | Anforderung | Version | Hinweise |
 |---|---|---|
-| Node.js | ≥ 20.0.0 | LTS empfohlen |
+| Node.js | ≥ 22.0.0 | LTS empfohlen |
 | Qdrant | ≥ 1.10 | Muss vor dem Start von BHGBrain laufen. Der mitgelieferte Client (`@qdrant/js-client-rest` `~1.19.0`) ruft die in Qdrant 1.10 eingeführte `query`-API auf; ältere Server schlagen bei der semantischen Suche fehl. |
 | OpenAI API-Schlüssel | — | Für Einbettungen (`text-embedding-3-small` standardmäßig). Der Server startet im Degraded-Modus, wenn er fehlt. |
 
@@ -186,6 +192,12 @@ Setzen Sie `qdrant.mode` in Ihrer Konfiguration auf `external` und verweisen Sie
 }
 ```
 
+Für Azure ist `embedding.model` der stromabwärts gesendete Deployment-Name, nicht die öffentliche Modellfamilien-Bezeichnung. Azure-Anmeldedaten werden beim Start einmalig aus `AZURE_FOUNDRY_API_KEY` geladen; eine Rotation dieses Geheimnisses erfordert einen Neustart oder ein explizites Neuladen der Konfiguration.
+
+`embedding.model` MUSS für **beide** Anbieter (`openai` und `azure-foundry`) eines der unterstützten Modelle sein — `text-embedding-ada-002`, `text-embedding-3-small` oder `text-embedding-3-large`. Dies wird beim Start erzwungen: Ein nicht unterstütztes oder falsch geschriebenes Modell (bzw. bei Azure ein Deployment-Name, der zu keiner unterstützten Modellfamilie passt) lässt die Konfigurationsvalidierung sofort mit einer Fehlermeldung fehlschlagen, die die unterstützten Modelle auflistet, statt stillschweigend Vektoren mit falscher Dimensionalität zu erzeugen.
+
+> **Von Grund auf bereitstellen?** Die PowerShell-Skripte in [`scripts/azure/`](./scripts/azure/README.md) richten eine Azure-AI-Foundry-/Azure-OpenAI-Ressource ein, stellen ein Embedding-Modell bereit (mit einem Deployment-Namen, der wie vorgeschrieben dem Modellnamen entspricht) und verdrahten `config.json` + `AZURE_FOUNDRY_API_KEY` von BHGBrain für Sie — ausgehend von nichts weiter als einem Azure-Abonnement.
+
 ---
 
 ## Installation
@@ -232,17 +244,45 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
 
   // Konfiguration des Einbettungsanbieters
   "embedding": {
-    // Derzeit wird nur "openai" unterstützt
+    // Anbieter: "openai" oder "azure-foundry"
     "provider": "openai",
-    // OpenAI-Modell für Einbettungen. Muss eines der unterstützten Modelle sein:
-    // "text-embedding-ada-002", "text-embedding-3-small", "text-embedding-3-large".
-    // Ein nicht unterstütztes Modell führt beim Start zu einem Konfigurationsfehler.
+    // Modellname (bei OpenAI) oder Azure-Deployment-Name (bei Azure).
+    // Muss eines der unterstützten Modelle sein: "text-embedding-ada-002",
+    // "text-embedding-3-small", "text-embedding-3-large". Ein nicht
+    // unterstützter Wert führt bei beiden Anbietern beim Start zu einem
+    // Konfigurationsfehler.
     "model": "text-embedding-3-small",
-    // Name der Umgebungsvariable mit dem OpenAI API-Schlüssel
-    "api_key_env": "OPENAI_API_KEY",
     // Vektordimensionen des Modells. Muss mit der Modellausgabe übereinstimmen.
     // WICHTIG: Eine Änderung nach dem Erstellen von Sammlungen erfordert deren Neuerstellung.
-    "dimensions": 1536
+    "dimensions": 1536,
+    // Anfrage-Timeout in Millisekunden
+    "request_timeout_ms": 30000,
+    // Maximale Anzahl Eingaben pro Embedding-Anfrage (Chunking-Schwellenwert)
+    "max_batch_inputs": 2048,
+    // Retry-Konfiguration für vorübergehende Fehler
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 1000
+    },
+    // Jeder Vektor wird beim Schreiben mit einer anbieterqualifizierten Identität
+    // (`<provider>/<model>@<dimensions>`) gestempelt. Weicht die vom Store erwartete
+    // Identität (beim ersten Schreiben nach dem Start übernommen) von dieser
+    // Konfiguration ab — z. B. nach einem Provider- oder Modellwechsel —, degradiert
+    // die `embedding`-Health-Komponente, und solange dieses Flag `true` ist, werden
+    // vektorproduzierende Schreibvorgänge mit einem Fehler abgelehnt, der auf den
+    // Re-Embed-Modus des `repair`-Tools verweist. Nur auf `false` setzen, wenn
+    // Schreibvorgänge absichtlich Einbettungsräume mischen sollen. Siehe
+    // „Migration des Einbettungsmodells" unten.
+    "refuse_writes_on_model_mismatch": true,
+    // Name der Umgebungsvariable mit dem OpenAI-API-Schlüssel (bei Azure ignoriert)
+    "api_key_env": "OPENAI_API_KEY",
+    // Azure-spezifische Konfiguration (erforderlich, wenn provider = "azure-foundry")
+    "azure": {
+      // Azure-Ressourcenname zur Konstruktion der Endpunkt-URL
+      "resource_name": "my-foundry-resource",
+      // Name der Umgebungsvariable mit dem Azure-API-Schlüssel
+      "api_key_env": "AZURE_FOUNDRY_API_KEY"
+    }
   },
 
   // Qdrant-Verbindungskonfiguration
@@ -290,7 +330,10 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Maximale Anzahl automatisch eingebetteter Erinnerungen
     "auto_inject_limit": 10,
     // Maximale Zeichenanzahl in Tool-Antwort-Payloads
-    "max_response_chars": 50000
+    "max_response_chars": 50000,
+    // Obergrenze pro Namespace für Erinnerungen mit pinned: true (siehe
+    // remember/tag und die memory://inject-Dokumentation)
+    "pin_limit_per_namespace": 20
   },
 
   // Einstellungen für Aufbewahrung und Lebenszyklus von Erinnerungen
@@ -342,7 +385,41 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "pre_expiry_warning_days": 7,
 
     // Qdrant-Segment-Kompaktierungsschwelle (kompaktieren, wenn dieser Anteil eines Segments gelöscht ist)
-    "compaction_deleted_threshold": 0.10
+    "compaction_deleted_threshold": 0.10,
+
+    // Geplante Gedächtnis-Destillation: gruppiert verwandte, noch aktive T2/T3-
+    // episodische Erinnerungen und verschmilzt jeden qualifizierenden Cluster
+    // per LLM-Aufruf zu einer dauerhaften T1-semantischen Erinnerung, wobei die
+    // Quellen mit Herkunftsangabe archiviert werden (siehe "Gedächtnis-Destillation"
+    // unten). Standardmäßig deaktiviert und ohne konfigurierten Extraktions-
+    // API-Schlüssel wirkungslos.
+    "distillation": {
+      // Hauptschalter. false (Standard): der Scheduler startet nie, und
+      // `bhgbrain distill` überspringt jeden Cluster (no_key), sofern kein
+      // Extraktions-API-Schlüssel konfiguriert ist.
+      "enabled": false,
+
+      // Cron-Zeitplan für den Hintergrund-Destillationsauftrag (UTC). Standard
+      // eine Stunde nach cleanup_schedule, damit ein gerade von GC archivierter
+      // Bestand nicht gleichzeitig destilliert wird.
+      "schedule": "0 3 * * *",
+
+      // Cosinus-Ähnlichkeitsschwelle, ab der zwei T2/T3-episodische Erinnerungen
+      // demselben Cluster zugeordnet werden. Bewusst konservativ — eine
+      // fehlerhafte Verschmelzung ist nach dem Archivieren der Quellen nicht
+      // rückgängig zu machen.
+      "similarity_threshold": 0.85,
+
+      // Ein Cluster unterhalb dieser Größe wird nicht destilliert (Signal zu schwach).
+      "min_cluster_size": 3,
+
+      // Ein Cluster oberhalb dieser Größe wird deterministisch in Blöcke dieser
+      // Größe aufgeteilt, statt als ein übergroßer Cluster destilliert zu werden.
+      "max_cluster_size": 20,
+
+      // Obergrenze der pro geplantem Lauf destillierten Cluster (LLM-Aufrufe).
+      "max_clusters_per_run": 10
+    }
   },
 
   // Deduplizierungseinstellungen
@@ -351,7 +428,20 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "enabled": true,
     // Cosinus-Ähnlichkeitsschwelle, ab der neuer Inhalt als UPDATE eines vorhandenen Inhalts gilt.
     // Stufenspezifische Anpassungen werden zusätzlich angewendet (siehe Abschnitt Deduplizierung unten).
-    "similarity_threshold": 0.92
+    "similarity_threshold": 0.92,
+    // Wie viele der 10 abgerufenen Ähnlichkeitskandidaten der Klassifikator für die
+    // Korroboration prüft (1-10; NOOP/DELETE/direktes UPDATE verwenden immer nur den nächsten).
+    "candidate_window": 5,
+    // Unabhängiger Ausschalter für den unten beschriebenen Korroborationspfad; false stellt
+    // die Klassifikation vor der Erweiterung (nur einzelner Kandidat) wieder her,
+    // unabhängig von den anderen drei Einstellungen hier.
+    "corroboration_enabled": true,
+    // Mindestanzahl der Fensterkandidaten (einschließlich des nächsten), die innerhalb von
+    // corroboration_margin des Update-Schwellenwerts liegen müssen, um ADD zu UPDATE zu eskalieren.
+    "corroboration_count": 2,
+    // Wie weit ein Kandidat unter dem Update-Schwellenwert liegen darf und trotzdem
+    // zur Korroboration zählt.
+    "corroboration_margin": 0.03
   },
 
   // Suchkonfiguration
@@ -361,6 +451,81 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "hybrid_weights": {
       "semantic": 0.7,
       "fulltext": 0.3
+    },
+    // Composite-Ranking: ordnet Ergebnisse nach Relevanz x einem Prior aus
+    // Wichtigkeit, Zugriffshäufigkeit und stufenabhängigem Recency-Decay
+    // (siehe "Composite Ranking" unten). enabled: false stellt die reine
+    // Relevanz-Reihenfolge wieder her (Verhalten vor dem Ranking).
+    "ranking": {
+      "enabled": true,
+      "w_importance": 0.3,
+      "w_access": 0.2,
+      "access_norm": 50,
+      // Täglicher exponentieller Decay-Satz pro Retention-Stufe. T0 ist 0 (verfällt nie).
+      "decay_per_day": {
+        "T0": 0,
+        "T1": 0.002,
+        "T2": 0.008,
+        "T3": 0.02
+      }
+    },
+    // Optionale LLM-Rerank-Stufe, nur für `recall` (siehe "Rerank" unten).
+    // Standardmäßig deaktiviert: sendet bei Aktivierung die Anfrage und den
+    // Text jedes Kandidaten an das konfigurierte LLM zur Relevanzbewertung,
+    // ersetzt `score` (nie `semantic_score`, daher bleibt die min_score-
+    // Filterung unberührt) für bewertete Kandidaten. Erfordert einen eigenen
+    // BHGBRAIN_RERANK_API_KEY.
+    "rerank": {
+      "enabled": false,
+      "provider": "openai",
+      // Wie viele der (bereits gerankten) Kandidaten von `recall` pro Aufruf
+      // an das LLM gesendet werden. 1-50.
+      "candidate_pool": 20,
+      "model": "gpt-4o-mini",
+      "model_env": "BHGBRAIN_RERANK_API_KEY",
+      // Jeder Fehler (Timeout, Non-2xx, fehlerhafte Antwort) fällt auf die
+      // Reihenfolge vor dem Rerank zurück, statt den recall-Aufruf fehlschlagen zu lassen.
+      "timeout_ms": 3000
+    },
+    // Maximal Marginal Relevance-Diversitäts-Neuordnung, angewendet nach dem
+    // Composite Ranking (siehe "MMR-Diversitäts-Neuordnung" unten).
+    // enabled: false stellt exakt die reine Composite-Relevanz-Reihenfolge wieder her.
+    "mmr": {
+      "enabled": true,
+      "lambda": 0.7,
+      "candidate_pool_multiplier": 3,
+      "candidate_pool_cap": 50
+    },
+    // Multi-Query-Expansion: semantische Suche/Recall embedden und durchsuchen
+    // mehr als eine Repräsentation der Anfrage und mergen Kandidaten anhand
+    // der ID (der höhere Score gewinnt), bevor das Ranking greift (siehe
+    // "Multi-Query-Expansion" unten).
+    "query_expansion": {
+      "enabled": true,
+      // Obergrenze der insgesamt durchsuchten Varianten (Original +
+      // Stoppwort-bereinigt + LLM-generiert), unabhängig von
+      // llm_paraphrase.variant_count.
+      "max_variants": 2,
+      // Deterministische, modellfreie Variante: die Anfrage ohne englische
+      // Stoppwörter, zusätzlich zum Original durchsucht, sofern sie sich
+      // unterscheidet und nicht leer ist.
+      "keyword_stripped": true,
+      // Optionale, modellgestützte Variantengenerierung. Standardmäßig aus:
+      // dies ist die erste Live-Pfad-LLM-Chat-Abhängigkeit und fügt pro
+      // Aufruf Latenz/Kosten hinzu.
+      "llm_paraphrase": {
+        "enabled": false,
+        // "paraphrase": formuliert die Anfrage um. "hyde": generiert eine
+        // hypothetische Antwort-Passage und embedded diese stattdessen
+        // (kann Recall verbessern, auf Kosten möglicher halluzinierter
+        // Details — siehe README unten).
+        "mode": "paraphrase",
+        "variant_count": 2,
+        // Timeout für die Chat-Completion-Anfrage; jeder Fehlschlag
+        // (Timeout, Nicht-2xx, fehlender Key) degradiert stillschweigend
+        // zu den modellfreien Varianten oben.
+        "timeout_ms": 3000
+      }
     }
   },
 
@@ -382,12 +547,34 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "trust_proxy": false
   },
 
-  // Auto-Inject-Payload-Budget (für die memory://inject-Ressource)
+  // Auto-Inject-Payload-Budget (für memory://inject und memory://inject/{hint})
   "auto_inject": {
-    // Maximale im Inject-Payload enthaltene Zeichenanzahl
+    // Budgetmenge, interpretiert gemäß budget_unit unten
     "max_chars": 30000,
     // Token-Budget (null = unbegrenzt, Zeichenbudget gilt)
-    "max_tokens": null
+    "max_tokens": null,
+    // Anteil des Budgets, der für den Erinnerungsabschnitt reserviert ist,
+    // damit Kategorieninhalt nicht mehr das gesamte Payload verbrauchen
+    // kann, bevor eine einzige Erinnerung injiziert wird. 0 stellt das
+    // bisherige Verhalten wieder her, bei dem Kategorien das gesamte
+    // Budget nutzen können.
+    "memory_budget_fraction": 0.4,
+    // 'chars' (Standard): max_chars ist ein Zeichenbudget, unverändert
+    // gegenüber vor dieser Option. 'tokens': max_chars wird als
+    // geschätztes Token-Budget behandelt (Zeichen/4, keine
+    // Tokenizer-Abhängigkeit), wodurch das effektive Zeichenbudget jedes
+    // Abschnitts mit 4 multipliziert wird.
+    "budget_unit": "chars",
+    // Gierige Near-Duplicate-Unterdrückung innerhalb des hint-basierten
+    // Erinnerungsabschnitts: Ein Kandidat, der deduplication.similarity_threshold
+    // gegenüber einer bereits ausgewählten Erinnerung überschreitet, wird übersprungen.
+    // Angepinnte Erinnerungen sind in beide Richtungen davon ausgenommen.
+    "dedup_suppression": true,
+    // Ob angepinnte Erinnerungen immer im Erinnerungsabschnitt enthalten sind
+    // (siehe defaults.pin_limit_per_namespace sowie den Parameter `pinned`
+    // von remember/tag). false deaktiviert diesen Schritt vollständig; die
+    // Pin-Obergrenze wird unabhängig davon weiterhin beim Schreiben durchgesetzt.
+    "pinned_enabled": true
   },
 
   // Observability-Einstellungen
@@ -402,17 +589,64 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
 
   // Ingestion-Pipeline-Einstellungen
   "pipeline": {
-    // Extraktionsdurchgang aktivieren (führt derzeit deterministische Einzelkandidaten-Extraktion aus)
-    "extraction_enabled": true,
-    // Modell für LLM-basierte Extraktion (für zukünftige Verwendung geplant)
+    // LLM-gestützte Multi-Kandidaten-Extraktion aktivieren: teilt mehrfaktigen
+    // `remember`-Inhalt vor Dedup/Schreiben in atomare Kandidaten-Erinnerungen auf.
+    // Standard false — bewusst opt-in, da die Aktivierung einen LLM-Aufruf
+    // (Kosten + Latenz) bei jedem ausreichend langen `remember` verursacht. Wenn
+    // false, oder wenn kein API-Schlüssel aufgelöst wird, erzeugt die Extraktion
+    // immer genau einen Kandidaten (heutiges Verhalten).
+    "extraction_enabled": false,
+    // Chat-Completions-Modell für die Extraktion
     "extraction_model": "gpt-4o-mini",
-    // Name der Umgebungsvariable für den API-Schlüssel des Extraktionsmodells
+    // Name der Umgebungsvariable für den API-Schlüssel des Extraktionsmodells; Fallback auf OPENAI_API_KEY
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // Inhalt kürzer als dies (Zeichen) überspringt den LLM-Aufruf und geht direkt
+    // zur Einzelkandidaten-Extraktion
+    "extraction_min_chars": 120,
+    // Kandidaten über dieser Grenze werden verworfen (nicht zusammengeführt), protokolliert und gezählt
+    "extraction_max_candidates": 6,
+    // Timeout für die Extraktionsanfrage in Millisekunden, per AbortController erzwungen
+    "extraction_timeout_ms": 4000,
     // Wenn true, Fallback auf Prüfsummen- + Volltext-Ähnlichkeits-Deduplizierung, falls Einbettung nicht verfügbar
-    "fallback_to_threshold_dedup": true
+    "fallback_to_threshold_dedup": true,
+    // Aktiviert eine optionale LLM-gestützte Zusammenfassungsstufe: ein günstiger
+    // Chat-Completion-Aufruf erzeugt das `summary`-Feld der Erinnerung statt des
+    // kostenlosen, eingebauten extraktiven Summarizers. Standard false — wie bei
+    // der Extraktion ist dies ein neuer externer Aufruf mit Kosten-/Latenz-
+    // Auswirkungen, bewusst opt-in. Jeder Fehlschlag (fehlender Schlüssel,
+    // Nicht-2xx, Timeout, Netzwerkfehler) fällt für diesen Schreibvorgang auf die
+    // extraktive Stufe zurück; die Zusammenfassung blockiert oder verhindert nie
+    // einen `remember`-/`revert`-Aufruf.
+    "summarization_enabled": false,
+    // Chat-Completions-Modell für die Zusammenfassung
+    "summarization_model": "gpt-4o-mini",
+    // Name der Umgebungsvariable für den API-Schlüssel des Zusammenfassungsmodells.
+    // Standardmäßig dieselbe Variable wie extraction_model_env (beide sind
+    // günstige Modellaufrufe im Schreibpfad gegen dasselbe OpenAI-Konto) — bei
+    // Bedarf auf eine andere Variable für einen separaten Schlüssel verweisen.
+    "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // Timeout für die Zusammenfassungsanfrage in Millisekunden, per AbortController erzwungen
+    "summarization_timeout_ms": 3000,
+    // Deterministisches, abhängigkeitsfreies Inhalts-Tagging: leitet zusätzliche
+    // Tags aus code-artigen Tokens, Dateipfaden, Repo-Kurzformen (owner/repo) und
+    // @Erwähnungen im normalisierten Inhalt ab und vereinigt sie mit
+    // aufruferseitigen Tags. Kein LLM-Aufruf, kein Netzwerkzugriff. `false`
+    // stellt exakt das Verhalten vor dieser Funktion wieder her. Siehe
+    // "Automatisches Taggen" unten.
+    "auto_tag_enabled": true,
+    // Obergrenze für automatisch abgeleitete Tags pro Erinnerung, angewendet vor
+    // der Zusammenführung mit aufruferseitigen Tags und dem Kürzen auf die
+    // Obergrenze von 20 Tags (beim Kürzen haben aufruferseitige Tags immer Vorrang).
+    "auto_tag_max_per_memory": 6
   },
 
-  // Speicherinhalt bei der Ingestion automatisch zusammenfassen
+  // Steuert die Qualitätsstufe zur Erzeugung des `summary`-Felds jeder Erinnerung.
+  // true (Standard): ein abhängigkeitsfreier extraktiver Summarizer bewertet
+  // jeden Satz im Inhalt nach Termhäufigkeit und wählt den repräsentativsten aus
+  // (mit Fallback auf die obige LLM-Stufe, wenn pipeline.summarization_enabled
+  // true ist und sie erfolgreich antwortet). false: der günstigste mögliche Weg —
+  // summary ist einfach die erste Zeile des Inhalts, auf 120 Zeichen gekürzt —
+  // unabhängig von pipeline.summarization_enabled.
   "auto_summarize": true
 }
 ```
@@ -423,11 +657,13 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
 
 | Variable | Erforderlich | Standard | Beschreibung |
 |---|---|---|---|
-| `OPENAI_API_KEY` | Ja (für Einbettungen) | — | OpenAI API-Schlüssel. Der Server startet im **Degraded-Modus**, wenn er fehlt – semantische Suche und Ingestion schlagen fehl, Volltextsuche und Kategorie-Lesezugriffe funktionieren weiterhin. |
+| `OPENAI_API_KEY` | Ja (für OpenAI-Anbieter) | — | OpenAI API-Schlüssel. Der Server startet im **Degraded-Modus**, wenn er fehlt – semantische Suche und Ingestion schlagen fehl, Volltextsuche und Kategorie-Lesezugriffe funktionieren weiterhin. |
+| `AZURE_FOUNDRY_API_KEY` | Ja (für Azure-Anbieter) | — | Azure-API-Schlüssel für den Azure-OpenAI-kompatiblen Embeddings-Endpunkt. Erforderlich, wenn `embedding.provider = "azure-foundry"`. |
 | `BHGBRAIN_TOKEN` | Erforderlich für nicht-Loopback-HTTP | — | Bearer-Token für HTTP-Authentifizierung. Der Server **verweigert den Start**, wenn der Host nicht Loopback ist und dieser Wert nicht gesetzt ist (außer `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Erforderlich für Qdrant Cloud | — | Setzen Sie `qdrant.api_key_env` in der Konfiguration auf den Namen dieser Variable. Der Standard-Konfigurationsfeldname ist `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | Nein | Automatisch aus dem Hostnamen generiert | Überschreibt den Gerätebezeichner für Multi-Device-Setups. Siehe [Geräteidentitätsauflösung](#geräteidentitätsauflösung). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | Nein | Fällt auf `OPENAI_API_KEY` zurück | API-Schlüssel für das LLM-Extraktionsmodell (zukünftige Verwendung). |
+| `BHGBRAIN_EXTRACTION_API_KEY` | Nein | Fällt auf `OPENAI_API_KEY` zurück | API-Schlüssel für das LLM-Extraktionsmodell, verwendet wenn `pipeline.extraction_enabled` auf `true` steht. Auch der Standardwert von `pipeline.summarization_model_env` (verwendet wenn `pipeline.summarization_enabled` auf `true` steht) — auf eine andere Variable verweisen, wenn ein separater Schlüssel für die Zusammenfassung gewünscht ist. Wird auch von der LLM-Paraphrase/HyDE-Phase der Multi-Query-Expansion gelesen (`search.query_expansion.llm_paraphrase.enabled`, siehe [Multi-Query-Expansion](#multi-query-expansion)), die den Schlüssel auf dieselbe Weise aus `pipeline.extraction_model_env` auflöst und bei fehlender Variable auf `OPENAI_API_KEY` zurückfällt. |
+| `BHGBRAIN_RERANK_API_KEY` | Nein | — (**kein** Fallback auf `OPENAI_API_KEY`) | API-Schlüssel für die optionale `recall`-Rerank-Stufe, verwendet wenn `search.rerank.enabled` auf `true` steht. Anders als `BHGBRAIN_EXTRACTION_API_KEY` gibt es hier keinen impliziten Fallback — die Aktivierung des Reranking ist ein bewusster, separat verschlüsselter Opt-in, der nie stillschweigend das Embedding- oder Extraktions-Budget verbraucht. Siehe [Rerank](#rerank). |
 
 Sicheres Bearer-Token generieren:
 
@@ -458,9 +694,12 @@ node dist/index.js --stdio --config=/path/to/config.json
 
 ### HTTP-Modus
 
-> Dieser Transport ist eine reine REST-API für Skripte, Health-Probes und die CLI. Er
-> implementiert **kein** MCP Streamable HTTP — MCP-Clients müssen stattdessen stdio
-> verwenden (siehe „MCP-Client-Konfiguration").
+> Dieser Transport spricht echtes MCP über HTTP — den **Streamable-HTTP**-Transport
+> unter `/mcp`, sodass mehrere MCP-Clients einen einzigen, dauerhaft laufenden
+> Serverprozess teilen können — zusätzlich zu einer schlichten REST-API
+> (`POST /tool/:name`, `GET /resource`) für Skripte, Health-Probes und die CLI. Siehe
+> „MCP-Client-Konfiguration", um einen Streamable-HTTP-fähigen Client auf `/mcp`
+> zeigen zu lassen.
 
 HTTP ist standardmäßig auf `127.0.0.1:3721` aktiviert. Setzen Sie `BHGBRAIN_TOKEN` vor dem Start, wenn Sie authentifizierten Zugriff wünschen:
 
@@ -475,9 +714,17 @@ Der Server hört standardmäßig auf `http://127.0.0.1:3721`. Verfügbare HTTP-E
 | Endpunkt | Authentifizierung erforderlich | Beschreibung |
 |---|---|---|
 | `GET /health` | Nein | Gesundheitsprüfung (unauthentifiziert für Probe-Kompatibilität) |
-| `POST /tool/:name` | Ja | Benanntes MCP-Tool aufrufen |
-| `GET /resource?uri=...` | Ja | MCP-Ressource per URI lesen |
+| `POST /mcp` | Ja | MCP Streamable HTTP: JSON-RPC-Anfragen; eine `initialize`-Anfrage eröffnet eine neue Sitzung |
+| `GET /mcp` | Ja | MCP Streamable HTTP: eigenständiger SSE-Kanal für eine bestehende Sitzung |
+| `DELETE /mcp` | Ja | MCP Streamable HTTP: beendet eine Sitzung |
+| `POST /tool/:name` | Ja | REST-Komfortschicht: benanntes MCP-Tool direkt aufrufen |
+| `GET /resource?uri=...` | Ja | REST-Komfortschicht: MCP-Ressource direkt per URI lesen |
 | `GET /metrics` | Ja | Metriken im Prometheus-Format (wenn `metrics_enabled: true`) |
+
+Jede `/mcp`-Sitzung ist ein frischer, In-Memory-MCP-Server, der denselben zugrunde
+liegenden Speicher wie jede andere Sitzung und die REST-Endpunkte nutzt — ein Neustart
+des Prozesses verwirft alle Sitzungen, und spezifikationskonforme Clients
+initialisieren sich automatisch neu.
 
 Beispiel Gesundheitsprüfung:
 
@@ -530,13 +777,38 @@ curl -X POST http://127.0.0.1:3721/tool/remember \
 }
 ```
 
-### OpenClaw / mcporter (stdio-Transport)
+### OpenClaw / mcporter (Streamable-HTTP-Transport)
 
-BHGBrain spricht MCP **ausschließlich über stdio**. Der unter „HTTP-Modus"
-beschriebene HTTP-Server ist eine reine REST-API (`POST /tool/:name`,
-`GET /resource`) — er ist *kein* MCP-Streamable-HTTP-Endpunkt, MCP-Clients können sich
-also nicht damit verbinden. Verweisen Sie stattdessen auf die Binärdatei
-`bhgbrain-server`:
+Der HTTP-Server von BHGBrain spricht echtes MCP unter `/mcp` über den
+**Streamable-HTTP**-Transport (siehe „HTTP-Modus") — starten Sie den Server einmal und
+richten Sie jeden MCP-Client auf dieselbe URL, sodass sie sich einen dauerhaft
+laufenden Prozess und ein SQLite-/Qdrant-Backend teilen, statt dass jeder Client sein
+eigenes isoliertes `--stdio`-Kindprozess startet:
+
+```json
+{
+  "mcpServers": {
+    "bhgbrain": {
+      "transport": "http",
+      "url": "http://127.0.0.1:3721/mcp",
+      "headers": {
+        "Authorization": "Bearer <your-token>"
+      }
+    }
+  }
+}
+```
+
+Starten Sie zuerst den Server (`node dist/index.js` oder `bhgbrain server start`) mit
+`BHGBRAIN_TOKEN` auf denselben Wert gesetzt wie im obigen Header.
+
+#### stdio-Transport (Alternative: pro Client ein Prozess)
+
+Clients, die nur stdio unterstützen (oder die keinen laufenden Server teilen dürfen),
+können weiterhin ihr eigenes `bhgbrain-server --stdio`-Kindprozess starten. Das wird
+vollständig unterstützt, allerdings erhält jeder Client, der dies tut, einen eigenen,
+isolierten Prozess — kein Zustand wird mit anderen Clients geteilt, bis er nach
+SQLite/Qdrant durchgeschrieben wird.
 
 ```json
 {
@@ -572,12 +844,15 @@ Oder gegen ein Quellcode-Checkout statt der global installierten Binärdatei:
 }
 ```
 
-> **OpenClaw läuft in WSL oder einem Container?** BHGBrain muss in derselben Umgebung
-> installiert sein. stdio bedeutet, dass der Client den Server als Kindprozess startet
-> — der Server kann also nicht in einer separaten Distribution oder einem separaten
-> Container liegen. Um Speicher umgebungsübergreifend zu teilen, geben Sie jeder
-> Installation ihre eigene SQLite-Datenbank und richten Sie alle auf denselben
-> Qdrant-Cluster aus (siehe „Multi-Device-Speicher").
+> **OpenClaw läuft in WSL oder einem Container mit dem stdio-Transport?** BHGBrain
+> muss in derselben Umgebung installiert sein. stdio bedeutet, dass der Client den
+> Server als Kindprozess startet — der Server kann also nicht in einer separaten
+> Distribution oder einem separaten Container liegen. Der Streamable-HTTP-Transport
+> oben umgeht dieses Problem vollständig — richten Sie Clients in jeder Umgebung auf
+> dieselbe URL `http://host:3721/mcp`. Um Speicher stattdessen über getrennte
+> Serverinstanzen hinweg zu teilen, geben Sie jeder Installation ihre eigene
+> SQLite-Datenbank und richten Sie alle auf denselben Qdrant-Cluster aus (siehe
+> „Multi-Device-Speicher").
 
 ---
 
@@ -714,6 +989,68 @@ Das repair-Tool:
 
 **Hinweis**: Erinnerungen, die vor dem Feature Content-in-Qdrant gespeichert wurden (vor 1.3), haben keinen Inhalt in ihrem Qdrant-Payload und können nicht über repair wiederhergestellt werden. Nur Metadaten (Tags, Typ, Wichtigkeit) bleiben für diese Einträge erhalten.
 
+### Migration des Einbettungsmodells
+
+Jeder Vektor wird beim Schreiben mit einer anbieterqualifizierten Identität versehen —
+`<provider>/<model>@<dimensions>` (z. B. `openai/text-embedding-3-small@1536`) — sowohl
+in der SQLite-Zeile als auch im Qdrant-Payload. Der Store merkt sich diese Identität
+zusätzlich als Erwartung, die beim ersten Schreibvorgang nach dem Start übernommen wird.
+
+Grund dafür: Das Mischen von Einbettungsräumen ist eine stille Korruption. Wenn Sie
+`embedding.provider` oder `embedding.model` in `config.json` bei gleichbleibender
+Dimensionalität ändern (z. B. Wechsel zu einer Azure-Deployment derselben Modellfamilie),
+erkennt dies auf Qdrant-Ebene nichts — neue Vektoren landen in derselben Sammlung wie
+alte, Kosinus-Ähnlichkeit zwischen den beiden Räumen ist bedeutungslos, und sowohl die
+Recall-Relevanz als auch die Deduplizierung (die Scores des nächsten Kandidaten und
+des Kandidatenfensters, die in die 0.92/0.98-Schwellenwerte einfließen) verschlechtern sich still. Eine Dimensionsänderung
+schlägt stattdessen laut mit einem kryptischen Qdrant-Fehler fehl; die Herkunfts-Stempel
+machen beide Fälle laut und handlungsfähig.
+
+**Ablauf nach einer Modelländerung:**
+
+1. Beim nächsten Start (oder Health-Check) stimmt die erwartete Identität des Stores
+   nicht mehr mit der aktiven Konfiguration überein. Die `embedding`-Health-Komponente
+   wird degradiert mit einer Meldung, die beide Identitäten nennt, und eine strukturierte
+   `embedding_identity_mismatch`-Warnung wird geloggt.
+2. Solange `embedding.refuse_writes_on_model_mismatch` auf `true` steht (Standard),
+   schlagen vektorproduzierende Schreibvorgänge (remember, tag-getriggerte
+   Re-Embeddings, Restore-Reconciliation) mit einem handlungsfähigen
+   `CONFLICT`-Fehler fehl, der auf den Re-Embed-Pfad verweist. Lesevorgänge
+   funktionieren weiter — Recall und Search bedienen weiterhin die alten Vektoren,
+   nur mit degradiertem Health-Status.
+3. Migration durchführen:
+
+   ```bash
+   bhgbrain repair --re-embed              # veraltete Stempel migrieren
+   bhgbrain repair --re-embed --dry-run    # Vorschau, wie viele Zeilen betroffen wären
+   bhgbrain repair --re-embed --include-legacy   # auch Zeilen ohne jeden Stempel einbeziehen
+   ```
+
+   Oder über das `repair`-MCP-Tool mit `mode: "re-embed"` (siehe
+   [MCP-Tools-Referenz](#mcp-tools-referenz)). Die Migration embedded betroffene
+   Erinnerungen in begrenzten, fortsetzbaren Batches — der Stempel selbst ist der
+   Fortschrittsmarker, sodass ein unterbrochener Lauf ohne Wiederholung bereits
+   abgeschlossener Zeilen fortgesetzt werden kann, und ein einzelner
+   Embed/Upsert-Fehler wird isoliert statt den ganzen Batch abzubrechen.
+4. Sobald keine veralteten Stempel mehr übrig sind, aktualisiert sich die erwartete
+   Identität des Stores automatisch, und die `embedding`-Degradation verschwindet —
+   ohne Neustart.
+
+**Hinweise:**
+- Alte Zeilen, die vor der Herkunfts-Stempelung geschrieben wurden, haben keinen
+  Stempel (`null`) und gelten als „unbekannt" — sie werden beim Re-Embed
+  ausgeschlossen, sofern nicht `--include-legacy` / `include_legacy: true`
+  übergeben wird, damit ein erstes Upgrade nicht überraschend ein vollständiges
+  Re-Embedding des gesamten Bestands (und dessen Embedding-API-Kosten) auslöst.
+- Re-Embedding wird immer vom Betreiber ausgelöst — nie automatisch, da es die
+  kostenpflichtige Embedding-API einmal pro migrierter Erinnerung aufruft.
+- Setzen Sie `embedding.refuse_writes_on_model_mismatch` nur dann auf `false`,
+  wenn Sie absichtlich zulassen möchten, dass Schreibvorgänge fortfahren und
+  Einbettungsräume mischen (z. B. ein bewusstes, überwachtes Migrationsfenster) —
+  der Stempel dokumentiert weiterhin, was passiert ist.
+- Archivierte Erinnerungen werden nie neu eingebettet; ihre Vektoren sind bereits
+  absichtlich entfernt (siehe [Verfall, Bereinigung und Archivierung](#verfall-bereinigung-und-archivierung)).
+
 ### Multi-Device-Konfigurationsbeispiel
 
 **Gerät A** (`config.json`):
@@ -761,8 +1098,8 @@ Jede in BHGBrain gespeicherte Erinnerung ist ein `MemoryRecord` mit folgenden Fe
 | `category` | `string \| null` | Kategoriename, wenn diese Erinnerung an eine persistente Richtlinienkategorie gebunden ist |
 | `content` | `string` | Der vollständige Speicherinhalt (bis zu 100.000 Zeichen) |
 | `summary` | `string` | Automatisch generierte Zusammenfassung der ersten Zeile (bis zu 120 Zeichen) |
-| `tags` | `string[]` | Freie Tags (alphanumerisch + Bindestriche, max. 20 Tags, max. 100 Zeichen je Tag) |
-| `source` | `"cli" \| "api" \| "agent" \| "import"` | Wie die Erinnerung erstellt wurde |
+| `tags` | `string[]` | Freie Tags (alphanumerisch + Bindestriche, max. 20 Tags, max. 100 Zeichen je Tag). Enthält sowohl aufruferseitige als auch automatisch abgeleitete Tags — siehe [Automatisches Taggen](#automatisches-taggen). |
+| `source` | `"cli" \| "api" \| "agent" \| "import" \| "distillation"` | Wie die Erinnerung erstellt wurde. `"distillation"` wird nur vom geplanten Destillationsauftrag geschrieben (siehe [Gedächtnis-Destillation](#gedächtnis-destillation)) |
 | `checksum` | `string` | SHA-256-Hash des normalisierten Inhalts (wird für exakte Deduplizierung verwendet) |
 | `embedding` | `number[]` | Vektoreinbettung (nicht in SQLite gespeichert; liegt in Qdrant) |
 | `importance` | `number (0–1)` | Wichtigkeitsbewertung (Standard 0.5) |
@@ -774,8 +1111,10 @@ Jede in BHGBrain gespeicherte Erinnerung ist ein `MemoryRecord` mit folgenden Fe
 | `last_accessed` | `string (ISO 8601)` | Zeitstempel des letzten Abrufs |
 | `last_operation` | `"ADD" \| "UPDATE" \| "DELETE" \| "NOOP"` | Zuletzt angewendeter Schreibvorgang |
 | `merged_from` | `string \| null` | ID der Erinnerung, aus der diese zusammengeführt wurde (Deduplizierungs-UPDATE-Pfad) |
+| `derived_from` | `string[] \| null` | IDs der archivierten T2/T3-episodischen Quellerinnerungen, aus denen diese Erinnerung destilliert wurde. Nur vom Destillationsauftrag gesetzt; `null` bei jedem gewöhnlichen Schreibvorgang (siehe [Gedächtnis-Destillation](#gedächtnis-destillation)) |
 | `archived` | `boolean` | Ob diese Erinnerung soft-archiviert ist (von Suche/Recall ausgeschlossen) |
 | `vector_synced` | `boolean` | Ob der Qdrant-Vektor mit dem SQLite-Zustand synchron ist |
+| `pinned` | `boolean` | Ob diese Erinnerung immer in `memory://inject`-Payloads enthalten ist, begrenzt durch `defaults.pin_limit_per_namespace`; hat keine Auswirkung auf `search`/`recall` |
 | `device_id` | `string \| null` | Bezeichner der BHGBrain-Instanz, die diese Erinnerung erstellt hat (siehe [Multi-Device-Speicher](#multi-device-speicher)) |
 | `created_at` | `string (ISO 8601)` | Erstellungszeitstempel |
 | `updated_at` | `string (ISO 8601)` | Letzter Aktualisierungszeitstempel |
@@ -796,6 +1135,7 @@ CREATE INDEX idx_memories_expiry      ON memories(decay_eligible, expires_at);
 CREATE INDEX idx_memories_review_due  ON memories(retention_tier, review_due);
 CREATE INDEX idx_memories_archived    ON memories(archived);
 CREATE INDEX idx_memories_vector_sync ON memories(vector_synced);
+CREATE INDEX idx_memories_pinned      ON memories(namespace, pinned);
 ```
 
 #### Qdrant-Payload-Indizes
@@ -867,7 +1207,7 @@ Jeder Erinnerung wird bei der Aufnahme eine **Aufbewahrungsstufe** zugewiesen, d
 
 **Wesentliche Eigenschaften nach Stufe:**
 
-- **T0**: `expires_at` ist immer `null`. `decay_eligible` ist immer `false`. T0-Erinnerungen können nicht automatisch bereinigt werden. Aktualisierungen von T0-Erinnerungen lösen einen Revisions-Snapshot in der Tabelle `memory_revisions` aus (append-only-Verlauf). T0-Erinnerungen erhalten in Hybrid-Suchergebnissen einen Score-Bonus von +0.1.
+- **T0**: `expires_at` ist immer `null`. `decay_eligible` ist immer `false`. T0-Erinnerungen können nicht automatisch bereinigt werden. Aktualisierungen von T0-Erinnerungen lösen einen Revisions-Snapshot in der Tabelle `memory_revisions` aus (append-only-Verlauf). T0-Erinnerungen verfallen im Composite Ranking nie (`decay_per_day.T0` ist standardmäßig `0`) und behalten so über alle Suchmodi hinweg einen dauerhaften Ranking-Vorteil.
 
 - **T1**: `review_due` wird auf `created_at + 365 Tage` gesetzt und bei jedem Zugriff zurückgesetzt. Erinnerungen, die ihrem `expires_at` nahekommen, werden in den Suchergebnissen mit `expiring_soon: true` markiert.
 
@@ -1034,9 +1374,12 @@ flowchart TD
     G --> H{"Highest Cosine<br/>Similarity Score"}
     H -->|"score ≥ noop threshold"| NOOP2["🔄 NOOP<br/>Near-duplicate found"]
     H -->|"score ≥ update threshold"| UPD["✏️ UPDATE Path"]
-    H -->|"score < update threshold"| ADD["➕ ADD Path"]
+    H -->|"score < update threshold"| WIN{"candidate_window:<br/>N corroborators ≥<br/>(update − margin)?"}
+    WIN -->|"Yes (≥ corroboration_count)"| CORR["✏️ UPDATE Path<br/>(corroborated)"]
+    WIN -->|"No"| ADD["➕ ADD Path"]
 
     UPD --> U1["Merge tags (union)"]
+    CORR --> U1
     U1 --> U2["Replace content"]
     U2 --> U3["importance = max(old, new)"]
     U3 --> U4["SQLite UPDATE"]
@@ -1054,9 +1397,9 @@ flowchart TD
 
     class REJECT reject
     class NOOP1,NOOP2 noop
-    class UPD,U1,U2,U3,U4,U5 update
+    class UPD,CORR,U1,U2,U3,U4,U5 update
     class ADD,A1,A2,A3 add
-    class A,B,C,D,E,F,G,H process
+    class A,B,C,D,E,F,G,H,WIN process
 ```
 
 #### Phase 1: Exakte Deduplizierung (Prüfsumme)
@@ -1073,12 +1416,23 @@ Wenn keine exakte Übereinstimmung gefunden wird, wird der Inhalt eingebettet un
 
 | Entscheidung | Bedingung | Auswirkung |
 |---|---|---|
-| `NOOP` | Score ≥ NOOP-Schwellenwert | Inhalt gilt als Duplikat; ID der vorhandenen Erinnerung wird ohne Schreibvorgang zurückgegeben |
-| `DELETE` | Score ≥ UPDATE-Schwellenwert **und** der Inhalt macht die Übereinstimmung explizit ungültig (z. B. "nicht mehr wahr", "Korrektur:", "vergiss das") | Die vorhandene Erinnerung wird gelöscht und der Kandidat wird als neue Erinnerung gespeichert, die über `merged_from` darauf verweist |
-| `UPDATE` | Score ≥ UPDATE-Schwellenwert | Inhalt ist eine Aktualisierung einer vorhandenen; Tags zusammenführen, Inhalt und Prüfsumme aktualisieren, ID beibehalten |
-| `ADD` | Score < UPDATE-Schwellenwert | Wirklich neue Erinnerung; mit neuer UUID erstellen |
+| `NOOP` | Score des nächsten Kandidaten ≥ NOOP-Schwellenwert | Inhalt gilt als Duplikat; ID der vorhandenen Erinnerung wird ohne Schreibvorgang zurückgegeben |
+| `DELETE` | Score des nächsten Kandidaten ≥ UPDATE-Schwellenwert **und** der Inhalt macht die Übereinstimmung explizit ungültig (z. B. "nicht mehr wahr", "Korrektur:", "vergiss das") | Die vorhandene Erinnerung wird gelöscht und der Kandidat wird als neue Erinnerung gespeichert, die über `merged_from` darauf verweist |
+| `DELETE` (opt-in) | Score des nächsten Kandidaten liegt im UPDATE-Band, die Phrasen-Heuristik oben hat **nicht** angeschlagen, `pipeline.contradiction_detection.enabled` ist `true`, und eine LLM-Entailment-Prüfung klassifiziert den Kandidaten relativ zur vorhandenen Erinnerung als `contradict` | Gleiche Wirkung wie das phrasenbasierte `DELETE` oben — die vorhandene Erinnerung wird gelöscht und der Kandidat wird als neue Erinnerung gespeichert, die über `merged_from` darauf verweist |
+| `UPDATE` | Score des nächsten Kandidaten ≥ UPDATE-Schwellenwert | Inhalt ist eine Aktualisierung einer vorhandenen; Tags zusammenführen, Inhalt und Prüfsumme aktualisieren, ID beibehalten |
+| `UPDATE` (korroboriert) | Score des nächsten Kandidaten < UPDATE-Schwellenwert, **aber** mindestens `deduplication.corroboration_count` Kandidaten innerhalb des Fensters der obersten `deduplication.candidate_window` (einschließlich des nächsten) erreichen ≥ `UPDATE-Schwellenwert − deduplication.corroboration_margin` | Mehrere nahezu identische Erinnerungen bilden unabhängig einen Cluster nahe dem Schwellenwert; Zusammenführung mit dem höchstbewerteten Kandidaten, genau wie bei einem direkten `UPDATE` |
+| `ADD` | Score des nächsten Kandidaten < UPDATE-Schwellenwert und kein korroborierter Cluster gefunden | Wirklich neue Erinnerung; mit neuer UUID erstellen |
 
-Das obige Diagramm zeigt die Pfade NOOP/UPDATE/ADD; DELETE ist eine Variante des UPDATE-Pfads, die nur ausgelöst wird, wenn die Ungültigkeits-Heuristik anschlägt.
+Das obige Diagramm zeigt die Pfade NOOP/UPDATE/ADD; DELETE ist eine Variante des UPDATE-Pfads, die ausgelöst wird, wenn entweder die phrasenbasierte Ungültigkeits-Heuristik anschlägt, oder (opt-in, siehe unten) eine LLM-Entailment-Prüfung einen Kandidaten im UPDATE-Band als Widerspruch zur vorhandenen Erinnerung klassifiziert. NOOP und DELETE werden immer ausschließlich anhand des nächsten Kandidaten entschieden — Korroboration gilt für sie nie (siehe "Kandidatenfenster und Korroboration" unten).
+
+**Widerspruchserkennung (opt-in, standardmäßig aus):** Die obige Phrasen-Heuristik erkennt nur Kandidaten, die explizit sagen, dass sie eine Korrektur sind ("nicht mehr wahr", "Korrektur:", ...). Ein Kandidat zum gleichen Thema, der ohne eine dieser Phrasen widerspricht — z. B. "Wir sind zu Postgres migriert", wenn der Speicher bereits "wir verwenden MySQL" enthält — fällt stillschweigend durch zu `UPDATE`, und beide Fakten koexistieren. Wird `pipeline.contradiction_detection.enabled: true` gesetzt, schließt das diese Lücke: Für Kandidaten, die im UPDATE-Band landen *und* die Phrasen-Heuristik nicht bereits ausgelöst haben, macht die Pipeline einen einzigen LLM-Aufruf (unter Wiederverwendung der `pipeline.extraction_model` / `pipeline.extraction_model_env`-Zugangsdaten — keine separate Modell- oder API-Schlüssel-Konfiguration), der den Kandidaten relativ zur vorhandenen Erinnerung als `agree`, `refine` oder `contradict` klassifiziert. Nur `contradict` ändert das Verhalten und führt zum gleichen Lösch-und-Ersetzen-Pfad wie die Phrasen-Heuristik; `agree`/`refine` fallen beide durch zum bestehenden `UPDATE`-Merge, identisch zum heutigen Verhalten. Die Phrasen-Heuristik wird immer zuerst geprüft und bricht ohne LLM-Aufruf ab, sobald sie zutrifft, sodass explizite Korrekturen weiterhin kostenlos und sofort bleiben.
+
+| `pipeline.contradiction_detection.*`-Feld | Standard | Bedeutung |
+|---|---|---|
+| `enabled` | `false` | Schaltet die LLM-Entailment-Prüfung für Schreibvorgänge im UPDATE-Band ein. Standardmäßig aus: keine Verhaltensänderung, keine zusätzliche Latenz/Kosten, bis ein Betreiber sich dafür entscheidet. |
+| `timeout_ms` | `5000` | Obergrenze für den Entailment-Aufruf. Bei Timeout, Netzwerkfehler, Nicht-2xx-Antwort oder einer nicht parsbaren/nicht gelisteten Klassifikation greift die Pipeline auf den bisherigen Zustand zurück — sie verfährt genau so, als wäre die Funktion für diesen Schreibvorgang deaktiviert — und protokolliert eine `contradiction_check_degraded`-Warnung, statt den Schreibvorgang zu blockieren oder abzulehnen. |
+
+**Abzuwägender Kompromiss vor der Aktivierung:** Die heutige Lücke ist ein falsch-negatives Ergebnis (ein echter Widerspruch bleibt unentdeckt; beide Erinnerungen bleiben bestehen, und eine spätere explizite Korrektur behebt es trotzdem). Eine fehlerhafte LLM-Klassifikation von `refine` als `contradict` ist ein falsch-positives Ergebnis, das stillschweigend eine Erinnerung löscht, die noch zutraf — und da Löschen-und-Ersetzen den Inhalt der gelöschten Erinnerung nicht in der Revisionshistorie bewahrt, ist dieser Verlust nicht trivial rückgängig zu machen. Die Prüfung ist konservativ formuliert (Temperatur 0, "nicht sicher → kein contradict") und ist deshalb standardmäßig deaktiviert; wer sie aktiviert, sollte diesen Kompromiss im Blick haben.
 
 **Stufenspezifische Deduplizierungsschwellenwerte:**
 
@@ -1091,6 +1445,10 @@ Der Basis-`similarity_threshold` (Standard 0.92) wird pro Stufe angepasst, da T0
 | `T2` | 0.98 | Basis (0.92) |
 | `T3` | 0.95 | max(Basis, 0.90) |
 
+**Kandidatenfenster und Korroboration:**
+
+Die Qdrant-Ähnlichkeitssuche ruft bereits die obersten 10 Kandidaten ab, aber standardmäßig prüft der Klassifikator für NOOP/DELETE/direktes UPDATE nur den einzigen nächsten. Wenn dieser nächste Kandidat *unter* dem UPDATE-Schwellenwert liegt, prüft die Pipeline zusätzlich, ob mehrere andere Kandidaten unabhängig voneinander nahe demselben Schwellenwert clustern — mehrere Beinahe-Wiederholungen derselben Tatsache sollten zu einer Erinnerung zusammengeführt werden, statt jeweils eine neue Variante per ADD anzulegen. Konkret: Liegen innerhalb der obersten `deduplication.candidate_window` Kandidaten (Standard 5, gedeckelt bei 10 — der bereits abgerufenen Obergrenze) mindestens `deduplication.corroboration_count` (Standard 2) mit einem Score ≥ `UPDATE-Schwellenwert − deduplication.corroboration_margin` (Standard 0.03), klassifiziert der Schreibvorgang `UPDATE` gegen den höchstbewerteten dieser Kandidaten statt `ADD`. Dies ist ausschließlich eine Einwegeskalation: Sie kann ein `ADD` in ein `UPDATE` verwandeln, ändert aber nie eine `NOOP`- oder `DELETE`-Entscheidung, und zielt immer auf den höchstbewerteten Kandidaten (keine neue Logik zur Konfliktlösung nötig). Mit `deduplication.corroboration_enabled: false` wird dieser Pfad vollständig deaktiviert und die Klassifikation vor der Erweiterung (nur einzelner Kandidat) wiederhergestellt; dies ist unabhängig von `deduplication.enabled`, das die semantische Deduplizierung insgesamt abschaltet. Wenn der Korroborationspfad greift, wird eine strukturierte `corroborated_dedup`-Warnung protokolliert (`targetId`, `topScore`, `corroborators`), damit Betreiber überwachen können, wie oft er auslöst, und Marge/Anzahl anpassen können.
+
 **UPDATE-Zusammenführungsverhalten:**
 - Tags werden vereinigt (vorhandene Tags ∪ neue Tags)
 - Inhalt wird durch die neue Version ersetzt
@@ -1099,6 +1457,119 @@ Der Basis-`similarity_threshold` (Standard 0.92) wird pro Stufe angepasst, da T0
 
 **Fallback-Verhalten:**
 Wenn der Einbettungsanbieter nicht verfügbar ist und `pipeline.fallback_to_threshold_dedup: true`, wechselt die Pipeline auf einen vektorlosen Dedup-Pfad, statt den Schreibvorgang fehlschlagen zu lassen. Exakte Prüfsummen-Treffer führen weiterhin sofort zu `NOOP` wie in Phase 1. Für alles andere nutzt die Pipeline die SQLite-Volltextsuche über denselben Namensraum/dieselbe Sammlung, um die ähnlichste vorhandene Erinnerung zu finden, und bewertet sie mit einer deterministischen Wortüberlappungs-Ähnlichkeit (nicht dem Vektor-Kosinuswert); bei Erreichen oder Überschreiten des `UPDATE`-Schwellenwerts wird der Inhalt in diese Erinnerung zusammengeführt (`UPDATE`, mit `vector_synced: false`), andernfalls wird er als neue Erinnerung nur in SQLite geschrieben (`ADD`, `vector_synced: false`). In beiden Fällen ist die Erinnerung für die Volltextsuche verfügbar, aber nicht für die semantische Suche, bis die Qdrant-Synchronisation wiederhergestellt ist, und das Erreichen dieses Pfads protokolliert eine strukturierte `degraded_write`-Warnung.
+
+---
+
+### Automatisches Taggen
+
+Die meisten Schreibvorgänge tragen keine aufruferseitigen Tags, wodurch der
+`tags`-Filter bei `recall`/`search` und die 2×-Gewichtung von Tag-Treffern bei der
+Volltextsuche ins Leere laufen. Wenn `pipeline.auto_tag_enabled` `true` ist
+(Standard), führt die Schreibpipeline einen deterministischen, abhängigkeitsfreien
+Extraktor über den normalisierten Inhalt jedes Kandidaten aus — kein LLM-Aufruf, kein
+Netzwerkzugriff — und vereinigt die Ergebnisse mit etwaigen aufruferseitigen Tags.
+Die Extraktion erfolgt vor der Dedup-Klassifizierung und ändert daher nie, ob ein
+Schreibvorgang als `ADD`/`UPDATE`/`DELETE`/`NOOP` eingestuft wird.
+
+**Extraktionskategorien** (in Prioritätsreihenfolge — höher priorisierte Kategorien
+bleiben erhalten, falls die kombinierte Tag-Menge gekürzt werden muss):
+
+1. **Code-artige Tokens** — Markdown-Inline-Code-Spans (`` `useEffect` ``) sowie
+   camelCase-/PascalCase-/`snake_case`-/gepunktete Bezeichner (`extractionEnabled`,
+   `search.ranking.enabled`), mit einer Mindestlänge von 5 Zeichen, um kurze
+   zufällige Treffer auszuschließen.
+2. **Dateipfade** — durch Schrägstriche getrennte Pfade mit erkannter Endung
+   (`src/pipeline/index.ts`) sowie eine feste Menge bekannter Dateinamen
+   (`package.json`, `README.md`, `Dockerfile`, ...), die auch ohne Verzeichnisangabe
+   erkannt werden.
+3. **Repo-Kurzformen** — zweiteilige `owner/repo`-artige Tokens, deren letztes
+   Segment keine erkannte Dateiendung trägt (`bhgbrain/core`); trägt das letzte
+   Segment eine Endung, wird der Token stattdessen als Dateipfad eingestuft.
+4. **@-Erwähnungen** — `@handle`-artige Tokens, denen kein Wortzeichen unmittelbar
+   vorausgeht, unter Ausschluss von E-Mail-Adressen (`jsmith@example.com` erzeugt
+   keinen Erwähnungs-Tag).
+
+**Slugifizierung:** Jeder erkannte Token wird so normalisiert, dass er unverändert
+dem `TagSchema` (`^[a-zA-Z0-9-]+$`, max. 100 Zeichen) genügt — kleingeschrieben, ein
+führendes `@` wird auf das Präfix `at-` abgebildet (sodass `@jsmith` zu `at-jsmith`
+wird, statt mit einem einfachen Wort-Tag zu kollidieren), jede Folge anderer Zeichen
+wird zu einem einzelnen `-` zusammengefasst, führende/nachgestellte `-` werden
+entfernt und auf 100 Zeichen gekürzt. Kandidaten, die nach der Slugifizierung kürzer
+als 2 Zeichen sind, werden verworfen. Beispiele: `src/pipeline/index.ts` →
+`src-pipeline-index-ts`, `bhgbrain/core` → `bhgbrain-core`, `` `useEffect` `` →
+`useeffect`.
+
+**Zusammenführung und Obergrenzen:** Automatisch abgeleitete Tags werden dedupliziert
+und mit aufruferseitigen Tags vereinigt (`aufruferseitige Tags ∪ automatische Tags`,
+aufruferseitige Tags stehen immer zuerst), dann auf die bestehende Obergrenze von 20
+Tags pro Erinnerung gekürzt — beim Kürzen werden immer zuerst automatisch abgeleitete
+Tags entfernt, nie ein aufruferseitiger. Bei `UPDATE` fließen automatisch abgeleitete
+Tags genau wie jeder andere Kandidaten-Tag in die bestehende Tag-Zusammenführung ein.
+
+| Konfigurationsfeld | Standard | Bedeutung |
+|---|---|---|
+| `pipeline.auto_tag_enabled` | `true` | Abschalter. `false` stellt exakt das Verhalten vor dieser Funktion wieder her: Die Kandidaten-Tags entsprechen genau der aufruferseitigen `tags`-Eingabe. |
+| `pipeline.auto_tag_max_per_memory` | `6` | Obergrenze für automatisch abgeleitete Tags pro Erinnerung, angewendet vor der Zusammenführung mit aufruferseitigen Tags. |
+
+Keine Schema- oder Speicheränderungen: Automatisch abgeleitete Tags werden als
+gewöhnliche Einträge im `tags`-Array gespeichert — dieselbe Spalte, dieselbe
+2×-Volltextgewichtung, derselbe `tags`-Filter-Pushdown bei `recall`/`search`.
+`import` und `remember` laufen beide über dieselbe Schreibpipeline und profitieren
+daher ohne separate Verdrahtung.
+
+**Bekannte Ungenauigkeit:** Die musterbasierte Extraktion taggt gelegentlich
+gewöhnlichen großgeschriebenen Fließtext oder Markennamen, die zufällig
+camelCase-/PascalCase-artig geformt sind (z. B. `GitHub` → `github`) — dies wird als
+inhärente Eigenschaft eines deterministischen v1-Extraktors akzeptiert, nicht als
+semantisches Verständnis; nutzen Sie die `remove`-Aktion des `tag`-Tools, um
+Ausreißer zu korrigieren, oder setzen Sie `pipeline.auto_tag_enabled: false`, um die
+Extraktion vollständig zu deaktivieren.
+
+---
+
+### Inhaltsherkunft
+
+Die Felder `origin`/`confidence` von `remember` erlauben es, festzuhalten, *woher der
+Inhalt einer Erinnerung stammt* und *wie sehr ihm vertraut werden soll* — zu
+unterscheiden von `embedding_model` (siehe [Migration des
+Einbettungsmodells](#migration-des-einbettungsmodells)), das festhält, welches
+Einbettungsmodell den *Vektor* erzeugt hat, nicht woher die Aussage stammt.
+
+- **`origin`** (`{ session_id?, tool?, repo?, branch? }`, alle Felder optionale
+  Freitext-Strings) identifiziert die Sitzung/das Tool/das Repository/den Branch, aus
+  dem eine Erinnerung stammt. `null`, wenn der Aufrufer nichts angibt — der
+  Normalfall, und immer der Fall bei Erinnerungen, die vor Einführung dieses Feldes
+  geschrieben wurden. Wird nicht automatisch aus dem MCP-Transport abgeleitet: es
+  gibt keine standardisierte Sitzungs-/Tool-Identität über Clients hinweg (Claude
+  CLI, Codex, Gemini, ...), daher ist dies ausschließlich vom Aufrufer anzugeben.
+- **`confidence`** (`number`, `[0, 1]`) gibt an, wie sehr dem Inhalt einer Erinnerung
+  vertraut werden soll. Lässt ein `remember`-Aufruf dies weg, wird der Standardwert
+  pro `source` aus `pipeline.default_confidence` verwendet (Konfiguration, Standard
+  `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`) — eine explizite Nutzeraussage erhält
+  standardmäßig volles Vertrauen, eine Schlussfolgerung eines Agenten standardmäßig
+  weniger. Bei einem Dedup-`UPDATE` wird `confidence` über `max(bestehend, neu)`
+  zusammengeführt (eine erneute Bestätigung senkt das Vertrauen nie, dieselbe Regel
+  wie bei `importance`); `origin` wird nur ersetzt, wenn der eingehende Aufruf eine
+  Herkunft angibt, andernfalls bleibt die bestehende Herkunft erhalten.
+
+Beide Felder werden auf jedem Lesepfad zurückgegeben, der bereits Erinnerungsdatensätze
+liefert — `recall`, `search`, `memory://{id}`, `memory://list` — kein neues Tool, keine
+neue Ressource. Beispiel für einen `remember`-Aufruf:
+
+```json
+{
+  "content": "The user said the deploy window is Tuesdays 2-4pm UTC.",
+  "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+  "confidence": 1.0
+}
+```
+
+| Konfigurationsfeld | Standard | Bedeutung |
+|---|---|---|
+| `pipeline.default_confidence.cli` | `1.0` | Standard-`confidence` für `source: "cli"`-Schreibvorgänge ohne Angabe. |
+| `pipeline.default_confidence.api` | `1.0` | Standard-`confidence` für `source: "api"`-Schreibvorgänge ohne Angabe. |
+| `pipeline.default_confidence.agent` | `0.7` | Standard-`confidence` für `source: "agent"`-Schreibvorgänge ohne Angabe. |
+| `pipeline.default_confidence.import` | `0.5` | Standard-`confidence` für `source: "import"`-Schreibvorgänge ohne Angabe. |
 
 ---
 
@@ -1215,7 +1686,7 @@ Der Server führt einen geplanten Bereinigungsauftrag aus (Standard: täglich um
 
 1. **Abgelaufene Erinnerungen identifizieren:** SQLite nach allen Erinnerungen abfragen, bei denen `decay_eligible = true` UND `expires_at < now()`. Nur `T2`/`T3` sind für direktes Archivieren-und-Löschen berechtigt:
    - `T0` ist immer ausgeschlossen (T0 ist nie verfallsberechtigt).
-   - `T1` wird nie direkt gelöscht. Abgelaufene oder `review_due`-überfällige `T1`-Erinnerungen werden stattdessen im GC-Ergebnis als **Review-Kandidaten** ausgewiesen, damit ein Operator entscheiden kann, ob sie befördert, neu gespeichert oder manuell gelöscht werden.
+   - `T1` wird nie direkt gelöscht. Abgelaufene oder `review_due`-überfällige `T1`-Erinnerungen werden stattdessen im GC-Ergebnis als **Review-Kandidaten** ausgewiesen, damit ein Operator entscheiden kann, ob sie befördert, neu gespeichert oder manuell gelöscht werden — oder sie über MCP mit dem Tool `review` (`action: "list"` / `"keep"` / `"archive"`; siehe [MCP-Tools-Referenz](#mcp-tools-referenz)) auflisten und disponieren.
 
 2. **Vor dem Löschen archivieren (wenn aktiviert):** Für jeden `T2`/`T3`-Kandidaten wird ein Zusammenfassungsdatensatz in die Tabelle `memory_archive` geschrieben und ein eigenständiges `ARCHIVE`-Audit-Ereignis protokolliert:
 
@@ -1266,6 +1737,8 @@ memory_revisions {
 
 Nur T0-Erinnerungen haben einen Revisionsverlauf. Die Vektoreinbettung in Qdrant spiegelt immer nur den aktuellen Inhalt wider.
 
+Der Revisionsverlauf ist über das Tool `revisions` (`action: "list"`) oder die Ressource `memory://{id}/revisions` lesbar, neueste zuerst. `revisions` (`action: "revert"`) stellt den Inhalt einer Erinnerung auf eine gewählte vorherige Revision zurück — mit erneutem Embedding, erneutem Upsert des Vektors und dem Anhängen (nicht Überschreiben) des Reverts selbst als neuer Verlaufseintrag — und protokolliert ein `REVISE`-Audit-Ereignis mit der Quellrevision. Siehe [MCP-Tools-Referenz](#mcp-tools-referenz) und [MCP-Ressourcen](#mcp-ressourcen).
+
 #### Stale-Markierung (Konsolidierungsdurchgang)
 
 Der Befehl `bhgbrain gc --consolidate` (oder `RetentionService.runConsolidation()`) führt einen sekundären Durchgang durch, der Erinnerungen als **Stale**-Kandidaten markiert:
@@ -1276,7 +1749,7 @@ Der Befehl `bhgbrain gc --consolidate` (oder `RetentionService.runConsolidation(
 
 #### Archivsuche und Wiederherstellung
 
-Gelöschte Erinnerungen (wenn `archive_before_delete: true`) können eingesehen und wiederhergestellt werden:
+Gelöschte Erinnerungen (wenn `archive_before_delete: true`) können über die CLI eingesehen und wiederhergestellt werden:
 
 ```bash
 bhgbrain archive list                 # Kürzlich archivierte Erinnerungen auflisten
@@ -1284,7 +1757,81 @@ bhgbrain archive search <query>       # Archiv per Text durchsuchen
 bhgbrain archive restore <memory_id>  # Eine archivierte Erinnerung wiederherstellen
 ```
 
-**Wiederherstellungssemantik:** Eine wiederhergestellte Erinnerung wird als **neue** `T2`-Erinnerung aus dem archivierten Zusammenfassungstext neu erstellt. Der ursprüngliche Inhalt (wenn er länger als die Zusammenfassung war) kann nicht wiederhergestellt werden – das Archiv speichert nur die 120-Zeichen-Zusammenfassung. Die wiederhergestellte Erinnerung erhält neue Zeitstempel und eine neue UUID und wird in Qdrant neu eingebettet.
+**Wiederherstellungssemantik:** Eine wiederhergestellte Erinnerung wird als **neue** Erinnerung (auf ihrer ursprünglichen Stufe) aus dem archivierten Zusammenfassungstext neu erstellt. Der ursprüngliche Inhalt (wenn er länger als die Zusammenfassung war) kann nicht wiederhergestellt werden – das Archiv speichert nur die 120-Zeichen-Zusammenfassung. Die wiederhergestellte Erinnerung erhält neue Zeitstempel und eine neue UUID und wird in Qdrant neu eingebettet. Das CLI-`archive restore` löscht zusätzlich die Archivzeile nach der Wiederherstellung.
+
+MCP-Clients haben einen entsprechenden Pfad: Der Parameter `include_archived` des `search`-Tools findet archivierte Erinnerungen per Zusammenfassungs-/Tag-Textabgleich (markiert mit `archived: true`, nie als Zugriff protokolliert), und die `restore`-Aktion des `review`-Tools erstellt eine aktive Erinnerung aus einem Archiveintrag neu — markiert mit `restored-from-archive`, wobei die Archivzeile (anders als beim CLI-Pfad) **beibehalten** wird, sodass ihr Ursprung nachvollziehbar bleibt. Siehe [MCP-Tools-Referenz](#mcp-tools-referenz).
+
+---
+
+### Gedächtnis-Destillation
+
+<a id="gedächtnis-destillation"></a>
+
+Ein geplanter "Schlaf"-Auftrag, der Cluster verwandter, noch aktiver `T2`/`T3`-
+`episodischer` Erinnerungen in eine einzige dauerhafte `T1`-`semantische` Erinnerung
+verwandelt — z. B. werden fünf einzelne Erinnerungen wie "per GitHub Actions
+deployt", "CI auf Actions umgestellt", "Actions-Runner auf node20 festgelegt" zu
+einer Erinnerung: "wir deployen per GitHub Actions." **Standardmäßig deaktiviert**
+(`retention.distillation.enabled: false`) — dies ist die einzige BHGBrain-Funktion,
+die einen ausgehenden LLM-Aufruf tätigt, und das Archivieren der Quellen verliert
+deren vollständigen Inhalt unwiderruflich, daher erfordert sie bewusstes Opt-in.
+
+**Aktivierung:**
+
+1. `retention.distillation.enabled: true` in `config.json` setzen.
+2. Einen Extraktions-API-Schlüssel bereitstellen: `pipeline.extraction_model_env`
+   (Standard `BHGBRAIN_EXTRACTION_API_KEY`) muss auf eine gesetzte
+   Umgebungsvariable verweisen — keine neue Umgebungsvariable wird eingeführt;
+   die Destillation nutzt denselben bereits für `pipeline.extraction_enabled` und
+   `search.rerank` dokumentierten Schlüssel.
+
+**Funktionsweise (bei jedem geplanten Lauf oder `bhgbrain distill`):**
+
+1. **Clustern:** Für jeden Namensraum/jede Sammlung mit `T2`/`T3`-`episodischen`
+   Erinnerungen werden deren Vektoren aus Qdrant geladen und Erinnerungen mit
+   Cosinus-Ähnlichkeit `≥ retention.distillation.similarity_threshold` (Standard
+   `0.85`) per Greedy-Union-Find zu zusammenhängenden Komponenten vereinigt.
+   Cluster kleiner als `min_cluster_size` (Standard `3`) bleiben unangetastet;
+   Cluster größer als `max_cluster_size` (Standard `20`) werden in Blöcke dieser
+   Größe aufgeteilt. Höchstens `max_clusters_per_run` (Standard `10`) Cluster —
+   die größten zuerst — werden pro Lauf verarbeitet.
+2. **Destillieren:** Für jeden qualifizierenden Cluster werden die Inhalte seiner
+   Mitglieder (älteste zuerst) in einem einzigen Chat-Completion-Aufruf an das
+   konfigurierte `pipeline.extraction_model` gesendet, mit der Bitte um eine
+   einzige konsolidierte Tatsache. Bei widersprüchlichen Quellen bittet der
+   Prompt das Modell, die zuletzt aktualisierte zu bevorzugen — eine
+   Abmilderung, keine Entailment-basierte Widerspruchserkennung. Ein Cluster
+   wird **übersprungen** (nie ein harter Fehlschlag des Auftrags), wenn kein
+   API-Schlüssel konfiguriert ist oder der LLM-Aufruf fehlschlägt; Übersprünge
+   werden nach Grund gezählt (`no_key` / `llm_error`).
+3. **Schreiben:** Die konsolidierte Tatsache wird über dieselbe `remember`-
+   Schreib-Pipeline geschrieben, die jede andere Erinnerung durchläuft —
+   Prüfsummen-Deduplizierung, Einbettung, Audit-Protokollierung — mit
+   `source: "distillation"`, `type: "semantic"`, `retention_tier: "T1"` und
+   `derived_from`, gesetzt auf die Quell-IDs des Clusters. Ein Cluster, der sich
+   nach einem vorherigen Destillationslauf erneut bildet, **aktualisiert** die
+   frühere destillierte Erinnerung (über den normalen Dedup-Pfad), statt ein
+   Duplikat zu erzeugen.
+4. **Quellen archivieren:** Erst nachdem die destillierte Erinnerung nachweislich
+   dauerhaft geschrieben wurde, werden die Quellerinnerungen des Clusters über
+   denselben `memory_archive`-Pfad wie GC archiviert und gelöscht, mit einem
+   eigenen `DISTILL`-Audit-Eintrag (`action: "distill"`), der sowohl auf die neue
+   Erinnerungs-ID als auch auf die archivierten Quell-IDs verweist. Schlägt das
+   Archivieren/Löschen nach einem erfolgreichen destillierten Schreibvorgang
+   fehl, wird dieser **nicht** zurückgerollt — die Quellen bleiben aktiv und der
+   Lauf wird als degradiert gemeldet (eine weiterhin aktive Quelle ist
+   unbedenklich: ein späterer Lauf kann sie erneut clustern, und der Dedup-Pfad
+   aktualisiert statt zu duplizieren).
+
+```bash
+bhgbrain distill                      # Destillation ausführen
+bhgbrain distill --dry-run            # Kandidaten-Cluster (IDs + Zusammenfassungen) anzeigen, ohne LLM aufzurufen oder zu schreiben/archivieren
+```
+
+Das Feld `retention.distillation` von `health://status` meldet `last_run_at`,
+`last_run_degraded` sowie kumulative `distilled_total`-/`skipped_total`-Zähler, und
+die `bhgbrain_distill_*`-Zähler/-Histogramme folgen derselben Namenskonvention wie
+`bhgbrain_gc_*` (siehe [Gesundheitszustand & Metriken](#gesundheitszustand--metriken)).
 
 ---
 
@@ -1363,15 +1910,17 @@ Die semantische Suche verwendet OpenAI-Einbettungen und Qdrant-Vektorähnlichkei
 
 ### Volltextsuche
 
-Die Volltextsuche verwendet SQLites interne Textübereinstimmung, um Erinnerungen zu finden, die bestimmte Wörter oder Phrasen enthalten.
+Die Volltextsuche verwendet einen echten SQLite-FTS5-Index, um Erinnerungen zu finden, die bestimmte Wörter oder Phrasen enthalten, mit englischem Stemming und BM25-Relevanzranking.
 
 **Funktionsweise:**
 1. Die Abfrage wird in Kleinbuchstaben-Terme aufgeteilt.
-2. Jeder Term wird gegen die Schattentabelle `memories_fts` mit `LIKE %term%` auf den Spalten `content`, `summary` und `tags` abgeglichen.
-3. Ergebnisse werden nach der Anzahl übereinstimmender Terme sortiert (mehr Übereinstimmungen = höherer Rang).
-4. Der Rang wird auf einen Score von 0.0–1.0 normalisiert: `min(1.0, Termanzahl / 10)`.
+2. Jeder Term wird als literale Phrase gegen die FTS5-Tabelle `memories_fts` (Spalten `content`/`summary`/`tags`, Tokenizer `porter unicode61`) abgeglichen und mit `AND` verknüpft – jeder Term muss übereinstimmen, und FTS5-Syntax innerhalb eines Terms (`NEAR`, `*`, Klammern, `AND`/`OR`, Spaltenfilter) wird als reglose Literaltext behandelt statt als Operator interpretiert.
+3. Der `porter`-Tokenizer wendet Stemming sowohl auf den Index als auch auf die Abfrage an, sodass ein Abfrageterm andere Flexionsformen desselben Wortes trifft (z. B. passt "runs" auf "running"; "deploy" auf "deployed") – nicht nur exakte Teilstrings.
+4. Ergebnisse werden mit `bm25()` gerankt, wobei Treffer in `summary` und `tags` 2x höher gewichtet werden als Treffer in `content` (entspricht der Gewichtung vor FTS5).
 5. Archivierte Erinnerungen sind ausgeschlossen (die FTS-Tabelle wird mit der Haupterinnerungstabelle synchron gehalten – archivierte Zeilen werden aus FTS entfernt).
 6. Zugriffsmetadaten werden für zurückgegebene Ergebnisse aktualisiert.
+
+**Fallback:** Wenn der laufende SQLite-Build kein `fts5`-Modul kompiliert hat (per Startup-Fähigkeitsprüfung verifiziert, nicht angenommen), fällt die Volltextsuche auf einen alten `LIKE '%term%'`-Matcher mit handgestricktem Termhäufigkeits-Rang zurück, statt einen Fehler zu werfen. Das ist sichtbar, nicht still: Die `sqlite`-Komponente von `health://status` trägt eine `message`, und beim Start wird einmalig eine `fts5_unavailable`-Warnung geloggt. Siehe [Health-Endpunkt](#health-endpunkt).
 
 **Wann zu verwenden:** Exakte Schlüsselwortsuchen, Suche nach spezifischen Bezeichnern (Speicher-IDs, Projektnamen, Systemnamen), wenn Sie die genaue verwendete Terminologie kennen.
 
@@ -1401,14 +1950,14 @@ flowchart TD
     end
 
     subgraph Fulltext["Fulltext Search"]
-        P2["Tokenize Query"] --> FTS["SQLite FTS<br/>LIKE matching"]
-        FTS --> FR["Ranked Results<br/><i>by term count</i>"]
+        P2["Tokenize Query"] --> FTS["SQLite FTS5<br/>MATCH + porter stemming"]
+        FTS --> FR["Ranked Results<br/><i>by BM25</i>"]
     end
 
     SR --> RRF["RRF Fusion<br/><i>semantic: 0.7 / fulltext: 0.3</i>"]
     FR --> RRF
-    RRF --> BOOST["T0 Score Boost<br/><i>+0.1 for foundational</i>"]
-    BOOST --> TOP["Return Top N Results"]
+    RRF --> RANK["Composite Ranking<br/><i>relevance x importance/access/decay prior</i>"]
+    RANK --> TOP["Return Top N Results"]
     TOP --> TRACK["Update Access Tracking<br/><i>count++, sliding window reset</i>"]
 
     classDef search fill:#4a90d9,stroke:#2c5f8a,color:#fff
@@ -1416,7 +1965,7 @@ flowchart TD
     classDef result fill:#5ba85b,stroke:#3d7a3d,color:#fff
 
     class P1,QD,SR,P2,FTS,FR search
-    class RRF,BOOST fusion
+    class RRF,RANK fusion
     class TOP,TRACK result
 ```
 
@@ -1436,7 +1985,7 @@ Die Hybridsuche kombiniert semantische und Volltextergebnisse mit **Reciprocal R
 
 4. Elemente, die nur in einer Liste erscheinen, erhalten `0` Beitrag von der anderen.
 5. Die zusammengeführte Liste wird nach RRF-Score (absteigend) sortiert.
-6. T0-Erinnerungen erhalten nach der RRF-Fusion einen **+0.1 Score-Bonus**, um sicherzustellen, dass grundlegendes Wissen prominent angezeigt wird.
+6. **Composite Ranking** (siehe unten) wird auf die Ergebnisse jedes Modus angewendet, einschließlich dieses RRF-Scores, und die Liste wird nach dem Composite-Score neu sortiert.
 7. Die Top-`limit`-Ergebnisse werden zurückgegeben.
 
 **Graceful Degradation:** Wenn der Einbettungsanbieter nicht verfügbar ist, fällt die Hybridsuche stillschweigend auf nur-Volltext-Ergebnisse zurück, anstatt einen Fehler zu melden.
@@ -1452,6 +2001,125 @@ Die Hybridsuche kombiniert semantische und Volltextergebnisse mit **Reciprocal R
   "limit": 10
 }
 ```
+
+---
+
+### Composite Ranking
+
+Jeder Suchmodus (`semantic`, `fulltext`, `hybrid`) sortiert seine Ergebnisse nach einem Composite-Score statt nach reiner Relevanz. Die Relevanz (Kosinus-Ähnlichkeit, FTS-Rang oder RRF-Score, je nach Modus) wird mit einem **Prior** multipliziert, der aus Signalen abgeleitet wird, die jede Erinnerung bereits trägt – `importance`, `access_count` und wie kürzlich sie aktualisiert wurde –, sodass eine oft bestätigte, als wichtig markierte oder kürzlich bearbeitete Erinnerung ein gleich relevantes, aber veraltetes Duplikat übertrifft.
+
+```
+final_score = relevance x (w_base + w_importance x importance + w_access x log1p(access_count) / log1p(access_norm))
+                        x exp(-decay_per_day[tier] x age_days)
+```
+
+- `w_base` ist fest auf `1.0` gesetzt und nicht konfigurierbar.
+- `age_days` wird ab `updated_at` gemessen, sodass ein `UPDATE` das effektive Alter einer Erinnerung zurücksetzt – eine gerade bearbeitete Erinnerung ist wieder "jung".
+- `T0`-Erinnerungen haben standardmäßig einen `decay_per_day` von `0` und verfallen daher nie, was grundlegendem Wissen einen dauerhaften Vorteil verschafft (dies ersetzt den alten pauschalen `+0.1` T0-Bonus).
+- Die Zugriffshäufigkeit wird log-gedämpft (`log1p`), sodass wenige zusätzliche Abrufe die Reihenfolge nicht dominieren können, und durch `access_norm` (Standard `50`) normalisiert, damit der Zugriffsterm größenordnungsmäßig mit dem Wichtigkeitsterm vergleichbar bleibt.
+
+**Konfiguration** (`search.ranking` in `config.json`, siehe [Konfiguration](#konfiguration)):
+
+| Feld | Standard | Bedeutung |
+|---|---|---|
+| `enabled` | `true` | Auf `false` setzen, um Composite Ranking vollständig zu deaktivieren und die reine Relevanz-Reihenfolge wiederherzustellen. |
+| `w_importance` | `0.3` | Gewichtung der `importance` (0–1) einer Erinnerung. |
+| `w_access` | `0.2` | Gewichtung der log-gedämpften Zugriffsanzahl. |
+| `access_norm` | `50` | Normalisiert den Zugriffsanzahl-Term; größere Werte erfordern mehr Zugriffe für denselben Bonus. |
+| `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Pro-Stufe exponentieller Decay-Satz auf `age_days`. Der Standard für `T2` ergibt eine Halbwertszeit von etwa 87 Tagen, passend zur 90-Tage-TTL. |
+
+**Was Composite Ranking *nicht* beeinflusst:** die rohen Felder `semantic_score` und `fulltext_score` jedes Ergebnisses sowie das Feld, auf das der `min_score`-Schwellenwert von `recall` angewendet wird (`semantic_score`) – siehe [Recall vs. Search](#recall-vs-search--unterschiede). Composite Ranking ändert die *Reihenfolge* der Ergebnisse, niemals, welche Erinnerungen die `min_score`-Schwelle passieren.
+
+---
+
+### Rerank
+
+`recall` unterstützt eine optionale Stufe, die den Kandidaten-Pool vor der `min_score`-Filterung und dem Abschneiden auf `limit` mit einer LLM-Relevanzbewertung neu bewertet. Composite Ranking und MMR (oben) leiten ihre Reihenfolge vollständig aus dem Query-Embedding ab – ein grober Proxy, der das Feld zuverlässig auf ein plausibles Top-20 eingrenzt, dieses Top-20 aber häufig falsch ordnet. Reranking investiert einen zusätzlichen LLM-Aufruf pro `recall`, um Anfrage und den *Text* jedes Kandidaten gemeinsam zu bewerten – auf Kosten zusätzlicher Latenz.
+
+**Standardmäßig deaktiviert.** Standardinstallationen führen den zusätzlichen Aufruf nie aus – `recall` bleibt bytegenau unverändert, bis `search.rerank.enabled: true` gesetzt wird.
+
+**Reihenfolge der Ranking-Pipeline:** Relevanz → Composite-Prior → MMR-Diversitäts-Neuordnung → **Rerank** (nur `recall`) → `min_score`-Filterung und Abschneiden auf `limit`.
+
+**Funktionsweise:**
+1. Bei Aktivierung erweitert `recall` seinen abgerufenen Kandidaten-Pool auf mindestens `search.rerank.candidate_pool`.
+2. Die obersten `candidate_pool`-Kandidaten (nach Score vor dem Rerank) werden zusammen mit dem Anfragetext in einem einzigen gebündelten Aufruf an das konfigurierte LLM gesendet.
+3. Das LLM liefert pro Kandidat eine Relevanzbewertung im Bereich `[0, 1]`. Der `score` jedes erfolgreich bewerteten Kandidaten wird durch die geclampte Bewertung ersetzt (der Rohwert wird zusätzlich als `rerank_score` im Ergebnis bereitgestellt), und die gesamte Liste wird nach dem neuen `score` neu sortiert.
+4. Jeder Kandidat, den die Antwort auslässt oder der nicht geparst werden kann, behält seinen Score von vor dem Rerank, statt verworfen zu werden.
+5. `min_score` und `limit` werden anschließend genau wie zuvor angewendet – `min_score` ist auf `semantic_score` kalibriert, das Reranking nie verändert, sodass Filterung und Ergebniszugehörigkeit unabhängig davon sind, ob Reranking gelaufen ist.
+
+**Fehler führen immer zu einem sanften Rückfall:** Ein Fehler des Providers, ein Timeout oder eine fehlerhafte Antwort fällt auf die Reihenfolge vor dem Rerank zurück – `recall` schlägt nie fehl, weil das Reranking fehlgeschlagen ist. Der Rückfall ist über den Metrik-Zähler `search_rerank_degraded` und ein strukturiertes `rerank_degraded`-Warn-Log beobachtbar.
+
+**Nur auf `recall` beschränkt:** `search` sowie `memory://inject`/`memory://inject/{hint}` sind von der `search.rerank`-Konfiguration in diesem Release nicht betroffen.
+
+**Konfiguration** (`search.rerank` in `config.json`, siehe [Konfiguration](#konfiguration)):
+
+| Feld | Standard | Bedeutung |
+|---|---|---|
+| `enabled` | `false` | Auf `true` setzen, um die Rerank-Stufe für `recall` zu aktivieren. |
+| `provider` | `"openai"` | Rerank-Provider. Aktuell der einzige unterstützte Wert. |
+| `candidate_pool` | `20` | Wie viele der (bereits gerankten) Kandidaten von `recall` pro Aufruf an das LLM gesendet werden, `1`-`50`. |
+| `model` | `"gpt-4o-mini"` | Für die Bewertung verwendetes Chat-Completions-Modell. |
+| `model_env` | `"BHGBRAIN_RERANK_API_KEY"` | Name der Umgebungsvariable mit dem API-Schlüssel. **Kein Fallback** auf `OPENAI_API_KEY` – siehe [Umgebungsvariablen](#umgebungsvariablen). |
+| `timeout_ms` | `3000` | Anfrage-Timeout; ein Timeout fällt wie jeder andere Fehler auf die Reihenfolge vor dem Rerank zurück. |
+
+**Unabhängig von der Extraktions-Pipeline:** Reranking löst sein eigenes `search.rerank.model`/`model_env` auf und liest nie `pipeline.extraction_model`/`extraction_model_env` – es funktioniert unabhängig davon, ob `pipeline.extraction_enabled` gesetzt ist.
+
+---
+
+### MMR-Diversitäts-Neuordnung
+
+`recall` und `search` (in den Modi `semantic` und `hybrid`) wenden nach dem Composite Ranking einen weiteren Neuordnungsschritt an: **Maximal Marginal Relevance (MMR)**. Composite Ranking allein kann weiterhin ein Top-K liefern, das von mehreren nahezu identischen Erinnerungen dominiert wird – zwei Fakten mit einer Kosinus-Ähnlichkeit von 0,85 etwa überstehen beide die Schreibzeit-Deduplizierung (die nur ≥ 0,92 zusammenführt) und landen beide gemeinsam nahe der Spitze. MMR tauscht einen konfigurierbaren Anteil der Top-Relevanz gegen Diversität, sodass die zurückgegebene Seite ihre Plätze auf *unterschiedliche* Fakten verteilt.
+
+**Reihenfolge der Ranking-Pipeline:** Relevanz (Kosinus / FTS-Rang / RRF) → Composite-Prior (Wichtigkeit/Zugriff/Decay) → **MMR-Diversitäts-Neuordnung** → nachgelagerte `min_score`-/Typ-/Tag-Filterung und Kürzung auf das `limit` des Aufrufers.
+
+**Funktionsweise:**
+1. `recall`/`search` holen einen größeren Kandidatenpool als `limit`, damit tatsächlich Spielraum zur Diversifizierung besteht.
+2. Der Composite-Score jedes Kandidaten wird über den abgerufenen Pool min-max-normalisiert, sodass `lambda` unabhängig davon dasselbe bedeutet, ob die Pool-Scores kosinus-skaliert (semantischer Modus) oder RRF-skaliert sind (hybrider Modus, typischerweise um zwei Größenordnungen kleiner).
+3. Ausgehend vom höchstbewerteten Kandidaten wählt MMR gierig den nächsten Kandidaten, der `lambda * normalisierte_relevanz - (1 - lambda) * max_ähnlichkeit_zu_bereits_ausgewählten` maximiert, wobei Ähnlichkeit die Kosinus-Ähnlichkeit zu jedem bereits ausgewählten Kandidaten mit Vektor ist.
+4. Dies ist eine **Neuordnung des gesamten Pools, niemals eine Kürzung** – jeder abgerufene Kandidat ist danach noch vorhanden, nur neu angeordnet. `min_score`, Typ-/Tag-Filterung und die Kürzung auf `limit` laufen alle nachgelagert ab, mechanisch unverändert, sodass eine `min_score`-Schwelle niemals zu wenige Ergebnisse liefern kann, nur weil MMR zuvor gelaufen ist.
+5. Kandidaten ohne Vektor (z. B. ein reiner Volltext-Treffer im hybriden Modus) werden nie bestraft und können andere nie bestrafen – sie tragen mit Ähnlichkeit `0` bei.
+
+**Der Volltextmodus ist nicht betroffen:** `mode: 'fulltext'` führt keine Vektoren, gegen die diversifiziert werden könnte, daher läuft MMR nie, unabhängig von `search.mmr.enabled`.
+
+**Konfiguration** (`search.mmr` in `config.json`, siehe [Konfiguration](#konfiguration)):
+
+| Feld | Standard | Bedeutung |
+|---|---|---|
+| `enabled` | `true` | Auf `false` setzen, um MMR vollständig zu deaktivieren und exakt die reine Composite-Relevanz-Reihenfolge wiederherzustellen. |
+| `lambda` | `0.7` | Abwägung zwischen Relevanz und Diversität, `0`–`1`. Nahe `1` nähert sich der reinen Composite-Relevanz-Reihenfolge an; nahe `0` bevorzugt Unähnlichkeit zwischen Kandidaten gegenüber Relevanz. |
+| `candidate_pool_multiplier` | `3` | Erweitert den aus dem Store abgerufenen Pool auf `limit * candidate_pool_multiplier`, wenn MMR anwendbar ist, und schafft so echten Diversifizierungsspielraum über das `limit` des Aufrufers hinaus. |
+| `candidate_pool_cap` | `50` | Obergrenze für die Größe des erweiterten Pools, unabhängig von `limit * candidate_pool_multiplier`. |
+
+**Nicht dasselbe wie die Nahdublikat-Unterdrückung von `memory://inject/{hint}`:** Diese Resource-Vorlage (siehe [MCP-Ressourcen](#mcp-ressourcen)) verfügt bereits über einen eigenen, separaten Nahdublikat-Mechanismus – eine harte Schwellenwert-Verwerfung (die `deduplication.similarity_threshold`, Standard `0.92`, wiederverwendet) statt des kontinuierlichen Relevanz-/Diversitäts-Kompromisses von MMR. Beide sind absichtlich unabhängig: Die `search.mmr`-Konfiguration hat keine Auswirkung auf `memory://inject/{hint}` und umgekehrt.
+
+---
+
+### Multi-Query-Expansion
+
+`recall` und `search` (in den Modi `semantic` und `hybrid`) embedden und durchsuchen mehr als eine Repräsentation der Anfrage, nicht nur den wörtlichen String. Eine umgangssprachliche Anfrage wie "wie deployen wir" kann so weit von einer Erinnerung entfernt embeddet werden, die als "Deployment läuft über `docker-compose up -d`" formuliert ist, dass die Kosinus-Ähnlichkeit unter `min_score` fällt – obwohl die Erinnerung die Frage eindeutig beantwortet. Multi-Query-Expansion erweitert den für einen einzelnen Aufruf durchsuchten Kandidatenpool, sodass eine solche Erinnerung trotzdem auftaucht.
+
+**Reihenfolge der Ranking-Pipeline:** Query-Expansion (Varianten-Embed/-Suche + Merge) → Relevanz (Kosinus / FTS-Rang / RRF) → Composite-Prior → MMR-Diversitäts-Neuordnung → nachgelagerte `min_score`-/Typ-/Tag-Filterung und Kürzung auf das `limit` des Aufrufers. Query-Expansion verändert nur, welche Kandidaten in die Pipeline eintreten; jede nachfolgende Stufe bleibt im Mechanismus unverändert.
+
+**Zwei unabhängig aktivierbare Phasen:**
+
+1. **Stoppwort-bereinigte Variante (standardmäßig an, kein Modell).** Zusätzlich zur Originalanfrage wird eine deterministische Variante mit einer kleinen, festen Menge englischer Stoppwörter embeddet und durchsucht (z. B. "how do we deploy" → "deploy"), sofern sie sich vom Original unterscheidet und nicht leer ist. Eine reine Stoppwort-Anfrage ("is it") oder eine bereits nur aus Inhaltswörtern bestehende Anfrage ("deploy production") erzeugt keine zusätzliche Variante. Beide Embeddings laufen über einen gebündelten `embedBatch`-Aufruf, sodass diese Phase nur eine zusätzliche Qdrant-Anfrage kostet, nicht einen zusätzlichen Embedding-API-Aufruf.
+2. **LLM-Paraphrase / HyDE (standardmäßig aus, modellabhängig).** Wenn `search.query_expansion.llm_paraphrase.enabled` auf `true` steht *und* sich ein API-Schlüssel auflösen lässt (aus `pipeline.extraction_model_env`, mit Fallback auf `OPENAI_API_KEY`), erzeugt ein Chat-Completion-Aufruf 1–3 zusätzliche Varianten – entweder umformulierte Paraphrasen der Anfrage (`mode: "paraphrase"`, Standard) oder eine hypothetische Antwort-Passage, die stattdessen embeddet wird (`mode: "hyde"`). HyDE kann den Recall verbessern, riskiert aber, das Embedding in Richtung halluzinierter Details (Tool-Namen, Zahlen) zu ziehen, die in der Anfrage nie erwähnt wurden – daher ist es optional statt Standard. Jeder Fehlschlag – fehlender Schlüssel, Nicht-2xx-Antwort, Timeout – degradiert stillschweigend zu den Phase-1-Varianten; ein Suchaufruf schlägt nie fehl, nur weil die Paraphrasen-Generierung fehlschlug.
+
+**Merging:** Kandidaten aus jeder durchsuchten Variante werden anhand der Speicher-ID zusammengeführt, wobei der **höchste** Score pro ID erhalten bleibt (nicht summiert oder gemittelt – eine von zwei Varianten getroffene Erinnerung wird nicht gegenüber einer nur von ihrer besten Variante getroffenen Erinnerung überhöht), bevor auf das `limit` des Aufrufers gekürzt wird und Scoring/Ranking fortgesetzt werden. Das bedeutet, `semantic_score` eines Ergebnisses bedeutet jetzt "bester Score über alle durchsuchten Varianten hinweg" statt "Score gegen die wörtliche Anfrage" – eine Änderung dessen, was das Feld repräsentiert, auch wenn sein Wertebereich und seine Kalibrierung gegenüber `min_score`/Composite Ranking unverändert bleiben.
+
+**Nicht auf Volltext angewendet:** Der eigenständige `mode: "fulltext"` und der Volltext-Zweig von Hybrid durchsuchen immer nur die einzelne Originalanfrage – der FTS5/BM25-Index (siehe [Volltextsuche](#volltextsuche)) wendet Stemming auf jeden Term an, was die meiste Flexionslücke schließt, für die die Query-Erweiterung existiert, entfernt aber keine Stoppwörter, sodass eine reine Stoppwort-Anfrage über den Volltext-Zweig weiterhin nichts liefert.
+
+**Konfiguration** (`search.query_expansion` in `config.json`, siehe [Konfiguration](#konfiguration)):
+
+| Feld | Standard | Bedeutung |
+|---|---|---|
+| `enabled` | `true` | Abschalter für das gesamte Feature. `false` stellt exakt das Kostenprofil vor der Query-Expansion wieder her (ein Embedding pro Anfrage). |
+| `max_variants` | `2` | Obergrenze der insgesamt durchsuchten Varianten (Original + Stoppwort-bereinigt + LLM), unabhängig von `llm_paraphrase.variant_count`. Varianten über der Grenze werden verworfen, nicht aufgeschoben. |
+| `keyword_stripped` | `true` | Aktiviert Phase 1 (die deterministische, modellfreie Variante). |
+| `llm_paraphrase.enabled` | `false` | Aktiviert Phase 2. Erfordert einen auflösbaren API-Schlüssel, sonst wird die LLM-Expansion stillschweigend übersprungen (einmal beim Start protokolliert, nicht pro Aufruf). |
+| `llm_paraphrase.mode` | `"paraphrase"` | `"paraphrase"` formuliert die Anfrage um; `"hyde"` generiert eine hypothetische Antwort-Passage zum Embedden. |
+| `llm_paraphrase.variant_count` | `2` | Wie viele Paraphrase-/HyDE-Varianten pro Aufruf angefordert werden (1–3). |
+| `llm_paraphrase.timeout_ms` | `3000` | Timeout für die Chat-Completion-Anfrage; ein Timeout zählt als Fehlschlag und degradiert zu Phase 1. |
 
 ---
 
@@ -1473,7 +2141,7 @@ BHGBrain bietet zwei Tools für den Speicherabruf mit unterschiedlicher Semantik
 | **Beabsichtigter Aufrufer** | KI-Agenten während der Aufgabenausführung | Menschen oder Admin-Agenten bei Untersuchungen |
 
 **Score-Filterung bei Recall:**
-Der Parameter `min_score` (Standard 0.6) fungiert als Qualitätssicherung – nur Erinnerungen mit einer Kosinus-Ähnlichkeit ≥ 0.6 werden zurückgegeben. Dies verhindert irrelevante Ergebnisse. Sie können `min_score` senken, um mehr Ergebnisse auf Kosten der Präzision abzurufen.
+Der Parameter `min_score` (Standard 0.6) fungiert als Qualitätssicherung – er wird auf das Feld `semantic_score` (Kosinus-Ähnlichkeit) angewendet, nicht auf den Composite-Rank-`score`, da `recall` im semantischen Modus läuft – nur Erinnerungen mit einer Kosinus-Ähnlichkeit ≥ 0.6 werden zurückgegeben. Dies verhindert irrelevante Ergebnisse. Sie können `min_score` senken, um mehr Ergebnisse auf Kosten der Präzision abzurufen.
 
 ```json
 // Recall-Beispiel – semantisch, gefiltert nach Typ und Tags
@@ -1491,7 +2159,7 @@ Der Parameter `min_score` (Standard 0.6) fungiert als Qualitätssicherung – nu
 
 ### Filterung
 
-Sowohl `recall` als auch `search` unterstützen Namensraum- und Sammlungs-Scoping. `recall` unterstützt zusätzlich Typ- und Tag-Filterung.
+Sowohl `recall` als auch `search` unterstützen Namensraum- und Sammlungs-Scoping sowie Zeitraum-Filterung (`after`/`before`). `recall` unterstützt zusätzlich Typ- und Tag-Filterung.
 
 **Namensraum-Filterung:** Wird immer angewendet. Alle Suchen sind auf einen einzelnen Namensraum beschränkt. Es gibt keine namensraumübergreifende Suche.
 
@@ -1499,19 +2167,21 @@ Sowohl `recall` als auch `search` unterstützen Namensraum- und Sammlungs-Scopin
 - Bei der semantischen Suche wird die Qdrant-Sammlung `bhgbrain_{namespace}_general` durchsucht (die Standard-Sammlung für den Namensraum).
 - Bei der Volltextsuche werden alle Erinnerungen im Namensraum unabhängig von der Sammlung durchsucht.
 
-**Typ-Filterung (nur `recall`):** Übergeben Sie `"type": "episodic"` | `"semantic"` | `"procedural"`, um Ergebnisse auf einen einzelnen Speichertyp zu beschränken. Die Filterung wird nach der semantischen Suche angewendet, sodass der vollständige Kandidatensatz zuerst aus Qdrant abgerufen wird.
+**Typ-Filterung (nur `recall`):** Übergeben Sie `"type": "episodic"` | `"semantic"` | `"procedural"`, um Ergebnisse auf einen einzelnen Speichertyp zu beschränken. Der Filter wird in den Speicher hinuntergereicht (ein Qdrant-Payload-Filter auf dem semantischen Pfad, ein SQL-Prädikat auf dem Volltext-Pfad), sodass `limit` passende Erinnerungen zählt, statt für nicht passende Kandidaten verbraucht zu werden, bevor die Filterung greift. Eine defensive Nachprüfung nach dem Abruf läuft weiterhin und sollte im Normalfall wirkungslos bleiben; entfernt sie doch einmal ein vom Speicher zurückgegebenes Ergebnis, erhöht sich ein `recall_zero_after_filter`-Zähler, damit Filter-Aushungerung beobachtbar bleibt.
 
-**Tag-Filterung (nur `recall`):** Übergeben Sie `"tags": ["auth", "security"]`, um Ergebnisse auf Erinnerungen zu beschränken, die mindestens einen der angegebenen Tags haben. Die Filterung wird nach dem Abruf angewendet.
+**Tag-Filterung (nur `recall`):** Übergeben Sie `"tags": ["auth", "security"]`, um Ergebnisse auf Erinnerungen zu beschränken, die mindestens einen der angegebenen Tags haben (beliebige Übereinstimmung). Wie bei der Typ-Filterung wird dies in den Speicher hinuntergereicht, statt erst nach dem Abruf angewendet zu werden.
+
+**Zeitraum-Filterung (`recall` und `search`):** Übergeben Sie `after` und/oder `before` (ISO-8601-Zeitstempel), um Ergebnisse auf Erinnerungen zu beschränken, deren `created_at` im angeforderten Zeitraum liegt – beide Grenzen sind einschließlich, und jede kann für ein offenes Ende weggelassen werden. Die Grenzen vergleichen mit `created_at` (wann die Erinnerung erstmals aufgezeichnet wurde), nicht mit `updated_at` (das das separate Recency-Decay-Signal im Composite Ranking steuert). Wie bei Typ/Tags wird der Filter in den Speicher hinuntergereicht, sodass `limit` Treffer innerhalb des Zeitraums zählt. Ein fehlerhafter Zeitstempel oder ein `after` nach `before` wird abgelehnt, bevor ein Speicher abgefragt wird.
 
 ---
 
-### Score-Schwellenwerte und Stufenverstärkungen
+### Score-Schwellenwerte und Composite Ranking
 
-**`min_score` (nur recall):** Ein Mindestkosinus-Ähnlichkeitsscore zwischen 0 und 1. Erinnerungen unter diesem Schwellenwert werden aus `recall`-Ergebnissen ausgeschlossen. Standard: 0.6.
+**`min_score` (nur recall):** Ein Mindestkosinus-Ähnlichkeitsscore zwischen 0 und 1, angewendet speziell auf das Feld `semantic_score` – nicht auf den Composite-Rank-`score` – da `recall` fest im semantischen Modus arbeitet und der Standardwert von `min_score` auf einen Kosinus-Ähnlichkeitsbereich kalibriert ist, nicht auf hybride RRF-Scores oder den Composite-Prior. Erinnerungen unter diesem Schwellenwert werden aus `recall`-Ergebnissen ausgeschlossen. Standard: 0.6.
 
 **Ausschluss abgelaufener Erinnerungen:** Qdrants Vektorsuchfilter schließt Erinnerungen aus, bei denen `decay_eligible = true UND expires_at < now()`. T0/T1-Erinnerungen (decay_eligible = false) werden nie durch den vektorseitigen Filter ausgeschlossen. Auf der SQLite-Seite überprüft der Lifecycle-Service den Ablauf jeder aus dem Vektorspeicher zurückgegebenen Erinnerung erneut.
 
-**T0 Score-Bonus (Hybridsuche):** Nach der RRF-Fusion erhalten T0 (grundlegende) Erinnerungen zusätzliche +0.1 zu ihrem Score. Dies stellt sicher, dass architektonisch bedeutsame Inhalte in Hybrid-Ergebnissen auch dann angezeigt werden, wenn ihre genaue Terminologie nicht gut zur Abfrage passt.
+**Composite Ranking (alle Modi):** `score` ist die Relevanz multipliziert mit einem Prior aus Wichtigkeit, Zugriff und Aktualität – siehe [Composite Ranking](#composite-ranking) oben. T0-Erinnerungen (grundlegend) verfallen standardmäßig nie, sodass architektonisch bedeutsame Inhalte auch mit zunehmendem Alter dauerhaft gut platziert bleiben.
 
 ---
 
@@ -1677,11 +2347,17 @@ Gibt einen `HealthSnapshot` zurück:
     "unsynced_vectors": 0,
     "over_capacity": false,
     "cleanup_lag_seconds": 120
+  },
+  "circuitBreakers": {
+    "openai_embedding": "closed",
+    "qdrant": "closed"
   }
 }
 ```
 
 `components.retention` wird ebenfalls `"degraded"` (mit Nachricht), wenn der letzte GC-Lauf — geplant oder manuell — einen teilweisen Fehler gemeldet hat (ein Archivierungs- oder Löschschritt ist fehlgeschlagen), unabhängig vom Kapazitätsdruck der Stufen. Der Status wird beim nächsten sauberen GC-Lauf wieder auf `"healthy"` zurückgesetzt.
+
+`components.sqlite` bleibt `"healthy"`, führt aber eine `message`, wenn das laufende SQLite-Build kein `fts5`-Modul besitzt: Die Volltextsuche läuft dann über den alten `LIKE`-basierten Matcher (siehe [Volltextsuche](#volltextsuche)) statt über einen FTS5/BM25-Index. Dies wird auch einmalig beim Start protokolliert (`event: "fts5_unavailable"`).
 
 **Gesamtstatus-Logik:**
 - `unhealthy` — wenn SQLite oder Qdrant fehlerhaft ist
@@ -1696,6 +2372,8 @@ Gibt einen `HealthSnapshot` zurück:
 | `qdrant` | Eine begrenzte, lesende Vektorabfrage ist erfolgreich (ein leeres Ergebnis oder eine noch nicht angelegte Collection gelten ebenfalls als gesund) | — | Die Vektorabfrage selbst schlägt fehl, auch wenn der Server erreichbar ist |
 | `embedding` | Embed-API-Aufruf erfolgreich | Fehlende Anmeldedaten oder nicht erreichbar | — |
 | `retention` | Alle Budgets innerhalb der Limits, keine nicht synchronisierten Vektoren | Budget überschritten ODER nicht synchronisierte Vektoren > 0 | — |
+
+**Circuit-Breaker:** Das `circuitBreakers`-Objekt meldet den Zustand jedes Unterbrechers für externe Abhängigkeiten (`closed`, `open` oder `half-open`). Ist ein Breaker `open`, werden Anfragen an diese Abhängigkeit bis zum Ablauf des Öffnungsfensters und einer erfolgreichen Half-Open-Probe mit einem `CircuitOpenError` kurzgeschlossen. Schwellenwerte werden über `resilience.circuit_breaker` konfiguriert (siehe [Konfiguration](#konfiguration)).
 
 **HTTP-Statuscodes:**
 - `200` für sowohl `healthy` als auch `degraded`
@@ -1725,9 +2403,22 @@ Metriken ohne Labels, sodass die Ausgabe abwärtskompatibel zum vorherigen label
 | `bhgbrain_tool_handler_ms_count` | Zähler | Anzahl der Tool-Handler-Latenzmessungen, mit den Labels `tool` und `status` |
 | `embedding_embed_batch_ms_p95` | Histogramm | 95. Perzentil der Embedding-Batch-Latenz |
 | `search_total_ms_p95` | Histogramm | 95. Perzentil der End-to-End-Suchlatenz |
+| `search_result_count_avg` | Histogramm | Durchschnittliche Anzahl der pro `search`/`recall`-Aufruf zurückgegebenen Ergebnisse, mit `mode`-Label (`semantic`/`fulltext`/`hybrid`). Zählt nur modus-spezifische Ergebnisse - von `include_archived` angehängte archivierte Treffer sind ausgeschlossen. |
+| `search_result_count_p50` | Histogramm | 50. Perzentil der Ergebnisanzahl, mit `mode`-Label |
+| `search_result_count_p95` | Histogramm | 95. Perzentil der Ergebnisanzahl, mit `mode`-Label |
+| `search_result_count_p99` | Histogramm | 99. Perzentil der Ergebnisanzahl, mit `mode`-Label |
+| `search_result_count_count` | Zähler | Anzahl der `search_result_count`-Stichproben, mit `mode`-Label |
+| `search_result_score_avg` | Histogramm | Durchschnittlicher zusammengesetzter Ergebnis-Score pro `search`/`recall`-Aufruf, mit `mode`-Label. Ein Sample pro Ergebnis; archivierte Treffer sind ausgeschlossen, da sie einen Platzhalter-Score (keinen Relevanz-Score) tragen. |
+| `search_result_score_p50` | Histogramm | 50. Perzentil des zusammengesetzten Ergebnis-Scores, mit `mode`-Label |
+| `search_result_score_p95` | Histogramm | 95. Perzentil des zusammengesetzten Ergebnis-Scores, mit `mode`-Label |
+| `search_result_score_p99` | Histogramm | 99. Perzentil des zusammengesetzten Ergebnis-Scores, mit `mode`-Label |
+| `search_result_score_count` | Zähler | Anzahl der `search_result_score`-Stichproben, mit `mode`-Label |
 | `bhgbrain_memory_count` | Messuhr | Aktuelle Gesamt-Erinnerungsanzahl (bei Schreiben/Löschen aktualisiert) |
 | `bhgbrain_rate_limit_buckets` | Messuhr | Aktive Rate-Limit-Verfolgungseimer |
 | `bhgbrain_rate_limited_total` | Zähler | Gesamt rate-limitierte Anfragen |
+| `recall_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive Nachprüfung von `recall` (Typ/Tags/`after`/`before`) nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
+| `search_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive `after`/`before`-Nachprüfung von `search` nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
+| `search_embedding_degraded` | Zähler | Wird erhöht, wenn eine Suche im Modus `hybrid` auf reinen Volltext zurückfällt, weil der Embedding-Provider oder der Vektorspeicher nicht verfügbar ist, mit `namespace`-Label |
 
 Zum Beispiel:
 
@@ -1846,8 +2537,25 @@ BHGBrain stellt zusätzlich zu Tools MCP-Ressourcen (lesbar über `ReadResource`
 | URI-Template | Name | Beschreibung |
 |---|---|---|
 | `memory://{id}` | Erinnerungsdetails | Vollständiger Erinnerungsdatensatz per UUID |
+| `memory://{id}/revisions` | Erinnerungsrevisionen | Revisionsverlauf einer Erinnerung, neueste zuerst |
+| `memory://inject/{hint}` | Sitzungs-Inject (mit Hinweis) | Budgetierter Kontextblock, dessen Erinnerungsabschnitt per hybrider Relevanz zum Hinweis statt nach Aktualität ausgewählt wird |
 | `category://{name}` | Kategorie | Vollständiger Kategorieninhalt nach Name |
 | `collection://{name}` | Sammlung | Erinnerungen in einer bestimmten Sammlung |
+
+### Ressourcenlisten-Änderungsbenachrichtigungen (list_changed)
+
+BHGBrain deklariert die MCP-Fähigkeit `resources.listChanged`. Nachdem ein
+`collections`-Aufruf mit `action: "create"` oder `"delete"` bzw. ein
+`category`-Aufruf mit `action: "set"` oder `"delete"` erfolgreich war, sendet der
+Server eine `notifications/resources/list_changed`-Benachrichtigung, damit ein
+verbundener Client weiß, dass sich `collection://list` / `category://list` geändert
+haben, statt sich auf eine veraltete zwischengespeicherte Kopie zu verlassen.
+Lesende Aktionen (`list`, `get`) und fehlgeschlagene Mutationen lösen niemals eine
+Benachrichtigung aus; auch einfache Speicherschreibvorgänge (`remember`, `forget`
+usw.) tun dies nicht — `memory://list` ändert sich dafür bei jedem Aufruf zu häufig.
+Diese Benachrichtigung wird nur über den stdio-Transport gesendet (ein
+langlebiger `Server` pro stdio-Verbindung); sie ist nicht mit den
+sitzungsbasierten Streamable-HTTP-`/mcp`-Verbindungen verdrahtet.
 
 ### `memory://list` — Paginierte Erinnerungsauflistung
 
@@ -1874,9 +2582,31 @@ Die Paginierung verwendet zusammengesetzte Cursor (`created_at|id`) für stabile
 
 Die Inject-Ressource erstellt einen budgetierten Text-Payload für die Einbettung in ein LLM-Kontextfenster:
 
-1. Alle Kategorieninhalte werden zuerst vorangestellt (vollständiger Inhalt, in Reihenfolge).
-2. Die top aktuellen Erinnerungen werden angehängt (Inhalt oder Zusammenfassung je nach verfügbarem Platz).
-3. Der Payload wird bei `auto_inject.max_chars` (Standard 30.000 Zeichen) abgeschnitten.
+1. Kategorieninhalte werden zuerst vorangestellt (vollständiger Inhalt, in Reihenfolge),
+   begrenzt auf ihren reservierten Budgetanteil:
+   `(1 - auto_inject.memory_budget_fraction) × Budget`. Was Kategorien ungenutzt
+   lassen, fließt in den Erinnerungsabschnitt unten (keine Verschwendung).
+2. **Angepinnte Erinnerungen werden als Nächstes immer eingeschlossen**, vor der
+   Auswahl nach Aktualität/Relevanz, unabhängig davon, wo sie sonst eingestuft
+   würden (siehe [Erinnerungen für garantierte Injektion anpinnen](#erinnerungen-für-garantierte-injektion-anpinnen)
+   unten).
+3. Erinnerungen werden in das verbleibende Budget angehängt (Inhalt oder
+   Zusammenfassung je nach verfügbarem Platz) — immer mindestens
+   `auto_inject.memory_budget_fraction × Budget`, sofern Erinnerungen existieren,
+   sodass Kategorieninhalt den Erinnerungsabschnitt nicht mehr aushungern kann.
+   - `memory://inject` (ohne Hinweis): oberste Erinnerungen nach **Aktualität**,
+     unverändert gegenüber vor dieser Option.
+   - `memory://inject/{hint}`: oberste Erinnerungen nach **hybrider Relevanz** zum
+     Hinweis (siehe unten).
+   - Eine Erinnerung, die sowohl angepinnt ist als auch hier unabhängig ausgewählt
+     würde, wird (per ID) aus diesem Schritt ausgeschlossen, sodass sie genau
+     einmal erscheint und keinen zusätzlichen Platz von `auto_inject_limit`
+     verbraucht.
+4. Der Payload wird bei `auto_inject.max_chars` abgeschnitten, interpretiert gemäß
+   `auto_inject.budget_unit` (Standard 30.000 Zeichen). Dies gilt auch für
+   angepinnten Inhalt: Übersteigen die angepinnten Erinnerungen eines Namespace
+   allein den reservierten Anteil des Erinnerungsabschnitts, werden sie wie jeder
+   andere Inhalt pro Eintrag abgeschnitten, und `truncated` ist `true`.
 
 Abfrageparameter:
 - `namespace` — Namensraum für den Inject (Standard: `global`)
@@ -1894,24 +2624,182 @@ Antwort:
 
 Das Berühren einer Erinnerung über `memory://{id}` erhöht deren Zugriffsanzahl und plant einen verzögerten Flush.
 
+### `memory://inject/{hint}` — Relevanzbasierte Sitzungsinjektion
+
+Eine parametrisierte Variante von `memory://inject`, die den Erinnerungsabschnitt per
+**hybrider Relevanz zu einem übergebenen Hinweis** (Aufgabenphrase, Repo-Name oder
+Thema) statt nach Aktualität auswählt:
+
+- Der Hinweis ist ein URI-Pfadsegment: einmal URI-dekodiert, getrimmt und auf 500
+  Zeichen begrenzt (dasselbe Limit wie `search`/`recall` für eine Abfrage), bevor er
+  die hybride Suche über den aufgelösten Namensraum steuert.
+- Die Auswahl verwendet dasselbe Composite-/RRF-Ranking, dieselbe
+  Ablauffilterung und dasselbe Top-K-Limit (`defaults.auto_inject_limit`) wie ein
+  normaler `search`/`recall`-Aufruf. Anders als der Pfad ohne Hinweis
+  **zeichnet ein Lesevorgang mit Hinweis Zugriffe auf** — er ist in jeder relevanten
+  Hinsicht ein Recall.
+- Ist der Embedding-Anbieter nicht verfügbar, degradiert die Auswahl elegant auf den
+  Volltext-Zweig — das Payload wird trotzdem erzeugt, nur ohne den semantischen Beitrag.
+- Ein leerer Hinweis (nach dem Trimmen leer) fällt auf das oben beschriebene
+  Aktualitätsverhalten zurück.
+- **Near-Duplicate-Unterdrückung**: Ist `auto_inject.dedup_suppression` `true`
+  (Standard), wird ein Kandidat übersprungen, dessen Vektorähnlichkeit zu einer
+  bereits ausgewählten Erinnerung `deduplication.similarity_threshold` überschreitet;
+  das freigewordene Budget geht an den nächsten unterschiedlichen Kandidaten.
+  **Angepinnte Erinnerungen sind davon in beide Richtungen ausgenommen**: Zwei
+  einander stark ähnliche angepinnte Erinnerungen werden beide injiziert (nie
+  gegenseitig unterdrückt), und eine angepinnte Erinnerung unterdrückt niemals
+  einen nach Relevanz ausgewählten Kandidaten, der ihr zufällig stark ähnelt —
+  und wird auch nicht durch ihn unterdrückt.
+
+Beispiel: `memory://inject/deploy%20to%20production` bedingt die Auswahl auf
+"deploy to production".
+
+Die Antwortstruktur ist identisch zu `memory://inject`.
+
+### Erinnerungen für garantierte Injektion anpinnen
+
+`memory://inject` und `memory://inject/{hint}` wählen ihren Erinnerungsabschnitt
+normalerweise nach Aktualität oder Relevanz aus, was bedeutet, dass eine
+bestimmte Tatsache nur dann in den injizierten Kontext gelangt, wenn sie gut
+genug eingestuft wird — eine kritische Betriebsregel („immer pnpm verwenden,
+niemals npm") kann stillschweigend herausfallen, wenn nichts kürzlich darauf
+verwiesen hat und sie nicht zum aktuellen Hinweis passt. **Anpinnen** schließt
+diese Lücke: Eine angepinnte Erinnerung wird immer in den Erinnerungsabschnitt
+aufgenommen, unabhängig von ihrer Einstufung nach Aktualität oder Relevanz.
+
+- **Setzbar über `remember`** beim Schreiben (`pinned: true`/`false`) — bei
+  einem Dedup-`UPDATE` bleibt der bestehende Pin-Status der Erinnerung erhalten,
+  wenn `pinned` weggelassen wird, sodass eine Inhaltskorrektur eine kritische
+  Tatsache nicht stillschweigend entpinnt; zum Ändern explizit angeben.
+- **Setzbar über `tag`** als dedizierter, leichtgewichtiger Umschalter
+  (`pinned: true`/`false`), der weder den Inhalt berührt noch dessen erneute
+  Übermittlung erfordert.
+- **Pro Namespace begrenzt**: `defaults.pin_limit_per_namespace` (Standard `20`)
+  begrenzt, wie viele Erinnerungen gleichzeitig angepinnt sein können,
+  durchgesetzt beim Schreiben. Wird die Obergrenze beim Anpinnen überschritten,
+  wird `INVALID_INPUT` zurückgegeben — zuerst eine andere Erinnerung entpinnen,
+  um Platz zu schaffen.
+- **Nutzt das vorhandene Budget des Erinnerungsabschnitts**
+  (`auto_inject.memory_budget_fraction`-Anteil) — es gibt kein separates
+  Kontingent. Übersteigt angepinnter Inhalt allein diesen Anteil, wird er wie
+  jeder andere Inhalt pro Eintrag abgeschnitten, und das `truncated`-Flag des
+  Payloads wird gesetzt.
+- **Von der Near-Duplicate-Unterdrückung ausgenommen** in beide Richtungen
+  (siehe oben).
+- **Keine Auswirkung auf `search`/`recall`**: `pinned` erscheint nie in
+  `SearchResult` und beeinflusst weder Ranking noch Reihenfolge — dies
+  unterscheidet sich bewusst von der Aufbewahrungsstufe `T0`, die nur
+  Aufbewahrung/Ranking beeinflusst und selbst keine Garantie für die
+  Injektions-Aufnahme bietet. Eine Erinnerung kann `T0` und angepinnt sein,
+  `T0` und nicht angepinnt, oder jede beliebige Stufe und angepinnt — beide sind
+  orthogonal.
+- **Abschaltbar**: `auto_inject.pinned_enabled: false` (Standard `true`)
+  deaktiviert den Schritt zur Aufnahme angepinnter Erinnerungen vollständig —
+  beide Inject-Vorlagen verhalten sich dann, als wäre keine Erinnerung
+  angepinnt. Die Obergrenze pro Namespace wird unabhängig von diesem Schalter
+  weiterhin beim Schreiben durchgesetzt.
+- **Dauerhaft**: Der Pin-Status wird im Qdrant-Payload persistiert und durch
+  `repair --mode from-qdrant` sowie die geräteübergreifende Synchronisation
+  wiederhergestellt, sodass er einen SQLite-Wiederaufbau übersteht.
+
+### `memory://{id}/revisions` — Revisionsverlauf
+
+Liefert den aufgezeichneten Revisionsverlauf einer Erinnerung, neueste zuerst, unter denselben Sichtbarkeitsregeln wie `memory://{id}` (`NOT_FOUND` bei unbekannter oder durch Sichtbarkeitsregeln ausgeschlossener Erinnerung). Nur T0-Erinnerungen sammeln Revisionen (siehe [T0-Revisionsverlauf](#t0-revisionsverlauf)), andere Stufen liefern eine leere Liste.
+
+Antwort:
+```json
+{
+  "id": "<uuid>",
+  "revisions": [
+    { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+Für stdio-Clients ohne Ressourcen-Unterstützung liefert die Aktion `list` des `revisions`-Tools dieselben Daten (siehe [MCP-Tools-Referenz](#mcp-tools-referenz)).
+
 ---
 
-## Bootstrap-Prompt
+## MCP-Prompts
 
-`BootstrapPrompt.txt` enthält einen strukturierten Interview-Prompt zum Aufbau eines **beruflichen Zweitgehirn-Profils** mit einem KI-Agenten.
+BHGBrain deklariert die MCP-Fähigkeit `prompts` und stellt neben Tools und
+Ressourcen zwei Prompts über `ListPrompts`/`GetPrompt` bereit:
 
-Verwenden Sie es, wenn Sie einen neuen KI-Assistenten einrichten oder wenn Sie BHGBrain mit einem umfangreichen, strukturierten Profil Ihres Arbeitskontexts, Entitäten, Mandanten und Disambiguierungsregeln befüllen möchten.
+| Prompt | Argumente | Beschreibung |
+|---|---|---|
+| `bootstrap-interview` | `section` (optional, `1`–`10`) | Führt durch das Bootstrap-Interview über das `bootstrap`-Tool. Ohne `section` gibt es eine Übersicht aller Abschnitte; mit `section` springt man direkt zu dessen Fragen. Eine ungültige oder außerhalb des Bereichs liegende `section` wird als JSON-RPC-InvalidParams-Fehler abgelehnt. |
+| `session-context` | `hint` (optional) | Liefert denselben budgetierten `memory://inject`- (bzw. `memory://inject/{hint}`-) Kontextblock als einzelne Prompt-Nachricht, zum Vorbereiten einer neuen Sitzung. |
 
-### Verwendung
+Beide Prompts liefern eine einzelne Nachricht mit Rolle `user`. Für Clients ohne
+Prompt-Unterstützung ist dieselbe Funktionalität direkt über das `bootstrap`-Tool
+bzw. die `memory://inject`-Ressource erreichbar — die Prompts sind eine
+Auffindbarkeits-Schicht, kein neues Verhalten.
 
-1. Beginnen Sie eine neue Unterhaltung mit Ihrem KI-Assistenten (Claude, GPT-4 usw.).
-2. Fügen Sie den gesamten Inhalt von `BootstrapPrompt.txt` als erste Nachricht ein.
-3. Lassen Sie den Agenten Sie Abschnitt für Abschnitt interviewen.
-4. Am Ende produziert der Agent ein strukturiertes Profil, das Sie über `bhgbrain.remember`-Aufrufe (oder `mcporter call bhgbrain.remember`) in BHGBrain speichern können.
+Beispiel:
 
-### Abgedeckte Themen
+```json
+// Verfügbare Prompts auflisten
+{ "method": "prompts/list" }
 
-Das Interview durchläuft 10 Abschnitte:
+// Direkt zu Abschnitt 3 des Bootstrap-Interviews springen
+{ "method": "prompts/get", "params": { "name": "bootstrap-interview", "arguments": { "section": "3" } } }
+
+// Sitzungskontext-Block, thematisch fokussiert
+{ "method": "prompts/get", "params": { "name": "session-context", "arguments": { "hint": "deploy to production" } } }
+```
+
+---
+
+## Onboarding
+
+BHGBrain bietet drei Wege, um Ihr Arbeitsprofil aufzubauen – von vollständig geführt bis zum Massenimport.
+
+### Option 1: Interaktives Bootstrap-Tool (empfohlen)
+
+Das `bootstrap`-MCP-Tool führt direkt innerhalb von BHGBrain ein zustandsbehaftetes 10-Abschnitte-Interview durch. Es verfolgt den Fortschritt, speichert währenddessen Erinnerungen und unterstützt Pause/Fortsetzung über Sitzungen hinweg.
+
+```json
+// Interview starten (oder fortsetzen)
+{ "name": "bootstrap", "arguments": { "action": "start" } }
+
+// Antworten für einen Abschnitt einreichen
+{ "name": "bootstrap", "arguments": { "action": "submit", "section": 1, "answers": "Jane Doe, CTO at Acme Corp..." } }
+
+// Fortschritt abfragen
+{ "name": "bootstrap", "arguments": { "action": "status" } }
+
+// Einen Abschnitt erneut durchführen
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+```
+
+Das Tool gibt nach jeder Einreichung die Fragen des nächsten Abschnitts zurück, sodass der Agent das Gespräch natürlich führen kann. Sitzungen bleiben in SQLite erhalten — Sie können Ihren Client schließen und später dort weitermachen, wo Sie aufgehört haben.
+
+### Option 2: Massenimport eines Profils
+
+Wenn Sie bereits ein vollständiges Profildokument haben (aus einem früheren Bootstrap, einem Wiki oder strukturierten Notizen), nutzen Sie das `import`-Tool, um es in einem Schritt einzulesen:
+
+```json
+// Ein 10-Abschnitte-Bootstrap-Profil importieren
+{ "name": "import", "arguments": { "format": "profile", "content": "## 1. Identity & Role\n..." } }
+
+// Beliebiges Markdown als Erinnerungen importieren
+{ "name": "import", "arguments": { "format": "freeform", "content": "## Architecture\nWe use microservices..." } }
+
+// Vorschau dessen, was gespeichert würde, ohne zu schreiben
+{ "name": "import", "arguments": { "format": "profile", "content": "...", "dry_run": true } }
+```
+
+Das Tool zerlegt das Dokument in einzelne Erinnerungen mit der pro Abschnitt korrekten Collection, Stufe, Typ, Wichtigkeit und Tags. Die Duplikaterkennung greift dabei — ein erneuter Import nach Aktualisierungen ist gefahrlos möglich.
+
+### Option 3: Manueller Bootstrap-Prompt
+
+`BootstrapPrompt.txt` enthält einen eigenständigen Interview-Prompt, den Sie in jede beliebige KI-Unterhaltung einfügen können. Der Agent interviewt Sie Abschnitt für Abschnitt und ruft für jede Tatsache `bhgbrain.remember` auf. Dies funktioniert mit jedem MCP-verbundenen Client, ohne dass die Tools `bootstrap` oder `import` benötigt werden.
+
+### Was es abdeckt
+
+Alle drei Methoden durchlaufen dieselben 10 Abschnitte:
 
 | Abschnitt | Was erfasst wird |
 |---|---|
@@ -1926,9 +2814,7 @@ Das Interview durchläuft 10 Abschnitte:
 | 9. Mandanten- & Umgebungskarte | Azure-Mandanten, Entwicklung/Staging/Produktion |
 | 10. Betriebsregeln | Namenskonventionen, Disambiguierung, Standardannahmen |
 
-Das Ergebnis ist ein sauberes strukturiertes Profil mit allen 10 Abschnitten plus einem Disambiguierungsleitfaden – genau das, was BHGBrain benötigt, um Fragen zu Ihrer Arbeit zuverlässig zu beantworten.
-
-**Bootstrap-Erinnerungen werden standardmäßig T0.** Über den Bootstrap-Prozess aufgenommene Inhalte sollten mit `source: import` und `tags: ["bootstrap", "profile"]` markiert werden. Der heuristische Klassifizierer erkennt diese Signale und weist die T0 (grundlegende) Stufe zu.
+**Bootstrap-Erinnerungen werden standardmäßig T0.** Über den Bootstrap-Ablauf aufgenommene Inhalte werden mit der passenden Quelle getaggt (`agent` für das Bootstrap-Tool, `import` für den Massenimport) und gemäß der Abschnitts-Zuordnungstabelle einer Stufe zugewiesen.
 
 ---
 
@@ -1966,12 +2852,25 @@ bhgbrain gc                           # Bereinigung ausführen
 bhgbrain gc --dry-run                 # Kandidaten und Review-Elemente anzeigen, ohne zu löschen
 bhgbrain gc --tier T3                 # Nur T3-Erinnerungen bereinigen
 
+# Gedächtnis-Destillation (verschmilzt T2/T3-episodische Erinnerungen per
+# LLM-Aufruf zu T1-semantischen Erinnerungen — siehe Gedächtnis-Destillation.
+# Standardmäßig deaktiviert; erfordert retention.distillation.enabled: true
+# und einen Extraktions-API-Schlüssel)
+bhgbrain distill                      # Destillation ausführen
+bhgbrain distill --dry-run            # Kandidaten-Cluster anzeigen, ohne LLM aufzurufen oder zu schreiben/archivieren
+
 # Audit-Protokoll
 bhgbrain audit                        # Aktuelle Audit-Einträge anzeigen
 
 # Reparatur (Multi-Geräte-Wiederherstellung)
 bhgbrain repair --from-qdrant                # Lokale SQLite aus Qdrant wiederherstellen (standardmäßig nur Erinnerungen des aktuellen Geräts)
 bhgbrain repair --from-qdrant --all-devices  # Aus den Erinnerungen aller Geräte wiederherstellen, nicht nur des aktuellen
+
+# Reparatur (Migration des Einbettungsmodells — siehe Migration des Einbettungsmodells)
+bhgbrain repair --re-embed                   # Vektoren mit veraltetem Embedding-Stempel migrieren
+bhgbrain repair --re-embed --dry-run         # Vorschau, wie viele Zeilen betroffen wären
+bhgbrain repair --re-embed --include-legacy  # Auch Zeilen ohne jeden Stempel einbeziehen
+bhgbrain repair --re-embed --batch-size 100  # Batch-Größe anpassen (Standard 50)
 
 # Kategorieverwaltung
 bhgbrain category list                # Alle Kategorien auflisten
@@ -1994,7 +2893,7 @@ bhgbrain server token                 # Neues zufälliges Bearer-Token generiere
 
 ## MCP-Tools-Referenz
 
-BHGBrain stellt 9 MCP-Tools bereit. Alle Tools validieren Eingaben mit Zod-Schemas und geben strukturiertes JSON zurück. Fehler verwenden einen konsistenten Umschlag:
+BHGBrain stellt 12 MCP-Tools bereit. Alle Tools validieren Eingaben mit Zod-Schemas und geben strukturiertes JSON zurück. Fehler verwenden einen konsistenten Umschlag:
 
 ```json
 {
@@ -2005,6 +2904,23 @@ BHGBrain stellt 9 MCP-Tools bereit. Alle Tools validieren Eingaben mit Zod-Schem
   }
 }
 ```
+
+**Titel und Annotationen:** Jedes Tool deklariert einen menschenlesbaren `title` und
+MCP-Verhaltens-`annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint` und
+`openWorldHint: false` — jedes Tool arbeitet auf dem lokalen Speicher, niemals auf
+einer offenen externen Domäne). `recall` und `search` sind `readOnlyHint: true` und
+lassen `destructiveHint`/`idempotentHint` weg (laut Spezifikation bedeutungslos,
+sobald `readOnlyHint` gesetzt ist). `forget`, `collections`, `category`, `backup` und
+`revisions` deklarieren `destructiveHint: true`. Dadurch behandelt ein
+spezifikationskonformer Client Lesevorgänge nicht mehr als genauso gefährlich wie
+ein Löschen — was unter den MCP-Spec-Standardwerten (`readOnlyHint: false`,
+`destructiveHint: true`) passiert, wenn ein Tool Annotationen ganz weglässt.
+
+**outputSchema:** `recall`, `search` und `remember` deklarieren ein `outputSchema`,
+das die Form ihres `structuredContent` beschreibt (angelehnt an die Typen
+`SearchResult`/`WriteResult`), sodass MCP-Clients Ergebnisse validieren können, statt
+nur den Text-Block als JSON zu parsen. Die Ergebnisformen der übrigen zehn Tools sind
+aktionsabhängig und noch nicht schema-beschrieben.
 
 ---
 
@@ -2020,11 +2936,16 @@ Inhalt in BHGBrain mit automatischer Deduplizierung, Normalisierung, Einbettung 
 | `namespace` | `string` | Nein | `"global"` | Namensraum-Scope. Muster: `^[a-zA-Z0-9/-]{1,200}$` |
 | `collection` | `string` | Nein | `"general"` | Sammlung innerhalb des Namensraums. Max. 100 Zeichen. |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | Nein | `"semantic"` | Speichertyp. Beeinflusst die Standard-Stufenzuweisung. |
-| `tags` | `string[]` | Nein | `[]` | Tags für Filterung und Klassifizierung. Max. 20 Tags, jeder max. 100 Zeichen. Muster: `^[a-zA-Z0-9-]+$` |
+| `tags` | `string[]` | Nein | `[]` | Tags für Filterung und Klassifizierung. Max. 20 Tags, jeder max. 100 Zeichen. Muster: `^[a-zA-Z0-9-]+$`. Die gespeicherte Erinnerung kann zusätzliche automatisch abgeleitete Tags enthalten — siehe [Automatisches Taggen](#automatisches-taggen). |
 | `category` | `string` | Nein | — | An einen Kategorie-Slot binden (impliziert T0-Stufe). Max. 100 Zeichen. |
 | `importance` | `number (0–1)` | Nein | `0.5` | Wichtigkeitsbewertung. Höhere Werte werden bei der Stale-Bereinigung priorisiert. |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | Nein | `"cli"` | Quelle der Erinnerung. Beeinflusst die Standard-Stufe (z. B. agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | Nein | automatisch zugewiesen | Explizite Stufenüberschreibung. Hat Vorrang vor allen Heuristiken. |
+| `pinned` | `boolean` | Nein | `false` bei ADD; bei UPDATE beibehalten | Pinnt diese Erinnerung, sodass sie immer in `memory://inject`-Payloads enthalten ist, begrenzt durch `defaults.pin_limit_per_namespace` (Standard 20). Bei einem Dedup-`UPDATE` bleibt der bestehende Pin-Status der Erinnerung erhalten, wenn `pinned` weggelassen wird — zum Ändern explizit angeben. Wird beim Neu-Pinnen die Obergrenze pro Namespace überschritten, wird `INVALID_INPUT` zurückgegeben. |
+| `origin` | `object` | Nein | `null` | Vom Aufrufer angegebene Inhaltsherkunft: `{ session_id?, tool?, repo?, branch? }`, alle Felder optionale Freitext-Strings (max. 200/100/200/200 Zeichen). Unbekannte Schlüssel werden abgelehnt. Zu unterscheiden vom vektor-bezogenen Feld `embedding_model` — siehe [Inhaltsherkunft](#inhaltsherkunft). Bei einem Dedup-`UPDATE` bleibt die bestehende Herkunft erhalten, wenn `origin` weggelassen wird; wird es angegeben, ersetzt es die vorherige. |
+| `confidence` | `number (0–1)` | Nein | pro `source` (siehe unten) | Wie sehr dem Inhalt dieser Erinnerung vertraut werden soll. Standardwert aus `pipeline.default_confidence[source]` (Konfiguration, Standard `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`), wenn weggelassen. Bei einem Dedup-`UPDATE` ist der zusammengeführte Wert `max(bestehend, neu)` — eine erneute Bestätigung senkt das Vertrauen nie. Siehe [Inhaltsherkunft](#inhaltsherkunft). |
+
+**Lange Inhalte werden abgelehnt, nicht stillschweigend zu einem „Mush-Vektor" verarbeitet:** Inhalte, die länger sind als `pipeline.long_content_threshold_chars` (Konfiguration, Standard `8.000` Zeichen ≈ 1–2 Seiten), werden mit einem `INVALID_INPUT`-Fehler abgelehnt, der die Zeichenanzahl, den Schwellenwert und die Lösung nennt: Verwenden Sie stattdessen das `import`-Tool mit `format: "freeform"`, oder teilen Sie den Inhalt in mehrere `remember`-Aufrufe auf. Dies ist beabsichtigt: Die Einbettung mehrerer tausend Wörter als einzelner Vektor erzeugt einen minderwertigen „Mush-Vektor", der viele unterschiedliche Anfragen schwach statt einer Anfrage präzise trifft. Die Obergrenze von 100.000 Zeichen aus der Tabelle oben gilt weiterhin als absolutes Maximum, aber `long_content_threshold_chars` ist die Grenze, auf die Aufrufer zuerst stoßen.
 
 **Ausgabe:**
 
@@ -2038,12 +2959,56 @@ Inhalt in BHGBrain mit automatischer Deduplizierung, Normalisierung, Einbettung 
 }
 ```
 
+> **Hinweis zum MCP-Umschlag (seit v1.17.0):** Das oben (und im
+> Multi-Kandidaten-Beispiel unten) gezeigte Objekt/Array ist das, was
+> `handleRemember` intern zurückgibt, und genau das, was `POST /tool/:name` (REST)
+> weiterhin zurückgibt. Über den **MCP-Transport** (stdio und Streamable-HTTP
+> `/mcp`) normalisiert die `CallTool`-Antwort ein erfolgreiches Ergebnis auf
+> `{ "results": [...] }` — ein einelementiges Array für einen einzelnen Kandidaten,
+> mehrere Elemente bei einer Aufteilung durch Multi-Kandidaten-Extraktion — sowohl in
+> `structuredContent` als auch im JSON-Text-Block, sodass ein einziges `outputSchema`
+> beide Fälle beschreiben kann. Ein spröder MCP-seitiger Parser, der das nackte Objekt
+> erwartet, muss angepasst werden, um `results[0]` zu lesen (oder über `results` zu
+> iterieren); REST-Clients sind nicht betroffen.
+
 `operation` ist eines von:
 - `ADD` — neue Erinnerung erstellt
 - `UPDATE` — vorhandene ähnliche Erinnerung aktualisiert (Inhalt zusammengeführt)
 - `NOOP` — exaktes oder nahezu exaktes Duplikat; vorhandene Erinnerung zurückgegeben
 
 Bei `UPDATE`-Operationen enthält `merged_with_id` die ID der aktualisierten Erinnerung.
+
+**Multi-Kandidaten-Extraktion:** Wenn `pipeline.extraction_enabled` auf `true` steht
+(Standard `false`) und der Inhalt mindestens `pipeline.extraction_min_chars` lang ist,
+kann `remember` mehrfaktigen Inhalt per LLM-Aufruf in mehrere atomare
+Kandidaten-Erinnerungen aufteilen, die jeweils unabhängig dedupliziert/klassifiziert
+werden. In diesem Fall gibt das Tool ein **JSON-Array** derselben pro-Kandidat-Objekte
+wie oben zurück — einen Eintrag pro Kandidat — statt eines einzelnen Objekts:
+
+```json
+[
+  {
+    "id": "3f4a1b2c-...",
+    "summary": "Alice owns the infra repo",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  },
+  {
+    "id": "9c7d2e5f-...",
+    "summary": "Deploys go through GitHub Actions",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  }
+]
+```
+
+Jede Art von Extraktionsfehler (Netzwerkfehler, Timeout, fehlerhafte/leere Antwort)
+fällt transparent auf die heutige Einzelobjekt-Antwort zurück — Extraktion blockiert
+oder verhindert niemals einen `remember`-Aufruf. Aufrufer, die annehmen, dass
+`remember` immer ein einzelnes Objekt zurückgibt, müssen aktualisiert werden, um
+zwischen Array und Objekt zu unterscheiden, bevor `extraction_enabled` aktiviert wird.
 
 **Beispiele:**
 
@@ -2088,10 +3053,13 @@ Die relevantesten Erinnerungen für eine Abfrage mithilfe semantischer (Vektor-)
 | `query` | `string` | **Ja** | — | Recall-Abfrage. Max. 500 Zeichen. |
 | `namespace` | `string` | Nein | `"global"` | Zu durchsuchender Namensraum. |
 | `collection` | `string` | Nein | — | Auf eine bestimmte Sammlung beschränken. Weglassen, um die Standard-Sammlung zu durchsuchen. |
-| `type` | `"episodic" \| "semantic" \| "procedural"` | Nein | — | Ergebnisse auf einen bestimmten Speichertyp filtern. Wird nach dem Abruf angewendet. |
-| `tags` | `string[]` | Nein | — | Auf Erinnerungen mit mindestens einem übereinstimmenden Tag filtern. Wird nach dem Abruf angewendet. |
+| `type` | `"episodic" \| "semantic" \| "procedural"` | Nein | — | Ergebnisse auf einen bestimmten Speichertyp filtern. In den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
+| `tags` | `string[]` | Nein | — | Auf Erinnerungen mit mindestens einem übereinstimmenden Tag filtern (beliebige Übereinstimmung). In den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. Trifft gleichermaßen auf aufruferseitige und automatisch abgeleitete Tags zu — siehe [Automatisches Taggen](#automatisches-taggen). |
 | `limit` | `integer (1–20)` | Nein | `5` | Maximale Anzahl der Ergebnisse. |
-| `min_score` | `number (0–1)` | Nein | `0.6` | Mindestkosinus-Ähnlichkeitsscore. Ergebnisse unter diesem Schwellenwert werden ausgeschlossen. |
+| `min_score` | `number (0–1)` | Nein | `0.6` | Mindestkosinus-Ähnlichkeitsscore, angewendet auf `semantic_score` (nicht auf den fusionierten/angepassten `score`). Ergebnisse unter diesem Schwellenwert werden ausgeschlossen. |
+| `after` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at >= after` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
+| `before` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at <= before` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
+| `follow_links` | `boolean` | Nein | `false` | Gibt zusätzlich die Ein-Hop-Nachbarn jedes Ergebnisses zurück (Kanten, die über das `relate`-Tool erstellt wurden, beide Richtungen, alle Relationen). Angehängte Einträge sind mit `linked_from`/`link_relation`/`link_direction` markiert, damit ein Client einen erweiterten Nachbarn von einem direkt relevanten Treffer unterscheiden kann; siehe `relate` unten. |
 
 **Ausgabe:**
 
@@ -2110,11 +3078,27 @@ Die relevantesten Erinnerungen für eine Abfrage mithilfe semantischer (Vektor-)
       "expires_at": null,
       "expiring_soon": false,
       "created_at": "2026-01-01T00:00:00Z",
-      "last_accessed": "2026-03-15T12:00:00Z"
+      "last_accessed": "2026-03-15T12:00:00Z",
+      "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+      "confidence": 1.0
     }
   ]
 }
 ```
+
+Jedes Ergebnis enthält außerdem `origin`/`confidence` (siehe [Inhaltsherkunft](#inhaltsherkunft)
+unter `remember`) — `origin` ist `null`, wenn die Erinnerung ohne Herkunftsangabe
+gespeichert wurde; `confidence` verwendet den Quellen-Standardwert, wenn der Aufrufer
+ihn weggelassen hat.
+
+Mit `follow_links: true` werden die Ein-Hop-Nachbarn jedes Basisergebnisses nach den
+Basisergebnissen angehängt (ohne die Anzahl der von `limit` erlaubten Basisergebnisse
+zu verringern), dedupliziert gegen die Basismenge und untereinander, und insgesamt auf
+`limit` angehängte Einträge begrenzt. Angehängte Einträge tragen `score: 0` (ein
+Platzhalter, kein Relevanzscore — dieselbe Konvention wie bei `include_archived` von
+`search`) sowie `linked_from` (die ID des Basisergebnisses), `link_relation` und
+`link_direction` (`"outgoing"`, wenn das Basisergebnis die Quelle der Kante ist,
+`"incoming"`, wenn es das Ziel ist). Ein bereits archivierter Nachbar wird übersprungen.
 
 ---
 
@@ -2154,14 +3138,17 @@ Erinnerungen mithilfe semantischer, Volltext- oder Hybrid-Modi durchsuchen. Biet
 | `collection` | `string` | Nein | — | Auf eine bestimmte Sammlung beschränken. |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | Nein | `"hybrid"` | Suchalgorithmus. |
 | `limit` | `integer (1–50)` | Nein | `10` | Maximale Anzahl der Ergebnisse. |
+| `include_archived` | `boolean` | Nein | `false` | Durchsucht zusätzlich archivierte Erinnerungen (siehe [Verfall, Bereinigung und Archivierung](#verfall-bereinigung-und-archivierung)) per Zusammenfassungs-/Tag-Textabgleich. Treffer werden nach den aktiven Ergebnissen angehängt, mit `archived: true` markiert und reduzieren nie, wie viele aktive Ergebnisse `limit` zulässt. Archivtreffer werden nicht als Zugriff protokolliert. |
+| `after` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at >= after` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Vektor-/Volltextspeicher hinuntergereicht — der erste hinuntergereichte Filter von `search`. |
+| `before` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at <= before` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Vektor-/Volltextspeicher hinuntergereicht. |
 
-**Ausgabe:** Gleiche Struktur wie `recall` — `{ "results": [...] }` — aber ohne den `min_score`-Filter und mit Unterstützung von bis zu 50 Ergebnissen.
+**Ausgabe:** Gleiche Struktur wie `recall` — `{ "results": [...] }` — aber ohne den `min_score`-Filter und mit Unterstützung von bis zu 50 Ergebnissen. Archivtreffer (bei `include_archived: true`) tragen `archived: true`, verwenden die gespeicherte Zusammenfassung als `content` und haben keinen aussagekräftigen `score` (es sind Metadaten-Texttreffer, keine gerankten Ergebnisse).
 
 ---
 
 ### `tag` — Tags verwalten
 
-Tags zu einer Erinnerung hinzufügen oder entfernen. Tags werden atomar zusammengeführt/gefiltert; Inhalt und Einbettung der Erinnerung sind nicht betroffen.
+Tags zu einer Erinnerung hinzufügen oder entfernen und/oder sie pinnen oder entpinnen. Tags und Pin-Status werden atomar aktualisiert; Inhalt und Einbettung der Erinnerung sind nicht betroffen.
 
 **Eingabe:**
 
@@ -2170,6 +3157,7 @@ Tags zu einer Erinnerung hinzufügen oder entfernen. Tags werden atomar zusammen
 | `id` | `string (UUID)` | **Ja** | — | Zu tagende Erinnerung. |
 | `add` | `string[]` | Nein | `[]` | Hinzuzufügende Tags. Max. 20 Tags insgesamt nach der Zusammenführung. |
 | `remove` | `string[]` | Nein | `[]` | Zu entfernende Tags. |
+| `pinned` | `boolean` | Nein | unverändert | Pinnt (`true`) oder entpinnt (`false`) diese Erinnerung, unabhängig von Tags — ein dedizierter Umschalter fürs Inject-Pinning, der keine erneute Übermittlung des Inhalts erfordert. Weglassen, um den Pin-Status unverändert zu lassen. Wird eine noch nicht angepinnte Erinnerung angepinnt, während der Namespace bereits an der Obergrenze `defaults.pin_limit_per_namespace` liegt, wird `INVALID_INPUT` zurückgegeben. |
 
 **Ausgabe:**
 
@@ -2180,7 +3168,7 @@ Tags zu einer Erinnerung hinzufügen oder entfernen. Tags werden atomar zusammen
 }
 ```
 
-Gibt `INVALID_INPUT` zurück, wenn das Hinzufügen von Tags das Limit von 20 Tags überschreiten würde.
+Gibt `INVALID_INPUT` zurück, wenn das Hinzufügen von Tags das Limit von 20 Tags überschreiten würde, oder wenn das Pinnen `defaults.pin_limit_per_namespace` überschreiten würde.
 
 ---
 
@@ -2330,19 +3318,347 @@ Speichersicherungen erstellen, auflisten oder wiederherstellen.
 
 ---
 
-### `repair` — SQLite aus Qdrant wiederherstellen
+### `bootstrap` — Interaktives Onboarding
 
-Erinnerungen aus Qdrant in die lokale SQLite-Datenbank wiederherstellen. Wird für Multi-Device-Setups, Datenwiederherstellung nach Verlust oder Onboarding neuer Geräte verwendet. Siehe [Reparatur und Wiederherstellung](#reparatur-und-wiederherstellung).
+Führt ein zustandsbehaftetes 10-Abschnitte-Interview durch, um Ihr Arbeitsprofil aufzubauen. Unterstützt Pause/Fortsetzung über Sitzungen hinweg.
 
 **Eingabe:**
 
 | Parameter | Typ | Erforderlich | Standard | Beschreibung |
 |---|---|---|---|---|
-| `dry_run` | `boolean` | Nein | `false` | Wenn `true`, wird berichtet, was wiederhergestellt würde, ohne Änderungen vorzunehmen. |
-| `device_id` | `string` | Nein | — | Wiederherstellung auf Erinnerungen eines bestimmten Geräts beschränken. Schließt sich mit `all_devices` gegenseitig aus. |
-| `all_devices` | `boolean` | Nein | `false` | Erinnerungen von allen Geräten ausdrücklich wiederherstellen. Schließt sich mit `device_id` gegenseitig aus. Dies ist auch das Standardverhalten, wenn keines der beiden Felder angegeben wird. |
+| `action` | `"start" \| "submit" \| "status" \| "reset"` | **Ja** | - | Die auszuführende Aktion. |
+| `section` | `integer (1-10)` | Für submit/reset | - | Abschnittsnummer, für die Antworten eingereicht oder zurückgesetzt werden. |
+| `answers` | `string` | Für submit | - | Ihre Antworten für den Abschnitt. Maximal 500.000 Zeichen. |
+| `namespace` | `string` | Nein | `"profile"` | Namensraum-Geltungsbereich. |
+
+**Aktionen:**
+
+- **`start`** — Erstellt eine neue Sitzung oder setzt eine bestehende fort. Gibt Titel, Fragen und Anweisungen des ersten unvollständigen Abschnitts zurück.
+- **`submit`** — Speichert Antworten als einzelne Erinnerungen für den angegebenen Abschnitt, markiert ihn als abgeschlossen und gibt den nächsten Abschnitt zurück.
+- **`status`** — Gibt eine Fortschrittsübersicht zurück: welche Abschnitte abgeschlossen sind, Erinnerungsanzahl, letzte Aktualisierung.
+- **`reset`** — Löscht alle Erinnerungen eines Abschnitts und markiert ihn als ausstehend für eine erneute Erfassung.
+
+**Ausgabe (start):**
+
+```json
+{
+  "complete": false,
+  "current_section": 1,
+  "title": "Identity & Role",
+  "questions": ["What is your full name...?", "..."],
+  "progress": { "complete": 0, "total": 10 }
+}
+```
+
+**Hinweise:**
+- Sitzungen werden in SQLite gespeichert — überstehen Client-Neustarts.
+- Eine Sitzung pro Namensraum. Ein `start`-Aufruf auf eine bestehende Sitzung setzt diese fort.
+- Das Einreichen für einen bereits abgeschlossenen Abschnitt gibt einen Fehler zurück; verwenden Sie zuerst `reset`.
+
+---
+
+### `import` — Massenimport von Profilen
+
+Importiert ein strukturiertes Profil- oder Freiform-Dokument in einem Schritt als einzelne Erinnerungen.
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `format` | `"profile" \| "freeform"` | **Ja** | - | `"profile"` für 10-Abschnitte-Bootstrap-Ausgabe, `"freeform"` für beliebiges Markdown. |
+| `content` | `string` | **Ja** | - | Der zu importierende Dokumenttext. Maximal 500.000 Zeichen. |
+| `namespace` | `string` | Nein | `"profile"` | Namensraum-Geltungsbereich. |
+| `dry_run` | `boolean` | Nein | `false` | Bei `true` wird eine Vorschau dessen zurückgegeben, was gespeichert würde, ohne zu schreiben. |
 
 **Ausgabe:**
+
+```json
+{
+  "dry_run": false,
+  "format": "profile",
+  "memories_created": 24,
+  "duplicates_skipped": 2,
+  "collections": ["identity", "goals", "entities", "..."],
+  "sections_processed": 10
+}
+```
+
+**Hinweise:**
+- `format: "profile"` erkennt `## N.`-Abschnittsüberschriften und ordnet jede der korrekten Collection, Stufe, Typ, Wichtigkeit und Tags zu.
+- `format: "freeform"` teilt nach Überschriften und Absatzgrenzen mit Standard-Metadaten (Collection: `general`, Stufe: `T2`).
+- Die Duplikaterkennung greift über die bestehende Schreibpipeline — ein erneuter Import ist gefahrlos möglich.
+- `dry_run: true` gibt Erinnerungsvorschauen ohne Schreibvorgänge zurück.
+- Überschriften, die außerhalb der 10 speicher-zugeordneten Abschnitte nummeriert sind (z. B. ein Dokument, das gegen eine ältere 12-Abschnitte-Vorlage geschrieben wurde), werden nicht stillschweigend verworfen — ihre Nummern werden in `sections_ignored` gemeldet, damit Sie wissen, dass Inhalt übersprungen wurde, statt ihn unbemerkt zu verlieren.
+- Wenn [`remember`](#remember--erinnerung-speichern) Ihren Inhalt wegen Überschreitung von `pipeline.long_content_threshold_chars` abgelehnt hat, verwenden Sie stattdessen `import` mit `format: "freeform"` — es teilt das Dokument nach Überschriften-/Absatzgrenzen und bettet jeden Abschnitt einzeln ein, wodurch das Problem eines einzelnen Matsch-Vektors vermieden wird, vor dem der Schwellenwert von `remember` schützt.
+
+---
+
+### `revisions` — Revisionsverlauf auflisten oder zurücksetzen
+
+Listet den Revisionsverlauf einer Erinnerung auf oder setzt deren Inhalt auf eine vorherige Revision zurück. Die Namensraum-Sichtbarkeit wird wie bei `forget` und `tag` aufgelöst (die Erinnerung wird zuerst per ID nachgeschlagen). Nur T0-Erinnerungen sammeln Revisionen — siehe [T0-Revisionsverlauf](#t0-revisionsverlauf).
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `action` | `"list" \| "revert"` | **Ja** | - | Auszuführende Operation. |
+| `id` | `string (UUID)` | **Ja** | - | Die Erinnerungs-ID. |
+| `revision` | `number` | Erforderlich für `revert` | - | Die Revisionsnummer, auf die zurückgesetzt werden soll. |
+
+**Ausgabe (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revisions": [
+    { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
+    { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
+  ]
+}
+```
+
+Eine Erinnerung ohne Inhaltsänderungen liefert ein leeres `revisions`-Array, keinen Fehler.
+
+**Ausgabe (`action: "revert"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "revision": 1,
+  "content": "der wiederhergestellte Inhalt"
+}
+```
+
+**Hinweise:**
+- Der Revert stellt den Inhalt der Zielrevision über denselben Pfad wieder her, den auch der UPDATE-Deduplizierungspfad von `remember` nutzt: neue Prüfsumme, neu eingebetteter Vektor, erneutes Upsert in Qdrant. Der Inhalt vor dem Revert wird als neuer, anhängender Verlaufseintrag erhalten (der Verlauf wird nie überschrieben).
+- Ein `REVISE`-Audit-Ereignis protokolliert die Quellrevisionsnummer, unterscheidbar vom generischen REVISE, das die Schreib-Pipeline bei gewöhnlichen T0-Inhaltsänderungen protokolliert.
+- Der Revert benötigt den Embedding-Provider — ist dieser nicht verfügbar, schlägt der Revert mit `EMBEDDING_UNAVAILABLE` fehl und die Erinnerung bleibt vollständig unverändert (kein Teil-Schreibvorgang, keine Vektor-Desynchronisierung).
+- Ein Revert auf eine nicht existierende Revisionsnummer liefert `NOT_FOUND`.
+
+---
+
+### `review` — Review-Warteschlange und Archiv-Wiederherstellung
+
+Listet die T1-Review-Warteschlange auf und disponiert sie, und stellt archivierte Erinnerungen wieder her. Schließt die Leseseite des gestuften Lebenszyklus: `review_due` (auf T1-Erinnerungen gestempelt, siehe [Stufenlebenszyklus](#stufenlebenszyklus--zuweisung-beförderung-gleitendes-fenster)) und `archived_memories` (siehe [Verfall, Bereinigung und Archivierung](#verfall-bereinigung-und-archivierung)) hatten bisher zwar einen Schreibpfad, aber keine MCP-seitige Leseoberfläche. Die Inhaltsrevision wird hier bewusst nicht dupliziert — dafür den UPDATE-Pfad von `remember` verwenden.
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `action` | `"list" \| "keep" \| "archive" \| "restore"` | **Ja** | - | Auszuführende Operation. |
+| `id` | `string (UUID)` | Erforderlich für `keep`/`archive`/`restore` | - | Die Erinnerungs-ID. Bei `restore` die ursprüngliche Erinnerungs-ID, die im Archiv nachgeschlagen wird. |
+| `days` | `integer (0–3650)` | Nein | `0` | (nur `list`) Vorlauffenster in Tagen über „jetzt fällig" hinaus. `0` liefert nur bereits fällige Erinnerungen. |
+| `namespace` | `string` | Nein | `"global"` | Namensraum-Bereich. |
+| `limit` | `integer (1–100)` | Nein | `20` | (nur `list`) Seitengröße. |
+| `cursor` | `string` | Nein | - | (nur `list`) Paginierungs-Cursor eines vorherigen `list`-Aufrufs. |
+
+**Ausgabe (`action: "list"`):**
+
+```json
+{
+  "items": [
+    {
+      "id": "3f4a1b2c-...",
+      "namespace": "global",
+      "collection": "general",
+      "summary": "Deployment-Runbook für den Payments-Service",
+      "tags": ["deployment", "runbook"],
+      "retention_tier": "T1",
+      "review_due": "2026-03-01T00:00:00.000Z",
+      "expires_at": "2026-03-01T00:00:00.000Z"
+    }
+  ],
+  "cursor": "2026-03-01T00:00:00.000Z|3f4a1b2c-..."
+}
+```
+
+Die Einträge sind nicht archivierte T1-Erinnerungen, deren `review_due` bei oder vor „jetzt + `days`" liegt, zurückgegeben mit dem am längsten fälligen zuerst. `cursor` ist `null`, sobald die letzte Seite erreicht ist; für die nächste Seite als `cursor`-Eingabe zurückgeben.
+
+**Ausgabe (`action: "keep"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "review_due": "2027-03-01T00:00:00.000Z",
+  "expires_at": "2027-03-01T00:00:00.000Z"
+}
+```
+
+Bestätigt, dass die Erinnerung weiterhin zutrifft: verlängert sowohl `review_due` als auch `expires_at` gemäß der Lebenszyklusrichtlinie der Stufe der Erinnerung (unter Wiederverwendung derselben Berechnung, die `remember` und zugriffsgesteuerte Promotion nutzen), unabhängig von `sliding_window_enabled` — eine explizite menschliche Bestätigung erhält die volle Verlängerung, selbst wenn die passive Gleitfenster-Erneuerung deaktiviert ist. Protokolliert ein `REVISE`-Audit-Ereignis, das eine Review-Bestätigung vermerkt. Liefert `NOT_FOUND`, falls die Erinnerung nicht existiert.
+
+**Ausgabe (`action: "archive"`):**
+
+```json
+{ "id": "3f4a1b2c-...", "archived": true }
+```
+
+Leitet die Erinnerung über denselben Archivierungsübergang, den auch GC nutzt: ihr Vektor wird entfernt, ihre Zeile wird nach `archived_memories` verschoben (Zusammenfassung, Tags, Stufe und Zugriffsstatistiken werden beibehalten; Inhalt und Vektor nicht), und ein `ARCHIVE`-Audit-Ereignis wird protokolliert. Liefert `NOT_FOUND`, falls die ID nie existiert hat, und `CONFLICT`, falls sie bereits archiviert ist.
+
+**Ausgabe (`action: "restore"`):**
+
+```json
+{
+  "id": "9c2e5f10-...",
+  "restored_from": "3f4a1b2c-...",
+  "archive_id": 42,
+  "restored": true
+}
+```
+
+Erstellt eine aktive Erinnerung aus der gespeicherten Zusammenfassung und den Tags des Archiveintrags neu, auf der ursprünglichen Stufe — ein **Stub mit Herkunftsnachweis**, keine Wiederbelebung: der ursprüngliche Inhalt und Vektor wurden nie aufbewahrt, daher ist der Inhalt der wiederhergestellten Erinnerung ihre archivierte Zusammenfassung, versehen mit ihren ursprünglichen Tags plus einem `restored-from-archive`-Markierungs-Tag, und frisch eingebettet, damit sie an der Suche teilnimmt. Die Archivzeile wird beibehalten (nicht gelöscht), anders als beim CLI-Befehl `archive restore`. Protokolliert ein `RESTORE`-Audit-Ereignis, das den Archivursprung verknüpft. Liefert `NOT_FOUND`, falls für die angegebene ID kein Archiveintrag existiert.
+
+---
+
+### `feedback` — Nützlichkeit einer Erinnerung protokollieren
+
+Protokolliert, ob eine zuvor von `recall` oder `search` zurückgegebene Erinnerung
+tatsächlich nützlich war, als unveränderliches Ereignis in einer eigenen
+`recall_feedback`-Tabelle, die mit der Erinnerung verknüpft ist. **Diese Version ist
+rein additiv**: Sie hat keine Auswirkung auf Ranking, Lebenszyklus oder irgendein
+Ergebnis von `recall`/`search`/`review` — es gibt keine Aggregation, keine
+Lese-/Listenoberfläche, keine Kopplung an Ranking oder Lebenszyklus. Die Ereignisse
+werden gesammelt, damit eine zukünftige Änderung die Gewichte von `search.ranking`,
+Verfallsraten und Dedup-Schwellenwerte anhand von Evidenz statt anhand von durch
+Inspektion gewählten Vorgaben anpassen kann.
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `id` | `string (UUID)` | **Ja** | - | Die Erinnerungs-ID aus einem vorherigen `recall`/`search`-Ergebnis. |
+| `useful` | `boolean` | **Ja** | - | Ob das Ergebnis nützlich war. |
+| `query` | `string (max. 500 Zeichen)` | Nein | - | Die Abfrage, die dieses Ergebnis erzeugt hat, für spätere Analysen übernommen. Wird nicht gegen einen vorherigen Aufruf geprüft. |
+| `score` | `number (0–1)` | Nein | - | Der vom Aufrufer beobachtete Score für dieses Ergebnis, für spätere Analysen übernommen. |
+
+**Ausgabe:**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "useful": true,
+  "recorded_at": "2026-03-01T00:00:00.000Z"
+}
+```
+
+Schlägt die Erinnerung auf dieselbe Weise nach wie `tag`/`forget` (nur aktive Zeilen)
+und liefert `NOT_FOUND`, falls sie nicht existiert — auch für eine ID, die nur im
+Archiv existiert. `query`/`score` werden genau wie angegeben gespeichert — `null`, wenn
+weggelassen, niemals ein erfundener Standardwert — und nicht gegen einen echten
+vorherigen `recall`/`search`-Aufruf geprüft, dasselbe Vertrauensmodell, das `tag`/
+`forget` bereits jeder von einem Aufrufer angegebenen `id` entgegenbringen. Mehrere
+Feedback-Ereignisse für dieselbe Erinnerung werden jeweils als eigene Zeile
+gespeichert; keines überschreibt ein früheres. Das Protokollieren von Feedback
+verändert niemals die eigenen Felder der referenzierten Erinnerung (`access_count`,
+`importance`, `retention_tier`, `review_due`, `updated_at` bleiben alle unverändert).
+
+---
+
+### `relate` — Erinnerungen mit typisierten Kanten verbinden
+
+Verbindet Erinnerungen mit typisierten, gerichteten Kanten — einer allgemeinen,
+vom Aufrufer autorisierten Beziehung neben dem automatischen `merged_from`-Ersetzungs
+zeiger der Write-Pipeline (den `relate` unangetastet lässt). Fünf Relationen werden
+unterstützt: `refines`, `contradicts`, `derived_from`, `about_same_entity`, `follows`.
+Kanten sind gerichtet (`from_id` → `to_id`), aber `list` und `follow_links` von
+`recall` (siehe oben) durchlaufen beide Richtungen, sodass konzeptionell symmetrische
+Relationen (`contradicts`, `about_same_entity`) sich in der Praxis symmetrisch
+verhalten.
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `action` | `"add" \| "list" \| "remove"` | **Ja** | — | Die auszuführende Operation. |
+| `from_id` | `string (UUID)` | Erforderlich für `add`/`remove` | — | Quell-Erinnerungs-ID. |
+| `to_id` | `string (UUID)` | Erforderlich für `add`/`remove` | — | Ziel-Erinnerungs-ID. Muss sich von `from_id` unterscheiden. |
+| `relation` | `"refines" \| "contradicts" \| "derived_from" \| "about_same_entity" \| "follows"` | Erforderlich für `add`/`remove` | — | Kantentyp. |
+| `id` | `string (UUID)` | Erforderlich für `list` | — | Die Erinnerung, deren Kanten aufgelistet werden sollen. |
+| `direction` | `"from" \| "to" \| "both"` | Nein | `"both"` | (nur `list`) Kanten relativ zu `id` nach Richtung filtern. |
+
+**Ausgabe (`action: "add"`):**
+
+```json
+{
+  "id": 42,
+  "namespace": "global",
+  "from_id": "3f4a1b2c-...",
+  "to_id": "9c2e5f10-...",
+  "relation": "refines",
+  "created_at": "2026-03-01T00:00:00.000Z",
+  "created": true
+}
+```
+
+Idempotent: Das erneute Hinzufügen einer bereits vorhandenen Kante (gleiche `from_id`,
+`to_id` und `relation`) liefert die vorhandene Zeile mit `created: false` zurück, statt
+einen Fehler auszulösen oder ein Duplikat zu erstellen. Liefert `NOT_FOUND`, falls eine
+der beiden Erinnerungs-IDs nicht existiert, und `INVALID_INPUT`, falls `from_id === to_id`
+oder die beiden Erinnerungen zu unterschiedlichen Namensräumen gehören
+(Cross-Collection-Verknüpfungen innerhalb desselben Namensraums sind erlaubt).
+
+**Ausgabe (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "links": [
+    {
+      "id": 42,
+      "from_id": "3f4a1b2c-...",
+      "to_id": "9c2e5f10-...",
+      "relation": "refines",
+      "direction": "outgoing",
+      "created_at": "2026-03-01T00:00:00.000Z",
+      "created_by": "c1"
+    }
+  ]
+}
+```
+
+Liefert jede Kante, die `id` berührt, in beide Richtungen, sofern `direction` sie nicht
+einschränkt, jede markiert mit `outgoing` (`id` ist `from_id`) oder `incoming` (`id` ist
+`to_id`). Verwendet den archiv-inklusiven Lookup, sodass Kanten einer bald zu
+archivierenden Erinnerung weiterhin auflistbar bleiben. Liefert `NOT_FOUND`, falls `id`
+nicht existiert.
+
+**Ausgabe (`action: "remove"`):**
+
+```json
+{ "removed": true, "from_id": "3f4a1b2c-...", "to_id": "9c2e5f10-...", "relation": "refines" }
+```
+
+Löscht die benannte Kante. Liefert `NOT_FOUND`, falls sie nicht existiert.
+
+Das Löschen einer Erinnerung (über `forget` oder die `archive`-Aktion von `review`)
+löscht kaskadierend jede Kante, die auf sie verwiesen hat, sodass `memory_links` nie
+einen verwaisten Verweis auf eine fehlende Erinnerung enthält. Für `relate` wird keine
+neue `AuditOperation` protokolliert — die Kantentabelle selbst, mit `created_at`/
+`created_by` auf jeder Zeile, ist der dauerhafte Nachweis.
+
+---
+
+### `repair` — SQLite aus Qdrant wiederherstellen oder veraltete Embedding-Stempel migrieren
+
+Repariert den lokalen Zustand aus externen Quellen. `mode: "from-qdrant"` (Standard)
+stellt Erinnerungen aus Qdrant in der lokalen SQLite-Datenbank wieder her — verwendet
+für Multi-Device-Setups, Datenwiederherstellung nach Verlust oder Onboarding neuer
+Geräte. `mode: "re-embed"` migriert Erinnerungen, deren Embedding-Stempel von
+`embedding.provider`/`embedding.model` abweicht — siehe
+[Migration des Einbettungsmodells](#migration-des-einbettungsmodells). Siehe auch
+[Reparatur und Wiederherstellung](#reparatur-und-wiederherstellung).
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `mode` | `"from-qdrant" \| "re-embed"` | Nein | `"from-qdrant"` | Welche Reparaturoperation ausgeführt wird. |
+| `dry_run` | `boolean` | Nein | `false` | Wenn `true`, wird berichtet, was sich ändern würde, ohne Änderungen vorzunehmen. |
+| `device_id` | `string` | Nein | — | (nur `from-qdrant`) Wiederherstellung auf Erinnerungen eines bestimmten Geräts beschränken. Schließt sich mit `all_devices` gegenseitig aus. |
+| `all_devices` | `boolean` | Nein | `false` | (nur `from-qdrant`) Erinnerungen von allen Geräten ausdrücklich wiederherstellen. Schließt sich mit `device_id` gegenseitig aus. Dies ist auch das Standardverhalten, wenn keines der beiden Felder angegeben wird. |
+| `include_legacy` | `boolean` | Nein | `false` | (nur `re-embed`) Auch alte Zeilen ohne jeden Embedding-Stempel einbeziehen, nicht nur Zeilen mit abweichendem Modell. |
+| `batch_size` | `number` | Nein | `50` | (nur `re-embed`) Erinnerungen pro Batch (1-500). |
+
+**Ausgabe (`mode: "from-qdrant"`):**
 
 ```json
 {
@@ -2361,12 +3677,237 @@ Erinnerungen aus Qdrant in die lokale SQLite-Datenbank wiederherstellen. Wird f�
 **Hinweise:**
 - Nur Punkte mit `content` in ihrem Qdrant-Payload können wiederhergestellt werden. Vor-1.3-Erinnerungen ohne Inhalt in Qdrant werden als `skipped_no_content` gemeldet.
 - Wiederhergestellte Erinnerungen bewahren ihre ursprüngliche `device_id` aus dem Qdrant-Payload. Wenn keine `device_id` im Payload existiert, wird die lokale Geräte-ID verwendet.
+- Wiederhergestellte Erinnerungen bewahren außerdem, welchen Embedding-Stempel (falls vorhanden) ihr Quellvektor bereits trug, statt die aktive Konfigurationsidentität zu beanspruchen — die Wiederherstellung rekonstruiert Metadaten für einen bestehenden Vektor, sie erzeugt keinen neuen.
 - Die gleichzeitige Angabe von `device_id` und `all_devices: true` wird als ungültige Eingabe abgelehnt.
 - Nach der Wiederherstellung führen Sie `npm run build` aus und starten Sie den Server bei Bedarf neu. Die wiederhergestellten Erinnerungen sind sofort für Suche und Recall verfügbar.
+
+**Ausgabe (`mode: "re-embed"`):**
+
+```json
+{
+  "mode": "re-embed",
+  "dry_run": false,
+  "active_identity": "openai/text-embedding-3-small@1536",
+  "include_legacy": false,
+  "updated": 118,
+  "failed": 0,
+  "remaining": 0,
+  "bound_reached": false,
+  "converged": true
+}
+```
+
+**Hinweise:**
+- Die Auswahl basiert auf dem Stempel selbst, sodass ein unterbrochener Lauf sicher fortgesetzt wird — bereits neu gestempelte Zeilen passen beim nächsten Aufruf einfach nicht mehr auf die Auswahlbedingung.
+- Ein Embed/Upsert-Fehler pro Erinnerung wird isoliert (in `failed` gezählt, für einen späteren Lauf belassen), statt den gesamten Batch abzubrechen.
+- `converged: true` bedeutet, dass keine veralteten Stempel mehr verbleiben (im Rahmen des angeforderten `include_legacy`); die erwartete Identität des Stores wird aktualisiert, und die `embedding`-Health-Degradation verschwindet sofort, ohne Neustart.
+- Auch über die CLI verfügbar: `bhgbrain repair --re-embed [--include-legacy] [--batch-size <n>] [--dry-run]`.
+
+---
+
+### `consolidate` — Auffinden und Zusammenführen von Duplikat-Clustern
+
+Findet und führt nahezu doppelte, bereits vorhandene Erinnerungen zusammen — schließt die Lücke auf der Lesenseite, die die schreibzeitige Duplikaterkennung offen lässt. Die Duplikaterkennung (siehe [Deduplizierung](#deduplizierung)) vergleicht einen eingehenden Schreibvorgang immer nur mit dem bereits Gespeicherten; nichts schaut *rückwärts* über bereits existierende Erinnerungen. Importe und Schreibvorgänge während eines Ausfalls (ein Embedding-Provider-Ausfall, der auf eine losere Checksum/Jaccard-Heuristik zurückfällt) hinterlassen regelmäßig Beinahe-Duplikate, die die schreibzeitige Duplikaterkennung im Nachhinein strukturell nicht erfassen kann. `action: "list"` durchsucht einen Namensraum/eine Collection nach Clustern von Beinahe-Duplikaten mittels einer begrenzten, paginierten Ähnlichkeitsabfrage pro Punkt (niemals ein vollständiger paarweiser Scan); `action: "merge"` führt ein explizit vom Menschen gewähltes Cluster in eine Ziel-Erinnerung zusammen und nutzt dabei denselben Archivierungsübergang wie das `review`-Werkzeug pro Quelle. Es gibt keinen automatischen oder geplanten Merge-Pfad — `merge` erfordert immer eine explizite `target_id` und `source_ids`.
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `action` | `"list" \| "merge"` | **Ja** | - | Welche Operation ausgeführt werden soll. |
+| `namespace` | `string` | Nein | `"global"` | Namensraum-Geltungsbereich. |
+| `collection` | `string` | Nein | `"general"` | Collection-Geltungsbereich. Cluster überspannen niemals mehrere Collections. |
+| `cursor` | `string` | Nein | - | (nur `list`) Paginierungs-Cursor aus einem vorherigen `list`-Aufruf. |
+| `min_cluster_size` | `integer (>= 2)` | Nein | `2` | (nur `list`) Cluster, die kleiner sind, werden aus dem Ergebnis entfernt. |
+| `target_id` | `string (UUID)` | Erforderlich für `merge` | - | Die Erinnerung, in die alle Quellen zusammengeführt werden. Inhalt und Embedding bleiben unverändert. |
+| `source_ids` | `array<string (UUID)>` | Erforderlich für `merge` | - | Erinnerungs-IDs, die in `target_id` zusammengeführt und archiviert werden. Darf `target_id` nicht enthalten. |
+
+**Ausgabe (`action: "list"`):**
+
+```json
+{
+  "clusters": [
+    {
+      "members": [
+        {
+          "id": "3f4a1b2c-...",
+          "summary": "Deployment-Runbook für den Payments-Service",
+          "tags": ["deployment", "runbook"],
+          "importance": 0.7,
+          "access_count": 4,
+          "updated_at": "2026-02-01T00:00:00.000Z"
+        },
+        {
+          "id": "9c2e5f10-...",
+          "summary": "Payments-Service Deployment-Runbook (v2)",
+          "tags": ["deployment"],
+          "importance": 0.5,
+          "access_count": 1,
+          "updated_at": "2026-01-15T00:00:00.000Z"
+        }
+      ],
+      "suggested_target": "3f4a1b2c-..."
+    }
+  ],
+  "cursor": null
+}
+```
+
+Erinnerungen werden zu einem Cluster gruppiert, wenn sie innerhalb der gescannten Seite durch eine Ähnlichkeitskante bei oder über `consolidation.similarity_threshold` (Standard `0.9` — bewusst unterhalb der schreibzeitigen UPDATE-Schwellenwerte der Duplikaterkennung, sodass `list` Kandidaten aufzeigt, die die Duplikaterkennung selbst nicht automatisch zusammengeführt hätte) verbunden sind. `suggested_target` ist **nur ein Hinweis**: das Mitglied mit der höchsten `importance` (bei Gleichstand entscheidet `access_count`, dann die zuletzt aktualisierte `updated_at`). `merge` leitet `target_id` niemals daraus ab — ein Aufrufer muss sie explizit benennen. `cursor` ist `null`, sobald die gescannte Seite kleiner als `consolidation.max_scan_per_call` ist; zum Fortsetzen des Scans über mehrere Aufrufe hinweg zurückgeben.
+
+**Ausgabe (`action: "merge"`):**
+
+```json
+{ "target_id": "3f4a1b2c-...", "merged": ["9c2e5f10-..."], "failed": [] }
+```
+
+Bei Erfolg werden die `tags` des Ziels zur Vereinigung seiner eigenen Tags und aller Quell-Tags, seine `importance` wird zum Maximum über Ziel und alle Quellen, und sein `merged_from`-Feld verzeichnet jede zusammengeführte Quell-ID (kommagetrennt, an einen etwaigen vorherigen Wert angehängt — eine Erinnerung kann im Laufe ihres Lebens Ziel mehrerer Konsolidierungen sein). Jede Quelle wird über denselben Übergang archiviert, den die `archive`-Aktion von `review` verwendet: Vektor entfernt, Zeile nach `archived_memories` verschoben, und ein `ARCHIVE`-Audit-Ereignis mit `action: "consolidate"` und `merged_into` (verweist auf das Ziel) wird aufgezeichnet. Lehnt mit `INVALID_INPUT` ab, wenn `target_id` in `source_ids` enthalten ist oder eine Quelle zu einem anderen Namensraum/einer anderen Collection als das Ziel gehört (in diesem Fall wird nichts archiviert), und mit `NOT_FOUND`, wenn eine Quell-ID nie existiert hat. Eine bereits archivierte Quelle wird stillschweigend übersprungen statt abgelehnt, sodass ein erneuter `merge`-Aufruf nach einem teilweise erfolgreichen Versuch sicher ist. Schlägt die Archivierung einer Quelle mittendrin fehl, unterscheiden die Arrays `merged`/`failed` in der Antwort, was erfolgreich war und was nicht — die fehlgeschlagene Quelle bleibt aktiv, nicht sowohl archiviert als auch nicht gelöscht.
+
+---
+
+## Docker
+
+BHGBrain bietet offiziellen Docker-Support mit zwei Bereitstellungsmodi: selbst gehostetes Qdrant (Sidecar-Container) und Qdrant Cloud (extern).
+
+### Schnellstart
+
+```bash
+# 1. Umgebung kopieren und konfigurieren (optional — eine fehlende .env
+#    bricht den Start nicht mehr ab; für Embeddings wird trotzdem OPENAI_API_KEY benötigt).
+cp .env.example .env
+# .env mit Ihrem OPENAI_API_KEY und weiteren Einstellungen bearbeiten
+
+# 2a. Selbst gehostetes Qdrant (inklusive Qdrant-Sidecar)
+docker compose --profile self-hosted up
+
+# 2b. Qdrant Cloud (kein Sidecar, BHGBRAIN_QDRANT_URL in .env konfigurieren)
+docker compose up
+```
+
+Der Server ist unter `http://localhost:3721` erreichbar (standardmäßig nur auf
+Host-Loopback veröffentlicht). Gesundheitszustand prüfen mit:
+
+```bash
+curl http://localhost:3721/health
+```
+
+### Sicherheitsstandards
+
+Der Container bindet die API an `0.0.0.0`, damit der veröffentlichte Port erreichbar ist,
+und ist **standardmäßig authentifiziert**:
+
+- Ist `BHGBRAIN_TOKEN` nicht gesetzt, **generiert** der Entrypoint beim ersten Start
+  ein Bearer-Token, speichert es dauerhaft unter `/data/bhgbrain-token` und gibt es in
+  den Logs aus. Abrufen mit:
+
+  ```bash
+  docker compose logs bhgbrain | grep token
+  # oder
+  docker compose exec bhgbrain cat /data/bhgbrain-token
+  ```
+
+- Stellen Sie Ihr eigenes stabiles Token bereit, indem Sie `BHGBRAIN_TOKEN` in `.env` setzen:
+
+  ```bash
+  echo "BHGBRAIN_TOKEN=$(openssl rand -hex 24)" >> .env
+  ```
+
+- Der veröffentlichte Port wird auf Host-Loopback abgebildet (`127.0.0.1:3721:3721`),
+  sodass die API standardmäßig nicht im LAN erreichbar ist. Ändern Sie das Mapping in
+  `docker-compose.yml`, um sie extern verfügbar zu machen.
+
+- Um bewusst **ohne** Authentifizierung zu laufen, setzen Sie
+  `BHGBRAIN_ALLOW_UNAUTHENTICATED=true` (der Server protokolliert eine Warnung; nicht
+  empfohlen bei Nicht-Loopback-Bindungen).
+
+Der Container läuft außerdem als Nicht-root-Benutzer (`node`).
+
+### Compose-Profile
+
+| Befehl | Was läuft |
+|---------|-----------|
+| `docker compose --profile self-hosted up` | BHGBrain + Qdrant-Sidecar (Port 6333) |
+| `docker compose up` | Nur BHGBrain (Verbindung zu Qdrant Cloud über Umgebungsvariablen) |
+
+### Docker-Umgebungsvariablen
+
+Diese `BHGBRAIN_*`-Umgebungsvariablen überschreiben, wenn gesetzt, Werte aus `config.json`:
+
+| Variable | Config-Feld | Standard im Container | Beschreibung |
+|----------|-------------|---------------------|-------------|
+| `BHGBRAIN_DATA_DIR` | `data_dir` | `/data` | Pfad des Container-Volumes |
+| `BHGBRAIN_HTTP_HOST` | `transport.http.host` | `0.0.0.0` | Bind-Adresse |
+| `BHGBRAIN_HTTP_PORT` | `transport.http.port` | `3721` | HTTP-Port |
+| `BHGBRAIN_QDRANT_MODE` | `qdrant.mode` | `embedded` | `embedded` oder `external` |
+| `BHGBRAIN_QDRANT_URL` | `qdrant.external_url` | — | Qdrant-Endpunkt-URL |
+| `BHGBRAIN_REQUIRE_LOOPBACK` | `security.require_loopback_http` | `false` | Loopback-Beschränkung |
+| `BHGBRAIN_ALLOW_UNAUTHENTICATED` | `security.allow_unauthenticated_http` | `false` | Auth-Prüfung überspringen |
+| `BHGBRAIN_LOG_LEVEL` | `observability.log_level` | `info` | Log-Ausführlichkeit |
+
+Zusätzlich die bestehenden Laufzeit-Variablen: `OPENAI_API_KEY`, `BHGBRAIN_TOKEN`, `QDRANT_API_KEY`, `BHGBRAIN_DEVICE_ID`.
+
+### Volume
+
+Das `/data`-Volume speichert die SQLite-Datenbank, das aufgelöste `config.json` und Sicherungen dauerhaft über Container-Neustarts hinweg. Dies wird über `BHGBRAIN_DATA_DIR` abgebildet.
+
+### Bootstrap beim ersten Start
+
+Wenn ein Container mit einem leeren `/data`-Volume startet und sich mit einer Qdrant-Instanz verbindet, die bereits Erinnerungen enthält, befüllt BHGBrain die lokale SQLite-Datenbank automatisch aus Qdrant über `bootstrapFromQdrant()`. Ein manueller `repair`-Schritt ist nicht erforderlich. Diese automatische Befüllung ist bewusst nicht auf ein Gerät beschränkt — sie stellt die Erinnerungen aller Geräte auf der frischen, leeren Datenbank wieder her. Ein anschließend manuell ausgeführtes `bhgbrain repair --from-qdrant` beschränkt sich standardmäßig nur auf die Erinnerungen des aktuellen Geräts (übergeben Sie `--all-devices`, um dies zu erweitern); siehe [CLI-Referenz](#cli-referenz).
+
+### Image erstellen
+
+```bash
+docker build -t bhgbrain .
+```
+
+Das Image verwendet einen mehrstufigen Build auf `node:22-slim` (~200MB Endgröße). Der Healthcheck nutzt das native `fetch()` von Node.js — kein `curl` erforderlich.
 
 ---
 
 ## Upgrade
+
+### 1.3 → 1.4 (Resilienz & Observability)
+
+**Keine manuelle Migration erforderlich.** Alle neuen Funktionen verwenden abwärtskompatible Standardwerte.
+
+Neuerungen:
+
+- **Circuit-Breaker** für OpenAI und Qdrant. Überschreiten aufeinanderfolgende Fehler den Schwellenwert (Standard 5), öffnet sich der Breaker und unterbricht Anfragen für 30 Sekunden, bevor er die Wiederherstellung testet. Zustände sind im Health-Endpunkt sichtbar (Feld `circuitBreakers`). Konfiguration über `resilience.circuit_breaker` in `config.json`.
+- **Azure-Einbettungsanbieter.** Unterstützung für Azure AI Foundry (Azure-OpenAI-kompatibler Embeddings-Endpunkt) hinzugefügt. Konfigurieren Sie `embedding.provider: "azure-foundry"` und stellen Sie `embedding.azure.resource_name` sowie die Umgebungsvariable `AZURE_FOUNDRY_API_KEY` bereit.
+- **Azure-Rollout-Leitfaden.** Behandeln Sie `embedding.model` als den Azure-Deployment-Namen, validieren Sie die Abrufqualität in einem Canary-Namensraum oder einer Canary-Collection vor der Umstellung, und führen Sie ein Rollback durch, indem Sie `embedding.provider` zurück auf `"openai"` setzen und den Prozess neu starten.
+- **Perzentil-Metriken.** Histogramm-Metriken geben jetzt neben den bestehenden `_avg`- und `_count`-Suffixen auch `_p50`, `_p95` und `_p99` aus.
+- **Härtung der Post-Restore-Abgleichung.** `backup.restore` erwirbt jetzt über `beginRestoreOperation()` eine Fail-Safe-Sperre, isoliert Fehler bei der Vektor-Abgleichung pro Schritt und schreibt den Fortschritt inkrementell fest. Ein Fehler des Vektor-Stores während der Abgleichung liefert einen degradierten Bereitschaftsstatus statt eines vollständigen Wiederherstellungsfehlers.
+- **stdio-Log-Routing.** Strukturierte Pino-Logs werden nach stderr umgeleitet, wenn `--stdio` aktiv ist, um eine Beschädigung des MCP-JSON-RPC-Handshakes auf stdout zu verhindern.
+- **Typsicherheit.** Interne `as any`-Casts wurden im gesamten Codebase durch typisierte Interfaces und `SqlParams` ersetzt.
+- **Testabdeckung.** Neue Testsuiten für die Module Embedding, HTTP-Transport, Metriken, Logger, Health und CLI.
+
+**Neuer Konfigurationsabschnitt**:
+```jsonc
+{
+  "resilience": {
+    "circuit_breaker": {
+      "failure_threshold": 5,       // aufeinanderfolgende Fehler bis zum Öffnen
+      "open_window_ms": 30000,      // ms bis zur Half-Open-Probe
+      "half_open_probe_count": 1    // Proben bis zum Schließen
+    }
+  }
+}
+```
+
+**Azure-Einbettungskonfiguration** (fügt `embedding.azure` hinzu):
+```jsonc
+{
+  "embedding": {
+    "provider": "azure-foundry",
+    "model": "my-embedding-deployment",
+    "dimensions": 1536,
+    "azure": {
+      "resource_name": "my-foundry-resource"
+    }
+  }
+}
+```
+
+---
 
 ### 1.2 → 1.3 (Multi-Device-Speicher & Datenresilienz)
 
@@ -2465,12 +4006,13 @@ Sobald die Drift-Prüfung abgeschlossen ist, wird die Sperre freigegeben — das
 - Einbettungsabhängige Operationen (semantische Suche, Speicheraufnahme) geben bei der Anfrage `EMBEDDING_UNAVAILABLE` zurück.
 - Volltextsuche und Kategorie-Lesezugriffe funktionieren im Degraded-Modus weiterhin.
 - Health-Probes melden den Einbettungsstatus als `degraded`, ohne echte API-Aufrufe zu machen.
+- Wenn ein Anbieter konfiguriert ist, ist dessen Embedding-Health-Probe eine **einmalige, begrenzte Anfrage** (unter Beachtung von `embedding.request_timeout_ms`) ohne Retry/Backoff — einheitlich für `openai` und `azure-foundry`. Die Probe umgeht den Circuit-Breaker und meldet einen Boolean; sie durchläuft nicht die produktive Retry-Schleife und spiegelt daher den aktuellen Anbieterstatus schnell wider, statt bei einem Ausfall mehrere Sekunden zu blockieren.
 
 ### MCP-Antwortverträge
 
 - Tool-Aufruf-Antworten enthalten strukturierte JSON-Payloads.
 - Fehlerantworten setzen `isError: true` im MCP-Protokoll für clientseitiges Routing.
-- Parametrisierte Ressourcen (`memory://{id}`, `category://{name}`, `collection://{name}`) werden als MCP-Ressource-Templates über `resources/templates/list` bereitgestellt.
+- Parametrisierte Ressourcen (`memory://{id}`, `memory://inject/{hint}`, `category://{name}`, `collection://{name}`) werden als MCP-Ressource-Templates über `resources/templates/list` bereitgestellt.
 
 ### Suche und Paginierung
 
@@ -2493,6 +4035,27 @@ Wenn eine T0 (grundlegende) Erinnerung aktualisiert wird, wird die vorherige Ver
 ### Kompatibilität des Einbettungsmodells
 
 Sammlungen sperren ihr Einbettungsmodell und ihre Dimensionen bei der Erstellung. Wenn Sie `embedding.model` oder `embedding.dimensions` in der Konfiguration ändern, werden neue Erinnerungen in vorhandenen Sammlungen mit einem `CONFLICT`-Fehler abgelehnt, bis Sie eine neue Sammlung erstellen. Dies verhindert das Mischen inkompatibler Einbettungsräume im selben Qdrant-Index.
+
+**Anbieterspezifische Hinweise:**
+- **OpenAI**: Das Feld `embedding.model` gibt den OpenAI-Modellnamen an (z. B. `text-embedding-3-small`).
+- **Azure Foundry**: Das Feld `embedding.model` gibt den Azure-Deployment-Namen an. `embedding.dimensions` muss mit den für dieses Deployment konfigurierten Ausgabedimensionen übereinstimmen.
+
+Stellen Sie sicher, dass `embedding.provider` entsprechend auf `"openai"` oder `"azure-foundry"` gesetzt ist.
+
+**Unterstützte Modelle und Fail-Fast-Validierung:** `embedding.model` wird beim Start gegen eine feste Menge unterstützter Modelle validiert — `text-embedding-ada-002` (feste 1536 Dimensionen), `text-embedding-3-small` (bis zu 1536 Dimensionen), `text-embedding-3-large` (bis zu 3072 Dimensionen) — für beide Anbieter. Ein nicht unterstütztes Modell oder `dimensions` außerhalb der Obergrenze des gewählten Modells lässt die Konfigurationsvalidierung fehlschlagen, bevor der Server startet, mit einer Fehlermeldung, die das konfigurierte Modell nennt und die unterstützte Menge auflistet. Bei Azure muss der in `embedding.model` konfigurierte Deployment-Name einer dieser unterstützten Modellfamilien entsprechen; Deployments, die nach nicht unterstützten Modellen benannt sind, starten nicht. Dies ersetzt das bisherige stillschweigende Verhalten, bei dem ein nicht erkanntes Modell Vektoren mit falscher Dimensionalität gegenüber der Qdrant-Sammlung erzeugen konnte.
+
+**Migrationsleitfaden:**
+- Verwenden Sie einen Canary-Namensraum oder eine Canary-Collection, bevor Sie den Produktionsverkehr auf Azure umstellen.
+- Ein Rollback erfolgt durch Zurücksetzen von `embedding.provider` auf `"openai"` und einen Neustart von BHGBrain.
+- Verwenden Sie eine bestehende Collection nur weiter, wenn Modellfamilie und konfigurierte Dimensionen kompatibel bleiben; erstellen Sie andernfalls eine neue Collection, um das Mischen von Einbettungsräumen zu vermeiden.
+
+### stdio-Log-Routing
+
+Im stdio-Transportmodus (`--stdio`) werden strukturierte Pino-Logs nach **stderr** statt nach stdout geschrieben. Dies ist für die Korrektheit des MCP-Protokolls nicht verhandelbar: Das MCP-SDK verwendet stdout ausschließlich für das JSON-RPC-Framing. Jede Nicht-JSON-Ausgabe auf stdout (etwa Log-Zeilen) würde dazu führen, dass MCP-Clients den Initialisierungs-Handshake fehlschlagen lassen.
+
+- Im HTTP-Modus schreiben Logs weiterhin normal nach stdout.
+- Die Funktion `createLogger()` akzeptiert einen optionalen `destination`-Stream; `index.ts` übergibt `process.stderr`, wenn `isStdio` erkannt wird.
+- Um stdio-Modus-Logs in eine Datei umzuleiten: `node dist/index.js --stdio 2>bhgbrain.log`
 
 ### Geheimnis-Erkennung
 

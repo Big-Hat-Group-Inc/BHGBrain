@@ -1,3 +1,4 @@
+import type pino from 'pino';
 import type { BrainConfig } from '../config/index.js';
 import type { HealthSnapshot, HealthStatus, ComponentHealth, VectorReconciliationStatus } from '../domain/types.js';
 import type { StorageManager } from '../storage/index.js';
@@ -17,6 +18,7 @@ export class HealthService {
     private embedding: EmbeddingProvider,
     private config: BrainConfig,
     private breakers: Record<string, CircuitBreaker> = {},
+    private logger?: pino.Logger,
   ) {}
 
   async check(): Promise<HealthSnapshot> {
@@ -53,16 +55,47 @@ export class HealthService {
         unsynced_vectors: this.storage.sqlite.countUnsyncedVectors(),
         over_capacity: this.isOverCapacity(countsByTier),
         cleanup_lag_seconds: this.computeCleanupLagSeconds(now),
+        distillation: this.buildDistillationRollup(),
       },
+    };
+  }
+
+  // Additive rollup (add-memory-distillation, task 6.2): read straight from
+  // the persisted `distillation_state` single-row table (see
+  // `SqliteStore.getDistillationState`) so it reflects the last run
+  // regardless of which process last ran the scheduled job.
+  private buildDistillationRollup(): NonNullable<HealthSnapshot['retention']>['distillation'] {
+    const state = this.storage.sqlite.getDistillationState();
+    return {
+      last_run_at: state.last_run_at,
+      last_run_degraded: state.last_run_degraded,
+      distilled_total: state.distilled_total,
+      skipped_total: state.skipped_total,
     };
   }
 
   private checkSqlite(): ComponentHealth {
     try {
       const ok = this.storage.sqlite.healthCheck();
-      return ok
-        ? { status: 'healthy' }
-        : { status: 'unhealthy', message: 'SQLite health check failed' };
+      if (!ok) {
+        return { status: 'unhealthy', message: 'SQLite health check failed' };
+      }
+      // openspec/changes/upgrade-fulltext-to-fts5, task 3.3 (visibility half):
+      // when the SQLite build lacks the fts5 module, fulltext search runs on the
+      // legacy LIKE-based matcher instead of the FTS5/BM25 path. Surface that here
+      // rather than silently — the "Missing FTS5 support SHALL degrade gracefully
+      // and visibly" spec requirement — while keeping the component healthy. Since
+      // migrate-sqlite-to-native-engine, the `node:sqlite` build ships fts5, so
+      // `isFts5Available()` is `true` in normal operation and this branch is not
+      // the expected steady state anymore; it stays as a visible fallback for any
+      // future build that lacks the module.
+      if (!this.storage.sqlite.isFts5Available()) {
+        return {
+          status: 'healthy',
+          message: 'Fulltext search is running the legacy LIKE-based matcher: this SQLite build has no fts5 module.',
+        };
+      }
+      return { status: 'healthy' };
     } catch (err) {
       return { status: 'unhealthy', message: (err as Error).message };
     }
@@ -75,11 +108,28 @@ export class HealthService {
         ? { status: 'healthy' }
         : { status: 'unhealthy', message: 'Qdrant unreachable' };
     } catch (err) {
-      return { status: 'unhealthy', message: (err as Error).message };
+      const message = (err as Error).message;
+      // Log the raw failure reason so an operator reading structured logs can
+      // tell a retrieval-path failure (e.g. "this.client.query is not a
+      // function") from a plain connectivity failure (e.g. ECONNREFUSED),
+      // not just an operator polling /health and reading the message field.
+      this.logger?.warn({ event: 'qdrant_health_check_failed', message });
+      return { status: 'unhealthy', message };
     }
   }
 
   private async checkEmbedding(): Promise<ComponentHealth> {
+    // Identity mismatch takes priority over (and is independent of) the
+    // reachability probe below: a store expecting a different embedding
+    // identity than the active configuration is degraded even if the
+    // currently-configured provider is perfectly reachable — the risk is
+    // mixed vector spaces, not connectivity. Cheap (single SQLite read), so
+    // it is not subject to the 30s reachability cache below.
+    const mismatch = this.checkEmbeddingIdentityMismatch();
+    if (mismatch) {
+      return mismatch;
+    }
+
     // If running in degraded mode, skip the API call entirely
     if (this.embedding instanceof DegradedEmbeddingProvider) {
       return { status: 'degraded', message: 'Embedding provider unavailable (missing credentials)' };
@@ -101,6 +151,19 @@ export class HealthService {
     }
     this.cachedEmbeddingAt = now;
     return this.cachedEmbeddingHealth;
+  }
+
+  private checkEmbeddingIdentityMismatch(): ComponentHealth | null {
+    const expected = this.storage.sqlite.getExpectedEmbeddingIdentity();
+    if (expected && expected !== this.embedding.identity) {
+      return {
+        status: 'degraded',
+        message: `Embedding identity mismatch: store expects "${expected}" but active configuration ` +
+          `is "${this.embedding.identity}". Run the repair tool with mode: "re-embed" to migrate ` +
+          `existing vectors, or restore the previous embedding.provider/model configuration.`,
+      };
+    }
+    return null;
   }
 
   // `null` means cleanup has never completed successfully (a fresh install,

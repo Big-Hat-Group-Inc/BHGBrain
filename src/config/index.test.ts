@@ -155,6 +155,388 @@ describe('loadConfig Azure embedding validation', () => {
   });
 });
 
+describe('pipeline.contradiction_detection config', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to disabled with a 5000ms timeout when omitted', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.contradiction_detection.enabled).toBe(false);
+    expect(config.pipeline.contradiction_detection.timeout_ms).toBe(5000);
+  });
+
+  it('accepts enabled: true with a missing/invalid extraction_model_env — reachability is a runtime concern, not a config-shape one', () => {
+    const configPath = writeConfig({
+      pipeline: {
+        contradiction_detection: { enabled: true },
+        extraction_model_env: '',
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.contradiction_detection.enabled).toBe(true);
+    expect(config.pipeline.extraction_model_env).toBe('');
+  });
+
+  it('honors an explicit timeout_ms override', () => {
+    const configPath = writeConfig({
+      pipeline: {
+        contradiction_detection: { enabled: true, timeout_ms: 2500 },
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.contradiction_detection.timeout_ms).toBe(2500);
+  });
+});
+
+// add-memory-provenance-metadata, task 8.2
+describe('pipeline.default_confidence config', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 when omitted', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.default_confidence).toEqual({
+      cli: 1.0, api: 1.0, agent: 0.7, import: 0.5,
+    });
+  });
+
+  it('honors explicit per-source overrides', () => {
+    const configPath = writeConfig({
+      pipeline: {
+        default_confidence: { agent: 0.3 },
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.default_confidence.agent).toBe(0.3);
+    // Unspecified sources keep their own defaults.
+    expect(config.pipeline.default_confidence.cli).toBe(1.0);
+  });
+
+  it('rejects out-of-[0,1] bounds per source', () => {
+    const configPath = writeConfig({
+      pipeline: {
+        default_confidence: { agent: 1.5 },
+      },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
+describe('search.rerank config (add-opt-in-rerank-stage)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to disabled with the documented defaults when omitted', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.search.rerank).toEqual({
+      enabled: false,
+      provider: 'openai',
+      candidate_pool: 20,
+      model: 'gpt-4o-mini',
+      model_env: 'BHGBRAIN_RERANK_API_KEY',
+      timeout_ms: 3000,
+    });
+  });
+
+  it('honors explicit overrides', () => {
+    const configPath = writeConfig({
+      search: {
+        rerank: {
+          enabled: true,
+          candidate_pool: 10,
+          model: 'gpt-4o',
+          model_env: 'MY_RERANK_KEY',
+          timeout_ms: 1500,
+        },
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.search.rerank).toEqual({
+      enabled: true,
+      provider: 'openai',
+      candidate_pool: 10,
+      model: 'gpt-4o',
+      model_env: 'MY_RERANK_KEY',
+      timeout_ms: 1500,
+    });
+  });
+
+  it('rejects candidate_pool: 0 (below the minimum)', () => {
+    const configPath = writeConfig({ search: { rerank: { candidate_pool: 0 } } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects candidate_pool: 51 (above the maximum)', () => {
+    const configPath = writeConfig({ search: { rerank: { candidate_pool: 51 } } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects an unsupported provider value', () => {
+    const configPath = writeConfig({ search: { rerank: { provider: 'anthropic' } } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a non-positive timeout_ms', () => {
+    const configPath = writeConfig({ search: { rerank: { timeout_ms: 0 } } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
+describe('consolidation config (add-duplicate-cluster-consolidation)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to enabled with threshold 0.9, neighbor_top_k 20, max_scan_per_call 500 when omitted', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.consolidation.enabled).toBe(true);
+    expect(config.consolidation.similarity_threshold).toBe(0.9);
+    expect(config.consolidation.neighbor_top_k).toBe(20);
+    expect(config.consolidation.max_scan_per_call).toBe(500);
+  });
+
+  it('honors explicit overrides', () => {
+    const configPath = writeConfig({
+      consolidation: {
+        enabled: false, similarity_threshold: 0.85, neighbor_top_k: 10, max_scan_per_call: 100,
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.consolidation.enabled).toBe(false);
+    expect(config.consolidation.similarity_threshold).toBe(0.85);
+    expect(config.consolidation.neighbor_top_k).toBe(10);
+    expect(config.consolidation.max_scan_per_call).toBe(100);
+  });
+
+  it('rejects a similarity_threshold outside [0,1]', () => {
+    const configPath = writeConfig({ consolidation: { similarity_threshold: 1.5 } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
+describe('pipeline extraction config (add-multi-candidate-extraction)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults extraction_enabled to false and the three bounded-cost fields to their documented defaults', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.extraction_enabled).toBe(false);
+    expect(config.pipeline.extraction_min_chars).toBe(120);
+    expect(config.pipeline.extraction_max_candidates).toBe(6);
+    expect(config.pipeline.extraction_timeout_ms).toBe(4000);
+  });
+
+  it('accepts explicit overrides for the three bounded-cost fields', () => {
+    const configPath = writeConfig({
+      pipeline: {
+        extraction_enabled: true,
+        extraction_min_chars: 50,
+        extraction_max_candidates: 3,
+        extraction_timeout_ms: 8000,
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.extraction_enabled).toBe(true);
+    expect(config.pipeline.extraction_min_chars).toBe(50);
+    expect(config.pipeline.extraction_max_candidates).toBe(3);
+    expect(config.pipeline.extraction_timeout_ms).toBe(8000);
+  });
+
+  it('rejects a non-positive extraction_max_candidates', () => {
+    const configPath = writeConfig({
+      pipeline: { extraction_max_candidates: 0 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a negative extraction_min_chars', () => {
+    const configPath = writeConfig({
+      pipeline: { extraction_min_chars: -1 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
+describe('pipeline.long_content_threshold_chars config (add-long-content-chunking)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to 8000 when omitted from config.json', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.long_content_threshold_chars).toBe(8000);
+  });
+
+  it('accepts an explicit override', () => {
+    const configPath = writeConfig({
+      pipeline: { long_content_threshold_chars: 20000 },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.long_content_threshold_chars).toBe(20000);
+  });
+
+  it('rejects zero', () => {
+    const configPath = writeConfig({
+      pipeline: { long_content_threshold_chars: 0 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a negative value', () => {
+    const configPath = writeConfig({
+      pipeline: { long_content_threshold_chars: -1 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a non-integer value', () => {
+    const configPath = writeConfig({
+      pipeline: { long_content_threshold_chars: 100.5 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a value above 100000', () => {
+    const configPath = writeConfig({
+      pipeline: { long_content_threshold_chars: 100001 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
 const ENV_KEYS = [
   'BHGBRAIN_DATA_DIR',
   'BHGBRAIN_HTTP_HOST',

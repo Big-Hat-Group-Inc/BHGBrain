@@ -2,9 +2,43 @@ import { QdrantClient } from '@qdrant/js-client-rest';
 import type { BrainConfig } from '../config/index.js';
 import type { CircuitBreaker } from '../resilience/index.js';
 import { CircuitOpenError } from '../resilience/index.js';
-import { internal } from '../errors/index.js';
+import { internal, invalidInput } from '../errors/index.js';
+import type { RecallFilter } from '../domain/types.js';
 
 const COLLECTION_PREFIX = 'bhgbrain_';
+
+// Only `.`/`_`/`-` plus alphanumerics may appear in an encoded segment. Raw
+// `namespace` (`^[a-zA-Z0-9/-]{1,200}$`) and `collection` (alphanumeric/hyphen
+// by convention, though its schema only enforces a length cap) inputs never
+// contain `.` or `_`, so `encodeCollectionNameSegment` below is injective
+// across the full valid input space, and the first bare `_` after an encoded
+// namespace remains unambiguously the namespace/collection separator the
+// prefix scan in `search()` relies on.
+const SAFE_COLLECTION_NAME_SEGMENT = /^[a-zA-Z0-9._-]+$/;
+
+// Qdrant's REST client embeds the collection name as a literal URL path
+// segment, so a raw `/` breaks routing instead of producing a clear error
+// (see qdrant/qdrant-client#807) — this is why a namespace like "team/project"
+// previously made every tool call fail with a bare, unhelpful INTERNAL error.
+// `.` is substituted because Qdrant's server accepts dots in real collection
+// names (qdrant/qdrant-web-ui#172 shows `create_collection(collection_name:
+// "dotted.name")` succeeding), and `.` cannot appear in raw namespace/collection
+// input, so this substitution can never collide two distinct raw values onto
+// the same encoded segment.
+function encodeCollectionNameSegment(value: string): string {
+  return value.replace(/\//g, '.');
+}
+
+// Narrows Qdrant's `ScoredPoint.vector` (unnamed dense vector | named vectors |
+// sparse | null | undefined per the client's OpenAPI types) down to the plain
+// `number[]` this codebase's dense, unnamed vectors always are. Named/sparse
+// shapes are foreign to this project's collections, so they narrow to
+// `undefined` rather than being guessed at.
+function extractDenseVector(value: unknown): number[] | undefined {
+  return Array.isArray(value) && value.every(v => typeof v === 'number')
+    ? (value as number[])
+    : undefined;
+}
 
 export class QdrantStore {
   private client: QdrantClient;
@@ -33,7 +67,19 @@ export class QdrantStore {
   }
 
   private collectionName(namespace: string, collection: string): string {
-    return `${COLLECTION_PREFIX}${namespace}_${collection}`;
+    const nsSegment = encodeCollectionNameSegment(namespace);
+    const collectionSegment = encodeCollectionNameSegment(collection);
+    // Defense in depth: schema-valid input always produces a safe segment
+    // today, so this should never fire in practice. It exists to turn any
+    // future schema drift or unanticipated character into a clear
+    // INVALID_INPUT at the point of failure rather than a Qdrant-side
+    // rejection surfacing as a generic INTERNAL error further up the stack.
+    if (!SAFE_COLLECTION_NAME_SEGMENT.test(nsSegment) || !SAFE_COLLECTION_NAME_SEGMENT.test(collectionSegment)) {
+      throw invalidInput(
+        `Namespace "${namespace}" and collection "${collection}" cannot be represented as a Qdrant collection name`,
+      );
+    }
+    return `${COLLECTION_PREFIX}${nsSegment}_${collectionSegment}`;
   }
 
   async ensureCollection(namespace: string, collection: string): Promise<void> {
@@ -75,6 +121,14 @@ export class QdrantStore {
     // index. Idempotent: a second call against an already-indexed collection
     // is a tolerated no-op.
     await this.ensureDeviceIdIndex(name);
+
+    // Same retroactive-indexing rationale as `ensureDeviceIdIndex`: collections
+    // created before add-time-scoped-recall shipped still get the `created_at`
+    // datetime index so `after`/`before` range filters run indexed rather than
+    // linearly scanned. Unindexed range filtering is still correct (Qdrant
+    // filters on unindexed fields, just slower), so this is a performance
+    // addition, not a correctness dependency.
+    await this.ensureCreatedAtIndex(name);
   }
 
   private async ensureDeviceIdIndex(name: string): Promise<void> {
@@ -82,6 +136,20 @@ export class QdrantStore {
       await this.client.createPayloadIndex(name, {
         field_name: 'device_id',
         field_schema: 'keyword',
+      });
+    } catch (err) {
+      if (this.isAlreadyExistsError(err)) {
+        return;
+      }
+      throw err;
+    }
+  }
+
+  private async ensureCreatedAtIndex(name: string): Promise<void> {
+    try {
+      await this.client.createPayloadIndex(name, {
+        field_name: 'created_at',
+        field_schema: 'datetime',
       });
     } catch (err) {
       if (this.isAlreadyExistsError(err)) {
@@ -150,17 +218,30 @@ export class QdrantStore {
     collection: string | undefined,
     vector: number[],
     limit: number,
-    filters?: {
-      type?: string;
-      tags?: string[];
-      minScore?: number;
-    },
-  ): Promise<Array<{ id: string; score: number; payload: Record<string, unknown> }>> {
+    // `withVector`: relevance-conditioned inject's near-duplicate suppression
+    // needs the raw vectors behind the semantic leg's results; every other
+    // caller omits it, so `with_vector` stays `false` (its pre-existing
+    // implicit default) and behavior is unchanged for them.
+    filters?: RecallFilter & { minScore?: number; withVector?: boolean },
+  ): Promise<Array<{ id: string; score: number; payload: Record<string, unknown>; vector?: number[] }>> {
     const must: Array<Record<string, unknown>> = [
       { key: 'namespace', match: { value: namespace } },
     ];
     if (filters?.type) {
       must.push({ key: 'type', match: { value: filters.type } });
+    }
+    if (filters?.tags && filters.tags.length > 0) {
+      // Match-any: a point matches if its `tags` payload array contains at
+      // least one of the requested tags (mirrors recall's pre-existing OR
+      // semantics over provided tags).
+      must.push({ key: 'tags', match: { any: filters.tags } });
+    }
+    if (filters?.after !== undefined || filters?.before !== undefined) {
+      // Native RFC 3339 datetime range filter on the `created_at` payload
+      // field (ISO 8601 string, unmodified since `toQdrantPayload`'s
+      // inception — see add-time-scoped-recall). Omitted entirely when
+      // neither bound is requested, so unfiltered calls are unchanged.
+      must.push({ key: 'created_at', range: { gte: filters.after, lte: filters.before } });
     }
     must.push({
       should: [
@@ -179,7 +260,7 @@ export class QdrantStore {
       targets = [this.collectionName(namespace, collection)];
     } else {
       const all = await this.listAllCollections();
-      const prefix = `${COLLECTION_PREFIX}${namespace}_`;
+      const prefix = `${COLLECTION_PREFIX}${encodeCollectionNameSegment(namespace)}_`;
       targets = all.filter(n => n.startsWith(prefix));
       if (targets.length === 0) return [];
     }
@@ -191,6 +272,7 @@ export class QdrantStore {
         filter: must.length > 0 ? { must } : undefined,
         score_threshold: filters?.minScore,
         with_payload: true,
+        with_vector: filters?.withVector ?? false,
       })).then(response => response.points).catch((err: unknown) => {
         // A target collection that no longer exists simply contributes no results.
         if (this.isNotFoundError(err)) return [];
@@ -202,6 +284,7 @@ export class QdrantStore {
       id: r.id as string,
       score: r.score,
       payload: (r.payload ?? {}) as Record<string, unknown>,
+      vector: extractDenseVector(r.vector),
     }));
     // Top-K across the merged candidate set when fanning out over collections.
     if (targets.length > 1) {
@@ -243,6 +326,55 @@ export class QdrantStore {
         event: 'similarity_search_failed',
         namespace,
         collection,
+        error: (err as Error).message,
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * Per-point ANN neighbor discovery for duplicate-cluster consolidation
+   * (`consolidate list`, see design.md "Neighbor discovery via Qdrant's own
+   * per-point ANN query"). Passes an existing point's id as the query
+   * instead of a raw vector — Qdrant's Query API resolves the point's stored
+   * vector server-side, so no vector is ever fetched or held client-side.
+   * Requests one extra result (`topK + 1`) because Qdrant returns the query
+   * point itself at score 1.0 when querying by id, then filters that self-hit
+   * out of the response. Bounded (`O(topK)` per call) rather than a full
+   * pairwise scan — see design.md Decisions.
+   */
+  async findNeighborsById(
+    namespace: string,
+    collection: string,
+    pointId: string,
+    topK: number,
+    minScore: number,
+  ): Promise<Array<{ id: string; score: number }>> {
+    const name = this.collectionName(namespace, collection);
+    try {
+      const response = await this.executeWithBreaker(() => this.client.query(name, {
+        query: pointId,
+        limit: topK + 1,
+        filter: {
+          must: [{ key: 'namespace', match: { value: namespace } }],
+        },
+        score_threshold: minScore,
+        with_payload: false,
+      }));
+      return response.points
+        .filter(r => r.id !== pointId)
+        .map(r => ({ id: r.id as string, score: r.score }));
+    } catch (err) {
+      // A collection that has never been written to yields no neighbors, not
+      // a thrown error — same convention as `searchSimilar`.
+      if (this.isNotFoundError(err)) {
+        return [];
+      }
+      this.logger?.warn({
+        event: 'neighbor_discovery_failed',
+        namespace,
+        collection,
+        point_id: pointId,
         error: (err as Error).message,
       });
       throw err;
@@ -341,8 +473,13 @@ export class QdrantStore {
   async scrollAll(
     collectionName: string,
     batchSize = 100,
-  ): Promise<Array<{ id: string; payload: Record<string, unknown> }>> {
-    const allPoints: Array<{ id: string; payload: Record<string, unknown> }> = [];
+    // Distillation's clustering pass (add-memory-distillation) needs the raw
+    // vectors behind every point in a collection to compute cosine similarity
+    // in memory; every pre-existing caller omits this, so `with_vector` stays
+    // `false` (its original hardcoded value) and their behavior is unchanged.
+    withVector = false,
+  ): Promise<Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>> {
+    const allPoints: Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }> = [];
     let offset: string | number | undefined = undefined;
 
     while (true) {
@@ -350,13 +487,14 @@ export class QdrantStore {
         limit: batchSize,
         offset,
         with_payload: true,
-        with_vector: false,
+        with_vector: withVector,
       });
 
       for (const point of response.points) {
         allPoints.push({
           id: point.id as string,
           payload: (point.payload ?? {}) as Record<string, unknown>,
+          vector: withVector ? extractDenseVector(point.vector) : undefined,
         });
       }
 
@@ -365,6 +503,30 @@ export class QdrantStore {
     }
 
     return allPoints;
+  }
+
+  /**
+   * `scrollAll` scoped to one namespace/collection, resolving the internal
+   * prefixed collection name so callers (e.g. `DistillationService`'s
+   * clustering pass) never need to duplicate `collectionName`'s prefix
+   * convention. A collection that has never been written to simply yields no
+   * points, same convention as `searchSimilar`/`findNeighborsById`.
+   */
+  async scrollCollection(
+    namespace: string,
+    collection: string,
+    batchSize = 100,
+    withVector = false,
+  ): Promise<Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>> {
+    const name = this.collectionName(namespace, collection);
+    try {
+      return await this.scrollAll(name, batchSize, withVector);
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return [];
+      }
+      throw err;
+    }
   }
 
   private isNotFoundError(err: unknown): boolean {

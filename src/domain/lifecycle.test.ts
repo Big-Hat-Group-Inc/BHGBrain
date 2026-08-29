@@ -23,6 +23,19 @@ describe('MemoryLifecycleService', () => {
     })).toBe('T1');
   });
 
+  // add-memory-distillation, task 7.1: confirms DistillationService's
+  // explicit `retention_tier: 'T1'` call with `source: 'distillation'` still
+  // resolves to T1 via the pre-existing `explicitTier` first-line short
+  // circuit — no new branch needed in assignTier for the new source value.
+  it('assigns explicit tier for distillation-sourced writes without a new branch', () => {
+    expect(service.assignTier({
+      explicitTier: 'T1',
+      source: 'distillation',
+      tags: [],
+      content: 'We deploy via GitHub Actions.',
+    })).toBe('T1');
+  });
+
   it('assigns categories to T0', () => {
     expect(service.assignTier({
       category: 'architecture',

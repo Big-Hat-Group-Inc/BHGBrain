@@ -23,7 +23,7 @@ export function isErrorEnvelope(value: unknown): value is { error: unknown } {
 export function buildToolCallResponse(result: unknown): McpToolResponse {
   const isError = isErrorEnvelope(result);
   const response: McpToolResponse = {
-    content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+    content: [{ type: 'text', text: JSON.stringify(result) }],
     ...(isError ? { isError: true } : {}),
   };
   if (!isError && result !== null && typeof result === 'object' && !Array.isArray(result)) {

@@ -149,6 +149,20 @@ describe('MetricsCollector', () => {
     expect(rememberAvg?.labels).toEqual({ tool: 'remember', status: 'error' });
   });
 
+  it('accumulates a labeled counter separately per distinct label set (add-retrieval-quality-metrics task 1.4)', () => {
+    const metrics = new MetricsCollector(createConfig());
+    metrics.incCounter('search_embedding_degraded', 1, { namespace: 'team-a' });
+    metrics.incCounter('search_embedding_degraded', 1, { namespace: 'team-a' });
+    metrics.incCounter('search_embedding_degraded', 1, { namespace: 'team-b' });
+
+    const entries = metrics.getMetrics();
+    const teamA = entries.find(e => e.name === 'search_embedding_degraded' && e.labels?.namespace === 'team-a');
+    const teamB = entries.find(e => e.name === 'search_embedding_degraded' && e.labels?.namespace === 'team-b');
+
+    expect(teamA).toEqual({ name: 'search_embedding_degraded', type: 'counter', value: 2, labels: { namespace: 'team-a' } });
+    expect(teamB).toEqual({ name: 'search_embedding_degraded', type: 'counter', value: 1, labels: { namespace: 'team-b' } });
+  });
+
   it('computes percentiles for empty, single-value, and known distributions', () => {
     expect(computePercentile([], 50)).toBe(0);
     expect(computePercentile([7], 95)).toBe(7);

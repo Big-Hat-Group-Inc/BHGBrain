@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import type pino from 'pino';
 import { HealthService } from './index.js';
 import { DegradedEmbeddingProvider } from '../embedding/index.js';
 import { CircuitBreaker } from '../resilience/index.js';
@@ -82,6 +83,7 @@ describe('HealthService', () => {
     return {
       sqlite: {
         healthCheck: vi.fn(() => true),
+        isFts5Available: vi.fn(() => true),
         countMemories: vi.fn(() => 42),
         getDbSizeBytes: vi.fn(() => 1024),
         countByTier: vi.fn(() => ({ T0: 0, T1: 0, T2: 0, T3: 0 })),
@@ -90,6 +92,10 @@ describe('HealthService', () => {
         countUnsyncedVectors: vi.fn(() => 0),
         getLifecycleOperation: vi.fn(() => null),
         getRetentionDegraded: vi.fn(() => ({ degraded: false, message: null, last_success_at: null })),
+        getExpectedEmbeddingIdentity: vi.fn(() => null),
+        getDistillationState: vi.fn(() => ({
+          last_run_at: null, last_run_degraded: false, distilled_total: 0, skipped_total: 0,
+        })),
       },
       qdrant: {
         healthCheck: vi.fn(async () => true),
@@ -100,8 +106,10 @@ describe('HealthService', () => {
 
   function createEmbedding(embeddingOk = true): EmbeddingProvider {
     return {
+      provider: 'openai',
       model: 'test',
       dimensions: 3,
+      identity: 'openai/test@3',
       embed: vi.fn(async () => [1, 2, 3]),
       embedBatch: vi.fn(async () => [[1, 2, 3]]),
       healthCheck: vi.fn(async () => embeddingOk),
@@ -263,6 +271,23 @@ describe('HealthService', () => {
     expect(result.components.qdrant.message).toBe('this.client.query is not a function');
   });
 
+  it('logs the qdrant retrieval failure reason to structured logs (task 2.2)', async () => {
+    const storage = createStorage();
+    storage.qdrant.healthCheck = vi.fn(async () => {
+      throw new TypeError('this.client.query is not a function');
+    });
+    const warn = vi.fn();
+    const logger = { warn } as unknown as pino.Logger;
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig(), {}, logger);
+    await health.check();
+
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'qdrant_health_check_failed',
+      message: 'this.client.query is not a function',
+    }));
+  });
+
   it('reports unhealthy when sqlite is unavailable', async () => {
     const storage = createStorage();
     storage.sqlite.healthCheck = vi.fn(() => false);
@@ -272,6 +297,35 @@ describe('HealthService', () => {
 
     expect(result.status).toBe('unhealthy');
     expect(result.components.sqlite.status).toBe('unhealthy');
+  });
+
+  // openspec/changes/upgrade-fulltext-to-fts5, task 4.5: with the FTS5 capability
+  // probe forced to fail, fulltext still works via the (unchanged) legacy path and
+  // health carries a message describing the fallback — the sqlite component stays
+  // healthy (this is today's expected steady state, not a fault) but is no longer
+  // silent about it.
+  it('surfaces the FTS5 fallback in the sqlite health message when the probe failed', async () => {
+    const storage = createStorage();
+    storage.sqlite.isFts5Available = vi.fn(() => false);
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.status).toBe('healthy');
+    expect(result.components.sqlite).toEqual({
+      status: 'healthy',
+      message: 'Fulltext search is running the legacy LIKE-based matcher: this SQLite build has no fts5 module.',
+    });
+  });
+
+  it('omits the FTS5 fallback message when the probe succeeded', async () => {
+    const storage = createStorage();
+    storage.sqlite.isFts5Available = vi.fn(() => true);
+
+    const health = new HealthService(storage, createEmbedding(true), createConfig());
+    const result = await health.check();
+
+    expect(result.components.sqlite).toEqual({ status: 'healthy' });
   });
 
   it('reports degraded when vectors still need reconciliation after restore', async () => {
@@ -365,6 +419,54 @@ describe('HealthService', () => {
       state: 'reconciling',
       unsynced_vectors: 5,
       message: 'Bounded background vector reconciliation is in progress.',
+    });
+  });
+
+  // openspec/changes/stamp-embedding-provenance
+  describe('embedding identity mismatch', () => {
+    it('degrades embedding health with both identities when the store expects a different one than active config', async () => {
+      const storage = createStorage();
+      storage.sqlite.getExpectedEmbeddingIdentity = vi.fn(() => 'azure-foundry/old-model@1536');
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.status).toBe('degraded');
+      expect(result.components.embedding.status).toBe('degraded');
+      expect(result.components.embedding.message).toContain('azure-foundry/old-model@1536');
+      expect(result.components.embedding.message).toContain('openai/test@3');
+    });
+
+    it('reports healthy embedding when the store has no adopted expectation yet', async () => {
+      const storage = createStorage();
+      storage.sqlite.getExpectedEmbeddingIdentity = vi.fn(() => null);
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.components.embedding.status).toBe('healthy');
+    });
+
+    it('reports healthy embedding when the store expectation matches the active identity', async () => {
+      const storage = createStorage();
+      storage.sqlite.getExpectedEmbeddingIdentity = vi.fn(() => 'openai/test@3');
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.components.embedding.status).toBe('healthy');
+    });
+
+    it('degrades on identity mismatch even when the reachability probe itself is healthy', async () => {
+      const storage = createStorage();
+      storage.sqlite.getExpectedEmbeddingIdentity = vi.fn(() => 'azure-foundry/old-model@1536');
+
+      // embeddingOk=true: the provider is perfectly reachable, but the
+      // mismatch must still win — connectivity is not the risk here.
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.components.embedding.status).toBe('degraded');
     });
   });
 });

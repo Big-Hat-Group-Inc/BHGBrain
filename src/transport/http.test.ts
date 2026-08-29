@@ -111,14 +111,14 @@ describe('createHttpServer', () => {
     };
     const resources = overrides?.resources ?? { handle: vi.fn(async (uri: string) => ({ uri })) };
 
-    const app = createHttpServer(
+    const { app, mcpSessions } = createHttpServer(
       config,
       ctx as never,
       resources as never,
       logger as never,
     );
 
-    return { app, resources };
+    return { app, resources, mcpSessions };
   }
 
   afterEach(() => {
@@ -315,4 +315,149 @@ describe('createHttpServer', () => {
       .send({ content: 'hello' });
     expect(clientB.status).toBe(200);
   });
+
+// Real MCP over HTTP (Streamable HTTP transport) at /mcp — session
+// lifecycle, protocol errors, security parity, and teardown (tasks 3.2-3.5).
+describe('createHttpServer /mcp routes', () => {
+  const MCP_ACCEPT = 'application/json, text/event-stream';
+
+  function initializeBody(id: number | string = 1) {
+    return {
+      jsonrpc: '2.0' as const,
+      id,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-06-18',
+        capabilities: {},
+        clientInfo: { name: 'test-client', version: '0.0.0' },
+      },
+    };
+  }
+
+  function toolsListBody(id: number | string = 2) {
+    return { jsonrpc: '2.0' as const, id, method: 'tools/list', params: {} };
+  }
+
+  async function initializeSession(app: import('express').Express, token = 'secret-token') {
+    const res = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', MCP_ACCEPT)
+      .set('Authorization', `Bearer ${token}`)
+      .send(initializeBody());
+    return res;
+  }
+
+  afterEach(() => {
+    vi.clearAllMocks();
+    delete process.env.BHGBRAIN_TOKEN;
+  });
+
+  it('creates a session on initialize and accepts a follow-up request with the session id (3.2)', async () => {
+    const { app } = await buildApp(createConfig(false, true));
+
+    const initRes = await initializeSession(app);
+    expect(initRes.status).toBe(200);
+    const sessionId = initRes.headers['mcp-session-id'];
+    expect(sessionId).toBeTruthy();
+    expect(initRes.body.result.serverInfo.name).toBe('bhgbrain');
+
+    const listRes = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', MCP_ACCEPT)
+      .set('Authorization', 'Bearer secret-token')
+      .set('mcp-session-id', sessionId)
+      .send(toolsListBody());
+    expect(listRes.status).toBe(200);
+    expect(Array.isArray(listRes.body.result.tools)).toBe(true);
+  });
+
+  it('rejects an unknown session id with 404 and a sessionless non-initialize POST with 400 (3.3)', async () => {
+    const { app } = await buildApp(createConfig(false, true));
+
+    const unknown = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', MCP_ACCEPT)
+      .set('Authorization', 'Bearer secret-token')
+      .set('mcp-session-id', 'this-session-does-not-exist')
+      .send(toolsListBody());
+    expect(unknown.status).toBe(404);
+
+    const missing = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', MCP_ACCEPT)
+      .set('Authorization', 'Bearer secret-token')
+      .send(toolsListBody());
+    expect(missing.status).toBe(400);
+  });
+
+  it('DELETE /mcp closes a session and a subsequent request with that id 404s (3.3)', async () => {
+    const { app } = await buildApp(createConfig(false, true));
+
+    const initRes = await initializeSession(app);
+    const sessionId = initRes.headers['mcp-session-id'];
+
+    const deleteRes = await request(app)
+      .delete('/mcp')
+      .set('Authorization', 'Bearer secret-token')
+      .set('mcp-session-id', sessionId);
+    expect(deleteRes.status).toBeLessThan(300);
+
+    const afterDelete = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', MCP_ACCEPT)
+      .set('Authorization', 'Bearer secret-token')
+      .set('mcp-session-id', sessionId)
+      .send(toolsListBody());
+    expect(afterDelete.status).toBe(404);
+  });
+
+  it('requires auth before a session is created and applies rate limiting to /mcp (3.4)', async () => {
+    const { app: authApp } = await buildApp(createConfig(false, true));
+    const unauthenticated = await request(authApp)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', MCP_ACCEPT)
+      .send(initializeBody());
+    expect(unauthenticated.status).toBe(401);
+
+    const { app: limitedApp } = await buildApp(
+      createConfig(false, true, { rateLimitRpm: 1 }),
+    );
+    const first = await initializeSession(limitedApp);
+    expect(first.status).toBe(200);
+
+    const second = await request(limitedApp)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', MCP_ACCEPT)
+      .set('Authorization', 'Bearer secret-token')
+      .send(initializeBody(2));
+    expect(second.status).toBe(429);
+  });
+
+  it('closeAll() empties the session registry and previously issued ids 404 (3.5)', async () => {
+    const { app, mcpSessions } = await buildApp(createConfig(false, true));
+
+    const initRes = await initializeSession(app);
+    const sessionId = initRes.headers['mcp-session-id'];
+    expect(mcpSessions.size).toBe(1);
+
+    await mcpSessions.closeAll();
+    expect(mcpSessions.size).toBe(0);
+
+    const afterTeardown = await request(app)
+      .post('/mcp')
+      .set('Content-Type', 'application/json')
+      .set('Accept', MCP_ACCEPT)
+      .set('Authorization', 'Bearer secret-token')
+      .set('mcp-session-id', sessionId)
+      .send(toolsListBody());
+    expect(afterTeardown.status).toBe(404);
+  });
+});
 });
