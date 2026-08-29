@@ -55,7 +55,22 @@ export class HealthService {
         unsynced_vectors: this.storage.sqlite.countUnsyncedVectors(),
         over_capacity: this.isOverCapacity(countsByTier),
         cleanup_lag_seconds: this.computeCleanupLagSeconds(now),
+        distillation: this.buildDistillationRollup(),
       },
+    };
+  }
+
+  // Additive rollup (add-memory-distillation, task 6.2): read straight from
+  // the persisted `distillation_state` single-row table (see
+  // `SqliteStore.getDistillationState`) so it reflects the last run
+  // regardless of which process last ran the scheduled job.
+  private buildDistillationRollup(): NonNullable<HealthSnapshot['retention']>['distillation'] {
+    const state = this.storage.sqlite.getDistillationState();
+    return {
+      last_run_at: state.last_run_at,
+      last_run_degraded: state.last_run_degraded,
+      distilled_total: state.distilled_total,
+      skipped_total: state.skipped_total,
     };
   }
 

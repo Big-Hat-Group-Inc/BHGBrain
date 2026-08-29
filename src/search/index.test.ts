@@ -145,6 +145,40 @@ describe('SearchService', () => {
     expect(storage.sqlite.fullTextSearch).toHaveBeenCalledWith('global', 'hello', 10, 'my-col');
   });
 
+  // add-memory-distillation, task 7.3: a distilled memory (source:
+  // 'distillation') is returned, ranked, and filtered exactly like any other
+  // T1 semantic memory — no special-casing by `source` anywhere on the read
+  // path (confirmed above: `search/index.ts` never branches on `source`).
+  it('ranks and returns a distillation-sourced memory like any other memory', async () => {
+    const distilled: StoredMemory = {
+      id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic',
+      content: 'We deploy via GitHub Actions.', summary: 'Deploy via Actions', tags: [],
+      source: 'distillation',
+      checksum: 'mem-1',
+      importance: 0.9,
+      retention_tier: 'T1',
+      expires_at: null,
+      decay_eligible: false,
+      review_due: null,
+      access_count: 0,
+      last_operation: 'ADD',
+      merged_from: null,
+      derived_from: ['a', 'b', 'c'],
+      archived: false,
+      vector_synced: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+    };
+    const { service, storage } = createSearchService({ memories: new Map([['mem-1', distilled]]) });
+    const results = await service.search('deploy', 'global', undefined, 'fulltext', 10);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.id).toBe('mem-1');
+    expect(results[0]!.type).toBe('semantic');
+    expect(storage.sqlite.fullTextSearch).toHaveBeenCalled();
+  });
+
   it('uses deferred flush instead of synchronous flush on read paths', async () => {
     const { service, storage } = createSearchService();
     await service.search('hello', 'global', undefined, 'fulltext', 10);

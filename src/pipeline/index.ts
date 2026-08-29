@@ -20,6 +20,24 @@ interface MemoryCandidate {
   importance?: number;
 }
 
+/**
+ * Reconciles an UPDATE target's existing `derived_from` with the incoming
+ * write's value (see `process()`'s `derived_from` doc comment). `undefined`
+ * means "this caller doesn't set derived_from" — the field is left
+ * untouched (returning `undefined` here makes `SqliteStore.updateMemory`
+ * skip the column entirely). An explicit array unions with whatever the
+ * target already carries, deduped, so a memory re-distilled from a
+ * re-forming cluster accumulates lineage instead of losing the prior run's.
+ */
+function mergeDerivedFrom(
+  existing: string[] | null | undefined,
+  incoming: string[] | null | undefined,
+): string[] | null | undefined {
+  if (incoming === undefined) return undefined;
+  if (incoming === null) return existing ?? null;
+  return [...new Set([...(existing ?? []), ...incoming])];
+}
+
 export class WritePipeline {
   private lifecycle: MemoryLifecycleService;
   private extraction: ExtractionProvider;
@@ -52,6 +70,15 @@ export class WritePipeline {
     // Explicit-set-wins on UPDATE (preserves existing pin state when
     // omitted); defaults to false on ADD when omitted. See add-inject-pinning.
     pinned?: boolean;
+    // Set only by `DistillationService`: the archived source memory ids this
+    // write consolidates. On ADD, stamped directly. On UPDATE (a re-forming
+    // cluster distilled a second time — see design.md Decision #7), unioned
+    // with the target's existing `derived_from` rather than replacing it, so
+    // lineage accumulates across repeated distillation runs instead of being
+    // clobbered. Omitted (undefined) for every non-distillation caller,
+    // leaving this parameter's behavior a no-op for them. See
+    // add-memory-distillation.
+    derived_from?: string[] | null;
   }): Promise<WriteResult[]> {
     const normalized = normalizeContent(input.content);
 
@@ -159,6 +186,7 @@ export class WritePipeline {
       retention_tier?: RetentionTier;
       device_id?: string | null;
       pinned?: boolean;
+      derived_from?: string[] | null;
     },
   ): Promise<WriteResult> {
     const checksum = computeChecksum(candidate.content);
@@ -267,6 +295,7 @@ export class WritePipeline {
         // Explicit-set-wins: an explicit `pinned` on this remember call
         // overrides; omitted preserves the existing memory's pin state.
         pinned: input.pinned !== undefined ? input.pinned : existing.pinned,
+        derived_from: mergeDerivedFrom(existing.derived_from, input.derived_from),
         updated_at: now,
       }, vector);
 
@@ -314,6 +343,7 @@ export class WritePipeline {
         access_count: 0,
         last_operation: 'DELETE',
         merged_from: operation.targetId,
+        derived_from: input.derived_from ?? null,
         archived: false,
         vector_synced: true,
         pinned: input.pinned ?? false,
@@ -357,6 +387,7 @@ export class WritePipeline {
       access_count: 0,
       last_operation: 'ADD',
       merged_from: null,
+      derived_from: input.derived_from ?? null,
       archived: false,
       vector_synced: true,
       pinned: input.pinned ?? false,

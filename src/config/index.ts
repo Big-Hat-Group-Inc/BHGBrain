@@ -146,6 +146,35 @@ const ConfigSchema = z.object({
     scheduled_cleanup_enabled: z.boolean().default(true),
     pre_expiry_warning_days: z.number().int().nonnegative().default(7),
     compaction_deleted_threshold: z.number().min(0).max(1).default(0.10),
+    // Scheduled "sleep" job that clusters related T2/T3 episodic memories and
+    // consolidates each qualifying cluster into one durable T1 semantic
+    // memory via an LLM call, archiving the sources with lineage
+    // (`derived_from`) preserved. Off by default: this is a new outbound LLM
+    // dependency with irreversible content loss on the sources (archiving
+    // keeps only summary/tags/tier), so existing installs are unaffected
+    // until an operator opts in and provisions an extraction API key. See
+    // add-memory-distillation.
+    distillation: z.object({
+      enabled: z.boolean().default(false),
+      // One hour after cleanup_schedule's default ('0 2 * * *'), so a
+      // freshly-archived-by-GC store isn't also mid-distillation at the same
+      // moment on a stock install.
+      schedule: z.string().default('0 3 * * *'),
+      // Cosine similarity floor for two T2/T3 episodic memories to be
+      // unioned into the same cluster. Conservative by design (recommend
+      // 0.85): a false merge is not reversible once sources are archived.
+      similarity_threshold: z.number().min(0).max(1).default(0.85),
+      // A connected component smaller than this is left alone — too weak a
+      // signal that these memories represent one durable fact.
+      min_cluster_size: z.number().int().min(2).default(3),
+      // A connected component larger than this is deterministically split
+      // into max_cluster_size-sized chunks rather than distilled as one
+      // (or dropped) — see distillation-cluster.ts.
+      max_cluster_size: z.number().int().min(2).default(20),
+      // Upper bound on clusters distilled (i.e. LLM calls made) per
+      // scheduled tick, bounding worst-case cost/latency per run.
+      max_clusters_per_run: z.number().int().positive().default(10),
+    }).default({}),
   }).default({}),
   deduplication: z.object({
     enabled: z.boolean().default(true),

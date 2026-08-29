@@ -34,6 +34,7 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
    - [Importance Scoring](#importance-scoring)
    - [Categories - Persistent Policy Slots](#categories--persistent-policy-slots)
    - [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving)
+   - [Memory Distillation](#memory-distillation)
    - [Pre-Expiry Warnings](#pre-expiry-warnings)
    - [Resource Limits and Capacity Budgets](#resource-limits-and-capacity-budgets)
 11. [Search](#search)
@@ -392,7 +393,39 @@ The file is created automatically on first run with all defaults applied. Edit i
     "pre_expiry_warning_days": 7,
 
     // Qdrant segment compaction threshold (compact when this fraction of a segment is deleted)
-    "compaction_deleted_threshold": 0.10
+    "compaction_deleted_threshold": 0.10,
+
+    // Scheduled memory distillation: clusters related, still-active T2/T3
+    // episodic memories and consolidates each qualifying cluster into one
+    // durable T1 semantic memory via an LLM call, archiving the sources with
+    // lineage (see "Memory Distillation" below). Off by default and inert
+    // without a configured extraction API key.
+    "distillation": {
+      // Master switch. false (default): the scheduler never starts and
+      // `bhgbrain distill` still runs on demand but skips every cluster
+      // (no_key) unless an extraction API key is configured.
+      "enabled": false,
+
+      // Cron schedule for the background distillation job, evaluated in UTC.
+      // Defaults an hour after cleanup_schedule so a freshly-archived-by-GC
+      // store isn't also mid-distillation at the same moment.
+      "schedule": "0 3 * * *",
+
+      // Cosine similarity floor for two T2/T3 episodic memories to be
+      // clustered together. Conservative by design — a false merge is not
+      // reversible once sources are archived.
+      "similarity_threshold": 0.85,
+
+      // A cluster smaller than this is left alone (too weak a signal).
+      "min_cluster_size": 3,
+
+      // A cluster larger than this is deterministically split into
+      // max_cluster_size-sized chunks rather than distilled as one.
+      "max_cluster_size": 20,
+
+      // Upper bound on clusters distilled (LLM calls made) per scheduled tick.
+      "max_clusters_per_run": 10
+    }
   },
 
   // Deduplication settings
@@ -1064,7 +1097,7 @@ Every memory stored in BHGBrain is a `MemoryRecord` with the following fields:
 | `content` | `string` | The full memory content (up to 100,000 characters) |
 | `summary` | `string` | Auto-generated first-line summary (up to 120 characters) |
 | `tags` | `string[]` | Free-form tags (alphanumeric + hyphens, max 20 tags, max 100 chars each). Includes both caller-supplied tags and any content-derived tags auto-tagging adds — see [Auto-Tagging](#auto-tagging). |
-| `source` | `"cli" \| "api" \| "agent" \| "import"` | How the memory was created |
+| `source` | `"cli" \| "api" \| "agent" \| "import" \| "distillation"` | How the memory was created. `"distillation"` is written only by the scheduled distillation job (see [Memory Distillation](#memory-distillation)) |
 | `checksum` | `string` | SHA-256 hash of normalized content (used for exact deduplication) |
 | `embedding` | `number[]` | Vector embedding (not stored in SQLite; lives in Qdrant) |
 | `importance` | `number (0-1)` | Importance score (default 0.5) |
@@ -1076,6 +1109,7 @@ Every memory stored in BHGBrain is a `MemoryRecord` with the following fields:
 | `last_accessed` | `string (ISO 8601)` | Timestamp of most recent retrieval |
 | `last_operation` | `"ADD" \| "UPDATE" \| "DELETE" \| "NOOP"` | Most recent write operation applied |
 | `merged_from` | `string \| null` | ID of the memory this was merged from (dedup UPDATE path) |
+| `derived_from` | `string[] \| null` | IDs of the archived T2/T3 episodic source memories this memory was distilled from. Set only by the distillation job; `null` for every ordinary write (see [Memory Distillation](#memory-distillation)) |
 | `archived` | `boolean` | Whether this memory is soft-archived (excluded from search/recall) |
 | `vector_synced` | `boolean` | Whether the Qdrant vector is in sync with SQLite state |
 | `pinned` | `boolean` | Whether this memory is always included in [`memory://inject`](#memoryinject---session-context-injection) payloads, bounded by `defaults.pin_limit_per_namespace`; has no effect on `search`/`recall` |
@@ -1681,6 +1715,69 @@ access-recorded), and the `review` tool's `restore` action recreates an active m
 from an archived record — tagged `restored-from-archive`, with the archive row
 **retained** (unlike the CLI path) so its origin stays inspectable. See
 [MCP Tools Reference](#mcp-tools-reference).
+
+---
+
+### Memory Distillation
+
+<a id="memory-distillation"></a>
+
+A scheduled "sleep" job that turns clusters of related, still-active `T2`/`T3`
+`episodic` memories into a single durable `T1` `semantic` memory — e.g. five separate
+memories like "deployed via GitHub Actions", "switched CI to Actions", "Actions runner
+pinned to node20" become one memory: "we deploy via GitHub Actions." **Off by default**
+(`retention.distillation.enabled: false`) — this is the only feature in BHGBrain that
+makes an outbound LLM call, and archiving sources loses their full content
+irreversibly, so it requires deliberate opt-in.
+
+**Enabling it:**
+
+1. Set `retention.distillation.enabled: true` in `config.json`.
+2. Provision an extraction API key: `pipeline.extraction_model_env` (default
+   `BHGBRAIN_EXTRACTION_API_KEY`) must resolve to a set environment variable — no new
+   env var is introduced; distillation reuses the same key already documented for
+   `pipeline.extraction_enabled` and `search.rerank`.
+
+**How it works (each scheduled tick, or `bhgbrain distill`):**
+
+1. **Cluster:** For each namespace/collection holding `T2`/`T3` `episodic` memories,
+   fetch their vectors from Qdrant and greedily union-find memories whose cosine
+   similarity is `≥ retention.distillation.similarity_threshold` (default `0.85`) into
+   connected components. Clusters smaller than `min_cluster_size` (default `3`) are
+   left alone; clusters larger than `max_cluster_size` (default `20`) are split into
+   `max_cluster_size`-sized chunks. At most `max_clusters_per_run` (default `10`)
+   clusters — the largest first — are processed per run.
+2. **Distill:** For each qualifying cluster, its members' contents (oldest to newest)
+   are sent to the configured `pipeline.extraction_model` as one chat-completion call,
+   asking for a single consolidated fact. On conflicting sources, the prompt asks the
+   model to prefer the most recently updated one — a mitigation, not entailment-based
+   contradiction detection. A cluster is **skipped** (never a hard failure of the job)
+   when no API key is configured or the LLM call fails; skips are counted by reason
+   (`no_key` / `llm_error`).
+3. **Write:** The consolidated fact is written through the same `remember` write
+   pipeline every other memory goes through — checksum dedup, embedding, audit
+   logging — with `source: "distillation"`, `type: "semantic"`, `retention_tier: "T1"`,
+   and `derived_from` set to the cluster's source memory ids. A cluster that re-forms
+   after a prior distillation run **updates** the earlier distilled memory (via the
+   normal dedup path) instead of creating a duplicate.
+4. **Archive sources:** Only after the distilled memory is confirmed durably written
+   are the cluster's source memories archived and deleted through the same
+   `memory_archive` path GC uses, with a dedicated `DISTILL` audit entry (`action:
+   "distill"`) referencing both the new memory id and the archived source ids. If
+   archival/deletion fails after a successful distilled write, the write is **not**
+   rolled back — sources are left active and the run is reported degraded (a still-
+   active source is safe: the next run may re-cluster it, and the dedup path UPDATEs
+   rather than duplicates).
+
+```bash
+bhgbrain distill                      # Run distillation
+bhgbrain distill --dry-run            # Show candidate clusters (ids + summaries) without calling the LLM or writing/archiving anything
+```
+
+`health://status`'s `retention.distillation` field reports `last_run_at`,
+`last_run_degraded`, and cumulative `distilled_total`/`skipped_total` counts, and
+`bhgbrain_distill_*` counters/histograms follow the same naming convention as
+`bhgbrain_gc_*` (see [Health & Metrics](#health--metrics)).
 
 ---
 
@@ -2675,6 +2772,12 @@ bhgbrain health                       # Full system health check
 bhgbrain gc                           # Run cleanup
 bhgbrain gc --dry-run                 # Show candidates and review items without deleting
 bhgbrain gc --tier T3                 # Clean up only T3 memories
+
+# Memory distillation (clusters T2/T3 episodic memories into T1 semantic
+# memories via an LLM call — see Memory Distillation. Off by default;
+# requires retention.distillation.enabled: true and an extraction API key)
+bhgbrain distill                      # Run distillation
+bhgbrain distill --dry-run            # Show candidate clusters without calling the LLM or writing/archiving anything
 
 # Audit log
 bhgbrain audit                        # Show recent audit entries

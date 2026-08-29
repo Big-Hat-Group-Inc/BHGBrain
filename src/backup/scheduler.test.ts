@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { parseCronExpression, nextRunAfter, CleanupScheduler } from './scheduler.js';
+import { parseCronExpression, nextRunAfter, CleanupScheduler, DistillationScheduler } from './scheduler.js';
 import type { BrainConfig } from '../config/index.js';
 import type { RetentionService } from './retention.js';
+import type { DistillationService } from '../pipeline/distillation.js';
 
 describe('parseCronExpression', () => {
   it('parses a daily-at-2am expression', () => {
@@ -128,5 +129,80 @@ describe('CleanupScheduler', () => {
     await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
 
     expect(runGc).not.toHaveBeenCalled();
+  });
+});
+
+describe('DistillationScheduler', () => {
+  function config(overrides: Partial<BrainConfig['retention']['distillation']> = {}): BrainConfig {
+    return {
+      retention: {
+        distillation: {
+          schedule: '0 3 * * *',
+          enabled: true,
+          ...overrides,
+        },
+      },
+    } as unknown as BrainConfig;
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-03-10T01:00:00.000Z'));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('invokes runOnce on the same execution path once the schedule elapses', async () => {
+    const runOnce = vi.fn(async () => ({ distilled: 0 }));
+    const distillation = { runOnce } as unknown as DistillationService;
+    const scheduler = new DistillationScheduler(config(), distillation, { info: vi.fn() });
+
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000); // 2 hours to 3am
+
+    expect(runOnce).toHaveBeenCalledTimes(1);
+    scheduler.stop();
+  });
+
+  it('does not schedule when retention.distillation.enabled is false', async () => {
+    const runOnce = vi.fn(async () => ({ distilled: 0 }));
+    const distillation = { runOnce } as unknown as DistillationService;
+    const scheduler = new DistillationScheduler(config({ enabled: false }), distillation, { info: vi.fn() });
+
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+
+    expect(runOnce).not.toHaveBeenCalled();
+    scheduler.stop();
+  });
+
+  it('reschedules after a run fails so one bad tick does not end scheduled distillation', async () => {
+    const runOnce = vi.fn(async () => {
+      throw new Error('boom');
+    });
+    const distillation = { runOnce } as unknown as DistillationService;
+    const scheduler = new DistillationScheduler(config(), distillation, { info: vi.fn(), error: vi.fn() });
+
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
+    expect(runOnce).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+    expect(runOnce).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+  });
+
+  it('stop() prevents further scheduled runs', async () => {
+    const runOnce = vi.fn(async () => ({ distilled: 0 }));
+    const distillation = { runOnce } as unknown as DistillationService;
+    const scheduler = new DistillationScheduler(config(), distillation, { info: vi.fn() });
+
+    scheduler.start();
+    scheduler.stop();
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+
+    expect(runOnce).not.toHaveBeenCalled();
   });
 });

@@ -34,6 +34,7 @@ BHGBrain speichert Erinnerungen in SQLite (Metadaten + Volltextsuche) und Qdrant
     - [Wichtigkeitsbewertung](#wichtigkeitsbewertung)
     - [Kategorien – Persistente Richtlinien-Slots](#kategorien--persistente-richtlinien-slots)
     - [Verfall, Bereinigung und Archivierung](#verfall-bereinigung-und-archivierung)
+    - [Gedächtnis-Destillation](#gedächtnis-destillation)
     - [Warnungen vor Ablauf](#warnungen-vor-ablauf)
     - [Ressourcenlimits und Kapazitätsbudgets](#ressourcenlimits-und-kapazitätsbudgets)
 11. [Suche](#suche)
@@ -358,7 +359,41 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "pre_expiry_warning_days": 7,
 
     // Qdrant-Segment-Kompaktierungsschwelle (kompaktieren, wenn dieser Anteil eines Segments gelöscht ist)
-    "compaction_deleted_threshold": 0.10
+    "compaction_deleted_threshold": 0.10,
+
+    // Geplante Gedächtnis-Destillation: gruppiert verwandte, noch aktive T2/T3-
+    // episodische Erinnerungen und verschmilzt jeden qualifizierenden Cluster
+    // per LLM-Aufruf zu einer dauerhaften T1-semantischen Erinnerung, wobei die
+    // Quellen mit Herkunftsangabe archiviert werden (siehe "Gedächtnis-Destillation"
+    // unten). Standardmäßig deaktiviert und ohne konfigurierten Extraktions-
+    // API-Schlüssel wirkungslos.
+    "distillation": {
+      // Hauptschalter. false (Standard): der Scheduler startet nie, und
+      // `bhgbrain distill` überspringt jeden Cluster (no_key), sofern kein
+      // Extraktions-API-Schlüssel konfiguriert ist.
+      "enabled": false,
+
+      // Cron-Zeitplan für den Hintergrund-Destillationsauftrag (UTC). Standard
+      // eine Stunde nach cleanup_schedule, damit ein gerade von GC archivierter
+      // Bestand nicht gleichzeitig destilliert wird.
+      "schedule": "0 3 * * *",
+
+      // Cosinus-Ähnlichkeitsschwelle, ab der zwei T2/T3-episodische Erinnerungen
+      // demselben Cluster zugeordnet werden. Bewusst konservativ — eine
+      // fehlerhafte Verschmelzung ist nach dem Archivieren der Quellen nicht
+      // rückgängig zu machen.
+      "similarity_threshold": 0.85,
+
+      // Ein Cluster unterhalb dieser Größe wird nicht destilliert (Signal zu schwach).
+      "min_cluster_size": 3,
+
+      // Ein Cluster oberhalb dieser Größe wird deterministisch in Blöcke dieser
+      // Größe aufgeteilt, statt als ein übergroßer Cluster destilliert zu werden.
+      "max_cluster_size": 20,
+
+      // Obergrenze der pro geplantem Lauf destillierten Cluster (LLM-Aufrufe).
+      "max_clusters_per_run": 10
+    }
   },
 
   // Deduplizierungseinstellungen
@@ -1037,7 +1072,7 @@ Jede in BHGBrain gespeicherte Erinnerung ist ein `MemoryRecord` mit folgenden Fe
 | `content` | `string` | Der vollständige Speicherinhalt (bis zu 100.000 Zeichen) |
 | `summary` | `string` | Automatisch generierte Zusammenfassung der ersten Zeile (bis zu 120 Zeichen) |
 | `tags` | `string[]` | Freie Tags (alphanumerisch + Bindestriche, max. 20 Tags, max. 100 Zeichen je Tag). Enthält sowohl aufruferseitige als auch automatisch abgeleitete Tags — siehe [Automatisches Taggen](#automatisches-taggen). |
-| `source` | `"cli" \| "api" \| "agent" \| "import"` | Wie die Erinnerung erstellt wurde |
+| `source` | `"cli" \| "api" \| "agent" \| "import" \| "distillation"` | Wie die Erinnerung erstellt wurde. `"distillation"` wird nur vom geplanten Destillationsauftrag geschrieben (siehe [Gedächtnis-Destillation](#gedächtnis-destillation)) |
 | `checksum` | `string` | SHA-256-Hash des normalisierten Inhalts (wird für exakte Deduplizierung verwendet) |
 | `embedding` | `number[]` | Vektoreinbettung (nicht in SQLite gespeichert; liegt in Qdrant) |
 | `importance` | `number (0–1)` | Wichtigkeitsbewertung (Standard 0.5) |
@@ -1049,6 +1084,7 @@ Jede in BHGBrain gespeicherte Erinnerung ist ein `MemoryRecord` mit folgenden Fe
 | `last_accessed` | `string (ISO 8601)` | Zeitstempel des letzten Abrufs |
 | `last_operation` | `"ADD" \| "UPDATE" \| "DELETE" \| "NOOP"` | Zuletzt angewendeter Schreibvorgang |
 | `merged_from` | `string \| null` | ID der Erinnerung, aus der diese zusammengeführt wurde (Deduplizierungs-UPDATE-Pfad) |
+| `derived_from` | `string[] \| null` | IDs der archivierten T2/T3-episodischen Quellerinnerungen, aus denen diese Erinnerung destilliert wurde. Nur vom Destillationsauftrag gesetzt; `null` bei jedem gewöhnlichen Schreibvorgang (siehe [Gedächtnis-Destillation](#gedächtnis-destillation)) |
 | `archived` | `boolean` | Ob diese Erinnerung soft-archiviert ist (von Suche/Recall ausgeschlossen) |
 | `vector_synced` | `boolean` | Ob der Qdrant-Vektor mit dem SQLite-Zustand synchron ist |
 | `pinned` | `boolean` | Ob diese Erinnerung immer in `memory://inject`-Payloads enthalten ist, begrenzt durch `defaults.pin_limit_per_namespace`; hat keine Auswirkung auf `search`/`recall` |
@@ -1651,6 +1687,78 @@ bhgbrain archive restore <memory_id>  # Eine archivierte Erinnerung wiederherste
 **Wiederherstellungssemantik:** Eine wiederhergestellte Erinnerung wird als **neue** Erinnerung (auf ihrer ursprünglichen Stufe) aus dem archivierten Zusammenfassungstext neu erstellt. Der ursprüngliche Inhalt (wenn er länger als die Zusammenfassung war) kann nicht wiederhergestellt werden – das Archiv speichert nur die 120-Zeichen-Zusammenfassung. Die wiederhergestellte Erinnerung erhält neue Zeitstempel und eine neue UUID und wird in Qdrant neu eingebettet. Das CLI-`archive restore` löscht zusätzlich die Archivzeile nach der Wiederherstellung.
 
 MCP-Clients haben einen entsprechenden Pfad: Der Parameter `include_archived` des `search`-Tools findet archivierte Erinnerungen per Zusammenfassungs-/Tag-Textabgleich (markiert mit `archived: true`, nie als Zugriff protokolliert), und die `restore`-Aktion des `review`-Tools erstellt eine aktive Erinnerung aus einem Archiveintrag neu — markiert mit `restored-from-archive`, wobei die Archivzeile (anders als beim CLI-Pfad) **beibehalten** wird, sodass ihr Ursprung nachvollziehbar bleibt. Siehe [MCP-Tools-Referenz](#mcp-tools-referenz).
+
+---
+
+### Gedächtnis-Destillation
+
+<a id="gedächtnis-destillation"></a>
+
+Ein geplanter "Schlaf"-Auftrag, der Cluster verwandter, noch aktiver `T2`/`T3`-
+`episodischer` Erinnerungen in eine einzige dauerhafte `T1`-`semantische` Erinnerung
+verwandelt — z. B. werden fünf einzelne Erinnerungen wie "per GitHub Actions
+deployt", "CI auf Actions umgestellt", "Actions-Runner auf node20 festgelegt" zu
+einer Erinnerung: "wir deployen per GitHub Actions." **Standardmäßig deaktiviert**
+(`retention.distillation.enabled: false`) — dies ist die einzige BHGBrain-Funktion,
+die einen ausgehenden LLM-Aufruf tätigt, und das Archivieren der Quellen verliert
+deren vollständigen Inhalt unwiderruflich, daher erfordert sie bewusstes Opt-in.
+
+**Aktivierung:**
+
+1. `retention.distillation.enabled: true` in `config.json` setzen.
+2. Einen Extraktions-API-Schlüssel bereitstellen: `pipeline.extraction_model_env`
+   (Standard `BHGBRAIN_EXTRACTION_API_KEY`) muss auf eine gesetzte
+   Umgebungsvariable verweisen — keine neue Umgebungsvariable wird eingeführt;
+   die Destillation nutzt denselben bereits für `pipeline.extraction_enabled` und
+   `search.rerank` dokumentierten Schlüssel.
+
+**Funktionsweise (bei jedem geplanten Lauf oder `bhgbrain distill`):**
+
+1. **Clustern:** Für jeden Namensraum/jede Sammlung mit `T2`/`T3`-`episodischen`
+   Erinnerungen werden deren Vektoren aus Qdrant geladen und Erinnerungen mit
+   Cosinus-Ähnlichkeit `≥ retention.distillation.similarity_threshold` (Standard
+   `0.85`) per Greedy-Union-Find zu zusammenhängenden Komponenten vereinigt.
+   Cluster kleiner als `min_cluster_size` (Standard `3`) bleiben unangetastet;
+   Cluster größer als `max_cluster_size` (Standard `20`) werden in Blöcke dieser
+   Größe aufgeteilt. Höchstens `max_clusters_per_run` (Standard `10`) Cluster —
+   die größten zuerst — werden pro Lauf verarbeitet.
+2. **Destillieren:** Für jeden qualifizierenden Cluster werden die Inhalte seiner
+   Mitglieder (älteste zuerst) in einem einzigen Chat-Completion-Aufruf an das
+   konfigurierte `pipeline.extraction_model` gesendet, mit der Bitte um eine
+   einzige konsolidierte Tatsache. Bei widersprüchlichen Quellen bittet der
+   Prompt das Modell, die zuletzt aktualisierte zu bevorzugen — eine
+   Abmilderung, keine Entailment-basierte Widerspruchserkennung. Ein Cluster
+   wird **übersprungen** (nie ein harter Fehlschlag des Auftrags), wenn kein
+   API-Schlüssel konfiguriert ist oder der LLM-Aufruf fehlschlägt; Übersprünge
+   werden nach Grund gezählt (`no_key` / `llm_error`).
+3. **Schreiben:** Die konsolidierte Tatsache wird über dieselbe `remember`-
+   Schreib-Pipeline geschrieben, die jede andere Erinnerung durchläuft —
+   Prüfsummen-Deduplizierung, Einbettung, Audit-Protokollierung — mit
+   `source: "distillation"`, `type: "semantic"`, `retention_tier: "T1"` und
+   `derived_from`, gesetzt auf die Quell-IDs des Clusters. Ein Cluster, der sich
+   nach einem vorherigen Destillationslauf erneut bildet, **aktualisiert** die
+   frühere destillierte Erinnerung (über den normalen Dedup-Pfad), statt ein
+   Duplikat zu erzeugen.
+4. **Quellen archivieren:** Erst nachdem die destillierte Erinnerung nachweislich
+   dauerhaft geschrieben wurde, werden die Quellerinnerungen des Clusters über
+   denselben `memory_archive`-Pfad wie GC archiviert und gelöscht, mit einem
+   eigenen `DISTILL`-Audit-Eintrag (`action: "distill"`), der sowohl auf die neue
+   Erinnerungs-ID als auch auf die archivierten Quell-IDs verweist. Schlägt das
+   Archivieren/Löschen nach einem erfolgreichen destillierten Schreibvorgang
+   fehl, wird dieser **nicht** zurückgerollt — die Quellen bleiben aktiv und der
+   Lauf wird als degradiert gemeldet (eine weiterhin aktive Quelle ist
+   unbedenklich: ein späterer Lauf kann sie erneut clustern, und der Dedup-Pfad
+   aktualisiert statt zu duplizieren).
+
+```bash
+bhgbrain distill                      # Destillation ausführen
+bhgbrain distill --dry-run            # Kandidaten-Cluster (IDs + Zusammenfassungen) anzeigen, ohne LLM aufzurufen oder zu schreiben/archivieren
+```
+
+Das Feld `retention.distillation` von `health://status` meldet `last_run_at`,
+`last_run_degraded` sowie kumulative `distilled_total`-/`skipped_total`-Zähler, und
+die `bhgbrain_distill_*`-Zähler/-Histogramme folgen derselben Namenskonvention wie
+`bhgbrain_gc_*` (siehe [Gesundheitszustand & Metriken](#gesundheitszustand--metriken)).
 
 ---
 
@@ -2632,6 +2740,13 @@ bhgbrain health                       # Vollständige Systemgesundheitsprüfung
 bhgbrain gc                           # Bereinigung ausführen
 bhgbrain gc --dry-run                 # Kandidaten und Review-Elemente anzeigen, ohne zu löschen
 bhgbrain gc --tier T3                 # Nur T3-Erinnerungen bereinigen
+
+# Gedächtnis-Destillation (verschmilzt T2/T3-episodische Erinnerungen per
+# LLM-Aufruf zu T1-semantischen Erinnerungen — siehe Gedächtnis-Destillation.
+# Standardmäßig deaktiviert; erfordert retention.distillation.enabled: true
+# und einen Extraktions-API-Schlüssel)
+bhgbrain distill                      # Destillation ausführen
+bhgbrain distill --dry-run            # Kandidaten-Cluster anzeigen, ohne LLM aufzurufen oder zu schreiben/archivieren
 
 # Audit-Protokoll
 bhgbrain audit                        # Aktuelle Audit-Einträge anzeigen

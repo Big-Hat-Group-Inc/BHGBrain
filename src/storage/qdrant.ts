@@ -439,8 +439,13 @@ export class QdrantStore {
   async scrollAll(
     collectionName: string,
     batchSize = 100,
-  ): Promise<Array<{ id: string; payload: Record<string, unknown> }>> {
-    const allPoints: Array<{ id: string; payload: Record<string, unknown> }> = [];
+    // Distillation's clustering pass (add-memory-distillation) needs the raw
+    // vectors behind every point in a collection to compute cosine similarity
+    // in memory; every pre-existing caller omits this, so `with_vector` stays
+    // `false` (its original hardcoded value) and their behavior is unchanged.
+    withVector = false,
+  ): Promise<Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>> {
+    const allPoints: Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }> = [];
     let offset: string | number | undefined = undefined;
 
     while (true) {
@@ -448,13 +453,14 @@ export class QdrantStore {
         limit: batchSize,
         offset,
         with_payload: true,
-        with_vector: false,
+        with_vector: withVector,
       });
 
       for (const point of response.points) {
         allPoints.push({
           id: point.id as string,
           payload: (point.payload ?? {}) as Record<string, unknown>,
+          vector: withVector ? extractDenseVector(point.vector) : undefined,
         });
       }
 
@@ -463,6 +469,30 @@ export class QdrantStore {
     }
 
     return allPoints;
+  }
+
+  /**
+   * `scrollAll` scoped to one namespace/collection, resolving the internal
+   * prefixed collection name so callers (e.g. `DistillationService`'s
+   * clustering pass) never need to duplicate `collectionName`'s prefix
+   * convention. A collection that has never been written to simply yields no
+   * points, same convention as `searchSimilar`/`findNeighborsById`.
+   */
+  async scrollCollection(
+    namespace: string,
+    collection: string,
+    batchSize = 100,
+    withVector = false,
+  ): Promise<Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>> {
+    const name = this.collectionName(namespace, collection);
+    try {
+      return await this.scrollAll(name, batchSize, withVector);
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return [];
+      }
+      throw err;
+    }
   }
 
   private isNotFoundError(err: unknown): boolean {

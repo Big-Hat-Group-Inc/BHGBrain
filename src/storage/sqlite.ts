@@ -117,6 +117,11 @@ export interface SqliteStorage {
   getTierStats(): TierStats[];
   setRetentionDegraded(degraded: boolean, message?: string | null, completedAt?: string): void;
   getRetentionDegraded(): { degraded: boolean; message: string | null; last_success_at: string | null };
+  recordDistillationRun(result: { distilled: number; skipped: number; degraded: boolean }, completedAt?: string): void;
+  getDistillationState(): {
+    last_run_at: string | null; last_run_degraded: boolean; distilled_total: number; skipped_total: number;
+  };
+  listDistillationCollections(): Array<{ namespace: string; collection: string }>;
   countArchivedMemories(): number;
   countUnsyncedVectors(): number;
   listMemoriesNeedingVectorSync(limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
@@ -203,6 +208,7 @@ CREATE TABLE IF NOT EXISTS memories (
   access_count INTEGER NOT NULL DEFAULT 0,
   last_operation TEXT NOT NULL DEFAULT 'ADD',
   merged_from TEXT,
+  derived_from TEXT,
   stale INTEGER NOT NULL DEFAULT 0,
   archived INTEGER NOT NULL DEFAULT 0,
   vector_synced INTEGER NOT NULL DEFAULT 1,
@@ -338,6 +344,19 @@ CREATE TABLE IF NOT EXISTS retention_state (
   message TEXT,
   last_success_at TEXT,
   updated_at TEXT NOT NULL
+);
+
+-- Single-row state for the most recent distillation job run, so
+-- HealthService can surface a retention.distillation rollup (last-run
+-- timestamp, last-run degraded flag, cumulative counts) that survives a
+-- restart and works across processes, mirroring retention_state above.
+-- See add-memory-distillation.
+CREATE TABLE IF NOT EXISTS distillation_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_run_at TEXT,
+  last_run_degraded INTEGER NOT NULL DEFAULT 0,
+  distilled_total INTEGER NOT NULL DEFAULT 0,
+  skipped_total INTEGER NOT NULL DEFAULT 0
 );
 
 -- Single-row record of the store's expected embedding identity
@@ -515,12 +534,13 @@ export class SqliteStore implements SqliteStorage {
     const pinned = mem.pinned ?? false;
     const deviceId = mem.device_id ?? null;
     const embeddingModel = mem.embedding_model ?? null;
+    const derivedFrom = mem.derived_from ?? null;
     this.db.run(
       `INSERT INTO memories (
         id, namespace, collection, type, category, content, summary, tags, source, checksum,
         importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
-        last_operation, merged_from, stale, archived, vector_synced, pinned, device_id, embedding_model, created_at, updated_at, last_accessed
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        last_operation, merged_from, derived_from, stale, archived, vector_synced, pinned, device_id, embedding_model, created_at, updated_at, last_accessed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         mem.id,
         mem.namespace,
@@ -540,6 +560,7 @@ export class SqliteStore implements SqliteStorage {
         mem.access_count,
         mem.last_operation,
         mem.merged_from,
+        derivedFrom ? JSON.stringify(derivedFrom) : null,
         0,
         archived ? 1 : 0,
         vectorSynced ? 1 : 0,
@@ -648,6 +669,9 @@ export class SqliteStore implements SqliteStorage {
       if (key === 'tags') {
         sets.push('tags = ?');
         vals.push(JSON.stringify(val));
+      } else if (key === 'derived_from') {
+        sets.push('derived_from = ?');
+        vals.push(val === null ? null : JSON.stringify(val));
       } else if (key === 'decay_eligible' || key === 'archived' || key === 'vector_synced' || key === 'pinned') {
         sets.push(`${key} = ?`);
         vals.push(val ? 1 : 0);
@@ -1179,6 +1203,71 @@ export class SqliteStore implements SqliteStorage {
     const row = stmt.getAsObject() as { degraded: number; message: string | null; last_success_at: string | null };
     stmt.free();
     return { degraded: row.degraded === 1, message: row.message ?? null, last_success_at: row.last_success_at ?? null };
+  }
+
+  // Cumulative counters (`distilled_total`/`skipped_total`) accumulate across
+  // every run this process (or a prior one, since it's persisted) has
+  // recorded; `last_run_degraded` reflects only the most recent run. See
+  // add-memory-distillation.
+  recordDistillationRun(
+    result: { distilled: number; skipped: number; degraded: boolean },
+    completedAt?: string,
+  ): void {
+    this.assertMutableAllowed();
+    const now = completedAt ?? new Date().toISOString();
+    this.db.run(
+      `INSERT INTO distillation_state (id, last_run_at, last_run_degraded, distilled_total, skipped_total)
+       VALUES (1, ?1, ?2, ?3, ?4)
+       ON CONFLICT(id) DO UPDATE SET
+         last_run_at = ?1,
+         last_run_degraded = ?2,
+         distilled_total = distillation_state.distilled_total + ?3,
+         skipped_total = distillation_state.skipped_total + ?4`,
+      [now, result.degraded ? 1 : 0, result.distilled, result.skipped],
+    );
+    this.markDirty();
+  }
+
+  getDistillationState(): {
+    last_run_at: string | null; last_run_degraded: boolean; distilled_total: number; skipped_total: number;
+  } {
+    const stmt = this.db.prepare(
+      `SELECT last_run_at, last_run_degraded, distilled_total, skipped_total FROM distillation_state WHERE id = 1`,
+    );
+    if (!stmt.step()) {
+      stmt.free();
+      return { last_run_at: null, last_run_degraded: false, distilled_total: 0, skipped_total: 0 };
+    }
+    const row = stmt.getAsObject() as {
+      last_run_at: string | null; last_run_degraded: number; distilled_total: number; skipped_total: number;
+    };
+    stmt.free();
+    return {
+      last_run_at: row.last_run_at ?? null,
+      last_run_degraded: row.last_run_degraded === 1,
+      distilled_total: row.distilled_total,
+      skipped_total: row.skipped_total,
+    };
+  }
+
+  /**
+   * Distinct namespace/collection pairs currently holding at least one
+   * non-archived T2/T3 episodic memory — the scan scope
+   * `DistillationService.runOnce` iterates over. See add-memory-distillation.
+   */
+  listDistillationCollections(): Array<{ namespace: string; collection: string }> {
+    const stmt = this.db.prepare(
+      `SELECT DISTINCT namespace, collection FROM memories
+       WHERE archived = 0 AND type = 'episodic' AND retention_tier IN ('T2', 'T3')
+       ORDER BY namespace, collection`,
+    );
+    const results: Array<{ namespace: string; collection: string }> = [];
+    while (stmt.step()) {
+      const row = this.getRow(stmt.getAsObject());
+      results.push({ namespace: this.getString(row, 'namespace'), collection: this.getString(row, 'collection') });
+    }
+    stmt.free();
+    return results;
   }
 
   countArchivedMemories(): number {
@@ -1874,6 +1963,7 @@ export class SqliteStore implements SqliteStorage {
       access_count: this.getNumber(row, 'access_count'),
       last_operation: this.getString(row, 'last_operation') as MemoryRecord['last_operation'],
       merged_from: this.getNullableString(row, 'merged_from'),
+      derived_from: JSON.parse(this.getNullableString(row, 'derived_from') ?? 'null') as string[] | null,
       archived: this.getBoolean(row, 'archived'),
       vector_synced: row.vector_synced === undefined ? true : this.getBoolean(row, 'vector_synced'),
       pinned: row.pinned === undefined ? false : this.getBoolean(row, 'pinned'),
@@ -2022,6 +2112,7 @@ export class SqliteStore implements SqliteStorage {
       { name: 'device_id', sql: `ALTER TABLE memories ADD COLUMN device_id TEXT` },
       { name: 'embedding_model', sql: `ALTER TABLE memories ADD COLUMN embedding_model TEXT` },
       { name: 'pinned', sql: `ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0` },
+      { name: 'derived_from', sql: `ALTER TABLE memories ADD COLUMN derived_from TEXT` },
     ];
 
     for (const column of requiredColumns) {

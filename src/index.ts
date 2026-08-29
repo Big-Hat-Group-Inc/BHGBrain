@@ -15,7 +15,9 @@ import { createQueryExpansionProvider, warnIfQueryExpansionDegraded } from './se
 import { createRerankProvider, warnIfRerankDegraded, OpenAiRerankProvider } from './rerank/index.js';
 import { BackupService } from './backup/index.js';
 import { RetentionService } from './backup/retention.js';
-import { CleanupScheduler } from './backup/scheduler.js';
+import { CleanupScheduler, DistillationScheduler } from './backup/scheduler.js';
+import { DistillationService } from './pipeline/distillation.js';
+import { DistillationLLMClient } from './pipeline/distillation-llm.js';
 import { HealthService } from './health/index.js';
 import { MetricsCollector } from './health/metrics.js';
 import { createLogger } from './health/logger.js';
@@ -78,6 +80,12 @@ async function main() {
   // constructed, so `health://status` reports it exactly when reranking is
   // configured.
   const rerankBreaker = new CircuitBreaker({ ...breakerOptions, key: 'rerank', logger });
+  // Not included in HealthService's `breakers` record below, same rationale
+  // as `extractionBreaker`/`summarizationBreaker`: distillation is off by
+  // default and, when enabled, a failing LLM call degrades that scheduled
+  // job's own result (surfaced via `retention.distillation` health), not the
+  // server's aggregate health status. See add-memory-distillation.
+  const distillationBreaker = new CircuitBreaker({ ...breakerOptions, key: 'distillation', logger });
   const metrics = new MetricsCollector(config);
   const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
@@ -167,6 +175,16 @@ async function main() {
   const cleanupScheduler = new CleanupScheduler(config, retentionService, logger);
   cleanupScheduler.start();
 
+  // Scheduled distillation: clusters related T2/T3 episodic memories and
+  // consolidates each qualifying cluster into one T1 semantic memory. Off by
+  // default (`retention.distillation.enabled: false`); the scheduler itself
+  // is a no-op start() when disabled, mirroring `cleanupScheduler` above. See
+  // add-memory-distillation.
+  const distillationLlmClient = new DistillationLLMClient(config, distillationBreaker, metrics);
+  const distillationService = new DistillationService(config, storage, pipeline, distillationLlmClient, logger, metrics);
+  const distillationScheduler = new DistillationScheduler(config, distillationService, logger);
+  distillationScheduler.start();
+
   const ctx: ToolContext = {
     config, storage, embedding, pipeline,
     search: searchService, backup: backupService,
@@ -213,6 +231,7 @@ async function main() {
       void (async () => {
         await mcpSessions.closeAll();
         cleanupScheduler.stop();
+        distillationScheduler.stop();
         httpServer.close(() => {
           logger.info({ event: 'shutdown_complete', signal });
           process.exit(0);

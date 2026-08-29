@@ -49,6 +49,25 @@ describe('SqliteStore', () => {
     expect(retrieved!.tags).toEqual(mem.tags);
   });
 
+  // add-memory-distillation, task 7.2: derived_from round-trips through
+  // insert/rowToMemory (null for an ordinary write, populated array for a
+  // distillation write) and through updateMemory's special-cased column.
+  it('round-trips derived_from through insert, read, and update', () => {
+    const mem = sampleMemory();
+    store.insertMemory(mem);
+    expect(store.getMemoryById(mem.id)!.derived_from).toBeNull();
+
+    const distilled = { ...sampleMemory(), id: '650e8400-e29b-41d4-a716-446655440001', checksum: 'def456', derived_from: ['a', 'b', 'c'] };
+    store.insertMemory(distilled);
+    expect(store.getMemoryById(distilled.id)!.derived_from).toEqual(['a', 'b', 'c']);
+
+    store.updateMemory(mem.id, { derived_from: ['x', 'y'] });
+    expect(store.getMemoryById(mem.id)!.derived_from).toEqual(['x', 'y']);
+
+    store.updateMemory(mem.id, { derived_from: null });
+    expect(store.getMemoryById(mem.id)!.derived_from).toBeNull();
+  });
+
   it('finds memory by checksum', () => {
     const mem = sampleMemory();
     store.insertMemory(mem);

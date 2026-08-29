@@ -2,7 +2,12 @@ export type MemoryType = 'episodic' | 'semantic' | 'procedural';
 
 export type CategorySlot = 'company-values' | 'architecture' | 'coding-requirements' | 'custom';
 
-export type MemorySource = 'cli' | 'api' | 'agent' | 'import';
+// 'distillation': written only by `DistillationService` when it consolidates
+// a cluster of related T2/T3 episodic memories into one T1 semantic memory.
+// A dedicated value (not 'agent') so distillation output is distinguishable
+// from agent-authored writes in ranking, audit, and the review queue. See
+// add-memory-distillation.
+export type MemorySource = 'cli' | 'api' | 'agent' | 'import' | 'distillation';
 
 export type WriteOperation = 'ADD' | 'UPDATE' | 'DELETE' | 'NOOP';
 
@@ -60,6 +65,16 @@ export interface MemoryRecord {
   access_count: number;
   last_operation: WriteOperation;
   merged_from: string | null;
+  // Ids of the archived T2/T3 episodic source memories this row was
+  // distilled from — set only on `DistillationService` output (JSON-encoded
+  // TEXT column, same convention as `tags`). `null` for every ordinary
+  // write. Structurally similar to `merged_from` but multi-valued, since
+  // distillation consolidates a whole cluster rather than one predecessor.
+  // See add-memory-distillation. Optional (like `device_id`/`embedding_model`
+  // below) so the many pre-existing object literals typed against
+  // `MemoryRecord`/`Omit<MemoryRecord, 'embedding'>` across the codebase and
+  // its tests do not all require updating for one new additive field.
+  derived_from?: string[] | null;
   archived: boolean;
   vector_synced: boolean;
   // Always included in `memory://inject` and `memory://inject/{hint}`
@@ -193,6 +208,16 @@ export interface HealthSnapshot {
     // Seconds since the last cleanup (GC) run that completed without a
     // partial failure; null if cleanup has never completed successfully.
     cleanup_lag_seconds: number | null;
+    // Additive rollup for the distillation job (add-memory-distillation) —
+    // absent from any pre-existing `retention` health consumer's assumptions
+    // since it is a new optional field, not a change to any existing one.
+    // Undefined when distillation has never run in this process.
+    distillation?: {
+      last_run_at: string | null;
+      last_run_degraded: boolean;
+      distilled_total: number;
+      skipped_total: number;
+    };
   };
 }
 
@@ -204,7 +229,10 @@ export interface ErrorEnvelope {
   };
 }
 
-export type LifecycleAuditOperation = 'PROMOTE' | 'ARCHIVE' | 'REVISE' | 'RESTORE';
+// 'DISTILL' is logged against the newly-written T1 semantic memory when
+// `DistillationService` archives a cluster's sources after a successful
+// distilled write — see add-memory-distillation.
+export type LifecycleAuditOperation = 'PROMOTE' | 'ARCHIVE' | 'REVISE' | 'RESTORE' | 'DISTILL';
 
 export interface AuditEntry {
   id: string;
@@ -229,7 +257,7 @@ export interface LifecycleAuditDetails {
   new_tier: RetentionTier | null;
   actor: string;
   timestamp: string;
-  action: 'promote' | 'archive' | 'revise' | 'delete' | 'restore' | 'consolidate';
+  action: 'promote' | 'archive' | 'revise' | 'delete' | 'restore' | 'consolidate' | 'distill';
   // Present only on the explicit `revisions` tool `revert` action's REVISE
   // audit entry — the revision number the memory was reverted to. Absent on
   // the generic T0-snapshot REVISE that `StorageManager.updateMemory` emits
@@ -241,6 +269,10 @@ export interface LifecycleAuditDetails {
   // ordinary `action: 'archive'` entries. See
   // add-duplicate-cluster-consolidation.
   merged_into?: string;
+  // Present only on `action: 'distill'` DISTILL entries: the archived source
+  // memory ids this distilled memory replaces (mirrors `derived_from` on the
+  // record itself). See add-memory-distillation.
+  derived_from?: string[];
 }
 
 export interface PaginatedResult<T> {

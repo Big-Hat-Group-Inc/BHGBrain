@@ -11,6 +11,10 @@ const retentionMocks = {
   restoreArchive: vi.fn(),
 };
 
+const distillationMocks = {
+  runOnce: vi.fn(),
+};
+
 vi.mock('../config/index.js', () => ({
   loadConfig: vi.fn(),
   ensureDataDir: vi.fn(),
@@ -60,6 +64,16 @@ vi.mock('../backup/retention.js', () => ({
   },
 }));
 
+vi.mock('../pipeline/distillation.js', () => ({
+  DistillationService: class {
+    runOnce = distillationMocks.runOnce;
+  },
+}));
+
+vi.mock('../pipeline/distillation-llm.js', () => ({
+  DistillationLLMClient: class {},
+}));
+
 vi.mock('../health/metrics.js', () => ({
   MetricsCollector: class {},
 }));
@@ -98,6 +112,9 @@ describe('CLI', () => {
     retentionMocks.listArchive.mockReset().mockReturnValue([{ id: 'arch-1' }]);
     retentionMocks.searchArchive.mockReset().mockReturnValue([{ id: 'arch-2' }]);
     retentionMocks.restoreArchive.mockReset().mockResolvedValue({ restored: true });
+    distillationMocks.runOnce.mockReset().mockResolvedValue({
+      clustersFound: 1, distilled: 1, skipped: [], archived: 3, degraded: false, candidates: [],
+    });
   });
 
   afterEach(() => {
@@ -232,6 +249,7 @@ describe('CLI', () => {
     await runProgram(['server', 'status'], context);
     await runProgram(['server', 'token']);
     await runProgram(['gc', '--dry-run', '--tier', 'T2'], context);
+    await runProgram(['distill', '--dry-run'], context);
     await runProgram(['stats', '--by-tier', '--expiring'], context);
     await runProgram(['health'], context);
     await runProgram(['audit'], context);
@@ -242,10 +260,33 @@ describe('CLI', () => {
       { stdio: 'inherit' },
     );
     expect(logSpy).toHaveBeenCalledWith('New token: token-1234');
+    expect(distillationMocks.runOnce).toHaveBeenCalledWith({ dryRun: true });
+    expect(logSpy).toHaveBeenCalledWith(JSON.stringify(
+      { clustersFound: 1, distilled: 1, skipped: [], archived: 3, degraded: false, candidates: [] },
+      null, 2,
+    ));
     expect(logSpy).toHaveBeenCalledWith('Total memories: 10');
     expect(logSpy).toHaveBeenCalledWith('  T0: 1');
     expect(logSpy).toHaveBeenCalledWith('  12345678 T2 expires 2026-04-01T00:00:00.000Z Expiring soon');
     expect(logSpy).toHaveBeenCalledWith('[2026-03-19T00:00:00.000Z] remember 12345678 ns:global client:cli');
+  });
+
+  // add-memory-distillation, task 5.4: a live (non-dry-run) `distill` reports
+  // the DistillationResult summary, distinct from the --dry-run coverage
+  // exercised in the sweep test above.
+  it('runs a live distill and reports the DistillationResult summary', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    distillationMocks.runOnce.mockResolvedValueOnce({
+      clustersFound: 2, distilled: 1, skipped: [{ reason: 'no_key', count: 1 }], archived: 3, degraded: false, candidates: [],
+    });
+
+    await runProgram(['distill']);
+
+    expect(distillationMocks.runOnce).toHaveBeenCalledWith({ dryRun: false });
+    expect(logSpy).toHaveBeenCalledWith(JSON.stringify(
+      { clustersFound: 2, distilled: 1, skipped: [{ reason: 'no_key', count: 1 }], archived: 3, degraded: false, candidates: [] },
+      null, 2,
+    ));
   });
 
   it('covers tier and archive commands including missing-memory branches', async () => {

@@ -5,7 +5,7 @@ const TAG_RE = /^[a-zA-Z0-9-]+$/;
 
 export const MemoryTypeSchema = z.enum(['episodic', 'semantic', 'procedural']);
 export const CategorySlotSchema = z.enum(['company-values', 'architecture', 'coding-requirements', 'custom']);
-export const MemorySourceSchema = z.enum(['cli', 'api', 'agent', 'import']);
+export const MemorySourceSchema = z.enum(['cli', 'api', 'agent', 'import', 'distillation']);
 export const WriteOperationSchema = z.enum(['ADD', 'UPDATE', 'DELETE', 'NOOP']);
 export const SearchModeSchema = z.enum(['semantic', 'fulltext', 'hybrid']);
 export const RetentionTierSchema = z.enum(['T0', 'T1', 'T2', 'T3']);

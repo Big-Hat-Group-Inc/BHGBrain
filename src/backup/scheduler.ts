@@ -1,5 +1,6 @@
 import type { BrainConfig } from '../config/index.js';
 import type { RetentionService } from './retention.js';
+import type { DistillationService } from '../pipeline/distillation.js';
 
 export interface CronSchedule {
   minute: number[];
@@ -200,6 +201,81 @@ export class CleanupScheduler {
       await this.retention.runGc();
     } catch (err) {
       this.logger?.error?.({ event: 'retention_scheduler_run_failed', error: (err as Error).message });
+    } finally {
+      this.scheduleNext();
+    }
+  }
+}
+
+/**
+ * Runs `DistillationService.runOnce` on the schedule configured at
+ * `retention.distillation.schedule`, using the exact same execution path as
+ * the `bhgbrain distill` CLI command. Reuses `parseCronExpression`/
+ * `nextRunAfter` (this file) rather than generalizing `CleanupScheduler` into
+ * a job-agnostic runner — see design.md Decision #5: two structurally
+ * similar scheduler instances is a smaller, safer change than a shared
+ * `CronJobRunner<T>` abstraction for exactly two jobs. See
+ * add-memory-distillation.
+ */
+export class DistillationScheduler {
+  private timer: NodeJS.Timeout | null = null;
+  private stopped = true;
+
+  constructor(
+    private config: BrainConfig,
+    private distillation: DistillationService,
+    private logger?: {
+      info: (obj: Record<string, unknown>) => void;
+      error?: (obj: Record<string, unknown>) => void;
+    },
+  ) {}
+
+  start(): void {
+    if (!this.config.retention.distillation.enabled) {
+      this.logger?.info({ event: 'distillation_scheduler_disabled' });
+      return;
+    }
+    this.stopped = false;
+    this.scheduleNext();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
+  private scheduleNext(): void {
+    if (this.stopped) return;
+
+    let delayMs: number;
+    try {
+      const schedule = parseCronExpression(this.config.retention.distillation.schedule);
+      const next = nextRunAfter(schedule, new Date());
+      delayMs = Math.max(0, next.getTime() - Date.now());
+    } catch (err) {
+      this.logger?.error?.({
+        event: 'distillation_scheduler_invalid_cron',
+        schedule: this.config.retention.distillation.schedule,
+        error: (err as Error).message,
+      });
+      return;
+    }
+
+    this.logger?.info({ event: 'distillation_scheduler_next_run', delay_ms: delayMs });
+    this.timer = setTimeout(() => {
+      void this.runOnce();
+    }, delayMs);
+    this.timer.unref?.();
+  }
+
+  private async runOnce(): Promise<void> {
+    try {
+      await this.distillation.runOnce();
+    } catch (err) {
+      this.logger?.error?.({ event: 'distillation_scheduler_run_failed', error: (err as Error).message });
     } finally {
       this.scheduleNext();
     }

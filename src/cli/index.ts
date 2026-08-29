@@ -14,6 +14,8 @@ import { SearchService } from '../search/index.js';
 import { BackupService } from '../backup/index.js';
 import { HealthService } from '../health/index.js';
 import { RetentionService } from '../backup/retention.js';
+import { DistillationService } from '../pipeline/distillation.js';
+import { DistillationLLMClient } from '../pipeline/distillation-llm.js';
 import { MetricsCollector } from '../health/metrics.js';
 import { createLogger } from '../health/logger.js';
 import { CircuitBreaker } from '../resilience/index.js';
@@ -237,6 +239,19 @@ export function createProgram(createContextImpl: typeof createContext = createCo
       const ctx = await createContextImpl();
       const retention = new RetentionService(ctx.config, ctx.storage, ctx.logger, ctx.metrics);
       const result = await retention.runGc({ dryRun: Boolean(opts.dryRun), tier: opts.tier });
+      console.log(JSON.stringify(result, null, 2));
+      ctx.storage.sqlite.close();
+    });
+
+  program
+    .command('distill')
+    .description('Run memory distillation (clusters T2/T3 episodic memories into T1 semantic memories)')
+    .option('--dry-run', 'Report candidate clusters without calling the LLM or writing/archiving anything')
+    .action(async (opts) => {
+      const ctx = await createContextImpl();
+      const llmClient = new DistillationLLMClient(ctx.config, undefined, ctx.metrics);
+      const distillation = new DistillationService(ctx.config, ctx.storage, ctx.pipeline, llmClient, ctx.logger, ctx.metrics);
+      const result = await distillation.runOnce({ dryRun: Boolean(opts.dryRun) });
       console.log(JSON.stringify(result, null, 2));
       ctx.storage.sqlite.close();
     });

@@ -34,6 +34,7 @@ BHGBrain 将记忆存储在 SQLite（元数据 + 全文搜索）和 Qdrant（语
     - [重要性评分](#重要性评分)
     - [类别——持久化策略槽](#类别持久化策略槽)
     - [衰减、清理与归档](#衰减清理与归档)
+    - [记忆蒸馏](#记忆蒸馏)
     - [到期前警告](#到期前警告)
     - [资源限制与容量预算](#资源限制与容量预算)
 11. [搜索](#搜索)
@@ -355,7 +356,34 @@ BHGBrain 从以下位置加载配置文件：
     "pre_expiry_warning_days": 7,
 
     // Qdrant 分段压缩阈值（当某分段中已删除数据占比超过此比例时触发压缩）
-    "compaction_deleted_threshold": 0.10
+    "compaction_deleted_threshold": 0.10,
+
+    // 定时记忆蒸馏：将相关且仍处于活跃状态的 T2/T3 情景记忆聚类，并通过 LLM
+    // 调用将每个符合条件的簇合并为一条持久的 T1 语义记忆，同时保留来源关系
+    // 归档源记忆（参见下方"记忆蒸馏"）。默认关闭；未配置提取 API 密钥时不生效。
+    "distillation": {
+      // 总开关。false（默认）：调度器永不启动，且 `bhgbrain distill` 会跳过
+      // 每个簇（no_key），除非配置了提取 API 密钥。
+      "enabled": false,
+
+      // 后台蒸馏任务的 cron 计划（UTC）。默认在 cleanup_schedule 之后一小时，
+      // 避免刚被 GC 归档的存储在同一时刻又被蒸馏。
+      "schedule": "0 3 * * *",
+
+      // 两条 T2/T3 情景记忆被归入同一簇所需的余弦相似度下限。刻意保守——
+      // 一旦来源被归档，错误的合并将无法撤销。
+      "similarity_threshold": 0.85,
+
+      // 小于该大小的簇将被忽略（信号太弱）。
+      "min_cluster_size": 3,
+
+      // 大于该大小的簇会被确定性地拆分为若干 max_cluster_size 大小的块，
+      // 而不是作为一个整体被蒸馏。
+      "max_cluster_size": 20,
+
+      // 每次定时运行最多蒸馏（即调用 LLM）的簇数上限。
+      "max_clusters_per_run": 10
+    }
   },
 
   // 去重设置
@@ -978,7 +1006,7 @@ BHGBrain 中存储的每条记忆都是一个 `MemoryRecord`，包含以下字�
 | `content` | `string` | 记忆的完整内容（最多 100,000 字符） |
 | `summary` | `string` | 自动生成的首行摘要（最多 120 字符） |
 | `tags` | `string[]` | 自由格式标签（字母数字 + 连字符，最多 20 个，每个最多 100 字符）。既包含调用方提供的标签，也可能包含内容自动派生的标签——详见[自动标记](#自动标记)。 |
-| `source` | `"cli" \| "api" \| "agent" \| "import"` | 记忆的创建方式 |
+| `source` | `"cli" \| "api" \| "agent" \| "import" \| "distillation"` | 记忆的创建方式。`"distillation"` 仅由定时蒸馏任务写入（参见[记忆蒸馏](#记忆蒸馏)） |
 | `checksum` | `string` | 规范化内容的 SHA-256 哈希（用于精确去重） |
 | `embedding` | `number[]` | 向量嵌入（不存储在 SQLite 中，存在 Qdrant 里） |
 | `importance` | `number (0–1)` | 重要性评分（默认 0.5） |
@@ -990,6 +1018,7 @@ BHGBrain 中存储的每条记忆都是一个 `MemoryRecord`，包含以下字�
 | `last_accessed` | `string (ISO 8601)` | 最近一次检索的时间戳 |
 | `last_operation` | `"ADD" \| "UPDATE" \| "DELETE" \| "NOOP"` | 最近一次应用的写操作 |
 | `merged_from` | `string \| null` | 该记忆合并自的来源记忆 ID（去重 UPDATE 路径） |
+| `derived_from` | `string[] \| null` | 该记忆蒸馏自的已归档 T2/T3 情景来源记忆 ID 列表。仅由蒸馏任务设置；普通写入始终为 `null`（参见[记忆蒸馏](#记忆蒸馏)） |
 | `archived` | `boolean` | 该记忆是否已软归档（从搜索/召回中排除） |
 | `vector_synced` | `boolean` | Qdrant 向量是否与 SQLite 状态同步 |
 | `pinned` | `boolean` | 该记忆是否始终包含在 `memory://inject` 载荷中，受 `defaults.pin_limit_per_namespace` 限制；对 `search`/`recall` 没有影响 |
@@ -1575,6 +1604,64 @@ bhgbrain archive restore <memory_id>  # 恢复已归档的记忆
 **恢复语义：** 恢复的记忆从归档摘要文本重新创建为一条**新的**记忆（沿用其原始层级）。原始内容（如果比摘要更长）无法恢复——归档仅存储 120 字符的摘要。恢复的记忆获得全新的时间戳和新 UUID，并在 Qdrant 中重新嵌入。CLI 的 `archive restore` 在恢复后还会删除该归档记录行。
 
 MCP 客户端也有对应的路径：`search` 工具的 `include_archived` 参数可按摘要/标签词条匹配找到已归档的记忆（标记为 `archived: true`，从不记录访问），而 `review` 工具的 `restore` 动作可根据归档记录重新创建一条活跃记忆——标记为 `restored-from-archive`，且归档记录行会被**保留**（这与 CLI 路径不同），以便其来源始终可追溯。参见 [MCP 工具参考](#mcp-工具参考)。
+
+---
+
+### 记忆蒸馏
+
+<a id="记忆蒸馏"></a>
+
+一项定时的"睡眠"任务，将相关且仍处于活跃状态的 `T2`/`T3` `episodic`（情景）记忆
+簇合并为一条持久的 `T1` `semantic`（语义）记忆——例如"通过 GitHub Actions 部署"、
+"CI 切换到了 Actions"、"Actions runner 固定为 node20" 这五条独立记忆，会变成一条
+记忆："我们通过 GitHub Actions 部署。"**默认关闭**
+（`retention.distillation.enabled: false`）——这是 BHGBrain 中唯一会发起出站 LLM
+调用的功能，且归档来源会不可逆地丢失其完整内容，因此需要主动开启。
+
+**启用方法：**
+
+1. 在 `config.json` 中设置 `retention.distillation.enabled: true`。
+2. 配置提取 API 密钥：`pipeline.extraction_model_env`（默认为
+   `BHGBRAIN_EXTRACTION_API_KEY`）必须指向一个已设置的环境变量——无需引入新的
+   环境变量；蒸馏复用的正是为 `pipeline.extraction_enabled` 和 `search.rerank`
+   已记录的同一密钥。
+
+**工作原理（每次定时运行，或执行 `bhgbrain distill` 时）：**
+
+1. **聚类：** 对每个存在 `T2`/`T3` `episodic` 记忆的命名空间/集合，从 Qdrant
+   取出其向量，并使用贪心并查集，将余弦相似度 `≥
+   retention.distillation.similarity_threshold`（默认 `0.85`）的记忆合并为
+   连通分量。小于 `min_cluster_size`（默认 `3`）的簇不予处理；大于
+   `max_cluster_size`（默认 `20`）的簇会被拆分为若干同等大小的块。每次运行
+   最多处理 `max_clusters_per_run`（默认 `10`）个簇——优先处理最大的。
+2. **蒸馏：** 对每个符合条件的簇，将其成员内容（从最旧到最新）通过一次
+   聊天补全调用发送给配置的 `pipeline.extraction_model`，要求其生成一条
+   合并后的事实。若来源存在冲突，提示词会要求模型优先采用最近更新的来源——
+   这只是一种缓解手段，而非基于蕴含关系的矛盾检测。当未配置 API 密钥或 LLM
+   调用失败时，该簇会被**跳过**（绝不会导致任务硬失败）；跳过情况会按原因
+   计数（`no_key` / `llm_error`）。
+3. **写入：** 合并后的事实会通过与其他所有记忆相同的 `remember` 写入流水线
+   写入——校验和去重、嵌入、审计日志——并带有 `source: "distillation"`、
+   `type: "semantic"`、`retention_tier: "T1"`，以及设置为该簇来源记忆 ID 的
+   `derived_from`。若某个簇在此前蒸馏之后重新形成，会**更新**（通过正常的
+   去重路径）此前的蒸馏记忆，而不是产生重复记录。
+4. **归档来源：** 只有在确认蒸馏出的记忆已持久写入之后，才会通过与 GC 相同的
+   `memory_archive` 路径归档并删除该簇的来源记忆，并记录一条专属的
+   `DISTILL` 审计条目（`action: "distill"`），同时引用新记忆的 ID 与被归档
+   来源的 ID。若在成功写入蒸馏记忆之后，归档/删除步骤失败，该写入**不会**
+   被回滚——来源记忆保持活跃，本次运行会被标记为降级状态（仍处于活跃状态
+   的来源是安全的：后续运行可能重新将其聚类，且去重路径会执行更新而非
+   产生重复）。
+
+```bash
+bhgbrain distill                      # 运行蒸馏
+bhgbrain distill --dry-run            # 显示候选簇（ID + 摘要），不调用 LLM 也不写入/归档任何内容
+```
+
+`health://status` 的 `retention.distillation` 字段会报告 `last_run_at`、
+`last_run_degraded`，以及累计的 `distilled_total`/`skipped_total` 计数，
+`bhgbrain_distill_*` 计数器/直方图遵循与 `bhgbrain_gc_*` 相同的命名约定
+（参见[健康状态与指标](#健康状态与指标)）。
 
 ---
 
@@ -2518,6 +2605,11 @@ bhgbrain health                       # 完整系统健康检查
 bhgbrain gc                           # 运行清理
 bhgbrain gc --dry-run                 # 显示候选项与待审核项，不实际删除
 bhgbrain gc --tier T3                 # 仅清理 T3 记忆
+
+# 记忆蒸馏（通过 LLM 调用将 T2/T3 情景记忆合并为 T1 语义记忆——参见记忆蒸馏。
+# 默认关闭；需要 retention.distillation.enabled: true 以及提取 API 密钥）
+bhgbrain distill                      # 运行蒸馏
+bhgbrain distill --dry-run            # 显示候选簇，不调用 LLM 也不写入/归档任何内容
 
 # 审计日志
 bhgbrain audit                        # 显示最近的审计条目

@@ -319,6 +319,112 @@ describe('WritePipeline NOOP handling', () => {
   });
 });
 
+// add-memory-distillation, task 4.6 ("a cluster that re-forms after a prior
+// distillation UPDATEs rather than duplicates the T1 memory"): confirms
+// DistillationService's writes go through the exact same classifyOperation
+// path every other write does (no special-casing), and that derived_from
+// specifically accumulates via union on UPDATE rather than being clobbered
+// or ignored.
+describe('WritePipeline distillation derived_from (add-memory-distillation)', () => {
+  const config = {
+    deduplication: { similarity_threshold: 0.92 },
+    pipeline: {
+      extraction_enabled: false,
+      fallback_to_threshold_dedup: true,
+      extraction_model: 'gpt-4o-mini',
+      extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
+      contradiction_detection: { enabled: false, timeout_ms: 5000 },
+    },
+  } as unknown as BrainConfig;
+
+  let embedding: EmbeddingProvider;
+  let storage: StorageManager;
+
+  beforeEach(() => {
+    embedding = {
+      model: 'test-model',
+      dimensions: 2,
+      embed: vi.fn(async () => [0.1, 0.2]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
+      healthCheck: vi.fn(async () => true),
+    };
+    storage = {
+      sqlite: {
+        getMemoryByChecksum: vi.fn(() => null),
+        getMemoryById: vi.fn(() => ({
+          id: 'distilled-t1-id',
+          summary: 'We deploy via GitHub Actions.',
+          type: 'semantic',
+          content: 'We deploy via GitHub Actions.',
+          created_at: '2026-01-01T00:00:00.000Z',
+          importance: 0.5,
+          tags: [],
+          derived_from: ['a', 'b'],
+        })),
+        insertMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+        fullTextSearch: vi.fn(() => []),
+      },
+      qdrant: {
+        // Above the T1 UPDATE threshold (0.95) so a re-clustered write of
+        // near-identical content targets the prior distilled memory instead
+        // of adding a new one.
+        searchSimilar: vi.fn(async () => [{ id: 'distilled-t1-id', score: 0.97 }]),
+      },
+      updateMemory: vi.fn(),
+      writeMemory: vi.fn(),
+      writeMemoryWithoutVector: vi.fn(),
+      deleteMemory: vi.fn(async () => true),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+  });
+
+  it('stamps derived_from directly on a fresh ADD', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => []);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await pipeline.process({
+      content: 'We deploy via GitHub Actions.',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic',
+      tags: [],
+      source: 'distillation',
+      retention_tier: 'T1',
+      derived_from: ['x', 'y', 'z'],
+    });
+
+    expect(storage.writeMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ derived_from: ['x', 'y', 'z'], source: 'distillation' }),
+      expect.anything(),
+    );
+  });
+
+  it('UPDATEs the prior distilled memory and unions derived_from instead of duplicating', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'We deploy via GitHub Actions (re-clustered).',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic',
+      tags: [],
+      source: 'distillation',
+      retention_tier: 'T1',
+      derived_from: ['b', 'c'],
+    });
+
+    expect(result[0]!.operation).toBe('UPDATE');
+    expect(result[0]!.merged_with_id).toBe('distilled-t1-id');
+    expect(storage.writeMemory).not.toHaveBeenCalled();
+    expect(storage.updateMemory).toHaveBeenCalledWith(
+      'distilled-t1-id',
+      expect.objectContaining({ derived_from: ['a', 'b', 'c'] }),
+      expect.anything(),
+    );
+  });
+});
+
 describe('WritePipeline pinned (add-inject-pinning)', () => {
   const config = {
     deduplication: { similarity_threshold: 0.92 },

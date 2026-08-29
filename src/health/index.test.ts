@@ -93,6 +93,9 @@ describe('HealthService', () => {
         getLifecycleOperation: vi.fn(() => null),
         getRetentionDegraded: vi.fn(() => ({ degraded: false, message: null, last_success_at: null })),
         getExpectedEmbeddingIdentity: vi.fn(() => null),
+        getDistillationState: vi.fn(() => ({
+          last_run_at: null, last_run_degraded: false, distilled_total: 0, skipped_total: 0,
+        })),
       },
       qdrant: {
         healthCheck: vi.fn(async () => true),
