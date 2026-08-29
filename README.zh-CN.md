@@ -53,8 +53,9 @@ BHGBrain 将记忆存储在 SQLite（元数据 + 全文搜索）和 Qdrant（语
 17. [引导提示词](#引导提示词)
 18. [CLI 参考](#cli-参考)
 19. [MCP 工具参考](#mcp-工具参考)
-20. [升级](#升级)
-21. [行为说明](#行为说明)
+20. [Docker](#docker)
+21. [升级](#升级)
+22. [行为说明](#行为说明)
 
 ---
 
@@ -191,6 +192,12 @@ volumes:
 }
 ```
 
+对于 Azure，`embedding.model` 是发送到上游的部署名称（deployment name），而非公开的模型系列名称。Azure 凭据仅在启动时从 `AZURE_FOUNDRY_API_KEY` 加载一次；轮换该密钥需要重启服务器或显式重新加载配置。
+
+`embedding.model` 必须是受支持的模型之一——`text-embedding-ada-002`、`text-embedding-3-small` 或 `text-embedding-3-large`——这一要求对 `openai` 和 `azure-foundry` **两种**提供商均适用。此项在启动时强制校验：不受支持或拼写错误的模型（对 Azure 而言，即部署名称与任何受支持的模型系列都不匹配）会立即导致配置校验失败，并返回列出受支持模型的错误信息，而不是启动后静默产出维度错误的向量。
+
+> **从零开始配置？** [`scripts/azure/`](./scripts/azure/README.md) 中的 PowerShell 脚本可以创建 Azure AI Foundry / Azure OpenAI 资源、部署一个嵌入模型（按要求将部署名称设置为与模型名称一致），并为你写好 BHGBrain 的 `config.json` 与 `AZURE_FOUNDRY_API_KEY`——只需一个 Azure 订阅即可从零开始。
+
 ---
 
 ## 安装
@@ -237,17 +244,25 @@ BHGBrain 从以下位置加载配置文件：
 
   // 嵌入提供商配置
   "embedding": {
-    // 目前仅支持 "openai"
+    // 提供商："openai" 或 "azure-foundry"
     "provider": "openai",
-    // 用于嵌入的 OpenAI 模型。必须是受支持的模型之一："text-embedding-ada-002"、
-    // "text-embedding-3-small"、"text-embedding-3-large"。不受支持的模型会在启动时
-    // 导致配置校验失败。
+    // 模型名称（OpenAI）或 Azure 部署名称（Azure）。
+    // 必须是受支持的模型之一："text-embedding-ada-002"、
+    // "text-embedding-3-small"、"text-embedding-3-large"。任一提供商
+    // 使用不受支持的值都会在启动时导致配置校验失败。
     "model": "text-embedding-3-small",
-    // 保存 OpenAI API key 的环境变量名称
-    "api_key_env": "OPENAI_API_KEY",
     // 模型输出的向量维度，必须与模型输出匹配。
     // 重要：在集合创建后更改此项需要重建集合。
     "dimensions": 1536,
+    // 请求超时时间（毫秒）
+    "request_timeout_ms": 30000,
+    // 单次嵌入请求的最大输入数量（分块阈值）
+    "max_batch_inputs": 2048,
+    // 瞬时故障的重试配置
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 1000
+    },
     // 每个向量在写入时都会打上带提供方限定的身份标记
     // （`<provider>/<model>@<dimensions>`）。如果存储层记录的期望身份
     // （在启动后首次写入时被采纳）与当前配置不一致——例如更换了提供方或
@@ -255,7 +270,16 @@ BHGBrain 从以下位置加载配置文件：
     // 写入操作就会被拒绝，并返回一个指明 `repair` 工具 re-embed 模式的错误。
     // 只有在你确实想让写入混用嵌入空间时才将其设为 false。参见下方的
     // “嵌入模型迁移”。
-    "refuse_writes_on_model_mismatch": true
+    "refuse_writes_on_model_mismatch": true,
+    // 保存 OpenAI API key 的环境变量名称（Azure 时忽略）
+    "api_key_env": "OPENAI_API_KEY",
+    // Azure 专用配置（当 provider = "azure-foundry" 时必填）
+    "azure": {
+      // 用于构造终结点 URL 的 Azure 资源名称
+      "resource_name": "my-foundry-resource",
+      // 保存 Azure API key 的环境变量名称
+      "api_key_env": "AZURE_FOUNDRY_API_KEY"
+    }
   },
 
   // Qdrant 连接配置
@@ -589,7 +613,8 @@ BHGBrain 从以下位置加载配置文件：
 
 | 变量 | 是否必需 | 默认值 | 说明 |
 |---|---|---|---|
-| `OPENAI_API_KEY` | 是（用于嵌入） | — | OpenAI API key。缺失时服务器以**降级模式**启动——语义搜索和数据摄入将失败，但全文搜索和类别读取仍正常工作。 |
+| `OPENAI_API_KEY` | 是（用于 OpenAI 提供商） | — | OpenAI API key。缺失时服务器以**降级模式**启动——语义搜索和数据摄入将失败，但全文搜索和类别读取仍正常工作。 |
+| `AZURE_FOUNDRY_API_KEY` | 是（用于 Azure 提供商） | — | 用于 Azure OpenAI 兼容嵌入端点的 Azure API key。当 `embedding.provider = "azure-foundry"` 时必需。 |
 | `BHGBRAIN_TOKEN` | 非回环 HTTP 时必需 | — | HTTP 认证的 Bearer token。若主机地址为非回环且此变量未设置，服务器**拒绝启动**（除非 `allow_unauthenticated_http: true`）。 |
 | `QDRANT_API_KEY` | Qdrant Cloud 时必需 | — | 在配置中将 `qdrant.api_key_env` 设置为此变量名称。默认配置字段名为 `QDRANT_API_KEY`。 |
 | `BHGBRAIN_DEVICE_ID` | 否 | 从主机名自动生成 | 覆盖多设备设置的设备标识符。参见[设备身份解析](#设备身份解析)。 |
@@ -2582,20 +2607,52 @@ stdio 传输发送（每个 stdio 连接对应一个长期存活的 `Server`）�
 
 ## 引导提示词
 
-`BootstrapPrompt.txt` 包含一个结构化的访谈提示词，用于与 AI 智能体共同构建**工作第二大脑档案**。
+BHGBrain 提供三种构建你的工作档案的方式，从全程引导到批量导入均可。
 
-在引导新 AI 助手时，或当你想用丰富的、结构化的工作上下文、实体、租户和消歧义规则填充 BHGBrain 时，使用它。
+### 方案 1：交互式引导工具（推荐）
 
-### 使用方法
+`bootstrap` MCP 工具直接在 BHGBrain 内部驱动一个有状态的 10 节访谈。它会跟踪进度、边访谈边存储记忆，并支持跨会话暂停/恢复。
 
-1. 与你的 AI 助手（Claude、GPT-4 等）开始一次全新对话。
-2. 将 `BootstrapPrompt.txt` 的全部内容作为第一条消息粘贴。
-3. 让智能体逐节访谈你。
-4. 最后，智能体会生成一个结构化档案，你可以通过 `bhgbrain.remember` 调用（或 `mcporter call bhgbrain.remember`）将其保存到 BHGBrain。
+```json
+// 开始（或恢复）访谈
+{ "name": "bootstrap", "arguments": { "action": "start" } }
+
+// 提交某一节的答案
+{ "name": "bootstrap", "arguments": { "action": "submit", "section": 1, "answers": "Jane Doe, CTO at Acme Corp..." } }
+
+// 查看进度
+{ "name": "bootstrap", "arguments": { "action": "status" } }
+
+// 重做某一节
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+```
+
+每次提交后，该工具会返回下一节的问题，方便智能体自然地推进对话。会话持久化在 SQLite 中——你可以关闭客户端，之后从中断处继续。
+
+### 方案 2：批量档案导入
+
+如果你已经有一份完成的档案文档（来自之前的引导流程、维基页面或结构化笔记），可以使用 `import` 工具一次性导入：
+
+```json
+// 导入一份 10 节的引导档案
+{ "name": "import", "arguments": { "format": "profile", "content": "## 1. Identity & Role\n..." } }
+
+// 将任意 Markdown 导入为记忆
+{ "name": "import", "arguments": { "format": "freeform", "content": "## Architecture\nWe use microservices..." } }
+
+// 预览将被存储的内容而不实际写入
+{ "name": "import", "arguments": { "format": "profile", "content": "...", "dry_run": true } }
+```
+
+该工具将文档解析为离散记忆，并为每一节赋予正确的集合、层级、类型、重要性和标签。去重逻辑同样适用——更新后重新导入是安全的。
+
+### 方案 3：手动引导提示词
+
+`BootstrapPrompt.txt` 包含一个可粘贴到任意 AI 对话中的独立访谈提示词。智能体会逐节访谈你，并为每个事实调用 `bhgbrain.remember`。这种方式适用于任何已连接 MCP 的客户端，无需 `bootstrap` 或 `import` 工具。
 
 ### 涵盖内容
 
-访谈涵盖 10 个部分：
+三种方式都会走完相同的 10 个部分：
 
 | 部分 | 捕获内容 |
 |---|---|
@@ -2610,9 +2667,7 @@ stdio 传输发送（每个 stdio 连接对应一个长期存活的 `Server`）�
 | 9. 租户与环境图谱 | Azure 租户、开发/预发布/生产环境 |
 | 10. 操作规则 | 命名约定、消歧义、默认假设 |
 
-输出生成一个包含所有 10 个部分及消歧义指南的简洁结构化档案——正是 BHGBrain 可靠回答工作相关问题所需的内容。
-
-**引导记忆默认为 T0。** 通过引导流程摄入的内容应标记 `source: import` 和 `tags: ["bootstrap", "profile"]`。启发式分类器识别这些信号并分配 T0（基础层）层级。
+**引导记忆默认为 T0。** 通过引导流程摄入的内容会被标记为相应的来源（`bootstrap` 工具对应 `agent`，批量导入对应 `import`），并按照章节映射表分配层级。
 
 ---
 
@@ -3101,6 +3156,81 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 
 ---
 
+### `bootstrap`——交互式引导
+
+驱动一个有状态的 10 节访谈来构建你的工作档案。支持跨会话暂停/恢复。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `action` | `"start" \| "submit" \| "status" \| "reset"` | **是** | - | 要执行的操作。 |
+| `section` | `integer (1-10)` | submit/reset 时需要 | - | 要提交答案或重置的节号。 |
+| `answers` | `string` | submit 时需要 | - | 该节的答案。最多 500,000 个字符。 |
+| `namespace` | `string` | 否 | `"profile"` | 命名空间范围。 |
+
+**动作：**
+
+- **`start`** —— 创建新会话或恢复现有会话。返回第一个未完成节的标题、问题和说明。
+- **`submit`** —— 将答案作为离散记忆存储到给定节，将其标记为已完成，并返回下一节。
+- **`status`** —— 返回进度概览：哪些节已完成、记忆数量、最后更新时间。
+- **`reset`** —— 删除某一节的所有记忆，并将其标记为待重新采集。
+
+**输出（start）：**
+
+```json
+{
+  "complete": false,
+  "current_section": 1,
+  "title": "Identity & Role",
+  "questions": ["What is your full name...?", "..."],
+  "progress": { "complete": 0, "total": 10 }
+}
+```
+
+**说明：**
+- 会话持久化在 SQLite 中——客户端重启后依然存在。
+- 每个命名空间一个会话。对已有会话调用 `start` 会恢复它。
+- 向已完成的节提交答案会返回错误；请先使用 `reset`。
+
+---
+
+### `import`——批量档案导入
+
+一次性将结构化档案或自由格式文档导入为离散记忆。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `format` | `"profile" \| "freeform"` | **是** | - | `"profile"` 用于 10 节引导输出，`"freeform"` 用于任意 Markdown。 |
+| `content` | `string` | **是** | - | 要导入的文档文本。最多 500,000 个字符。 |
+| `namespace` | `string` | 否 | `"profile"` | 命名空间范围。 |
+| `dry_run` | `boolean` | 否 | `false` | 为 `true` 时，返回将被存储内容的预览而不实际写入。 |
+
+**输出：**
+
+```json
+{
+  "dry_run": false,
+  "format": "profile",
+  "memories_created": 24,
+  "duplicates_skipped": 2,
+  "collections": ["identity", "goals", "entities", "..."],
+  "sections_processed": 10
+}
+```
+
+**说明：**
+- `format: "profile"` 识别 `## N.` 节标题，并将每一节映射到正确的集合、层级、类型、重要性和标签。
+- `format: "freeform"` 按标题和段落边界拆分，使用默认元数据（集合：`general`，层级：`T2`）。
+- 去重通过现有写入管道生效——重新导入是安全的。
+- `dry_run: true` 返回记忆预览且不产生任何写入。
+- 编号超出 10 个存储映射节范围的标题（例如按旧的 12 节模板编写的文档）不会被静默丢弃——其编号会记录在 `sections_ignored` 中，让你知道内容被跳过而不是在毫无提示的情况下丢失。
+- 如果 [`remember`](#remember存储记忆) 因内容超过 `pipeline.long_content_threshold_chars` 而拒绝了你的内容，改用 `format: "freeform"` 的 `import`——它会按标题/段落边界拆分文档并独立嵌入每个片段，从而避开 `remember` 的阈值所防范的单一混合向量问题。
+
+---
+
 ### `revisions`——列出或回退记忆版本历史
 
 列出某条记忆的版本历史，或将其内容回退到某个历史版本。命名空间可见性的解析方式与 `forget`、`tag` 相同（先按 ID 查找该记忆）。只有 T0 记忆会累积版本——参见 [T0 版本历史](#t0-版本历史)。
@@ -3456,7 +3586,142 @@ SQLite 数据库——用于多设备设置、数据丢失恢复或新设备接�
 
 ---
 
+## Docker
+
+BHGBrain 提供官方 Docker 支持，具有两种部署模式：自托管 Qdrant（sidecar 容器）和 Qdrant Cloud（外部模式）。
+
+### 快速开始
+
+```bash
+# 1. 复制并配置环境变量（可选——缺少 .env 不再会导致启动中止；
+#    但嵌入功能仍需要 OPENAI_API_KEY）。
+cp .env.example .env
+# 编辑 .env，填入 OPENAI_API_KEY 及其他设置
+
+# 2a. 自托管 Qdrant（包含 Qdrant sidecar）
+docker compose --profile self-hosted up
+
+# 2b. Qdrant Cloud（无 sidecar，在 .env 中配置 BHGBRAIN_QDRANT_URL）
+docker compose up
+```
+
+服务器默认监听 `http://localhost:3721`（默认仅发布到宿主机回环地址）。使用以下命令检查健康状态：
+
+```bash
+curl http://localhost:3721/health
+```
+
+### 安全默认值
+
+容器将 API 绑定到 `0.0.0.0` 以便发布的端口可访问，并且**默认启用认证**：
+
+- 如果未设置 `BHGBRAIN_TOKEN`，入口脚本会在首次运行时**生成一个 Bearer token**，将其持久化到 `/data/bhgbrain-token`，并打印到日志中。可通过以下方式获取：
+
+  ```bash
+  docker compose logs bhgbrain | grep token
+  # 或
+  docker compose exec bhgbrain cat /data/bhgbrain-token
+  ```
+
+- 通过在 `.env` 中设置 `BHGBRAIN_TOKEN` 来提供你自己的稳定 token：
+
+  ```bash
+  echo "BHGBRAIN_TOKEN=$(openssl rand -hex 24)" >> .env
+  ```
+
+- 发布的端口映射到宿主机回环地址（`127.0.0.1:3721:3721`），因此默认情况下 API 无法从局域网访问。要对外暴露，请修改 `docker-compose.yml` 中的映射。
+
+- 若要刻意在**不启用认证**的情况下运行，设置 `BHGBRAIN_ALLOW_UNAUTHENTICATED=true`（服务器会记录警告；不建议用于非回环绑定）。
+
+容器同时以非 root 用户（`node`）运行。
+
+### Compose 配置文件
+
+| 命令 | 运行内容 |
+|---------|-----------|
+| `docker compose --profile self-hosted up` | BHGBrain + Qdrant sidecar（端口 6333） |
+| `docker compose up` | 仅 BHGBrain（通过环境变量连接 Qdrant Cloud） |
+
+### Docker 环境变量
+
+以下 `BHGBRAIN_*` 环境变量在设置时会覆盖 `config.json` 中的值：
+
+| 变量 | 配置字段 | 容器内默认值 | 说明 |
+|----------|-------------|---------------------|-------------|
+| `BHGBRAIN_DATA_DIR` | `data_dir` | `/data` | 容器卷路径 |
+| `BHGBRAIN_HTTP_HOST` | `transport.http.host` | `0.0.0.0` | 绑定地址 |
+| `BHGBRAIN_HTTP_PORT` | `transport.http.port` | `3721` | HTTP 端口 |
+| `BHGBRAIN_QDRANT_MODE` | `qdrant.mode` | `embedded` | `embedded` 或 `external` |
+| `BHGBRAIN_QDRANT_URL` | `qdrant.external_url` | — | Qdrant 端点 URL |
+| `BHGBRAIN_REQUIRE_LOOPBACK` | `security.require_loopback_http` | `false` | 回环限制 |
+| `BHGBRAIN_ALLOW_UNAUTHENTICATED` | `security.allow_unauthenticated_http` | `false` | 跳过认证检查 |
+| `BHGBRAIN_LOG_LEVEL` | `observability.log_level` | `info` | 日志详细程度 |
+
+此外还有现有的运行时变量：`OPENAI_API_KEY`、`BHGBRAIN_TOKEN`、`QDRANT_API_KEY`、`BHGBRAIN_DEVICE_ID`。
+
+### 卷
+
+`/data` 卷在容器重启之间持久化 SQLite 数据库、解析后的 `config.json` 和备份。它对应 `BHGBRAIN_DATA_DIR`。
+
+### 首次运行时的引导
+
+当容器以空的 `/data` 卷启动，并连接到一个已经存有记忆的 Qdrant 实例时，BHGBrain 会通过 `bootstrapFromQdrant()` 自动将本地 SQLite 数据库从 Qdrant 中回填。无需手动执行 `repair` 步骤。这种自动回填有意不按设备限定范围——它会将每台设备的记忆都恢复到这个全新的空数据库中。之后手动运行 `bhgbrain repair --from-qdrant` 默认只针对当前设备的记忆（传入 `--all-devices` 可扩大范围）；参见 [CLI 参考](#cli-参考)。
+
+### 构建镜像
+
+```bash
+docker build -t bhgbrain .
+```
+
+该镜像使用基于 `node:22-slim` 的多阶段构建（最终大小约 200MB）。健康检查使用 Node.js 原生的 `fetch()`——无需 `curl`。
+
+---
+
 ## 升级
+
+### 1.3 → 1.4（弹性与可观测性）
+
+**无需手动迁移。** 所有新功能均使用向后兼容的默认值。
+
+新增内容：
+
+- **熔断器**，用于 OpenAI 和 Qdrant。当连续失败次数超过阈值（默认 5 次）时，熔断器会打开并在 30 秒内短路请求，之后再探测是否恢复。状态可在健康端点中查看（`circuitBreakers` 字段）。可通过 `config.json` 中的 `resilience.circuit_breaker` 配置。
+- **Azure 嵌入提供商。** 新增对 Azure AI Foundry（兼容 Azure OpenAI 的嵌入端点）的支持。配置 `embedding.provider: "azure-foundry"`，并提供 `embedding.azure.resource_name` 及 `AZURE_FOUNDRY_API_KEY` 环境变量。
+- **Azure 上线指引。** 将 `embedding.model` 视为 Azure 部署名称，在切换前先在金丝雀命名空间或集合中验证检索质量，回滚方式是将 `embedding.provider` 切回 `"openai"` 并重启进程。
+- **百分位指标。** 直方图指标现在除了已有的 `_avg` 和 `_count` 后缀外，还会发出 `_p50`、`_p95` 和 `_p99` 后缀。
+- **恢复后协调加固。** `backup.restore` 现在通过 `beginRestoreOperation()` 获取故障保护锁，将向量协调错误按步骤隔离，并增量刷新进度。协调过程中的向量存储故障会返回降级就绪状态，而不是完整的恢复失败。
+- **stdio 日志路由。** 当 `--stdio` 处于激活状态时，Pino 结构化日志会被重定向到 stderr，防止破坏标准输出上的 MCP JSON-RPC 握手。
+- **类型安全。** 内部的 `as any` 类型转换在整个代码库中被替换为带类型的接口和 `SqlParams`。
+- **测试覆盖率。** 为嵌入、HTTP 传输、指标、日志记录器、健康检查和 CLI 模块新增了测试套件。
+
+**新配置部分**：
+```jsonc
+{
+  "resilience": {
+    "circuit_breaker": {
+      "failure_threshold": 5,       // 触发打开所需的连续失败次数
+      "open_window_ms": 30000,      // 半开探测前等待的毫秒数
+      "half_open_probe_count": 1    // 关闭所需的探测次数
+    }
+  }
+}
+```
+
+**Azure 嵌入配置**（新增 `embedding.azure`）：
+```jsonc
+{
+  "embedding": {
+    "provider": "azure-foundry",
+    "model": "my-embedding-deployment",
+    "dimensions": 1536,
+    "azure": {
+      "resource_name": "my-foundry-resource"
+    }
+  }
+}
+```
+
+---
 
 ### 1.2 → 1.3（多设备记忆与数据弹性）
 
@@ -3572,7 +3837,7 @@ bhgbrain backup create
 ### 操作可观测性
 
 - **有界指标：** 直方图值使用有界循环缓冲区（最后 1000 个样本）。
-- **指标语义：** 直方图指标发出 `_avg` 和 `_count` 后缀。
+- **指标语义：** 直方图指标发出 `_avg`、`_p50`、`_p95`、`_p99` 和 `_count` 后缀。
 - **原子写入：** 数据库和备份文件写入使用先写临时文件再重命名的方式，防止崩溃时出现截断的部分文件。
 - **延迟刷写：** 读路径的访问元数据（触摸计数）使用有界异步批处理（5 秒窗口），而非每次请求都进行同步的全数据库刷写。
 - **跨存储一致性：** 如果相应的 Qdrant 操作失败，SQLite 更新会回滚。
@@ -3585,7 +3850,26 @@ bhgbrain backup create
 
 集合在创建时锁定其嵌入模型和维度。如果你在配置中更改 `embedding.model` 或 `embedding.dimensions`，现有集合中的新记忆将被拒绝并返回 `CONFLICT` 错误，直到你创建新集合。这防止了在同一 Qdrant 索引中混用不兼容的嵌入空间。
 
-**受支持的模型与启动时校验：** `embedding.model` 会在启动时针对固定的受支持模型集合进行校验——`text-embedding-ada-002`（固定 1536 维）、`text-embedding-3-small`（最多 1536 维）、`text-embedding-3-large`（最多 3072 维）。不受支持的模型，或超出所选模型上限的 `dimensions`，会在服务器启动前导致配置校验失败，错误信息会指出配置的模型并列出受支持的模型集合。
+**特定提供商说明：**
+- **OpenAI**：`embedding.model` 字段指定 OpenAI 模型名称（例如 `text-embedding-3-small`）。
+- **Azure Foundry**：`embedding.model` 字段指定 Azure 部署名称。`embedding.dimensions` 必须与该部署配置的输出维度一致。
+
+请确保相应地将 `embedding.provider` 设置为 `"openai"` 或 `"azure-foundry"`。
+
+**受支持的模型与启动时校验：** 对于这两个提供商，`embedding.model` 都会在启动时针对固定的受支持模型集合进行校验——`text-embedding-ada-002`（固定 1536 维）、`text-embedding-3-small`（最多 1536 维）、`text-embedding-3-large`（最多 3072 维）。不受支持的模型，或超出所选模型上限的 `dimensions`，会在服务器启动前导致配置校验失败，错误信息会指出配置的模型并列出受支持的模型集合。对于 Azure，`embedding.model` 中配置的部署名称必须匹配这些受支持模型系列之一；以不受支持模型命名的部署将无法启动。这取代了此前的静默行为——无法识别的模型可能会针对 Qdrant 集合生成维度错误的向量。
+
+**迁移指引：**
+- 在将生产流量切换到 Azure 之前，先使用金丝雀命名空间或集合进行验证。
+- 回滚方式是将 `embedding.provider` 切回 `"openai"` 并重启 BHGBrain。
+- 只有当模型系列和配置的维度保持兼容时才复用现有集合；否则应创建新集合以避免混用嵌入空间。
+
+### stdio 日志路由
+
+在 stdio 传输模式（`--stdio`）下，Pino 结构化日志会写入 **stderr** 而非 stdout。这对 MCP 协议的正确性是不可妥协的：MCP SDK 专门使用 stdout 进行 JSON-RPC 分帧。stdout 上任何非 JSON 的输出（例如日志行）都会导致 MCP 客户端的初始化握手失败。
+
+- 在 HTTP 模式下，日志照常写入 stdout。
+- `createLogger()` 函数接受一个可选的 `destination` 流；当检测到 `isStdio` 时，`index.ts` 会传入 `process.stderr`。
+- 要将 stdio 模式的日志捕获到文件：`node dist/index.js --stdio 2>bhgbrain.log`
 
 ### 密钥检测
 
