@@ -77,7 +77,7 @@ graph TD
         RH["Resource Handler<br/><i>memory:// URIs</i>"]
 
         subgraph Storage["Storage Manager"]
-            subgraph SQLite["SQLite (sql.js)"]
+            subgraph SQLite["SQLite (node:sqlite)"]
                 S1["metadata"]
                 S2["fulltext (FTS)"]
                 S3["categories"]
@@ -113,7 +113,7 @@ graph TD
     class OpenAI external
 ```
 
-- **SQLite**（通过 `sql.js`，以内存方式运行并定期原子性刷写到磁盘）是所有记忆元数据、全文搜索索引、类别、审计追踪、版本历史及归档记录的**权威数据源**。
+- **SQLite**（通过 `node:sqlite` 的原生 `DatabaseSync`，采用 WAL 日志记录，提交级持久性）是所有记忆元数据、全文搜索索引、类别、审计追踪、版本历史及归档记录的**权威数据源**。
 - **Qdrant** 存储用于相似度搜索的语义向量嵌入。Qdrant 的写入始终在 SQLite 写入成功后进行；写入失败通过 `vector_synced` 标志追踪，并在健康检查端点中呈现。
 - **OpenAI text-embedding-3-small**（默认，可配置）为每条记忆生成 1536 维嵌入向量。
 - **原子写入**确保数据库文件不会被部分写入——所有磁盘 I/O 均采用"先写临时文件再重命名"的方式。

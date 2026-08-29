@@ -1,6 +1,7 @@
-import initSqlJs, { type Database } from 'sql.js';
-import { readFileSync, writeFileSync, existsSync, renameSync, statSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { readFileSync, writeFileSync, existsSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import type {
   MemoryRecord,
   MemoryOrigin,
@@ -74,6 +75,7 @@ export interface BootstrapSectionRow {
 export interface SqliteStorage {
   init(): Promise<void>;
   reloadFromDisk(): Promise<void>;
+  activateDatabaseImage(image: Buffer): Promise<void>;
   flush(): void;
   flushIfDirty(): void;
   scheduleDeferredFlush(): void;
@@ -397,13 +399,14 @@ CREATE INDEX IF NOT EXISTS idx_memory_links_to ON memory_links(to_id);
 CREATE INDEX IF NOT EXISTS idx_memory_links_namespace ON memory_links(namespace);
 `;
 
-// SQLite-lock retry/backoff (audit follow-up 2026-06-05, task 4.2): this
-// store runs on sql.js, an in-process, single-threaded WASM SQLite build
-// with no separate database server and no OS-level file lock contended by
-// concurrent connections — every read/write goes through this one `Database`
-// instance in this one Node.js process. There is therefore no "SQLite is
-// locked by another writer" condition for a retry-with-backoff wrapper to
-// recover from; the closest real failure (a WASM/JS exception from a
+// SQLite-lock retry/backoff (audit follow-up 2026-06-05, task 4.2; revisited by
+// migrate-sqlite-to-native-engine): this store runs on `node:sqlite`'s
+// `DatabaseSync`, a single, synchronous, in-process native SQLite connection —
+// still no separate database server and no OS-level file lock contended by
+// concurrent connections, since every read/write goes through this one
+// `DatabaseSync` instance in this one Node.js process. There is therefore no
+// "SQLite is locked by another writer" condition for a retry-with-backoff
+// wrapper to recover from; the closest real failure (a native exception from a
 // malformed statement or constraint violation) is not a transient
 // lock-contention error and should not be retried. Per the
 // `retention-and-degradation` spec's "In-process store documents retry as
@@ -412,75 +415,134 @@ CREATE INDEX IF NOT EXISTS idx_memory_links_namespace ON memory_links(namespace)
 // `openspec/changes/add-operations-security-reliability/specs/
 // retention-and-degradation/spec.md`.
 export class SqliteStore implements SqliteStorage {
-  private db!: Database;
+  private db!: DatabaseSync;
   private dbPath: string;
-  private dirty = false;
-  private deferredFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private lifecycleOperation: string | null = null;
-  private static readonly DEFERRED_FLUSH_MS = 5_000;
   // Startup FTS5 capability probe result (openspec/changes/upgrade-fulltext-to-fts5,
-  // task 1.1). The pinned sql.js distribution (sql.js@^1.12.0, verified against the
-  // resolved 1.14.1 build) does NOT compile in the `fts5` virtual table module — its
-  // wasm binary carries no `fts5`/`SQLITE_ENABLE_FTS5` symbols and
-  // `CREATE VIRTUAL TABLE ... USING fts5` throws "no such module: fts5" — so this
-  // probes rather than assumes availability, per design.md. Consumed by
-  // HealthService to surface the (today: always-on) legacy fulltext fallback
-  // visibly rather than silently, per the "Missing FTS5 support SHALL degrade
-  // gracefully and visibly" requirement.
+  // task 1.1; migrate-sqlite-to-native-engine task 1.7). `node:sqlite`'s bundled
+  // SQLite build compiles in the `fts5` virtual table module, so this probes
+  // (rather than assumes) availability and is expected to report `true` here —
+  // the probe itself stays engine-agnostic and authoritative, per design.md, so
+  // it also correctly reports `false` again if ever run against a build that
+  // omits fts5. Consumed by HealthService to surface a legacy-fulltext fallback
+  // condition visibly rather than silently, per the "Missing FTS5 support SHALL
+  // degrade gracefully and visibly" requirement.
   private ftsAvailable = false;
 
   constructor(private dataDir: string) {
     this.dbPath = join(dataDir, 'brain.db');
   }
 
-  async init(): Promise<void> {
-    const SQL = await initSqlJs();
-    if (existsSync(this.dbPath)) {
-      const buffer = readFileSync(this.dbPath);
-      this.db = new SQL.Database(buffer);
-    } else {
-      this.db = new SQL.Database();
-    }
+  /**
+   * Executes a single SQL statement with no result rows (INSERT/UPDATE/DELETE/
+   * single-statement DDL). One of three private helpers
+   * (`execSql`/`queryAll`/`queryOne`) that encapsulate `DatabaseSync`'s
+   * `prepare()`/`run()`/`all()`/`get()` idiom so the ~80 call sites below never
+   * touch the engine directly (migrate-sqlite-to-native-engine task 1.1).
+   */
+  private execSql(sql: string, params: SqlParams = []): void {
+    this.db.prepare(sql).run(...params);
+  }
+
+  /** Runs `sql` and returns every result row. */
+  private queryAll(sql: string, params: SqlParams = []): SqlRow[] {
+    return this.db.prepare(sql).all(...params).map(row => this.getRow(row));
+  }
+
+  /** Runs `sql` and returns the first result row, or `null` if there is none. */
+  private queryOne(sql: string, params: SqlParams = []): SqlRow | null {
+    const row = this.db.prepare(sql).get(...params);
+    return row === undefined ? null : this.getRow(row);
+  }
+
+  /**
+   * Opens (creating if absent) `this.dbPath` directly with `DatabaseSync` — no
+   * whole-file read — applies the WAL pragmas, runs column migrations and
+   * `SCHEMA_SQL`, and re-probes FTS5 support. Shared by `init()`,
+   * `reloadFromDisk()`, and `activateDatabaseImage()` so all three open paths
+   * stay identical.
+   */
+  private openDatabase(): void {
+    this.db = new DatabaseSync(this.dbPath);
+    // WAL: page-level journaling instead of sql.js's whole-file export/rewrite.
+    // synchronous=NORMAL: durable at every commit (fsynced on WAL checkpoint
+    // boundaries) without paying full-fsync cost per write; only an OS/power
+    // failure (not an application crash) can lose the last few commits — see
+    // design.md "Pragmas at open".
+    this.db.exec('PRAGMA journal_mode = WAL');
+    this.db.exec('PRAGMA synchronous = NORMAL');
     // Run column migrations BEFORE SCHEMA_SQL so new indexes (e.g. idx_memories_tier)
     // that reference retention_tier don't fail on an existing DB that predates the column.
     this.ensureMemoryColumns();
-    this.db.run(SCHEMA_SQL);
+    this.db.exec(SCHEMA_SQL);
     this.ftsAvailable = this.probeFts5Support();
-    this.flush();
+  }
+
+  async init(): Promise<void> {
+    this.openDatabase();
   }
 
   async reloadFromDisk(): Promise<void> {
-    const SQL = await initSqlJs();
     this.cancelDeferredFlush();
-    this.dirty = false;
     if (this.db) {
       this.db.close();
     }
     if (!existsSync(this.dbPath)) {
       throw new Error(`Database file not found: ${this.dbPath}`);
     }
-    const buffer = readFileSync(this.dbPath);
-    this.db = new SQL.Database(buffer);
-    this.ensureMemoryColumns();
-    this.db.run(SCHEMA_SQL);
-    this.ftsAvailable = this.probeFts5Support();
-    this.dirty = false;
+    this.removeStaleSidecarFiles();
+    this.openDatabase();
+  }
+
+  /**
+   * Activates a full replacement database image (a restored backup): closes
+   * the live connection, removes any stale `-wal`/`-shm` sidecars so they
+   * cannot be replayed against the new image, atomically writes `image` onto
+   * `brain.db`, then reopens. Closing before overwriting is required on
+   * Windows, where renaming onto a file with an open native handle fails
+   * (EPERM) — harmless under the old memory-only sql.js engine, but required
+   * here. See design.md "Restore must close-before-overwrite" and
+   * migrate-sqlite-to-native-engine task 2.1.
+   */
+  async activateDatabaseImage(image: Buffer): Promise<void> {
+    this.cancelDeferredFlush();
+    if (this.db) {
+      this.db.close();
+    }
+    this.removeStaleSidecarFiles();
+    atomicWriteFileSync(this.dbPath, image);
+    this.openDatabase();
+  }
+
+  /** Removes any `-wal`/`-shm` sidecars next to `dbPath`, if present. */
+  private removeStaleSidecarFiles(): void {
+    for (const suffix of ['-wal', '-shm']) {
+      const sidecar = `${this.dbPath}${suffix}`;
+      if (existsSync(sidecar)) {
+        try {
+          unlinkSync(sidecar);
+        } catch {
+          // Best-effort: a sidecar that can't be removed will simply be
+          // superseded once the reopened connection re-establishes its own
+          // WAL, so this never needs to fail the reload/activation.
+        }
+      }
+    }
   }
 
   /**
    * Attempts to create (and immediately drop) a scratch FTS5 virtual table in the
    * temp schema, so its result never touches the persisted database image.
    * openspec/changes/upgrade-fulltext-to-fts5 task 1.1 — the engine-level FTS5
-   * fulltext path (table DDL, migration, BM25 query) is gated behind this probe and
-   * is not implemented yet (the pinned sql.js build has no fts5 module to exercise
-   * or verify it against; see the `ftsAvailable` comment above). The probe itself is
-   * real and generic: it will correctly report `true` the day the underlying sql.js
-   * build (or a swapped-in SQLite binding) compiles fts5 in.
+   * fulltext path (table DDL, migration, BM25 query) is not implemented yet (see
+   * `ftsAvailable`'s comment above); this only probes capability. The probe
+   * itself is real and generic: it reports `true` on any SQLite build (this
+   * engine's included) that compiles fts5 in, and `false` otherwise.
    */
   private probeFts5Support(): boolean {
     try {
-      this.db.run(`CREATE VIRTUAL TABLE temp.__fts5_probe USING fts5(x)`);
-      this.db.run(`DROP TABLE temp.__fts5_probe`);
+      this.db.exec(`CREATE VIRTUAL TABLE temp.__fts5_probe USING fts5(x)`);
+      this.db.exec(`DROP TABLE temp.__fts5_probe`);
       return true;
     } catch {
       return false;
@@ -489,41 +551,48 @@ export class SqliteStore implements SqliteStorage {
 
   /**
    * Whether this SQLite build supports FTS5 (openspec/changes/upgrade-fulltext-to-fts5).
-   * Always `false` today against the pinned sql.js dependency — see `ftsAvailable`.
-   * Consumed by HealthService to surface the legacy-fulltext-fallback condition.
+   * `node:sqlite`'s bundled build ships fts5, so this reports `true` in normal
+   * operation — see `ftsAvailable`. Consumed by HealthService to surface the
+   * legacy-fulltext-fallback condition if it is ever `false`.
    */
   isFts5Available(): boolean {
     return this.ftsAvailable;
   }
 
+  /**
+   * Checkpoints the write-ahead log into the main database file (PASSIVE: best
+   * effort, never blocks on or interrupts other readers/writers). Every commit
+   * is already durable under WAL+NORMAL (see `openDatabase`'s pragmas), so this
+   * is not required for correctness — it exists so `brain.db` reflects recent
+   * writes for external tooling that reads the file directly, and to keep the
+   * public `flush()` contract meaningful. Kept on `SqliteStorage` so the ~38
+   * existing call sites need no changes (migrate-sqlite-to-native-engine task 1.4).
+   */
   flush(): void {
-    const data = this.db.export();
-    atomicWriteFileSync(this.dbPath, Buffer.from(data));
-    this.dirty = false;
+    this.db.exec('PRAGMA wal_checkpoint(PASSIVE)');
   }
 
-  private markDirty(): void {
-    this.dirty = true;
-  }
-
+  /**
+   * No-op: there is no deferred-write buffer to flush under WAL — every write
+   * already persisted at commit time. Kept on the interface for call-site
+   * compatibility (migrate-sqlite-to-native-engine task 1.4).
+   */
   flushIfDirty(): void {
-    if (this.dirty) this.flush();
+    // Intentionally empty.
   }
 
+  /**
+   * No-op: WAL+NORMAL durability makes every commit durable immediately, so
+   * there is no window left to defer a flush across. Kept on the interface for
+   * call-site compatibility.
+   */
   scheduleDeferredFlush(): void {
-    if (this.lifecycleOperation) return;
-    if (this.deferredFlushTimer) return;
-    this.deferredFlushTimer = setTimeout(() => {
-      this.deferredFlushTimer = null;
-      this.flushIfDirty();
-    }, SqliteStore.DEFERRED_FLUSH_MS);
+    // Intentionally empty.
   }
 
+  /** No-op counterpart to `scheduleDeferredFlush()`. */
   cancelDeferredFlush(): void {
-    if (this.deferredFlushTimer) {
-      clearTimeout(this.deferredFlushTimer);
-      this.deferredFlushTimer = null;
-    }
+    // Intentionally empty.
   }
 
   insertMemory(mem: MemoryRecordWithoutEmbedding): void {
@@ -540,7 +609,7 @@ export class SqliteStore implements SqliteStorage {
     const derivedFrom = mem.derived_from ?? null;
     const origin = mem.origin ? JSON.stringify(mem.origin) : null;
     const confidence = mem.confidence ?? 1.0;
-    this.db.run(
+    this.execSql(
       `INSERT INTO memories (
         id, namespace, collection, type, category, content, summary, tags, source, checksum,
         importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
@@ -579,11 +648,10 @@ export class SqliteStore implements SqliteStorage {
         mem.last_accessed,
       ],
     );
-    this.db.run(
+    this.execSql(
       `INSERT INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
       [mem.id, mem.namespace, mem.content, mem.summary, mem.tags.join(' ')],
     );
-    this.markDirty();
   }
 
   upsertMemoryFromPayload(id: string, payload: Record<string, unknown>): boolean {
@@ -643,9 +711,9 @@ export class SqliteStore implements SqliteStorage {
     // IGNORE`) insert into `memories` fails loudly on a constraint violation instead
     // of being swallowed, and the surrounding transaction guarantees no orphan FTS
     // row survives a rolled-back memories insert.
-    this.db.run('BEGIN TRANSACTION');
+    this.execSql('BEGIN TRANSACTION');
     try {
-      this.db.run(
+      this.execSql(
         `INSERT INTO memories (
           id, namespace, collection, type, category, content, summary, tags, source, checksum,
           importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
@@ -658,16 +726,15 @@ export class SqliteStore implements SqliteStorage {
           'ADD', null, 0, 0, 1, pinned ? 1 : 0, deviceId, embeddingModel, origin, confidence, createdAt, now, now,
         ],
       );
-      this.db.run(
+      this.execSql(
         `INSERT OR IGNORE INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
         [id, namespace, content, summary, tags.join(' ')],
       );
-      this.db.run('COMMIT');
+      this.execSql('COMMIT');
     } catch (err) {
-      this.db.run('ROLLBACK');
+      this.execSql('ROLLBACK');
       throw err;
     }
-    this.markDirty();
     return true;
   }
 
@@ -702,32 +769,30 @@ export class SqliteStore implements SqliteStorage {
     }
     if (sets.length === 0) return;
     vals.push(id);
-    this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, vals);
+    this.execSql(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, vals);
 
     if (fields.content || fields.summary || fields.tags || fields.archived) {
-      this.db.run(`DELETE FROM memories_fts WHERE id = ?`, [id]);
+      this.execSql(`DELETE FROM memories_fts WHERE id = ?`, [id]);
       const mem = this.getMemoryById(id, true);
       if (mem && !mem.archived) {
-        this.db.run(
+        this.execSql(
           `INSERT INTO memories_fts (id, namespace, content, summary, tags) VALUES (?, ?, ?, ?, ?)`,
           [mem.id, mem.namespace, mem.content, mem.summary, mem.tags.join(' ')],
         );
       }
     }
-    this.markDirty();
   }
 
   deleteMemory(id: string): boolean {
     this.assertMutableAllowed();
     const mem = this.getMemoryById(id, true);
     if (!mem) return false;
-    this.db.run(`DELETE FROM memories WHERE id = ?`, [id]);
-    this.db.run(`DELETE FROM memories_fts WHERE id = ?`, [id]);
+    this.execSql(`DELETE FROM memories WHERE id = ?`, [id]);
+    this.execSql(`DELETE FROM memories_fts WHERE id = ?`, [id]);
     // Cascade-clean edges (add-memory-links) so both `forget` and `review`'s
     // `archive` action (which calls this same method after archiveMemory)
     // never leave a memory_links row pointing at a now-missing memory.
-    this.db.run(`DELETE FROM memory_links WHERE from_id = ? OR to_id = ?`, [id, id]);
-    this.markDirty();
+    this.execSql(`DELETE FROM memory_links WHERE from_id = ? OR to_id = ?`, [id, id]);
     return true;
   }
 
@@ -735,15 +800,8 @@ export class SqliteStore implements SqliteStorage {
     const sql = includeArchived
       ? `SELECT * FROM memories WHERE id = ?`
       : `SELECT * FROM memories WHERE id = ? AND archived = 0`;
-    const stmt = this.db.prepare(sql);
-    stmt.bind([id]);
-    if (!stmt.step()) {
-      stmt.free();
-      return null;
-    }
-    const row = this.getRow(stmt.getAsObject());
-    stmt.free();
-    return this.rowToMemory(row);
+    const row = this.queryOne(sql, [id]);
+    return row ? this.rowToMemory(row) : null;
   }
 
   getMemoryByChecksum(namespace: string, checksum: string, collection?: string): MemoryRecordWithoutEmbedding | null {
@@ -757,15 +815,8 @@ export class SqliteStore implements SqliteStorage {
       params.push(collection);
     }
     sql += ` LIMIT 1`;
-    const stmt = this.db.prepare(sql);
-    stmt.bind(params);
-    if (!stmt.step()) {
-      stmt.free();
-      return null;
-    }
-    const row = this.getRow(stmt.getAsObject());
-    stmt.free();
-    return this.rowToMemory(row);
+    const row = this.queryOne(sql, params);
+    return row ? this.rowToMemory(row) : null;
   }
 
   listMemories(namespace: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
@@ -821,38 +872,28 @@ export class SqliteStore implements SqliteStorage {
   }
 
   countPinnedMemories(namespace: string): number {
-    const stmt = this.db.prepare(
+    const row = this.queryOne(
       `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND archived = 0 AND pinned = 1`,
+      [namespace],
     );
-    stmt.bind([namespace]);
-    stmt.step();
-    const row = stmt.getAsObject() as { cnt: number };
-    stmt.free();
-    return row.cnt;
+    return row ? this.getNumber(row, 'cnt') : 0;
   }
 
   countMemories(namespace?: string): number {
     const sql = namespace
       ? `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND archived = 0`
       : `SELECT COUNT(*) as cnt FROM memories WHERE archived = 0`;
-    const params = namespace ? [namespace] : [];
-    const stmt = this.db.prepare(sql);
-    stmt.bind(params);
-    stmt.step();
-    const row = stmt.getAsObject() as { cnt: number };
-    stmt.free();
-    return row.cnt;
+    const params: SqlParams = namespace ? [namespace] : [];
+    const row = this.queryOne(sql, params);
+    return row ? this.getNumber(row, 'cnt') : 0;
   }
 
   countMemoriesInCollection(namespace: string, collection: string): number {
-    const stmt = this.db.prepare(
+    const row = this.queryOne(
       `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`,
+      [namespace, collection],
     );
-    stmt.bind([namespace, collection]);
-    stmt.step();
-    const row = stmt.getAsObject() as { cnt: number };
-    stmt.free();
-    return row.cnt;
+    return row ? this.getNumber(row, 'cnt') : 0;
   }
 
   fullTextSearch(namespace: string, query: string, limit: number, collection?: string, filter?: RecallFilter): Array<{ id: string; rank: number }> {
@@ -914,11 +955,9 @@ export class SqliteStore implements SqliteStorage {
     // (which ranks by array position), so this replaces the previous constant rank
     // that made the fulltext RRF component degenerate.
     const sql = `SELECT f.id, f.content, f.summary, f.tags FROM memories_fts f${collectionJoin} WHERE f.namespace = ? AND ${conditions.join(' AND ')} LIMIT ?`;
-    const stmt = this.db.prepare(sql);
-    stmt.bind(params);
+    const rows = this.queryAll(sql, params);
     const scored: Array<{ id: string; rank: number }> = [];
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
+    for (const row of rows) {
       const content = this.getString(row, 'content').toLowerCase();
       const summary = this.getString(row, 'summary').toLowerCase();
       const tags = this.getString(row, 'tags').toLowerCase();
@@ -930,7 +969,6 @@ export class SqliteStore implements SqliteStorage {
       }
       scored.push({ id: this.getString(row, 'id'), rank: score });
     }
-    stmt.free();
     // Higher relevance first; break ties on id for deterministic ordering.
     scored.sort((a, b) => (b.rank - a.rank) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     return scored.slice(0, limit);
@@ -950,8 +988,7 @@ export class SqliteStore implements SqliteStorage {
 
   markStale(memoryId: string): void {
     this.assertMutableAllowed();
-    this.db.run(`UPDATE memories SET stale = 1 WHERE id = ?`, [memoryId]);
-    this.markDirty();
+    this.execSql(`UPDATE memories SET stale = 1 WHERE id = ?`, [memoryId]);
   }
 
   getStaleMemories(importanceBelow: number, limit: number): MemoryRecordWithoutEmbedding[] {
@@ -962,27 +999,20 @@ export class SqliteStore implements SqliteStorage {
   }
 
   listStaleCandidateIds(cutoffIso: string): string[] {
-    const stmt = this.db.prepare(
+    const rows = this.queryAll(
       `SELECT id FROM memories WHERE last_accessed < ? AND stale = 0 AND category IS NULL AND archived = 0`,
+      [cutoffIso],
     );
-    stmt.bind([cutoffIso]);
-    const ids: string[] = [];
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      ids.push(this.getString(row, 'id'));
-    }
-    stmt.free();
-    return ids;
+    return rows.map(row => this.getString(row, 'id'));
   }
 
   touchMemory(id: string): void {
     if (this.lifecycleOperation) return;
     const now = new Date().toISOString();
-    this.db.run(
+    this.execSql(
       `UPDATE memories SET access_count = access_count + 1, last_accessed = ? WHERE id = ?`,
       [now, id],
     );
-    this.markDirty();
   }
 
   recordAccess(
@@ -1009,8 +1039,7 @@ export class SqliteStore implements SqliteStorage {
       params.push(reviewDue);
     }
     params.push(id);
-    this.db.run(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, params);
-    this.markDirty();
+    this.execSql(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, params);
   }
 
   markVectorSync(
@@ -1025,14 +1054,13 @@ export class SqliteStore implements SqliteStorage {
     // window (allowDuringLifecycle: true) can stamp the new identity without
     // tripping assertMutableAllowed, which updateMemory always enforces.
     if (options && 'embeddingModel' in options) {
-      this.db.run(
+      this.execSql(
         `UPDATE memories SET vector_synced = ?, embedding_model = ? WHERE id = ?`,
         [synced ? 1 : 0, options.embeddingModel ?? null, id],
       );
     } else {
-      this.db.run(`UPDATE memories SET vector_synced = ? WHERE id = ?`, [synced ? 1 : 0, id]);
+      this.execSql(`UPDATE memories SET vector_synced = ? WHERE id = ?`, [synced ? 1 : 0, id]);
     }
-    this.markDirty();
   }
 
   markVectorsSyncBatch(ids: string[], synced: boolean, options?: { allowDuringLifecycle?: boolean }): void {
@@ -1041,11 +1069,10 @@ export class SqliteStore implements SqliteStorage {
     }
     if (ids.length === 0) return;
     const placeholders = ids.map(() => '?').join(', ');
-    this.db.run(
+    this.execSql(
       `UPDATE memories SET vector_synced = ? WHERE id IN (${placeholders})`,
       [synced ? 1 : 0, ...ids],
     );
-    this.markDirty();
   }
 
   markAllVectorsSyncState(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number {
@@ -1056,8 +1083,7 @@ export class SqliteStore implements SqliteStorage {
     if (affected === 0) {
       return 0;
     }
-    this.db.run(`UPDATE memories SET vector_synced = ? WHERE archived = 0`, [synced ? 1 : 0]);
-    this.markDirty();
+    this.execSql(`UPDATE memories SET vector_synced = ? WHERE archived = 0`, [synced ? 1 : 0]);
     return affected;
   }
 
@@ -1071,7 +1097,8 @@ export class SqliteStore implements SqliteStorage {
     // field (update.<field> === undefined) is a no-op write in SQL, without
     // needing to know the row's current value in JS and without rebuilding/
     // re-parsing the SQL string per row (matching prior per-row SET-shape
-    // behavior exactly).
+    // behavior exactly). Reused directly (not through `execSql`) because the
+    // whole point is compiling the statement once for the loop, not once per row.
     const stmt = this.db.prepare(
       `UPDATE memories SET
         access_count = ?,
@@ -1081,36 +1108,30 @@ export class SqliteStore implements SqliteStorage {
         review_due = CASE WHEN ? THEN ? ELSE review_due END
       WHERE id = ?`,
     );
-    try {
-      for (const update of updates) {
-        const expiresChanged = update.expires_at !== undefined;
-        const tierChanged = !!update.retention_tier;
-        const reviewChanged = update.review_due !== undefined;
-        const params: SqlParams = [
-          update.access_count,
-          update.last_accessed,
-          expiresChanged ? 1 : 0,
-          expiresChanged ? (update.expires_at as string | null) : null,
-          tierChanged ? 1 : 0,
-          tierChanged ? (update.retention_tier as string) : null,
-          reviewChanged ? 1 : 0,
-          reviewChanged ? (update.review_due as string | null) : null,
-          update.id,
-        ];
-        stmt.bind(params);
-        stmt.step();
-      }
-    } finally {
-      stmt.free();
+    for (const update of updates) {
+      const expiresChanged = update.expires_at !== undefined;
+      const tierChanged = !!update.retention_tier;
+      const reviewChanged = update.review_due !== undefined;
+      const params: SqlParams = [
+        update.access_count,
+        update.last_accessed,
+        expiresChanged ? 1 : 0,
+        expiresChanged ? (update.expires_at as string | null) : null,
+        tierChanged ? 1 : 0,
+        tierChanged ? (update.retention_tier as string) : null,
+        reviewChanged ? 1 : 0,
+        reviewChanged ? (update.review_due as string | null) : null,
+        update.id,
+      ];
+      stmt.run(...params);
     }
-    this.markDirty();
   }
 
   listExpiredMemories(nowIso: string, tier?: RetentionTier): MemoryRecordWithoutEmbedding[] {
     const sql = tier
       ? `SELECT * FROM memories WHERE archived = 0 AND decay_eligible = 1 AND expires_at IS NOT NULL AND expires_at < ? AND retention_tier = ? ORDER BY expires_at ASC`
       : `SELECT * FROM memories WHERE archived = 0 AND decay_eligible = 1 AND expires_at IS NOT NULL AND expires_at < ? ORDER BY expires_at ASC`;
-    const params = tier ? [nowIso, tier] : [nowIso];
+    const params: SqlParams = tier ? [nowIso, tier] : [nowIso];
     return this.queryMemories(sql, params);
   }
 
@@ -1165,26 +1186,22 @@ export class SqliteStore implements SqliteStorage {
   }
 
   countExpiringMemories(nowIso: string, untilIso: string): number {
-    const stmt = this.db.prepare(
+    const row = this.queryOne(
       `SELECT COUNT(*) as cnt FROM memories WHERE archived = 0 AND expires_at IS NOT NULL AND expires_at >= ? AND expires_at <= ?`,
+      [nowIso, untilIso],
     );
-    stmt.bind([nowIso, untilIso]);
-    stmt.step();
-    const row = stmt.getAsObject() as { cnt: number };
-    stmt.free();
-    return row.cnt;
+    return row ? this.getNumber(row, 'cnt') : 0;
   }
 
   countByTier(): Record<RetentionTier, number> {
     const counts: Record<RetentionTier, number> = { T0: 0, T1: 0, T2: 0, T3: 0 };
-    const stmt = this.db.prepare(
+    const rows = this.queryAll(
       `SELECT retention_tier, COUNT(*) as cnt FROM memories WHERE archived = 0 GROUP BY retention_tier`,
     );
-    while (stmt.step()) {
-      const row = stmt.getAsObject() as { retention_tier: RetentionTier; cnt: number };
-      counts[row.retention_tier] = row.cnt;
+    for (const row of rows) {
+      const tier = this.getString(row, 'retention_tier') as RetentionTier;
+      counts[tier] = this.getNumber(row, 'cnt');
     }
-    stmt.free();
     return counts;
   }
 
@@ -1201,7 +1218,7 @@ export class SqliteStore implements SqliteStorage {
     this.assertMutableAllowed();
     const degradedInt = degraded ? 1 : 0;
     const now = completedAt ?? new Date().toISOString();
-    this.db.run(
+    this.execSql(
       `INSERT INTO retention_state (id, degraded, message, last_success_at, updated_at)
        VALUES (1, ?1, ?2, CASE WHEN ?1 = 0 THEN ?3 ELSE NULL END, ?3)
        ON CONFLICT(id) DO UPDATE SET
@@ -1211,18 +1228,18 @@ export class SqliteStore implements SqliteStorage {
          updated_at = ?3`,
       [degradedInt, message, now],
     );
-    this.markDirty();
   }
 
   getRetentionDegraded(): { degraded: boolean; message: string | null; last_success_at: string | null } {
-    const stmt = this.db.prepare(`SELECT degraded, message, last_success_at FROM retention_state WHERE id = 1`);
-    if (!stmt.step()) {
-      stmt.free();
+    const row = this.queryOne(`SELECT degraded, message, last_success_at FROM retention_state WHERE id = 1`);
+    if (!row) {
       return { degraded: false, message: null, last_success_at: null };
     }
-    const row = stmt.getAsObject() as { degraded: number; message: string | null; last_success_at: string | null };
-    stmt.free();
-    return { degraded: row.degraded === 1, message: row.message ?? null, last_success_at: row.last_success_at ?? null };
+    return {
+      degraded: this.getNumber(row, 'degraded') === 1,
+      message: this.getNullableString(row, 'message'),
+      last_success_at: this.getNullableString(row, 'last_success_at'),
+    };
   }
 
   // Cumulative counters (`distilled_total`/`skipped_total`) accumulate across
@@ -1235,7 +1252,7 @@ export class SqliteStore implements SqliteStorage {
   ): void {
     this.assertMutableAllowed();
     const now = completedAt ?? new Date().toISOString();
-    this.db.run(
+    this.execSql(
       `INSERT INTO distillation_state (id, last_run_at, last_run_degraded, distilled_total, skipped_total)
        VALUES (1, ?1, ?2, ?3, ?4)
        ON CONFLICT(id) DO UPDATE SET
@@ -1245,28 +1262,22 @@ export class SqliteStore implements SqliteStorage {
          skipped_total = distillation_state.skipped_total + ?4`,
       [now, result.degraded ? 1 : 0, result.distilled, result.skipped],
     );
-    this.markDirty();
   }
 
   getDistillationState(): {
     last_run_at: string | null; last_run_degraded: boolean; distilled_total: number; skipped_total: number;
   } {
-    const stmt = this.db.prepare(
+    const row = this.queryOne(
       `SELECT last_run_at, last_run_degraded, distilled_total, skipped_total FROM distillation_state WHERE id = 1`,
     );
-    if (!stmt.step()) {
-      stmt.free();
+    if (!row) {
       return { last_run_at: null, last_run_degraded: false, distilled_total: 0, skipped_total: 0 };
     }
-    const row = stmt.getAsObject() as {
-      last_run_at: string | null; last_run_degraded: number; distilled_total: number; skipped_total: number;
-    };
-    stmt.free();
     return {
-      last_run_at: row.last_run_at ?? null,
-      last_run_degraded: row.last_run_degraded === 1,
-      distilled_total: row.distilled_total,
-      skipped_total: row.skipped_total,
+      last_run_at: this.getNullableString(row, 'last_run_at'),
+      last_run_degraded: this.getNumber(row, 'last_run_degraded') === 1,
+      distilled_total: this.getNumber(row, 'distilled_total'),
+      skipped_total: this.getNumber(row, 'skipped_total'),
     };
   }
 
@@ -1276,34 +1287,22 @@ export class SqliteStore implements SqliteStorage {
    * `DistillationService.runOnce` iterates over. See add-memory-distillation.
    */
   listDistillationCollections(): Array<{ namespace: string; collection: string }> {
-    const stmt = this.db.prepare(
+    const rows = this.queryAll(
       `SELECT DISTINCT namespace, collection FROM memories
        WHERE archived = 0 AND type = 'episodic' AND retention_tier IN ('T2', 'T3')
        ORDER BY namespace, collection`,
     );
-    const results: Array<{ namespace: string; collection: string }> = [];
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      results.push({ namespace: this.getString(row, 'namespace'), collection: this.getString(row, 'collection') });
-    }
-    stmt.free();
-    return results;
+    return rows.map(row => ({ namespace: this.getString(row, 'namespace'), collection: this.getString(row, 'collection') }));
   }
 
   countArchivedMemories(): number {
-    const stmt = this.db.prepare(`SELECT COUNT(*) as cnt FROM memory_archive`);
-    stmt.step();
-    const row = stmt.getAsObject() as { cnt: number };
-    stmt.free();
-    return row.cnt;
+    const row = this.queryOne(`SELECT COUNT(*) as cnt FROM memory_archive`);
+    return row ? this.getNumber(row, 'cnt') : 0;
   }
 
   countUnsyncedVectors(): number {
-    const stmt = this.db.prepare(`SELECT COUNT(*) as cnt FROM memories WHERE archived = 0 AND vector_synced = 0`);
-    stmt.step();
-    const row = stmt.getAsObject() as { cnt: number };
-    stmt.free();
-    return row.cnt;
+    const row = this.queryOne(`SELECT COUNT(*) as cnt FROM memories WHERE archived = 0 AND vector_synced = 0`);
+    return row ? this.getNumber(row, 'cnt') : 0;
   }
 
   listMemoriesNeedingVectorSync(limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
@@ -1332,14 +1331,8 @@ export class SqliteStore implements SqliteStorage {
    * hasn't written since upgrading to provenance stamping).
    */
   getExpectedEmbeddingIdentity(): string | null {
-    const stmt = this.db.prepare(`SELECT identity FROM embedding_state WHERE id = 1`);
-    if (!stmt.step()) {
-      stmt.free();
-      return null;
-    }
-    const row = stmt.getAsObject() as { identity: string };
-    stmt.free();
-    return row.identity;
+    const row = this.queryOne(`SELECT identity FROM embedding_state WHERE id = 1`);
+    return row ? this.getString(row, 'identity') : null;
   }
 
   /**
@@ -1353,23 +1346,21 @@ export class SqliteStore implements SqliteStorage {
   adoptEmbeddingIdentityIfAbsent(identity: string): void {
     this.assertMutableAllowed();
     const now = new Date().toISOString();
-    this.db.run(
+    this.execSql(
       `INSERT OR IGNORE INTO embedding_state (id, identity, adopted_at, updated_at) VALUES (1, ?, ?, ?)`,
       [identity, now, now],
     );
-    this.markDirty();
   }
 
   /** Unconditionally overwrites the store's expected embedding identity (a completed re-embed). */
   setExpectedEmbeddingIdentity(identity: string): void {
     this.assertMutableAllowed();
     const now = new Date().toISOString();
-    this.db.run(
+    this.execSql(
       `INSERT INTO embedding_state (id, identity, adopted_at, updated_at) VALUES (1, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET identity = ?1, updated_at = ?3`,
       [identity, now, now],
     );
-    this.markDirty();
   }
 
   /**
@@ -1380,15 +1371,12 @@ export class SqliteStore implements SqliteStorage {
    * requested".
    */
   countMemoriesWithStaleEmbeddingStamp(activeIdentity: string, includeLegacy: boolean): number {
-    const stmt = this.db.prepare(
+    const row = this.queryOne(
       `SELECT COUNT(*) as cnt FROM memories
        WHERE archived = 0 AND (embedding_model != ?1 OR (embedding_model IS NULL AND ?2))`,
+      [activeIdentity, includeLegacy ? 1 : 0],
     );
-    stmt.bind([activeIdentity, includeLegacy ? 1 : 0]);
-    stmt.step();
-    const row = stmt.getAsObject() as { cnt: number };
-    stmt.free();
-    return row.cnt;
+    return row ? this.getNumber(row, 'cnt') : 0;
   }
 
   listMemoriesWithStaleEmbeddingStamp(
@@ -1415,19 +1403,13 @@ export class SqliteStore implements SqliteStorage {
   }
 
   listMemoryChecksums(): Array<{ id: string; checksum: string }> {
-    const stmt = this.db.prepare(`SELECT id, checksum FROM memories WHERE archived = 0`);
-    const rows: Array<{ id: string; checksum: string }> = [];
-    while (stmt.step()) {
-      const row = stmt.getAsObject() as { id: string; checksum: string };
-      rows.push({ id: row.id, checksum: row.checksum });
-    }
-    stmt.free();
-    return rows;
+    const rows = this.queryAll(`SELECT id, checksum FROM memories WHERE archived = 0`);
+    return rows.map(row => ({ id: this.getString(row, 'id'), checksum: this.getString(row, 'checksum') }));
   }
 
   archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void {
     this.assertMutableAllowed();
-    this.db.run(
+    this.execSql(
       `INSERT INTO memory_archive (memory_id, summary, tier, namespace, created_at, expired_at, access_count, tags)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
@@ -1441,32 +1423,20 @@ export class SqliteStore implements SqliteStorage {
         JSON.stringify(memory.tags),
       ],
     );
-    this.markDirty();
   }
 
   listArchive(limit: number): ArchiveRecord[] {
-    const stmt = this.db.prepare(`SELECT * FROM memory_archive ORDER BY expired_at DESC LIMIT ?`);
-    stmt.bind([limit]);
-    const rows: ArchiveRecord[] = [];
-    while (stmt.step()) {
-      rows.push(this.rowToArchive(stmt.getAsObject()));
-    }
-    stmt.free();
-    return rows;
+    const rows = this.queryAll(`SELECT * FROM memory_archive ORDER BY expired_at DESC LIMIT ?`, [limit]);
+    return rows.map(row => this.rowToArchive(row));
   }
 
   searchArchive(query: string, limit: number): ArchiveRecord[] {
     const like = `%${query.toLowerCase()}%`;
-    const stmt = this.db.prepare(
+    const rows = this.queryAll(
       `SELECT * FROM memory_archive WHERE LOWER(summary) LIKE ? OR LOWER(tags) LIKE ? ORDER BY expired_at DESC LIMIT ?`,
+      [like, like, limit],
     );
-    stmt.bind([like, like, limit]);
-    const rows: ArchiveRecord[] = [];
-    while (stmt.step()) {
-      rows.push(this.rowToArchive(stmt.getAsObject()));
-    }
-    stmt.free();
-    return rows;
+    return rows.map(row => this.rowToArchive(row));
   }
 
   /**
@@ -1479,62 +1449,41 @@ export class SqliteStore implements SqliteStorage {
    */
   searchArchived(namespace: string, query: string, limit: number): ArchiveRecord[] {
     const like = `%${query.toLowerCase()}%`;
-    const stmt = this.db.prepare(
+    const rows = this.queryAll(
       `SELECT * FROM memory_archive WHERE namespace = ? AND (LOWER(summary) LIKE ? OR LOWER(tags) LIKE ?) ORDER BY expired_at DESC LIMIT ?`,
+      [namespace, like, like, limit],
     );
-    stmt.bind([namespace, like, like, limit]);
-    const rows: ArchiveRecord[] = [];
-    while (stmt.step()) {
-      rows.push(this.rowToArchive(stmt.getAsObject()));
-    }
-    stmt.free();
-    return rows;
+    return rows.map(row => this.rowToArchive(row));
   }
 
   getArchiveByMemoryId(memoryId: string): ArchiveRecord | null {
-    const stmt = this.db.prepare(`SELECT * FROM memory_archive WHERE memory_id = ? ORDER BY id DESC LIMIT 1`);
-    stmt.bind([memoryId]);
-    if (!stmt.step()) {
-      stmt.free();
-      return null;
-    }
-    const row = this.rowToArchive(stmt.getAsObject());
-    stmt.free();
-    return row;
+    const row = this.queryOne(`SELECT * FROM memory_archive WHERE memory_id = ? ORDER BY id DESC LIMIT 1`, [memoryId]);
+    return row ? this.rowToArchive(row) : null;
   }
 
   deleteArchive(memoryId: string): void {
     this.assertMutableAllowed();
-    this.db.run(`DELETE FROM memory_archive WHERE memory_id = ?`, [memoryId]);
-    this.markDirty();
+    this.execSql(`DELETE FROM memory_archive WHERE memory_id = ?`, [memoryId]);
   }
 
   insertRevision(memoryId: string, revision: number, content: string, updatedAt: string, updatedBy?: string): void {
     this.assertMutableAllowed();
-    this.db.run(
+    this.execSql(
       `INSERT INTO memory_revisions (memory_id, revision, content, updated_at, updated_by) VALUES (?, ?, ?, ?, ?)`,
       [memoryId, revision, content, updatedAt, updatedBy ?? null],
     );
-    this.markDirty();
   }
 
   listRevisions(memoryId: string): MemoryRevisionRecord[] {
-    const stmt = this.db.prepare(`SELECT * FROM memory_revisions WHERE memory_id = ? ORDER BY revision DESC`);
-    stmt.bind([memoryId]);
-    const results: MemoryRevisionRecord[] = [];
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      results.push({
-        id: this.getNumber(row, 'id'),
-        memory_id: this.getString(row, 'memory_id'),
-        revision: this.getNumber(row, 'revision'),
-        content: this.getString(row, 'content'),
-        updated_at: this.getString(row, 'updated_at'),
-        updated_by: this.getNullableString(row, 'updated_by'),
-      });
-    }
-    stmt.free();
-    return results;
+    const rows = this.queryAll(`SELECT * FROM memory_revisions WHERE memory_id = ? ORDER BY revision DESC`, [memoryId]);
+    return rows.map(row => ({
+      id: this.getNumber(row, 'id'),
+      memory_id: this.getString(row, 'memory_id'),
+      revision: this.getNumber(row, 'revision'),
+      content: this.getString(row, 'content'),
+      updated_at: this.getString(row, 'updated_at'),
+      updated_by: this.getNullableString(row, 'updated_by'),
+    }));
   }
 
   private rowToMemoryLink(row: SqlRow): MemoryLinkRecord {
@@ -1556,32 +1505,25 @@ export class SqliteStore implements SqliteStorage {
     // Read-then-write (mirrors getArchiveByMemoryId's read-before-insert
     // shape) rather than INSERT OR IGNORE + a second query, so an existing
     // edge is returned verbatim including its original created_at/created_by.
-    const existingStmt = this.db.prepare(
+    const existing = this.queryOne(
       `SELECT * FROM memory_links WHERE from_id = ? AND to_id = ? AND relation = ?`,
+      [fromId, toId, relation],
     );
-    existingStmt.bind([fromId, toId, relation]);
-    if (existingStmt.step()) {
-      const row = this.rowToMemoryLink(this.getRow(existingStmt.getAsObject()));
-      existingStmt.free();
-      return { record: row, created: false };
+    if (existing) {
+      return { record: this.rowToMemoryLink(existing), created: false };
     }
-    existingStmt.free();
 
     const now = new Date().toISOString();
-    this.db.run(
+    this.execSql(
       `INSERT INTO memory_links (namespace, from_id, to_id, relation, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)`,
       [namespace, fromId, toId, relation, now, createdBy],
     );
-    this.markDirty();
 
-    const insertedStmt = this.db.prepare(
+    const inserted = this.queryOne(
       `SELECT * FROM memory_links WHERE from_id = ? AND to_id = ? AND relation = ?`,
+      [fromId, toId, relation],
     );
-    insertedStmt.bind([fromId, toId, relation]);
-    insertedStmt.step();
-    const record = this.rowToMemoryLink(this.getRow(insertedStmt.getAsObject()));
-    insertedStmt.free();
-    return { record, created: true };
+    return { record: this.rowToMemoryLink(inserted as SqlRow), created: true };
   }
 
   listMemoryLinks(
@@ -1593,32 +1535,25 @@ export class SqliteStore implements SqliteStorage {
       sql += ` AND relation = ?`;
       params.push(options.relation);
     }
-    const stmt = this.db.prepare(sql);
-    stmt.bind(params);
-    const results: Array<MemoryLinkRecord & { direction: 'outgoing' | 'incoming' }> = [];
-    while (stmt.step()) {
-      const record = this.rowToMemoryLink(this.getRow(stmt.getAsObject()));
-      results.push({ ...record, direction: record.from_id === memoryId ? 'outgoing' : 'incoming' });
-    }
-    stmt.free();
-    return results;
+    const rows = this.queryAll(sql, params);
+    return rows.map((row) => {
+      const record = this.rowToMemoryLink(row);
+      return { ...record, direction: record.from_id === memoryId ? ('outgoing' as const) : ('incoming' as const) };
+    });
   }
 
   removeMemoryLink(fromId: string, toId: string, relation: MemoryLinkRelation): boolean {
     this.assertMutableAllowed();
-    const existingStmt = this.db.prepare(
+    const existing = this.queryOne(
       `SELECT 1 FROM memory_links WHERE from_id = ? AND to_id = ? AND relation = ?`,
+      [fromId, toId, relation],
     );
-    existingStmt.bind([fromId, toId, relation]);
-    const exists = existingStmt.step();
-    existingStmt.free();
-    if (!exists) return false;
+    if (!existing) return false;
 
-    this.db.run(
+    this.execSql(
       `DELETE FROM memory_links WHERE from_id = ? AND to_id = ? AND relation = ?`,
       [fromId, toId, relation],
     );
-    this.markDirty();
     return true;
   }
 
@@ -1635,29 +1570,22 @@ export class SqliteStore implements SqliteStorage {
     const now = new Date().toISOString();
     const existing = this.getCategory(name);
     if (existing) {
-      this.db.run(
+      this.execSql(
         `UPDATE categories SET content = ?, slot = ?, revision = revision + 1, updated_at = ? WHERE name = ?`,
         [content, slot, now, name],
       );
     } else {
-      this.db.run(
+      this.execSql(
         `INSERT INTO categories (name, slot, content, revision, updated_at) VALUES (?, ?, ?, 1, ?)`,
         [name, slot, content, now],
       );
     }
-    this.markDirty();
     return this.getCategory(name)!;
   }
 
   getCategory(name: string): CategoryRecord | null {
-    const stmt = this.db.prepare(`SELECT * FROM categories WHERE name = ?`);
-    stmt.bind([name]);
-    if (!stmt.step()) {
-      stmt.free();
-      return null;
-    }
-    const row = this.getRow(stmt.getAsObject());
-    stmt.free();
+    const row = this.queryOne(`SELECT * FROM categories WHERE name = ?`, [name]);
+    if (!row) return null;
     return {
       name: this.getString(row, 'name'),
       slot: this.getString(row, 'slot') as CategoryRecord['slot'],
@@ -1668,50 +1596,36 @@ export class SqliteStore implements SqliteStorage {
   }
 
   listCategories(): CategoryRecord[] {
-    const stmt = this.db.prepare(`SELECT * FROM categories ORDER BY name`);
-    const results: CategoryRecord[] = [];
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      results.push({
-        name: this.getString(row, 'name'),
-        slot: this.getString(row, 'slot') as CategoryRecord['slot'],
-        content: this.getString(row, 'content'),
-        updated_at: this.getString(row, 'updated_at'),
-        revision: this.getNumber(row, 'revision'),
-      });
-    }
-    stmt.free();
-    return results;
+    const rows = this.queryAll(`SELECT * FROM categories ORDER BY name`);
+    return rows.map(row => ({
+      name: this.getString(row, 'name'),
+      slot: this.getString(row, 'slot') as CategoryRecord['slot'],
+      content: this.getString(row, 'content'),
+      updated_at: this.getString(row, 'updated_at'),
+      revision: this.getNumber(row, 'revision'),
+    }));
   }
 
   deleteCategory(name: string): boolean {
     this.assertMutableAllowed();
     const exists = this.getCategory(name);
     if (!exists) return false;
-    this.db.run(`DELETE FROM categories WHERE name = ?`, [name]);
-    this.markDirty();
+    this.execSql(`DELETE FROM categories WHERE name = ?`, [name]);
     return true;
   }
 
   createCollection(namespace: string, name: string, embeddingModel: string, embeddingDimensions: number): void {
     this.assertMutableAllowed();
     const now = new Date().toISOString();
-    this.db.run(
+    this.execSql(
       `INSERT OR IGNORE INTO collections (name, namespace, embedding_model, embedding_dimensions, created_at) VALUES (?, ?, ?, ?, ?)`,
       [name, namespace, embeddingModel, embeddingDimensions, now],
     );
-    this.markDirty();
   }
 
   getCollection(namespace: string, name: string): CollectionRecord | null {
-    const stmt = this.db.prepare(`SELECT * FROM collections WHERE namespace = ? AND name = ?`);
-    stmt.bind([namespace, name]);
-    if (!stmt.step()) {
-      stmt.free();
-      return null;
-    }
-    const row = this.getRow(stmt.getAsObject());
-    stmt.free();
+    const row = this.queryOne(`SELECT * FROM collections WHERE namespace = ? AND name = ?`, [namespace, name]);
+    if (!row) return null;
     return {
       name: this.getString(row, 'name'),
       namespace: this.getString(row, 'namespace'),
@@ -1724,88 +1638,62 @@ export class SqliteStore implements SqliteStorage {
     const sql = namespace
       ? `SELECT c.name, COUNT(m.id) as count FROM collections c LEFT JOIN memories m ON c.name = m.collection AND c.namespace = m.namespace AND m.archived = 0 WHERE c.namespace = ? GROUP BY c.name ORDER BY c.name`
       : `SELECT c.name, COUNT(m.id) as count FROM collections c LEFT JOIN memories m ON c.name = m.collection AND c.namespace = m.namespace AND m.archived = 0 GROUP BY c.namespace, c.name ORDER BY c.name`;
-    const params = namespace ? [namespace] : [];
-    const stmt = this.db.prepare(sql);
-    stmt.bind(params);
-    const results: Array<{ name: string; count: number }> = [];
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      results.push({ name: this.getString(row, 'name'), count: this.getNumber(row, 'count') });
-    }
-    stmt.free();
-    return results;
+    const params: SqlParams = namespace ? [namespace] : [];
+    const rows = this.queryAll(sql, params);
+    return rows.map(row => ({ name: this.getString(row, 'name'), count: this.getNumber(row, 'count') }));
   }
 
   deleteCollection(namespace: string, name: string): boolean {
     this.assertMutableAllowed();
-    const stmt = this.db.prepare(`SELECT 1 FROM collections WHERE namespace = ? AND name = ?`);
-    stmt.bind([namespace, name]);
-    const exists = stmt.step();
-    stmt.free();
+    const exists = this.queryOne(`SELECT 1 FROM collections WHERE namespace = ? AND name = ?`, [namespace, name]);
     if (!exists) return false;
-    this.db.run(`DELETE FROM collections WHERE namespace = ? AND name = ?`, [namespace, name]);
-    this.markDirty();
+    this.execSql(`DELETE FROM collections WHERE namespace = ? AND name = ?`, [namespace, name]);
     return true;
   }
 
   deleteMemoriesInCollection(namespace: string, collection: string): { deleted: number; ids: string[] } {
     this.assertMutableAllowed();
-    const select = this.db.prepare(`SELECT id FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`);
-    select.bind([namespace, collection]);
-    const ids: string[] = [];
-    while (select.step()) {
-      const row = this.getRow(select.getAsObject());
-      ids.push(this.getString(row, 'id'));
-    }
-    select.free();
+    const idRows = this.queryAll(`SELECT id FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`, [namespace, collection]);
+    const ids = idRows.map(row => this.getString(row, 'id'));
 
     if (ids.length === 0) {
       return { deleted: 0, ids: [] };
     }
 
-    this.db.run(`DELETE FROM memories_fts WHERE namespace = ? AND id IN (SELECT id FROM memories WHERE namespace = ? AND collection = ?)`, [
+    this.execSql(`DELETE FROM memories_fts WHERE namespace = ? AND id IN (SELECT id FROM memories WHERE namespace = ? AND collection = ?)`, [
       namespace,
       namespace,
       collection,
     ]);
-    this.db.run(`DELETE FROM memories WHERE namespace = ? AND collection = ?`, [namespace, collection]);
-    this.markDirty();
+    this.execSql(`DELETE FROM memories WHERE namespace = ? AND collection = ?`, [namespace, collection]);
 
     return { deleted: ids.length, ids };
   }
 
   insertAudit(entry: AuditEntry): void {
     this.assertMutableAllowed();
-    this.db.run(
+    this.execSql(
       `INSERT INTO audit_log (id, timestamp, namespace, operation, memory_id, client_id, details) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [entry.id, entry.timestamp, entry.namespace, entry.operation, entry.memory_id, entry.client_id, entry.details ?? null],
     );
-    this.markDirty();
   }
 
   listAudit(limit: number): AuditEntry[] {
-    const stmt = this.db.prepare(`SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?`);
-    stmt.bind([limit]);
-    const results: AuditEntry[] = [];
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      results.push({
-        id: this.getString(row, 'id'),
-        timestamp: this.getString(row, 'timestamp'),
-        namespace: this.getString(row, 'namespace'),
-        operation: this.getString(row, 'operation') as AuditEntry['operation'],
-        memory_id: this.getString(row, 'memory_id'),
-        client_id: this.getString(row, 'client_id'),
-        details: this.getNullableString(row, 'details') ?? undefined,
-      });
-    }
-    stmt.free();
-    return results;
+    const rows = this.queryAll(`SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?`, [limit]);
+    return rows.map(row => ({
+      id: this.getString(row, 'id'),
+      timestamp: this.getString(row, 'timestamp'),
+      namespace: this.getString(row, 'namespace'),
+      operation: this.getString(row, 'operation') as AuditEntry['operation'],
+      memory_id: this.getString(row, 'memory_id'),
+      client_id: this.getString(row, 'client_id'),
+      details: this.getNullableString(row, 'details') ?? undefined,
+    }));
   }
 
   recordFeedback(entry: RecallFeedbackEntry): void {
     this.assertMutableAllowed();
-    this.db.run(
+    this.execSql(
       `INSERT INTO recall_feedback (memory_id, namespace, query, score, useful, client_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         entry.memory_id,
@@ -1817,36 +1705,48 @@ export class SqliteStore implements SqliteStorage {
         entry.created_at,
       ],
     );
-    this.markDirty();
   }
 
   insertBackupMeta(path: string, sizeBytes: number, memoryCount: number, checksum: string): void {
     this.assertMutableAllowed();
-    this.db.run(
+    this.execSql(
       `INSERT INTO backup_metadata (path, size_bytes, memory_count, checksum, created_at) VALUES (?, ?, ?, ?, ?)`,
       [path, sizeBytes, memoryCount, checksum, new Date().toISOString()],
     );
-    this.markDirty();
   }
 
   listBackups(): Array<{ path: string; size_bytes: number; memory_count: number; created_at: string }> {
-    const stmt = this.db.prepare(`SELECT * FROM backup_metadata ORDER BY created_at DESC`);
-    const results: Array<{ path: string; size_bytes: number; memory_count: number; created_at: string }> = [];
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      results.push({
-        path: this.getString(row, 'path'),
-        size_bytes: this.getNumber(row, 'size_bytes'),
-        memory_count: this.getNumber(row, 'memory_count'),
-        created_at: this.getString(row, 'created_at'),
-      });
-    }
-    stmt.free();
-    return results;
+    const rows = this.queryAll(`SELECT * FROM backup_metadata ORDER BY created_at DESC`);
+    return rows.map(row => ({
+      path: this.getString(row, 'path'),
+      size_bytes: this.getNumber(row, 'size_bytes'),
+      memory_count: this.getNumber(row, 'memory_count'),
+      created_at: this.getString(row, 'created_at'),
+    }));
   }
 
+  /**
+   * `DatabaseSync` has no `serialize()`/`export()` (sql.js's whole-image dump).
+   * `VACUUM INTO` writes a compacted, self-contained, checkpointed copy of the
+   * live database to a temp file inside `dataDir` (same volume, so the rename-
+   * free `readFileSync` below never crosses a filesystem boundary), which is
+   * read back into memory and then removed. See design.md "exportData() via
+   * VACUUM INTO".
+   */
   exportData(): Buffer {
-    return Buffer.from(this.db.export());
+    const tmpPath = join(this.dataDir, `.brain-export-${randomUUID()}.sqlite`);
+    try {
+      this.db.prepare('VACUUM INTO ?').run(tmpPath);
+      return readFileSync(tmpPath);
+    } finally {
+      if (existsSync(tmpPath)) {
+        try {
+          unlinkSync(tmpPath);
+        } catch {
+          // Best-effort cleanup of the scratch export file.
+        }
+      }
+    }
   }
 
   getDatabasePath(): string {
@@ -1855,9 +1755,7 @@ export class SqliteStore implements SqliteStorage {
 
   healthCheck(): boolean {
     try {
-      const stmt = this.db.prepare('SELECT 1');
-      stmt.step();
-      stmt.free();
+      this.db.prepare('SELECT 1').get();
       return true;
     } catch {
       return false;
@@ -1866,7 +1764,12 @@ export class SqliteStore implements SqliteStorage {
 
   close(): void {
     this.cancelDeferredFlush();
-    this.flushIfDirty();
+    // TRUNCATE checkpoint folds the WAL back into the main file and removes
+    // the `-wal`/`-shm` sidecars, so a clean shutdown leaves `brain.db`
+    // self-contained and readable by any whole-file reader (old sql.js
+    // builds, external inspection tools) — see design.md "close() checkpoints
+    // TRUNCATE first".
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     this.db.close();
   }
 
@@ -1903,32 +1806,19 @@ export class SqliteStore implements SqliteStorage {
   }
 
   listMemoryIdsInCollection(namespace: string, collection: string): string[] {
-    const stmt = this.db.prepare(`SELECT id FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`);
-    stmt.bind([namespace, collection]);
-    const ids: string[] = [];
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      ids.push(this.getString(row, 'id'));
-    }
-    stmt.free();
-    return ids;
+    const rows = this.queryAll(`SELECT id FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`, [namespace, collection]);
+    return rows.map(row => this.getString(row, 'id'));
   }
 
   listCategoryHeaders(): CategoryHeader[] {
-    const stmt = this.db.prepare(`SELECT name, slot, updated_at, revision, LENGTH(content) as content_length FROM categories ORDER BY name`);
-    const results: CategoryHeader[] = [];
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      results.push({
-        name: this.getString(row, 'name'),
-        slot: this.getString(row, 'slot'),
-        updated_at: this.getString(row, 'updated_at'),
-        revision: this.getNumber(row, 'revision'),
-        content_length: this.getNumber(row, 'content_length'),
-      });
-    }
-    stmt.free();
-    return results;
+    const rows = this.queryAll(`SELECT name, slot, updated_at, revision, LENGTH(content) as content_length FROM categories ORDER BY name`);
+    return rows.map(row => ({
+      name: this.getString(row, 'name'),
+      slot: this.getString(row, 'slot'),
+      updated_at: this.getString(row, 'updated_at'),
+      revision: this.getNumber(row, 'revision'),
+      content_length: this.getNumber(row, 'content_length'),
+    }));
   }
 
   getCategoryContentSlice(name: string, maxChars: number): CategoryContentSlice | null {
@@ -1936,16 +1826,11 @@ export class SqliteStore implements SqliteStorage {
     // character-counting unit, so callers can compare `length` against a
     // SQLite-derived total (e.g. CategoryHeader.content_length) without ever
     // going through JS's UTF-16 `.length` on either side.
-    const stmt = this.db.prepare(
+    const row = this.queryOne(
       `SELECT substr(content, 1, ?) as content, LENGTH(substr(content, 1, ?)) as content_length FROM categories WHERE name = ?`,
+      [maxChars, maxChars, name],
     );
-    stmt.bind([maxChars, maxChars, name]);
-    if (!stmt.step()) {
-      stmt.free();
-      return null;
-    }
-    const row = this.getRow(stmt.getAsObject());
-    stmt.free();
+    if (!row) return null;
     return {
       content: this.getNullableString(row, 'content') ?? '',
       length: this.getNumber(row, 'content_length'),
@@ -1953,14 +1838,7 @@ export class SqliteStore implements SqliteStorage {
   }
 
   private queryMemories(sql: string, params: SqlParams): MemoryRecordWithoutEmbedding[] {
-    const stmt = this.db.prepare(sql);
-    stmt.bind(params);
-    const results: MemoryRecordWithoutEmbedding[] = [];
-    while (stmt.step()) {
-      results.push(this.rowToMemory(this.getRow(stmt.getAsObject())));
-    }
-    stmt.free();
-    return results;
+    return this.queryAll(sql, params).map(row => this.rowToMemory(row));
   }
 
   private rowToMemory(row: SqlRow): MemoryRecordWithoutEmbedding {
@@ -2033,41 +1911,30 @@ export class SqliteStore implements SqliteStorage {
   createBootstrapSession(namespace: string, totalSections: number): void {
     const now = new Date().toISOString();
     for (let i = 1; i <= totalSections; i++) {
-      this.db.run(
+      this.execSql(
         `INSERT OR IGNORE INTO bootstrap_sessions (namespace, section_number, status, memory_ids, updated_at) VALUES (?, ?, 'pending', '[]', ?)`,
         [namespace, i, now],
       );
     }
-    this.dirty = true;
-    this.scheduleDeferredFlush();
   }
 
   getBootstrapSession(namespace: string): BootstrapSectionRow[] {
-    const stmt = this.db.prepare(`SELECT * FROM bootstrap_sessions WHERE namespace = ? ORDER BY section_number`);
-    stmt.bind([namespace]);
-    const rows: BootstrapSectionRow[] = [];
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      rows.push({
-        namespace: this.getString(row, 'namespace'),
-        section_number: this.getNumber(row, 'section_number'),
-        status: this.getString(row, 'status') as 'pending' | 'complete',
-        memory_ids: JSON.parse(this.getString(row, 'memory_ids')) as string[],
-        updated_at: this.getString(row, 'updated_at'),
-      });
-    }
-    stmt.free();
-    return rows;
+    const rows = this.queryAll(`SELECT * FROM bootstrap_sessions WHERE namespace = ? ORDER BY section_number`, [namespace]);
+    return rows.map(row => ({
+      namespace: this.getString(row, 'namespace'),
+      section_number: this.getNumber(row, 'section_number'),
+      status: this.getString(row, 'status') as 'pending' | 'complete',
+      memory_ids: JSON.parse(this.getString(row, 'memory_ids')) as string[],
+      updated_at: this.getString(row, 'updated_at'),
+    }));
   }
 
   updateBootstrapSection(namespace: string, sectionNumber: number, status: 'pending' | 'complete', memoryIds: string[]): void {
     const now = new Date().toISOString();
-    this.db.run(
+    this.execSql(
       `UPDATE bootstrap_sessions SET status = ?, memory_ids = ?, updated_at = ? WHERE namespace = ? AND section_number = ?`,
       [status, JSON.stringify(memoryIds), now, namespace, sectionNumber],
     );
-    this.dirty = true;
-    this.scheduleDeferredFlush();
   }
 
   resetBootstrapSection(namespace: string, sectionNumber: number): string[] {
@@ -2083,15 +1950,8 @@ export class SqliteStore implements SqliteStorage {
    * recovery list survives a mid-deletion failure (see `clearBootstrapSection`).
    */
   getBootstrapSectionMemoryIds(namespace: string, sectionNumber: number): string[] {
-    const stmt = this.db.prepare(`SELECT memory_ids FROM bootstrap_sessions WHERE namespace = ? AND section_number = ?`);
-    stmt.bind([namespace, sectionNumber]);
-    let memoryIds: string[] = [];
-    if (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      memoryIds = JSON.parse(this.getString(row, 'memory_ids')) as string[];
-    }
-    stmt.free();
-    return memoryIds;
+    const row = this.queryOne(`SELECT memory_ids FROM bootstrap_sessions WHERE namespace = ? AND section_number = ?`, [namespace, sectionNumber]);
+    return row ? (JSON.parse(this.getString(row, 'memory_ids')) as string[]) : [];
   }
 
   /**
@@ -2103,43 +1963,29 @@ export class SqliteStore implements SqliteStorage {
    */
   clearBootstrapSection(namespace: string, sectionNumber: number): void {
     const now = new Date().toISOString();
-    this.db.run(
+    this.execSql(
       `UPDATE bootstrap_sessions SET status = 'pending', memory_ids = '[]', updated_at = ? WHERE namespace = ? AND section_number = ?`,
       [now, namespace, sectionNumber],
     );
-    this.dirty = true;
-    this.scheduleDeferredFlush();
   }
 
   bootstrapSessionExists(namespace: string): boolean {
-    const stmt = this.db.prepare(`SELECT COUNT(*) as cnt FROM bootstrap_sessions WHERE namespace = ?`);
-    stmt.bind([namespace]);
-    let exists = false;
-    if (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
-      exists = this.getNumber(row, 'cnt') > 0;
-    }
-    stmt.free();
-    return exists;
+    const row = this.queryOne(`SELECT COUNT(*) as cnt FROM bootstrap_sessions WHERE namespace = ?`, [namespace]);
+    return row ? this.getNumber(row, 'cnt') > 0 : false;
   }
 
   private ensureMemoryColumns(): void {
     // Guard: if the memories table doesn't exist yet (fresh DB), skip migrations —
     // SCHEMA_SQL will create it with all columns present.
-    const tableStmt = this.db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='memories'`);
-    const tableFound = tableStmt.step();
-    tableStmt.free();
+    const tableFound = this.queryOne(`SELECT name FROM sqlite_master WHERE type='table' AND name='memories'`);
     if (!tableFound) {
       return;
     }
 
     const existingColumns = new Set<string>();
-    const stmt = this.db.prepare(`PRAGMA table_info(memories)`);
-    while (stmt.step()) {
-      const row = this.getRow(stmt.getAsObject());
+    for (const row of this.queryAll(`PRAGMA table_info(memories)`)) {
       existingColumns.add(this.getString(row, 'name'));
     }
-    stmt.free();
 
     const requiredColumns: Array<{ name: string; sql: string }> = [
       { name: 'retention_tier', sql: `ALTER TABLE memories ADD COLUMN retention_tier TEXT NOT NULL DEFAULT 'T2'` },
@@ -2158,7 +2004,7 @@ export class SqliteStore implements SqliteStorage {
 
     for (const column of requiredColumns) {
       if (!existingColumns.has(column.name)) {
-        this.db.run(column.sql);
+        this.db.exec(column.sql);
       }
     }
   }

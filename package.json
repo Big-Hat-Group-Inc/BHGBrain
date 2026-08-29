@@ -1,6 +1,6 @@
 {
   "name": "@kkaminsk/bhgbrain",
-  "version": "1.30.0",
+  "version": "1.31.0",
   "description": "Persistent, vector-backed memory for MCP clients",
   "type": "module",
   "main": "dist/index.js",
@@ -54,7 +54,6 @@
     "express": "^5.1.0",
     "openai": "^4.85.4",
     "pino": "^9.6.0",
-    "sql.js": "^1.12.0",
     "uuid": "^11.1.0",
     "zod": "^3.24.2"
   },

@@ -60,7 +60,7 @@ describe('BackupService restore activation', () => {
         countMemories: vi.fn(() => 7),
         countUnsyncedVectors: vi.fn(() => 0),
       },
-      reloadSqliteFromDisk: vi.fn(async () => {}),
+      activateSqliteImage: vi.fn(async () => {}),
       detectAndMarkVectorDrift: vi.fn(async () => ({ mode: 'no-drift', driftedCount: 0 })),
       reconcileVectorsFromSqlite: vi.fn(async () => ({ reconciled: 0, remaining: 0, boundReached: false })),
       setBackgroundReconciliationActive: vi.fn(),
@@ -83,7 +83,7 @@ describe('BackupService restore activation', () => {
     expect(storage.sqlite.beginLifecycleOperation).toHaveBeenCalledWith('restore');
     expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith('restore');
     expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledTimes(1);
-    expect(storage.reloadSqliteFromDisk).toHaveBeenCalledTimes(1);
+    expect(storage.activateSqliteImage).toHaveBeenCalledTimes(1);
     expect(storage.detectAndMarkVectorDrift).toHaveBeenCalledWith({
       expectedEmbeddingModel: 'test-model',
       expectedEmbeddingDimensions: 3,
@@ -109,7 +109,7 @@ describe('BackupService restore activation', () => {
         countMemories: vi.fn(() => 5),
         countUnsyncedVectors: vi.fn(() => 0),
       },
-      reloadSqliteFromDisk: vi.fn(async () => {}),
+      activateSqliteImage: vi.fn(async () => {}),
       detectAndMarkVectorDrift: vi.fn(async () => ({ mode: 'partial-drift', driftedCount: 2 })),
       reconcileVectorsFromSqlite: vi.fn(async () => {
         callOrder.push('reconcileVectorsFromSqlite');
@@ -164,7 +164,7 @@ describe('BackupService restore activation', () => {
         countMemories: vi.fn(() => 3),
         countUnsyncedVectors: vi.fn(() => 3),
       },
-      reloadSqliteFromDisk: vi.fn(async () => {}),
+      activateSqliteImage: vi.fn(async () => {}),
       detectAndMarkVectorDrift: vi.fn(async () => ({ mode: 'full-rebuild', driftedCount: 3 })),
       reconcileVectorsFromSqlite: vi.fn(async () => ({ reconciled: 3, remaining: 0, boundReached: false })),
       setBackgroundReconciliationActive: vi.fn(),
@@ -208,7 +208,7 @@ describe('BackupService restore activation', () => {
           countMemories: vi.fn(() => 4),
           countUnsyncedVectors: vi.fn(() => 4),
         },
-        reloadSqliteFromDisk: vi.fn(async () => {}),
+        activateSqliteImage: vi.fn(async () => {}),
         detectAndMarkVectorDrift: vi.fn(async () => ({ mode: 'partial-drift', driftedCount: 4 })),
         // Always reports remaining work, so every attempt should retry.
         reconcileVectorsFromSqlite: vi.fn(async () => ({ reconciled: 0, remaining: 4, boundReached: true })),
@@ -252,7 +252,7 @@ describe('BackupService restore activation', () => {
         countMemories: vi.fn(() => 4),
         countUnsyncedVectors: vi.fn(() => 4),
       },
-      reloadSqliteFromDisk: vi.fn(async () => {}),
+      activateSqliteImage: vi.fn(async () => {}),
       detectAndMarkVectorDrift: vi.fn(async () => {
         throw embeddingUnavailable('Embedding provider is unavailable: missing API credentials');
       }),
@@ -296,7 +296,7 @@ describe('BackupService restore activation', () => {
         countMemories: vi.fn(() => 0),
         countUnsyncedVectors: vi.fn(() => 0),
       },
-      reloadSqliteFromDisk: vi.fn(async () => {}),
+      activateSqliteImage: vi.fn(async () => {}),
       detectAndMarkVectorDrift: vi.fn(),
       reconcileVectorsFromSqlite: vi.fn(),
       setBackgroundReconciliationActive: vi.fn(),
@@ -336,7 +336,7 @@ describe('BackupService restore activation', () => {
         countMemories: vi.fn(() => 0),
         countUnsyncedVectors: vi.fn(() => 0),
       },
-      reloadSqliteFromDisk: vi.fn(async () => { throw new Error('reload exploded'); }),
+      activateSqliteImage: vi.fn(async () => { throw new Error('reload exploded'); }),
       detectAndMarkVectorDrift: vi.fn(),
       reconcileVectorsFromSqlite: vi.fn(),
       setBackgroundReconciliationActive: vi.fn(),
@@ -372,7 +372,7 @@ describe('BackupService restore activation', () => {
         countMemories: vi.fn(() => 2),
         countUnsyncedVectors: vi.fn(() => 0),
       },
-      reloadSqliteFromDisk: vi.fn(async () => {}),
+      activateSqliteImage: vi.fn(async () => {}),
       detectAndMarkVectorDrift: vi.fn(async () => ({ mode: 'no-drift', driftedCount: 0 })),
       reconcileVectorsFromSqlite: vi.fn(),
       setBackgroundReconciliationActive: vi.fn(),
@@ -412,7 +412,7 @@ describe('BackupService restore activation', () => {
         countMemories: vi.fn(() => 2),
         countUnsyncedVectors: vi.fn(() => 0),
       },
-      reloadSqliteFromDisk: vi.fn(async () => {}),
+      activateSqliteImage: vi.fn(async () => {}),
       detectAndMarkVectorDrift: vi.fn(async () => ({ mode: 'no-drift', driftedCount: 0 })),
       reconcileVectorsFromSqlite: vi.fn(),
       setBackgroundReconciliationActive: vi.fn(),
@@ -450,7 +450,7 @@ describe('BackupService restore activation', () => {
         countMemories: vi.fn(() => 1),
         countUnsyncedVectors: vi.fn(() => 0),
       },
-      reloadSqliteFromDisk: vi.fn(() => new Promise<void>((resolve) => {
+      activateSqliteImage: vi.fn(() => new Promise<void>((resolve) => {
         resolveReload = resolve;
       })),
       detectAndMarkVectorDrift: vi.fn(async () => ({ mode: 'no-drift', driftedCount: 0 })),

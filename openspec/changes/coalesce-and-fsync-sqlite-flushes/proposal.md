@@ -1,3 +1,12 @@
+> **Superseded (2026-08-29):** `migrate-sqlite-to-native-engine` has landed. The
+> `SqliteStore` engine is now `node:sqlite`'s `DatabaseSync` with WAL journaling and
+> `synchronous=NORMAL`, so persistence is already page-level and commit-durable — the
+> whole-file `db.export()`/`atomicWriteFileSync` rewrite this proposal coalesces and
+> fsyncs no longer exists to coalesce. `flush()`/`flushIfDirty()`/
+> `scheduleDeferredFlush()`/`cancelDeferredFlush()` are now checkpoint/no-op methods
+> kept only for call-site compatibility. Do not implement this proposal's tasks; close
+> it out instead.
+
 ## Why
 
 Persistence today has the trade-offs exactly backwards: it pays a full-database-image

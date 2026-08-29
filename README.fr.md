@@ -77,7 +77,7 @@ graph TD
         RH["Resource Handler<br/><i>memory:// URIs</i>"]
 
         subgraph Storage["Storage Manager"]
-            subgraph SQLite["SQLite (sql.js)"]
+            subgraph SQLite["SQLite (node:sqlite)"]
                 S1["metadata"]
                 S2["fulltext (FTS)"]
                 S3["categories"]
@@ -113,7 +113,7 @@ graph TD
     class OpenAI external
 ```
 
-- **SQLite** (via `sql.js`, en mémoire avec vidange atomique périodique sur disque) est la **source de référence** pour toutes les métadonnées de mémoire, l'index de recherche plein texte, les catégories, la piste d'audit, l'historique des révisions et les enregistrements d'archive.
+- **SQLite** (via le `DatabaseSync` natif de `node:sqlite`, journalisation WAL avec durabilité au niveau des commits) est la **source de référence** pour toutes les métadonnées de mémoire, l'index de recherche plein texte, les catégories, la piste d'audit, l'historique des révisions et les enregistrements d'archive.
 - **Qdrant** stocke les embeddings vectoriels sémantiques pour la recherche par similarité. Qdrant est toujours écrit après la réussite de SQLite ; les échecs sont suivis via l'indicateur `vector_synced` et exposés dans le point de terminaison de santé.
 - **OpenAI text-embedding-3-small** (par défaut, configurable) génère des embeddings en 1536 dimensions pour chaque souvenir.
 - **Les écritures atomiques** garantissent que les fichiers de base de données ne sont jamais partiellement écrits — toutes les E/S disque utilisent le mécanisme d'écriture-vers-temp-puis-renommage.

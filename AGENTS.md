@@ -7,7 +7,9 @@ BHGBrain is a persistent, vector-backed memory system for MCP (Model Context Pro
 **Key Technologies:**
 - TypeScript with Node.js (>=20.0.0)
 - ES modules (`"type": "module"`)
-- SQLite for metadata storage (via sql.js)
+- SQLite for metadata storage (via `node:sqlite`'s `DatabaseSync`, Node's built-in
+  native binding — requires Node >=22; WAL journaling, commit-level durability, bundled
+  FTS5)
 - Qdrant for vector storage (client `@qdrant/js-client-rest` `~1.19.0`; requires Qdrant
   server ≥ 1.10 for the `query` API the adapter uses in `src/storage/qdrant.ts` - keep the
   client range and server floor in `README.md` § Prerequisites in sync with each other)
@@ -40,7 +42,6 @@ npm run lint             # Type check (tsc --noEmit) + eslint src
 ```
 src/
 ├── index.ts              # Main entry point, MCP server setup
-├── types.d.ts            # TypeScript declarations for sql.js
 ├── config/               # Configuration management with Zod schemas
 ├── storage/              # SQLite + Qdrant data layer
 ├── embedding/            # Embedding providers (OpenAI + Azure Foundry)
@@ -221,22 +222,20 @@ openspec list --json
 ## Common Gotchas
 
 1. **ES Modules**: Always use `.js` extensions in imports
-2. **Type Differences**: sql.js types are declared in `types.d.ts`
-3. **Dual Transport**: Test both HTTP and stdio modes
-4. **Namespace Scoping**: Operations are namespace-scoped by default
-5. **Collection Delete**: Requires `force: true` for non-empty collections
-6. **Memory Types**: Use correct type (`episodic`/`semantic`/`procedural`)
-7. **Embedding Dimensions**: Must match Qdrant configuration
-8. **Zod Validation**: All config must pass Zod schema validation
-9. **sql.js has no FTS5**: the pinned `sql.js` distribution (`^1.12.0`, currently
-   resolving 1.14.1) does **not** compile in the SQLite `fts5` virtual-table module —
-   `CREATE VIRTUAL TABLE ... USING fts5` throws `no such module: fts5`, and the wasm
-   binary carries no `fts5`/`SQLITE_ENABLE_FTS5` symbols. `SqliteStore.isFts5Available()`
-   probes this at startup (always `false` today) and `HealthService` surfaces the
-   fallback in the `sqlite` health component's `message`; fulltext search
-   (`fullTextSearch` in `src/storage/sqlite.ts`) still runs the legacy `LIKE`-based
-   matcher unconditionally. See `openspec/changes/upgrade-fulltext-to-fts5` before
-   assuming an FTS5/BM25 index exists — it doesn't, on this dependency.
+2. **Dual Transport**: Test both HTTP and stdio modes
+3. **Namespace Scoping**: Operations are namespace-scoped by default
+4. **Collection Delete**: Requires `force: true` for non-empty collections
+5. **Memory Types**: Use correct type (`episodic`/`semantic`/`procedural`)
+6. **Embedding Dimensions**: Must match Qdrant configuration
+7. **Zod Validation**: All config must pass Zod schema validation
+8. **FTS5 is available but unused for queries**: `node:sqlite`'s bundled SQLite build
+   compiles in the `fts5` virtual-table module (`migrate-sqlite-to-native-engine`
+   replaced the old `sql.js` engine, which did not), so `SqliteStore.isFts5Available()`
+   now probes `true` and the `sqlite` health component no longer surfaces the legacy-
+   fulltext fallback message. Fulltext search (`fullTextSearch` in
+   `src/storage/sqlite.ts`) still runs the legacy `LIKE`-based matcher unconditionally,
+   though — the engine-level FTS5/BM25 query path itself is not implemented yet. See
+   `openspec/changes/upgrade-fulltext-to-fts5`, now unblocked by this change.
 
 ## Quick Start for New Features
 

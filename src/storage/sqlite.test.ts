@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SqliteStore } from './sqlite.js';
-import type { Database } from 'sql.js';
+import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -87,16 +87,17 @@ describe('SqliteStore', () => {
     expect(store.getMemoryById(mem.id)).toBeNull();
   });
 
-  // openspec/changes/upgrade-fulltext-to-fts5, task 1.1: the startup FTS5
-  // capability probe. This is a canary, not just a smoke test — it is pinned
-  // `false` because the pinned sql.js dependency (sql.js@^1.12.0) does not compile
-  // in the `fts5` virtual table module (verified: `CREATE VIRTUAL TABLE ... USING
-  // fts5` throws "no such module: fts5"). If this ever starts failing because the
-  // probe now returns `true`, that is good news — it means sql.js has started
-  // shipping fts5, and the engine-level FTS5/BM25 fulltext path (not implemented
-  // in this change — see tasks.md notes) can finally be built and tested.
-  it('reports FTS5 unavailable against the pinned sql.js build', () => {
-    expect(store.isFts5Available()).toBe(false);
+  // openspec/changes/upgrade-fulltext-to-fts5, task 1.1, flipped by
+  // migrate-sqlite-to-native-engine task 4.1: the startup FTS5 capability
+  // probe. This is a canary, not just a smoke test — `node:sqlite`'s bundled
+  // SQLite build compiles in the `fts5` virtual table module (verified:
+  // `CREATE VIRTUAL TABLE ... USING fts5` succeeds), unlike the previous
+  // sql.js engine, so it now pins `true`. If this ever starts failing because
+  // the probe returns `false` again, that means the engine build lost fts5 —
+  // investigate before assuming the engine-level FTS5/BM25 fulltext path
+  // (upgrade-fulltext-to-fts5, not implemented yet) can proceed.
+  it('reports FTS5 available on the native SQLite build', () => {
+    expect(store.isFts5Available()).toBe(true);
   });
 
   it('counts memories', () => {
@@ -263,21 +264,16 @@ describe('SqliteStore', () => {
   describe('recall_feedback', () => {
     // recall_feedback has no read/list surface by design (design.md
     // Non-Goals: "no read surface"), so tests reach into the underlying
-    // sql.js database directly to verify persistence instead of adding
-    // production read paths just for test introspection.
+    // native SQLite database directly to verify persistence instead of
+    // adding production read paths just for test introspection.
     const rawRows = (): Array<{
       memory_id: string; namespace: string; query: string | null; score: number | null;
       useful: number; client_id: string; created_at: string;
     }> => {
-      const db = (store as unknown as { db: Database }).db;
-      const result = db.exec('SELECT memory_id, namespace, query, score, useful, client_id, created_at FROM recall_feedback ORDER BY id ASC');
-      if (result.length === 0) return [];
-      const [{ columns, values }] = result;
-      return values.map(row => {
-        const obj: Record<string, unknown> = {};
-        columns.forEach((col, i) => { obj[col] = row[i]; });
-        return obj as ReturnType<typeof rawRows>[number];
-      });
+      const db = (store as unknown as { db: DatabaseSync }).db;
+      return db.prepare(
+        'SELECT memory_id, namespace, query, score, useful, client_id, created_at FROM recall_feedback ORDER BY id ASC',
+      ).all() as ReturnType<typeof rawRows>;
     };
 
     it('persists a feedback row with correct memory_id/namespace/useful/created_at', () => {
@@ -690,14 +686,16 @@ describe('SqliteStore', () => {
   });
 
   it('upsertMemoryFromPayload rolls back the memories insert if the FTS insert fails, leaving no orphan row and no over-reported success', () => {
-    const dbInternal = (store as unknown as { db: { run: (sql: string, params?: unknown[]) => void } }).db;
-    const originalRun = dbInternal.run.bind(dbInternal);
-    dbInternal.run = (sql: string, params?: unknown[]) => {
+    const dbInternal = (store as unknown as { db: DatabaseSync }).db;
+    const originalPrepare = dbInternal.prepare.bind(dbInternal);
+    dbInternal.prepare = ((sql: string) => {
       if (sql.includes('INSERT OR IGNORE INTO memories_fts')) {
-        throw new Error('simulated fts insert failure');
+        return {
+          run: () => { throw new Error('simulated fts insert failure'); },
+        } as unknown as StatementSync;
       }
-      return originalRun(sql, params);
-    };
+      return originalPrepare(sql);
+    }) as typeof dbInternal.prepare;
 
     try {
       expect(() => store.upsertMemoryFromPayload('atomic-fail-id', {
@@ -706,7 +704,7 @@ describe('SqliteStore', () => {
         checksum: 'atomic-fail-chk',
       })).toThrow('simulated fts insert failure');
     } finally {
-      dbInternal.run = originalRun;
+      dbInternal.prepare = originalPrepare;
     }
 
     // The transaction must have rolled back: no orphan `memories` row either.
@@ -1143,18 +1141,17 @@ describe('SqliteStore origin/confidence (add-memory-provenance-metadata)', () =>
     // defaults the additive migration establishes (`origin` nullable,
     // `confidence REAL NOT NULL DEFAULT 1.0`), not on any application code
     // path that explicitly sets them.
-    const dbInternal = (store as unknown as { db: { run: (sql: string, params?: unknown[]) => void } }).db;
+    const dbInternal = (store as unknown as { db: DatabaseSync }).db;
     const now = new Date().toISOString();
-    dbInternal.run(
+    dbInternal.prepare(
       `INSERT INTO memories (
         id, namespace, collection, type, category, content, summary, tags, source, checksum,
         importance, retention_tier, decay_eligible, access_count, last_operation, stale, archived,
         vector_synced, pinned, created_at, updated_at, last_accessed
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        'pre-migration-id', 'global', 'general', 'semantic', null, 'legacy content', 'legacy content',
-        '[]', 'cli', 'legacy-checksum', 0.5, 'T2', 1, 0, 'ADD', 0, 0, 1, 0, now, now, now,
-      ],
+    ).run(
+      'pre-migration-id', 'global', 'general', 'semantic', null, 'legacy content', 'legacy content',
+      '[]', 'cli', 'legacy-checksum', 0.5, 'T2', 1, 0, 'ADD', 0, 0, 1, 0, now, now, now,
     );
     const mem = store.getMemoryById('pre-migration-id');
     expect(mem?.origin).toBeNull();
@@ -1220,6 +1217,88 @@ describe('SqliteStore origin/confidence (add-memory-provenance-metadata)', () =>
     const mem = store.getMemoryById('880e8400-e29b-41d4-a716-446655440003');
     expect(mem?.origin).toEqual({ tool: 'recovered-tool' });
     expect(mem?.confidence).toBe(0.77);
+  });
+
+  // migrate-sqlite-to-native-engine task 4.3: durability. WAL + synchronous=NORMAL
+  // makes a committed write durable at commit time, with no deferred-flush window
+  // to lose it to — the property sql.js's memory-only engine could never provide.
+  // A second SqliteStore is opened on the same dataDir *after* the first is closed
+  // (rather than mid-process) so this only proves persistence-to-disk, not merely
+  // in-memory state surviving within one connection.
+  it('a committed write survives close and reopen without ever calling flush() (durability)', async () => {
+    const mem = sampleMemory();
+    store.insertMemory(mem);
+    // No flush() call. If this were still the old deferred-flush world, an
+    // unflushed write would be lost here.
+    store.close();
+
+    const reopened = new SqliteStore(tempDir);
+    await reopened.init();
+    const found = reopened.getMemoryById(mem.id);
+    expect(found).not.toBeNull();
+    expect(found!.content).toBe(mem.content);
+    expect(found!.summary).toBe(mem.summary);
+
+    // Hand the reopened connection to the outer afterEach so it (and tempDir)
+    // still get cleaned up exactly once.
+    store = reopened;
+  });
+
+  // migrate-sqlite-to-native-engine task 4.4: backup/restore round trip.
+  describe('exportData / activateDatabaseImage (backup/restore round trip)', () => {
+    it('exportData() produces a standalone image openable with no sidecar files', async () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+
+      const exported = store.exportData();
+
+      const standaloneDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-standalone-'));
+      try {
+        writeFileSync(join(standaloneDir, 'brain.db'), exported);
+        const standaloneStore = new SqliteStore(standaloneDir);
+        await standaloneStore.init();
+        try {
+          const found = standaloneStore.getMemoryById(mem.id);
+          expect(found).not.toBeNull();
+          expect(found!.content).toBe(mem.content);
+        } finally {
+          standaloneStore.close();
+        }
+      } finally {
+        rmSync(standaloneDir, { recursive: true, force: true });
+      }
+    });
+
+    it('activateDatabaseImage() swaps in a replacement image while the store is open (Windows close-before-overwrite)', async () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      expect(store.countMemories()).toBe(1);
+
+      // Build a second, independent image with different content.
+      const otherDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-other-'));
+      let otherImage: Buffer;
+      try {
+        const otherStore = new SqliteStore(otherDir);
+        await otherStore.init();
+        try {
+          otherStore.insertMemory({
+            ...sampleMemory(), id: '10000000-0000-0000-0000-000000000099', checksum: 'other-image-chk',
+          });
+          otherImage = otherStore.exportData();
+        } finally {
+          otherStore.close();
+        }
+      } finally {
+        rmSync(otherDir, { recursive: true, force: true });
+      }
+
+      // Activate the second image over the live, still-open `store` connection.
+      await store.activateDatabaseImage(otherImage);
+
+      expect(store.getMemoryById(mem.id)).toBeNull();
+      expect(store.getMemoryById('10000000-0000-0000-0000-000000000099')).not.toBeNull();
+      expect(store.countMemories()).toBe(1);
+    });
   });
 });
 

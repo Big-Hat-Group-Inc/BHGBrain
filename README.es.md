@@ -77,7 +77,7 @@ graph TD
         RH["Resource Handler<br/><i>memory:// URIs</i>"]
 
         subgraph Storage["Storage Manager"]
-            subgraph SQLite["SQLite (sql.js)"]
+            subgraph SQLite["SQLite (node:sqlite)"]
                 S1["metadata"]
                 S2["fulltext (FTS)"]
                 S3["categories"]
@@ -113,7 +113,7 @@ graph TD
     class OpenAI external
 ```
 
-- **SQLite** (vía `sql.js`, en memoria con volcado atómico periódico a disco) es el **sistema de registro** para todos los metadatos de memoria, índice de búsqueda de texto completo, categorías, historial de auditoría, historial de revisiones y registros de archivo.
+- **SQLite** (vía el `DatabaseSync` nativo de `node:sqlite`, con journaling WAL y durabilidad a nivel de confirmación) es el **sistema de registro** para todos los metadatos de memoria, índice de búsqueda de texto completo, categorías, historial de auditoría, historial de revisiones y registros de archivo.
 - **Qdrant** almacena embeddings de vectores semánticos para búsqueda por similitud. Qdrant siempre se escribe después de que SQLite tiene éxito; los fallos se rastrean mediante el indicador `vector_synced` y se exponen en el endpoint de salud.
 - **OpenAI text-embedding-3-small** (por defecto, configurable) genera embeddings de 1536 dimensiones para cada memoria.
 - Las **escrituras atómicas** garantizan que los archivos de base de datos nunca se escriban parcialmente — todas las E/S de disco utilizan escritura-en-temporal-luego-renombrar.

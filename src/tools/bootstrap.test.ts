@@ -1,5 +1,4 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import initSqlJs from 'sql.js';
 import { SqliteStore } from '../storage/sqlite.js';
 import { handleTool, type ToolContext } from './index.js';
 import type { StorageManager } from '../storage/index.js';

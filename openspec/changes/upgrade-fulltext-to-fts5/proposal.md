@@ -1,3 +1,11 @@
+> **Unblocked (2026-08-29):** `migrate-sqlite-to-native-engine` has landed. The
+> `SqliteStore` engine is now `node:sqlite`'s `DatabaseSync`, whose bundled SQLite
+> build compiles FTS5 in — `probeFts5Support()` (`src/storage/sqlite.ts`) now returns
+> `true` and `SqliteStore.isFts5Available()` reflects it (verified by the flipped
+> canary in `src/storage/sqlite.test.ts`). The premise blocking this proposal's tasks
+> 1.2 onward ("the pinned sql.js dependency does not compile fts5") no longer holds;
+> its remaining 11 tasks can proceed.
+
 ## Why
 
 Despite its name, `memories_fts` is a plain table, and `fullTextSearch`

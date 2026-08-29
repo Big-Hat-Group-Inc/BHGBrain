@@ -400,6 +400,18 @@ export class StorageManager {
     await this.sqlite.reloadFromDisk();
   }
 
+  /**
+   * Activates a full replacement SQLite image (a restored backup) through
+   * `SqliteStore.activateDatabaseImage`, which closes the live connection
+   * before writing over `brain.db` — required on Windows, where a native
+   * engine's open file handle blocks a rename onto the same path. See
+   * migrate-sqlite-to-native-engine design.md "Restore must
+   * close-before-overwrite".
+   */
+  async activateSqliteImage(image: Buffer): Promise<void> {
+    await this.sqlite.activateDatabaseImage(image);
+  }
+
   markAllMemoriesVectorSync(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number {
     const affected = this.sqlite.markAllVectorsSyncState(synced, options);
     this.sqlite.flushIfDirty();
