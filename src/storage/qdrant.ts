@@ -2,10 +2,32 @@ import { QdrantClient } from '@qdrant/js-client-rest';
 import type { BrainConfig } from '../config/index.js';
 import type { CircuitBreaker } from '../resilience/index.js';
 import { CircuitOpenError } from '../resilience/index.js';
-import { internal } from '../errors/index.js';
+import { internal, invalidInput } from '../errors/index.js';
 import type { RecallFilter } from '../domain/types.js';
 
 const COLLECTION_PREFIX = 'bhgbrain_';
+
+// Only `.`/`_`/`-` plus alphanumerics may appear in an encoded segment. Raw
+// `namespace` (`^[a-zA-Z0-9/-]{1,200}$`) and `collection` (alphanumeric/hyphen
+// by convention, though its schema only enforces a length cap) inputs never
+// contain `.` or `_`, so `encodeCollectionNameSegment` below is injective
+// across the full valid input space, and the first bare `_` after an encoded
+// namespace remains unambiguously the namespace/collection separator the
+// prefix scan in `search()` relies on.
+const SAFE_COLLECTION_NAME_SEGMENT = /^[a-zA-Z0-9._-]+$/;
+
+// Qdrant's REST client embeds the collection name as a literal URL path
+// segment, so a raw `/` breaks routing instead of producing a clear error
+// (see qdrant/qdrant-client#807) — this is why a namespace like "team/project"
+// previously made every tool call fail with a bare, unhelpful INTERNAL error.
+// `.` is substituted because Qdrant's server accepts dots in real collection
+// names (qdrant/qdrant-web-ui#172 shows `create_collection(collection_name:
+// "dotted.name")` succeeding), and `.` cannot appear in raw namespace/collection
+// input, so this substitution can never collide two distinct raw values onto
+// the same encoded segment.
+function encodeCollectionNameSegment(value: string): string {
+  return value.replace(/\//g, '.');
+}
 
 // Narrows Qdrant's `ScoredPoint.vector` (unnamed dense vector | named vectors |
 // sparse | null | undefined per the client's OpenAPI types) down to the plain
@@ -45,7 +67,19 @@ export class QdrantStore {
   }
 
   private collectionName(namespace: string, collection: string): string {
-    return `${COLLECTION_PREFIX}${namespace}_${collection}`;
+    const nsSegment = encodeCollectionNameSegment(namespace);
+    const collectionSegment = encodeCollectionNameSegment(collection);
+    // Defense in depth: schema-valid input always produces a safe segment
+    // today, so this should never fire in practice. It exists to turn any
+    // future schema drift or unanticipated character into a clear
+    // INVALID_INPUT at the point of failure rather than a Qdrant-side
+    // rejection surfacing as a generic INTERNAL error further up the stack.
+    if (!SAFE_COLLECTION_NAME_SEGMENT.test(nsSegment) || !SAFE_COLLECTION_NAME_SEGMENT.test(collectionSegment)) {
+      throw invalidInput(
+        `Namespace "${namespace}" and collection "${collection}" cannot be represented as a Qdrant collection name`,
+      );
+    }
+    return `${COLLECTION_PREFIX}${nsSegment}_${collectionSegment}`;
   }
 
   async ensureCollection(namespace: string, collection: string): Promise<void> {
@@ -226,7 +260,7 @@ export class QdrantStore {
       targets = [this.collectionName(namespace, collection)];
     } else {
       const all = await this.listAllCollections();
-      const prefix = `${COLLECTION_PREFIX}${namespace}_`;
+      const prefix = `${COLLECTION_PREFIX}${encodeCollectionNameSegment(namespace)}_`;
       targets = all.filter(n => n.startsWith(prefix));
       if (targets.length === 0) return [];
     }

@@ -15,6 +15,7 @@ type MockClient = {
   getCollection?: Mock<QdrantClient['getCollection']>;
   createCollection?: Mock<QdrantClient['createCollection']>;
   createPayloadIndex?: Mock<QdrantClient['createPayloadIndex']>;
+  upsert?: Mock<QdrantClient['upsert']>;
 };
 
 function createStore(
@@ -104,6 +105,68 @@ describe('QdrantStore.search collection fan-out', () => {
     const store = createStore(client);
     const results = await store.search('global', 'work', [1, 2, 3], 10);
     expect(results).toEqual([{ id: 'w1', score: 0.9, payload: { namespace: 'global' } }]);
+  });
+});
+
+describe('QdrantStore namespace/collection name encoding (slash safety)', () => {
+  // fix-namespace-slash-collection-naming: `namespace` values may legally
+  // contain `/` per the tool schema pattern (`^[a-zA-Z0-9/-]{1,200}$`), but a
+  // raw `/` breaks Qdrant's REST client because the collection name is used
+  // as a literal URL path segment (qdrant/qdrant-client#807). These guard the
+  // fix's three required properties: it works, it can't collide two distinct
+  // namespaces onto the same collection, and it can't make a short namespace
+  // false-positive prefix-match a longer, related one during fan-out search.
+  it('resolves a slash-containing namespace to a valid collection name on write', async () => {
+    const upsert = vi.fn<QdrantClient['upsert']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => ({}) as never),
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex: vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never),
+      upsert,
+    };
+    const store = createStore(client);
+
+    await store.upsert('test/mcp-verify', 'general', 'id-1', [1, 2, 3], { content: 'x' });
+
+    expect(upsert).toHaveBeenCalledWith(
+      'bhgbrain_test.mcp-verify_general',
+      expect.objectContaining({ points: expect.any(Array) }),
+    );
+  });
+
+  it('does not collide a literal-hyphen namespace with a slash-containing one', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+
+    await store.searchSimilar('a-b', 'work', [1, 2, 3], 5);
+    await store.searchSimilar('a/b', 'work', [1, 2, 3], 5);
+
+    const [nameForLiteralHyphen, nameForSlash] = client.query.mock.calls.map(c => c[0]);
+    expect(nameForLiteralHyphen).not.toBe(nameForSlash);
+  });
+
+  it('does not let a namespace false-positive prefix-match a longer, related namespace during fan-out', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(async () => ({
+        collections: [
+          { name: 'bhgbrain_a_general' }, // namespace "a"
+          { name: 'bhgbrain_a.b_general' }, // namespace "a/b" — must stay distinct
+        ],
+      })),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+
+    await store.search('a', undefined, [1, 2, 3], 10);
+
+    const searched = client.query.mock.calls.map(c => c[0]);
+    expect(searched).toContain('bhgbrain_a_general');
+    expect(searched).not.toContain('bhgbrain_a.b_general');
   });
 });
 
