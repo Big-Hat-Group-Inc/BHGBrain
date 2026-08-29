@@ -277,6 +277,77 @@ describe('pipeline extraction config (add-multi-candidate-extraction)', () => {
   });
 });
 
+describe('pipeline.long_content_threshold_chars config (add-long-content-chunking)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to 8000 when omitted from config.json', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.long_content_threshold_chars).toBe(8000);
+  });
+
+  it('accepts an explicit override', () => {
+    const configPath = writeConfig({
+      pipeline: { long_content_threshold_chars: 20000 },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.long_content_threshold_chars).toBe(20000);
+  });
+
+  it('rejects zero', () => {
+    const configPath = writeConfig({
+      pipeline: { long_content_threshold_chars: 0 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a negative value', () => {
+    const configPath = writeConfig({
+      pipeline: { long_content_threshold_chars: -1 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a non-integer value', () => {
+    const configPath = writeConfig({
+      pipeline: { long_content_threshold_chars: 100.5 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a value above 100000', () => {
+    const configPath = writeConfig({
+      pipeline: { long_content_threshold_chars: 100001 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
 const ENV_KEYS = [
   'BHGBRAIN_DATA_DIR',
   'BHGBRAIN_HTTP_HOST',

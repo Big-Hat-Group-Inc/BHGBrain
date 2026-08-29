@@ -804,7 +804,10 @@ describe('handleRecall filter pushdown and score semantics (push-down-recall-fil
 describe('remember tool multi-candidate response shape', () => {
   function makeCtx(process: ReturnType<typeof vi.fn>): ToolContext {
     return {
-      config: { device: { id: 'local-device' } } as unknown as ToolContext['config'],
+      config: {
+        device: { id: 'local-device' },
+        pipeline: { long_content_threshold_chars: 8000 },
+      } as unknown as ToolContext['config'],
       storage: { sqlite: { countMemories: vi.fn(() => 3) } } as unknown as StorageManager,
       embedding: {} as EmbeddingProvider,
       pipeline: { process } as unknown as WritePipeline,
@@ -841,5 +844,80 @@ describe('remember tool multi-candidate response shape', () => {
 
     expect(Array.isArray(result)).toBe(false);
     expect(result.id).toBe('a');
+  });
+});
+
+// add-long-content-chunking: `handleRemember` rejects content over
+// `config.pipeline.long_content_threshold_chars` before ever calling
+// `ctx.pipeline.process`, so nothing is embedded or written for over-threshold
+// content.
+describe('remember long-content threshold guard', () => {
+  function makeCtx(process: ReturnType<typeof vi.fn>, thresholdChars: number): ToolContext {
+    return {
+      config: {
+        device: { id: 'local-device' },
+        pipeline: { long_content_threshold_chars: thresholdChars },
+      } as unknown as ToolContext['config'],
+      storage: { sqlite: { countMemories: vi.fn(() => 0) } } as unknown as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: { process } as unknown as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('rejects content over the default 8000-char threshold with INVALID_INPUT and never calls the pipeline', async () => {
+    const process = vi.fn(async () => [
+      { id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' },
+    ]);
+    const ctx = makeCtx(process, 8000);
+    const content = 'x'.repeat(8001);
+
+    const result = await handleTool(ctx, 'remember', { content }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(result.error.message).toContain('import');
+    expect(process).not.toHaveBeenCalled();
+  });
+
+  it('accepts content exactly at the threshold', async () => {
+    const process = vi.fn(async () => [
+      { id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' },
+    ]);
+    const ctx = makeCtx(process, 8000);
+    const content = 'x'.repeat(8000);
+
+    const result = await handleTool(ctx, 'remember', { content }, 'c1') as { id: string };
+
+    expect(process).toHaveBeenCalledTimes(1);
+    expect(result.id).toBe('a');
+  });
+
+  it('accepts content comfortably under the threshold', async () => {
+    const process = vi.fn(async () => [
+      { id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' },
+    ]);
+    const ctx = makeCtx(process, 8000);
+
+    const result = await handleTool(ctx, 'remember', { content: 'short content' }, 'c1') as { id: string };
+
+    expect(process).toHaveBeenCalledTimes(1);
+    expect(result.id).toBe('a');
+  });
+
+  it('honors a custom pipeline.long_content_threshold_chars instead of a hardcoded constant', async () => {
+    const process = vi.fn(async () => [
+      { id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' },
+    ]);
+    const ctx = makeCtx(process, 100);
+    const content = 'x'.repeat(101);
+
+    const result = await handleTool(ctx, 'remember', { content }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(process).not.toHaveBeenCalled();
   });
 });

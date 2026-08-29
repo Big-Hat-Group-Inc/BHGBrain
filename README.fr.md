@@ -2318,6 +2318,8 @@ Stocke du contenu dans BHGBrain avec déduplication automatique, normalisation, 
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | Non | `"cli"` | Source du souvenir. Affecte le niveau par défaut (ex. agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | Non | auto-attribué | Remplacement de niveau explicite. Prend le dessus sur toutes les heuristiques. |
 
+**Le contenu long est rejeté, pas transformé silencieusement en « vecteur bouillie » :** le contenu plus long que `pipeline.long_content_threshold_chars` (configuration, valeur par défaut `8 000` caractères ≈ 1–2 pages) est rejeté avec une erreur `INVALID_INPUT` indiquant le nombre de caractères, le seuil, et la solution : appelez `import` avec `format: "freeform"` à la place, ou divisez le contenu en plusieurs appels `remember` plus petits. Ceci est intentionnel : intégrer plusieurs milliers de mots en un seul vecteur produit un « vecteur bouillie » de mauvaise qualité qui correspond faiblement à de nombreuses requêtes non liées plutôt que fortement à une seule. Le plafond absolu de 100 000 caractères du tableau ci-dessus s'applique toujours, mais `long_content_threshold_chars` est la limite que les appelants atteindront en premier.
+
 **Sortie :**
 
 ```json

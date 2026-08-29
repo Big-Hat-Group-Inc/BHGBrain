@@ -2261,6 +2261,8 @@ BHGBrain 暴露 11 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | 否 | `"cli"` | 记忆来源。影响默认层级（例如 agent+procedural → T1）。 |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | 否 | 自动分配 | 显式层级覆盖。优先于所有启发式规则。 |
 
+**超长内容会被拒绝，而不是被静默嵌入为低质量的"糊状向量"：** 超过 `pipeline.long_content_threshold_chars`（配置项，默认 `8,000` 字符，约 1–2 页）的内容会被拒绝，并返回 `INVALID_INPUT` 错误，其中说明了实际字符数、配置的阈值以及解决方法：改用 `format: "freeform"` 调用 `import` 工具，或将内容拆分为多次较小的 `remember` 调用。这是有意为之：将数千字的文本嵌入为单个向量会产生低质量的"糊状向量"，它会与许多不相关的查询产生弱匹配，而不是与某一个查询产生强匹配。上表中 100,000 字符的硬性上限仍然适用，作为绝对上限，但调用者实际会先触及 `long_content_threshold_chars` 这一限制。
+
 **输出：**
 
 ```json

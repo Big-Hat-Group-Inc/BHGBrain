@@ -2313,6 +2313,8 @@ Inhalt in BHGBrain mit automatischer Deduplizierung, Normalisierung, Einbettung 
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | Nein | `"cli"` | Quelle der Erinnerung. Beeinflusst die Standard-Stufe (z. B. agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | Nein | automatisch zugewiesen | Explizite Stufenüberschreibung. Hat Vorrang vor allen Heuristiken. |
 
+**Lange Inhalte werden abgelehnt, nicht stillschweigend zu einem „Mush-Vektor" verarbeitet:** Inhalte, die länger sind als `pipeline.long_content_threshold_chars` (Konfiguration, Standard `8.000` Zeichen ≈ 1–2 Seiten), werden mit einem `INVALID_INPUT`-Fehler abgelehnt, der die Zeichenanzahl, den Schwellenwert und die Lösung nennt: Verwenden Sie stattdessen das `import`-Tool mit `format: "freeform"`, oder teilen Sie den Inhalt in mehrere `remember`-Aufrufe auf. Dies ist beabsichtigt: Die Einbettung mehrerer tausend Wörter als einzelner Vektor erzeugt einen minderwertigen „Mush-Vektor", der viele unterschiedliche Anfragen schwach statt einer Anfrage präzise trifft. Die Obergrenze von 100.000 Zeichen aus der Tabelle oben gilt weiterhin als absolutes Maximum, aber `long_content_threshold_chars` ist die Grenze, auf die Aufrufer zuerst stoßen.
+
 **Ausgabe:**
 
 ```json

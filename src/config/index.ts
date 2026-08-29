@@ -241,6 +241,13 @@ const ConfigSchema = z.object({
     // Enforced via AbortController on the chat-completions fetch.
     extraction_timeout_ms: z.number().int().positive().default(4000),
     fallback_to_threshold_dedup: z.boolean().default(true),
+    // `remember` rejects content longer than this (add-long-content-chunking) —
+    // long unsplit text embeds as one low-quality "mush vector"; callers should
+    // use `import` with `format: "freeform"` instead, which chunks by heading/
+    // paragraph boundaries and embeds each chunk independently. Capped at the
+    // `remember` content schema's own ceiling (`ContentSchema.max(100000)` in
+    // `src/domain/schemas.ts`) since a threshold above that can never trigger.
+    long_content_threshold_chars: z.number().int().positive().max(100000).default(8000),
     // Opt-in LLM entailment check for UPDATE-band writes that don't already
     // trip the regex-based `detectsInvalidation` fast path (see
     // `add-contradiction-detection`). Reuses `extraction_model` /

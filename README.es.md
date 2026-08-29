@@ -2315,6 +2315,8 @@ Almacena contenido en BHGBrain con deduplicación automática, normalización, e
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | No | `"cli"` | Fuente de la memoria. Afecta al nivel predeterminado (p.ej., agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | No | auto-asignado | Anulación explícita del nivel. Tiene precedencia sobre todas las heurísticas. |
 
+**El contenido largo se rechaza, no se convierte silenciosamente en un "vector mush":** el contenido más largo que `pipeline.long_content_threshold_chars` (configuración, predeterminado `8.000` caracteres ≈ 1–2 páginas) se rechaza con un error `INVALID_INPUT` que indica el recuento de caracteres, el umbral y la solución: llame a `import` con `format: "freeform"` en su lugar, o divida el contenido en llamadas `remember` más pequeñas. Esto es intencional: incrustar varios miles de palabras como un solo vector produce un "vector mush" de baja calidad que coincide débilmente con muchas consultas no relacionadas en lugar de coincidir fuertemente con una sola. El límite absoluto de 100.000 caracteres de la tabla anterior sigue aplicándose como techo absoluto, pero `long_content_threshold_chars` es el límite que los llamantes alcanzarán primero.
+
 **Salida:**
 
 ```json

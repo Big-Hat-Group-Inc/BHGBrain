@@ -135,6 +135,23 @@ async function handleRemember(
 ): Promise<WriteResult | WriteResult[]> {
   const input = parseInput(RememberInputSchema, args);
   logCtx.namespace = input.namespace;
+
+  // Long-content guard (add-long-content-chunking): only `remember` passes raw,
+  // unchunked caller content into the pipeline — `import` and `bootstrap` already
+  // pre-split their candidates, so this check is deliberately scoped here rather
+  // than inside `WritePipeline.process`. Content strictly over the threshold is
+  // rejected before any embedding call or pipeline invocation; content at or under
+  // it is unaffected.
+  const threshold = ctx.config.pipeline.long_content_threshold_chars;
+  if (input.content.length > threshold) {
+    throw invalidInput(
+      `Content is ${input.content.length} characters, which exceeds the ` +
+      `${threshold}-character limit for remember. Use the import tool with ` +
+      `format: "freeform" to store long content as chunked, independently-embedded ` +
+      `memories, or split this content into smaller remember calls.`,
+    );
+  }
+
   const results = await ctx.pipeline.process({
     content: input.content,
     namespace: input.namespace,

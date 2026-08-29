@@ -2388,6 +2388,17 @@ Store content in BHGBrain with automatic deduplication, normalization, embedding
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | No | `"cli"` | Source of the memory. Affects default tier (e.g., agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | No | auto-assigned | Explicit tier override. Takes precedence over all heuristics. |
 
+**Long content is rejected, not silently mush-embedded:** content longer than
+`pipeline.long_content_threshold_chars` (config, default `8,000` characters ≈ 1–2
+pages) is rejected with an `INVALID_INPUT` error naming the character count, the
+threshold, and the fix — call [`import`](#import---bulk-profile-import) with
+`format: "freeform"` instead, or split the content into smaller `remember` calls. This
+is intentional: embedding several thousand words as a single vector produces a
+low-quality "mush vector" that matches many unrelated queries weakly instead of any one
+query strongly. The 100,000-character hard cap in the table above still applies as an
+absolute ceiling, but `long_content_threshold_chars` is the limit callers will actually
+hit first.
+
 **Output:**
 
 ```json
@@ -2795,6 +2806,7 @@ Import a structured profile or freeform document as discrete memories in one sho
 - Deduplication applies via the existing write pipeline — safe to re-import.
 - `dry_run: true` returns memory previews with zero writes.
 - Headings numbered outside the 10 storage-mapped sections (e.g. a document written against an older 12-section template) are not silently dropped — their numbers are reported in `sections_ignored` so you know content was skipped instead of losing it without notice.
+- If [`remember`](#remember---store-a-memory) rejected your content for exceeding `pipeline.long_content_threshold_chars`, use `import` with `format: "freeform"` here instead — it splits the document by heading/paragraph boundaries and embeds each chunk independently, avoiding the single mush-vector problem `remember`'s threshold guards against.
 
 ---
 
