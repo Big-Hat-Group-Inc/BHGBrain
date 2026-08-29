@@ -46,12 +46,13 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
 13. [Health & Metrics](#health--metrics)
 14. [Security](#security)
 15. [MCP Resources](#mcp-resources)
-16. [Onboarding](#onboarding)
-17. [CLI Reference](#cli-reference)
-18. [MCP Tools Reference](#mcp-tools-reference)
-19. [Docker](#docker)
-20. [Upgrading](#upgrading)
-21. [Behavior Notes](#behavior-notes)
+16. [MCP Prompts](#mcp-prompts)
+17. [Onboarding](#onboarding)
+18. [CLI Reference](#cli-reference)
+19. [MCP Tools Reference](#mcp-tools-reference)
+20. [Docker](#docker)
+21. [Upgrading](#upgrading)
+22. [Behavior Notes](#behavior-notes)
 
 ---
 
@@ -2123,6 +2124,19 @@ BHGBrain exposes MCP resources (readable via `ReadResource`) in addition to tool
 | `category://{name}` | Category | Full category content by name |
 | `collection://{name}` | Collection | Memories in a specific collection |
 
+### Resource List Change Notifications
+
+BHGBrain declares the `resources.listChanged` MCP capability. After a `collections`
+call with `action: "create"` or `"delete"`, or a `category` call with `action: "set"`
+or `"delete"`, succeeds, the server sends a `notifications/resources/list_changed`
+notification so a connected client knows `collection://list` / `category://list`
+changed instead of relying on a stale cached copy. Read actions (`list`, `get`) and
+failed mutations never trigger a notification; plain memory writes (`remember`,
+`forget`, etc.) don't either — `memory://list` churns too often per call for the
+notification to be useful there. This notification is sent over the stdio transport
+only (one long-lived `Server` per stdio connection); it is not wired to the
+per-session Streamable HTTP `/mcp` connections.
+
 ### `memory://list` - Paginated Memory Listing
 
 Query parameters:
@@ -2220,6 +2234,35 @@ Response:
 ```
 
 To read this from a stdio client that lacks resource support, use the `revisions` tool's `list` action instead (same data — see [MCP Tools Reference](#mcp-tools-reference)).
+
+---
+
+## MCP Prompts
+
+BHGBrain declares the `prompts` MCP capability and serves two prompts via `ListPrompts`/`GetPrompt`, alongside its tools and resources:
+
+| Prompt | Arguments | Description |
+|---|---|---|
+| `bootstrap-interview` | `section` (optional, `1`-`10`) | Drives the [bootstrap interview](#option-1-interactive-bootstrap-tool-recommended) via the `bootstrap` tool. Omit `section` for an overview of every section; specify it to jump straight to that section's questions. An out-of-range or non-integer `section` is rejected as a JSON-RPC InvalidParams error. |
+| `session-context` | `hint` (optional) | Returns the same budgeted [`memory://inject`](#memoryinject---session-context-injection) (or `memory://inject/{hint}` when `hint` is given) context block as a single prompt message, for priming a new session with relevant memories and policy categories. |
+
+Both prompts return a single `user`-role text message. For clients without prompt
+support, the same functionality is reachable directly through the `bootstrap` tool and
+the `memory://inject` resource, respectively — the prompts are a discoverability
+layer, not new behavior.
+
+Example:
+
+```json
+// List available prompts
+{ "method": "prompts/list" }
+
+// Jump straight to section 3 of the bootstrap interview
+{ "method": "prompts/get", "params": { "name": "bootstrap-interview", "arguments": { "section": "3" } } }
+
+// Get the session context block, biased toward a topic
+{ "method": "prompts/get", "params": { "name": "session-context", "arguments": { "hint": "deploy to production" } } }
+```
 
 ---
 
@@ -2368,6 +2411,23 @@ BHGBrain exposes 13 MCP tools. All tools validate input with Zod schemas and ret
 }
 ```
 
+**Titles and annotations:** every tool declares a human-readable `title` and MCP
+behavioral `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`, and
+`openWorldHint: false` — every tool operates on the local store, never an open
+external domain). `recall` and `search` are `readOnlyHint: true` and omit
+`destructiveHint`/`idempotentHint` (meaningless per spec once `readOnlyHint` is set).
+`forget`, `collections`, `category`, `backup`, and `revisions` declare
+`destructiveHint: true`. This means a spec-compliant client no longer treats every
+read as being exactly as dangerous as a delete, which is what happens under the MCP
+spec's defaults (`readOnlyHint: false`, `destructiveHint: true`) when a tool omits
+annotations entirely.
+
+**outputSchema:** `recall`, `search`, and `remember` declare an `outputSchema`
+describing their `structuredContent` shape (mirroring the `SearchResult`/
+`WriteResult` types), so MCP clients can validate results instead of only
+JSON-parsing the text block. The other ten tools' result shapes are action-dependent
+and are not yet schema-described.
+
 ---
 
 ### `remember` - Store a Memory
@@ -2410,6 +2470,16 @@ hit first.
   "created_at": "2026-03-15T12:00:00Z"
 }
 ```
+
+> **MCP envelope note (since v1.17.0):** the object/array shown above (and in the
+> multi-candidate example below) is what `handleRemember` returns internally and
+> exactly what `POST /tool/:name` (REST) still returns. Over the **MCP transport**
+> (stdio and Streamable HTTP `/mcp`), the `CallTool` response normalizes a successful
+> result to `{ "results": [...] }` — a one-element array for a single candidate,
+> multiple elements when multi-candidate extraction splits content — both in
+> `structuredContent` and the JSON text block, so a single `outputSchema` can describe
+> both cases. A brittle MCP-side parser expecting the bare object must be updated to
+> read `results[0]` (or iterate `results`); REST clients are unaffected.
 
 `operation` is one of:
 - `ADD` - new memory created

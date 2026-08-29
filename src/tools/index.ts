@@ -33,6 +33,12 @@ export interface ToolContext {
   health: HealthService;
   metrics: MetricsCollector;
   logger: pino.Logger;
+  // Fires after a successful collection create/delete or category set/delete
+  // so a connected MCP client can be told `collection://list` /
+  // `category://list` changed (task 5.1). Wired only by the stdio transport
+  // to `server.sendResourceListChanged()` (fire-and-forget, errors logged at
+  // debug); left `undefined` on the REST path, where it is a no-op.
+  notifyResourceListChanged?: () => void;
 }
 
 // Mutable out-param populated by tool handlers as soon as they resolve the
@@ -489,6 +495,7 @@ async function handleCollections(
         ctx.embedding.model, ctx.embedding.dimensions,
       );
       ctx.storage.sqlite.flushIfDirty();
+      ctx.notifyResourceListChanged?.();
       return { ok: true, namespace, name: input.name };
 
     case 'delete':
@@ -518,6 +525,7 @@ async function handleCollections(
       ctx.storage.sqlite.flushIfDirty();
 
       ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
+      ctx.notifyResourceListChanged?.();
       return { ok: true, namespace, name: input.name, deleted_memory_count: deletedMemoryCount };
   }
 }
@@ -547,6 +555,7 @@ async function handleCategory(ctx: ToolContext, args: unknown): Promise<unknown>
       const slot = input.slot ?? 'custom';
       const result = ctx.storage.sqlite.setCategory(input.name, slot, input.content);
       ctx.storage.sqlite.flushIfDirty();
+      ctx.notifyResourceListChanged?.();
       return result;
     }
 
@@ -555,6 +564,7 @@ async function handleCategory(ctx: ToolContext, args: unknown): Promise<unknown>
       const removed = ctx.storage.sqlite.deleteCategory(input.name);
       if (!removed) throw notFound(`Category "${input.name}" not found`);
       ctx.storage.sqlite.flushIfDirty();
+      ctx.notifyResourceListChanged?.();
       return { ok: true, name: input.name };
     }
   }

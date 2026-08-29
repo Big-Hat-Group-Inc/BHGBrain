@@ -921,3 +921,121 @@ describe('remember long-content threshold guard', () => {
     expect(process).not.toHaveBeenCalled();
   });
 });
+
+describe('notifyResourceListChanged hook (complete-mcp-protocol-surface task 5.3)', () => {
+  function createCtx(notify?: ReturnType<typeof vi.fn>): ToolContext {
+    return {
+      config: {} as ToolContext['config'],
+      storage: {
+        sqlite: {
+          listCollections: vi.fn(() => []),
+          createCollection: vi.fn(),
+          flushIfDirty: vi.fn(),
+          getCollection: vi.fn(() => ({ name: 'general' })),
+          deleteCollection: vi.fn(() => true),
+          countMemories: vi.fn(() => 0),
+          listCategories: vi.fn(() => []),
+          getCategory: vi.fn(() => ({ name: 'x', slot: 'custom', content: 'c', revision: 1 })),
+          setCategory: vi.fn(() => ({ name: 'x', slot: 'custom', revision: 1 })),
+          deleteCategory: vi.fn(() => true),
+        },
+        countMemoriesInCollection: vi.fn(() => 0),
+        deleteCollectionData: vi.fn(async () => ({ deleted: 0, ids: [] })),
+        logAudit: vi.fn(),
+      } as unknown as StorageManager,
+      embedding: { model: 'm', dimensions: 1 } as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } as unknown as pino.Logger,
+      notifyResourceListChanged: notify,
+    };
+  }
+
+  it('fires exactly once on collections create', async () => {
+    const notify = vi.fn();
+    const ctx = createCtx(notify);
+
+    await handleTool(ctx, 'collections', { action: 'create', namespace: 'global', name: 'new-col' }, 'c1');
+
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires exactly once on collections delete', async () => {
+    const notify = vi.fn();
+    const ctx = createCtx(notify);
+
+    await handleTool(ctx, 'collections', { action: 'delete', namespace: 'global', name: 'general' }, 'c1');
+
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires exactly once on category set', async () => {
+    const notify = vi.fn();
+    const ctx = createCtx(notify);
+
+    await handleTool(ctx, 'category', { action: 'set', name: 'x', content: 'hello' }, 'c1');
+
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires exactly once on category delete', async () => {
+    const notify = vi.fn();
+    const ctx = createCtx(notify);
+
+    await handleTool(ctx, 'category', { action: 'delete', name: 'x' }, 'c1');
+
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not fire on collections list (read action)', async () => {
+    const notify = vi.fn();
+    const ctx = createCtx(notify);
+
+    await handleTool(ctx, 'collections', { action: 'list', namespace: 'global' }, 'c1');
+
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('does not fire on category list/get (read actions)', async () => {
+    const notify = vi.fn();
+    const ctx = createCtx(notify);
+
+    await handleTool(ctx, 'category', { action: 'list' }, 'c1');
+    await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1');
+
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('does not fire when a collections delete fails (non-empty, no force)', async () => {
+    const notify = vi.fn();
+    const ctx = createCtx(notify);
+    (ctx.storage.countMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue(3);
+
+    const result = await handleTool(ctx, 'collections', { action: 'delete', namespace: 'global', name: 'general' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('CONFLICT');
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('does not fire when a category delete fails (not found)', async () => {
+    const notify = vi.fn();
+    const ctx = createCtx(notify);
+    (ctx.storage.sqlite.deleteCategory as ReturnType<typeof vi.fn>).mockReturnValue(false);
+
+    const result = await handleTool(ctx, 'category', { action: 'delete', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('NOT_FOUND');
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op when the hook is absent (REST path)', async () => {
+    const ctx = createCtx(undefined);
+
+    const result = await handleTool(ctx, 'collections', { action: 'create', namespace: 'global', name: 'new-col' }, 'c1');
+
+    expect((result as { ok: boolean }).ok).toBe(true);
+  });
+});

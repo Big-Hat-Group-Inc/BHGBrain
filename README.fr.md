@@ -46,11 +46,12 @@ BHGBrain stocke les souvenirs dans SQLite (métadonnées + recherche plein texte
 13. [Santé et métriques](#santé-et-métriques)
 14. [Sécurité](#sécurité)
 15. [Ressources MCP](#ressources-mcp)
-16. [Prompt d'amorçage](#prompt-damorçage)
-17. [Référence CLI](#référence-cli)
-18. [Référence des outils MCP](#référence-des-outils-mcp)
-19. [Mise à jour](#mise-à-jour)
-20. [Notes de comportement](#notes-de-comportement)
+16. [Prompts MCP](#prompts-mcp)
+17. [Prompt d'amorçage](#prompt-damorçage)
+18. [Référence CLI](#référence-cli)
+19. [Référence des outils MCP](#référence-des-outils-mcp)
+20. [Mise à jour](#mise-à-jour)
+21. [Notes de comportement](#notes-de-comportement)
 
 ---
 
@@ -2079,6 +2080,21 @@ BHGBrain expose des ressources MCP (lisibles via `ReadResource`) en plus des out
 | `category://{name}` | Catégorie | Contenu complet de la catégorie par nom |
 | `collection://{name}` | Collection | Souvenirs dans une collection spécifique |
 
+### Notifications de changement de liste de ressources (list_changed)
+
+BHGBrain déclare la capacité MCP `resources.listChanged`. Après le succès d'un
+appel `collections` avec `action: "create"` ou `"delete"`, ou d'un appel `category`
+avec `action: "set"` ou `"delete"`, le serveur envoie une notification
+`notifications/resources/list_changed` afin qu'un client connecté sache que
+`collection://list` / `category://list` a changé, plutôt que de se fier à une copie
+en cache obsolète. Les actions de lecture (`list`, `get`) et les mutations
+échouées ne déclenchent jamais de notification ; les écritures de souvenirs
+simples (`remember`, `forget`, etc.) non plus — `memory://list` change trop souvent
+par appel pour que la notification y soit utile. Cette notification n'est envoyée
+que via le transport stdio (un `Server` unique à durée de vie longue par connexion
+stdio) ; elle n'est pas connectée aux connexions par session du transport
+Streamable HTTP `/mcp`.
+
 ### `memory://list` — Liste paginée des souvenirs
 
 Paramètres de requête :
@@ -2180,6 +2196,36 @@ Réponse :
 ```
 
 Pour un client stdio sans support des ressources, utilisez plutôt l'action `list` de l'outil `revisions` (mêmes données — voir [Référence des outils MCP](#référence-des-outils-mcp)).
+
+---
+
+## Prompts MCP
+
+BHGBrain déclare la capacité MCP `prompts` et sert deux prompts via
+`ListPrompts`/`GetPrompt`, aux côtés de ses outils et ressources :
+
+| Prompt | Arguments | Description |
+|---|---|---|
+| `bootstrap-interview` | `section` (optionnel, `1`–`10`) | Guide l'entretien d'amorçage via l'outil `bootstrap`. Omettre `section` donne un aperçu de toutes les sections ; la préciser saute directement aux questions de cette section. Une `section` hors limites ou non entière est rejetée comme une erreur JSON-RPC InvalidParams. |
+| `session-context` | `hint` (optionnel) | Renvoie le même bloc de contexte budgété `memory://inject` (ou `memory://inject/{hint}` si `hint` est fourni) sous forme d'un unique message de prompt, pour préparer une nouvelle session. |
+
+Les deux prompts renvoient un unique message de rôle `user`. Pour les clients sans
+support des prompts, la même fonctionnalité reste accessible directement via
+l'outil `bootstrap` et la ressource `memory://inject` respectivement — les prompts
+sont une couche de découvrabilité, pas un nouveau comportement.
+
+Exemple :
+
+```json
+// Lister les prompts disponibles
+{ "method": "prompts/list" }
+
+// Sauter directement à la section 3 de l'entretien d'amorçage
+{ "method": "prompts/get", "params": { "name": "bootstrap-interview", "arguments": { "section": "3" } } }
+
+// Obtenir le bloc de contexte de session, orienté vers un sujet
+{ "method": "prompts/get", "params": { "name": "session-context", "arguments": { "hint": "deploy to production" } } }
+```
 
 ---
 
@@ -2298,6 +2344,25 @@ BHGBrain expose 11 outils MCP. Tous les outils valident les entrées avec des sc
 }
 ```
 
+**Titres et annotations :** chaque outil déclare un `title` lisible par l'humain et
+des `annotations` de comportement MCP (`readOnlyHint`, `destructiveHint`,
+`idempotentHint` et `openWorldHint: false` — chaque outil opère sur le stockage
+local, jamais sur un domaine externe ouvert). `recall` et `search` sont
+`readOnlyHint: true` et omettent `destructiveHint`/`idempotentHint` (dénués de sens
+selon la spécification une fois `readOnlyHint` activé). `forget`, `collections`,
+`category`, `backup` et `revisions` déclarent `destructiveHint: true`. Cela signifie
+qu'un client conforme à la spécification ne traite plus chaque lecture comme aussi
+dangereuse qu'une suppression — ce qui se produit sous les valeurs par défaut de la
+spécification MCP (`readOnlyHint: false`, `destructiveHint: true`) lorsqu'un outil
+omet complètement les annotations.
+
+**outputSchema :** `recall`, `search` et `remember` déclarent un `outputSchema`
+décrivant la forme de leur `structuredContent` (reflétant les types
+`SearchResult`/`WriteResult`), afin que les clients MCP puissent valider les
+résultats au lieu de simplement analyser le bloc de texte en JSON. Les formes de
+résultat des dix autres outils dépendent de l'action et ne sont pas encore décrites
+par un schéma.
+
 ---
 
 ### `remember` — Stocker un souvenir
@@ -2331,6 +2396,17 @@ Stocke du contenu dans BHGBrain avec déduplication automatique, normalisation, 
   "created_at": "2026-03-15T12:00:00Z"
 }
 ```
+
+> **Note sur l'enveloppe MCP (depuis v1.17.0) :** l'objet/tableau montré ci-dessus
+> (et dans l'exemple multi-candidats ci-dessous) est ce que `handleRemember` renvoie
+> en interne, et exactement ce que `POST /tool/:name` (REST) continue de renvoyer.
+> Sur le **transport MCP** (stdio et Streamable HTTP `/mcp`), la réponse `CallTool`
+> normalise un résultat réussi en `{ "results": [...] }` — un tableau à un élément
+> pour un seul candidat, plusieurs éléments lorsque l'extraction multi-candidats
+> divise le contenu — à la fois dans `structuredContent` et dans le bloc de texte
+> JSON, afin qu'un seul `outputSchema` puisse décrire les deux cas. Un analyseur
+> côté MCP fragile qui attend l'objet nu doit être mis à jour pour lire
+> `results[0]` (ou itérer sur `results`) ; les clients REST ne sont pas affectés.
 
 `operation` est l'un des suivants :
 - `ADD` — nouveau souvenir créé

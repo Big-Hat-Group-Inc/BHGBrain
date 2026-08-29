@@ -46,13 +46,15 @@ src/
 ├── search/               # Hybrid semantic + fulltext search
 ├── tools/                # MCP tool handlers and schemas
 ├── resources/            # MCP resource handlers
+├── prompts/              # MCP prompts (bootstrap-interview, session-context)
 ├── transport/            # HTTP server and middleware
 ├── health/               # Health checks, metrics, logging
 ├── backup/               # Backup/restore with retention
 ├── errors/               # Error handling utilities
 ├── domain/               # Domain logic (normalization, schemas)
 ├── resilience/           # Circuit breakers for external dependencies
-└── cli/                  # CLI entry point
+├── cli/                  # CLI entry point
+└── version.ts            # PACKAGE_VERSION read from package.json at startup
 ```
 
 ## Key Design Patterns

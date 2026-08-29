@@ -46,11 +46,12 @@ BHGBrain almacena memorias en SQLite (metadatos + búsqueda de texto completo) y
 13. [Salud y Métricas](#salud-y-métricas)
 14. [Seguridad](#seguridad)
 15. [Recursos MCP](#recursos-mcp)
-16. [Prompt de Bootstrap](#prompt-de-bootstrap)
-17. [Referencia de la CLI](#referencia-de-la-cli)
-18. [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)
-19. [Actualización](#actualización)
-20. [Notas de Comportamiento](#notas-de-comportamiento)
+16. [Prompts MCP](#prompts-mcp)
+17. [Prompt de Bootstrap](#prompt-de-bootstrap)
+18. [Referencia de la CLI](#referencia-de-la-cli)
+19. [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)
+20. [Actualización](#actualización)
+21. [Notas de Comportamiento](#notas-de-comportamiento)
 
 ---
 
@@ -2075,6 +2076,21 @@ BHGBrain expone recursos MCP (legibles vía `ReadResource`) además de las herra
 | `category://{name}` | Categoría | Contenido completo de categoría por nombre |
 | `collection://{name}` | Colección | Memorias en una colección específica |
 
+### Notificaciones de Cambio de Lista de Recursos (list_changed)
+
+BHGBrain declara la capacidad MCP `resources.listChanged`. Después de que una
+llamada a `collections` con `action: "create"` o `"delete"`, o una llamada a
+`category` con `action: "set"` o `"delete"`, tenga éxito, el servidor envía una
+notificación `notifications/resources/list_changed` para que un cliente conectado
+sepa que `collection://list` / `category://list` cambió, en lugar de confiar en una
+copia en caché obsoleta. Las acciones de lectura (`list`, `get`) y las mutaciones
+fallidas nunca disparan una notificación; las escrituras de memoria simples
+(`remember`, `forget`, etc.) tampoco — `memory://list` cambia con demasiada
+frecuencia por llamada para que la notificación sea útil ahí. Esta notificación se
+envía solo por el transporte stdio (un único `Server` de larga vida por conexión
+stdio); no está conectada a las conexiones por sesión del transporte Streamable
+HTTP `/mcp`.
+
 ### `memory://list` — Listado Paginado de Memorias
 
 Parámetros de consulta:
@@ -2176,6 +2192,36 @@ Respuesta:
 ```
 
 Para un cliente stdio sin soporte de recursos, use en su lugar la acción `list` de la herramienta `revisions` (los mismos datos — ver [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)).
+
+---
+
+## Prompts MCP
+
+BHGBrain declara la capacidad MCP `prompts` y sirve dos prompts vía
+`ListPrompts`/`GetPrompt`, junto a sus herramientas y recursos:
+
+| Prompt | Argumentos | Descripción |
+|---|---|---|
+| `bootstrap-interview` | `section` (opcional, `1`–`10`) | Guía la entrevista de bootstrap a través de la herramienta `bootstrap`. Omitir `section` da una visión general de todas las secciones; especificarla salta directamente a las preguntas de esa sección. Una `section` fuera de rango o no entera se rechaza como un error JSON-RPC InvalidParams. |
+| `session-context` | `hint` (opcional) | Devuelve el mismo bloque de contexto `memory://inject` (o `memory://inject/{hint}` cuando se da `hint`) con presupuesto, como un único mensaje de prompt, para preparar una nueva sesión. |
+
+Ambos prompts devuelven un único mensaje con rol `user`. Para clientes sin soporte
+de prompts, la misma funcionalidad es accesible directamente a través de la
+herramienta `bootstrap` y el recurso `memory://inject` respectivamente — los
+prompts son una capa de descubribilidad, no un comportamiento nuevo.
+
+Ejemplo:
+
+```json
+// Listar los prompts disponibles
+{ "method": "prompts/list" }
+
+// Saltar directamente a la sección 3 de la entrevista de bootstrap
+{ "method": "prompts/get", "params": { "name": "bootstrap-interview", "arguments": { "section": "3" } } }
+
+// Obtener el bloque de contexto de sesión, sesgado hacia un tema
+{ "method": "prompts/get", "params": { "name": "session-context", "arguments": { "hint": "deploy to production" } } }
+```
 
 ---
 
@@ -2295,6 +2341,25 @@ BHGBrain expone 11 herramientas MCP. Todas las herramientas validan la entrada c
 }
 ```
 
+**Títulos y anotaciones:** cada herramienta declara un `title` legible por humanos y
+`annotations` de comportamiento MCP (`readOnlyHint`, `destructiveHint`,
+`idempotentHint` y `openWorldHint: false` — cada herramienta opera sobre el almacén
+local, nunca sobre un dominio externo abierto). `recall` y `search` son
+`readOnlyHint: true` y omiten `destructiveHint`/`idempotentHint` (sin sentido según
+la especificación una vez que `readOnlyHint` está activo). `forget`, `collections`,
+`category`, `backup` y `revisions` declaran `destructiveHint: true`. Esto significa
+que un cliente conforme a la especificación ya no trata cada lectura como algo tan
+peligroso como una eliminación — que es lo que ocurre bajo los valores
+predeterminados de la especificación MCP (`readOnlyHint: false`,
+`destructiveHint: true`) cuando una herramienta omite las anotaciones por completo.
+
+**outputSchema:** `recall`, `search` y `remember` declaran un `outputSchema` que
+describe la forma de su `structuredContent` (reflejando los tipos
+`SearchResult`/`WriteResult`), de modo que los clientes MCP pueden validar los
+resultados en lugar de solo parsear el bloque de texto como JSON. Las formas de
+resultado de las otras diez herramientas dependen de la acción y aún no están
+descritas por esquema.
+
 ---
 
 ### `remember` — Almacenar una Memoria
@@ -2328,6 +2393,18 @@ Almacena contenido en BHGBrain con deduplicación automática, normalización, e
   "created_at": "2026-03-15T12:00:00Z"
 }
 ```
+
+> **Nota sobre el sobre MCP (desde v1.17.0):** el objeto/array mostrado arriba (y en
+> el ejemplo multi-candidato de abajo) es lo que `handleRemember` devuelve
+> internamente, y exactamente lo que `POST /tool/:name` (REST) sigue devolviendo.
+> Sobre el **transporte MCP** (stdio y Streamable HTTP `/mcp`), la respuesta de
+> `CallTool` normaliza un resultado exitoso a `{ "results": [...] }` — un array de un
+> elemento para un solo candidato, varios elementos cuando la extracción
+> multi-candidato divide el contenido — tanto en `structuredContent` como en el
+> bloque de texto JSON, de modo que un único `outputSchema` puede describir ambos
+> casos. Un parser frágil del lado MCP que espere el objeto desnudo debe actualizarse
+> para leer `results[0]` (o iterar sobre `results`); los clientes REST no se ven
+> afectados.
 
 `operation` es uno de:
 - `ADD` — nueva memoria creada

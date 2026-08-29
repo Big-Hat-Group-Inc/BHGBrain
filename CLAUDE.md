@@ -21,8 +21,15 @@ handlers in `src/tools/index.ts`. Registered: `remember`, `recall`, `forget`, `s
 `category://list`, `collection://list`, `health://status`. Templates: `memory://{id}`,
 `memory://{id}/revisions`, `memory://inject/{hint}`, `category://{name}`, `collection://{name}`.
 
-Changing either surface means updating the schema/handler *and* `README.md`
-(§ "MCP Tools Reference") in the same change.
+**Prompts** — `src/prompts/index.ts` (`MCP_PROMPT_DEFINITIONS` + `handleGetPrompt`),
+registered via `ListPromptsRequestSchema`/`GetPromptRequestSchema` in
+`src/transport/mcp-server.ts`. Registered: `bootstrap-interview` (optional `section`
+arg), `session-context` (optional `hint` arg, delegates to the `memory://inject`
+resource path).
+
+Changing any of these three surfaces means updating the schema/handler *and*
+`README.md` (§ "MCP Tools Reference" for tools, § "MCP Resources" for resources,
+§ "MCP Prompts" for prompts) in the same change.
 
 ## Verification
 

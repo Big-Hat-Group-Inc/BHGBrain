@@ -46,11 +46,12 @@ BHGBrain speichert Erinnerungen in SQLite (Metadaten + Volltextsuche) und Qdrant
 13. [Gesundheitszustand & Metriken](#gesundheitszustand--metriken)
 14. [Sicherheit](#sicherheit)
 15. [MCP-Ressourcen](#mcp-ressourcen)
-16. [Bootstrap-Prompt](#bootstrap-prompt)
-17. [CLI-Referenz](#cli-referenz)
-18. [MCP-Tools-Referenz](#mcp-tools-referenz)
-19. [Upgrade](#upgrade)
-20. [Verhaltenshinweise](#verhaltenshinweise)
+16. [MCP-Prompts](#mcp-prompts)
+17. [Bootstrap-Prompt](#bootstrap-prompt)
+18. [CLI-Referenz](#cli-referenz)
+19. [MCP-Tools-Referenz](#mcp-tools-referenz)
+20. [Upgrade](#upgrade)
+21. [Verhaltenshinweise](#verhaltenshinweise)
 
 ---
 
@@ -2074,6 +2075,21 @@ BHGBrain stellt zusätzlich zu Tools MCP-Ressourcen (lesbar über `ReadResource`
 | `category://{name}` | Kategorie | Vollständiger Kategorieninhalt nach Name |
 | `collection://{name}` | Sammlung | Erinnerungen in einer bestimmten Sammlung |
 
+### Ressourcenlisten-Änderungsbenachrichtigungen (list_changed)
+
+BHGBrain deklariert die MCP-Fähigkeit `resources.listChanged`. Nachdem ein
+`collections`-Aufruf mit `action: "create"` oder `"delete"` bzw. ein
+`category`-Aufruf mit `action: "set"` oder `"delete"` erfolgreich war, sendet der
+Server eine `notifications/resources/list_changed`-Benachrichtigung, damit ein
+verbundener Client weiß, dass sich `collection://list` / `category://list` geändert
+haben, statt sich auf eine veraltete zwischengespeicherte Kopie zu verlassen.
+Lesende Aktionen (`list`, `get`) und fehlgeschlagene Mutationen lösen niemals eine
+Benachrichtigung aus; auch einfache Speicherschreibvorgänge (`remember`, `forget`
+usw.) tun dies nicht — `memory://list` ändert sich dafür bei jedem Aufruf zu häufig.
+Diese Benachrichtigung wird nur über den stdio-Transport gesendet (ein
+langlebiger `Server` pro stdio-Verbindung); sie ist nicht mit den
+sitzungsbasierten Streamable-HTTP-`/mcp`-Verbindungen verdrahtet.
+
 ### `memory://list` — Paginierte Erinnerungsauflistung
 
 Abfrageparameter:
@@ -2174,6 +2190,36 @@ Antwort:
 ```
 
 Für stdio-Clients ohne Ressourcen-Unterstützung liefert die Aktion `list` des `revisions`-Tools dieselben Daten (siehe [MCP-Tools-Referenz](#mcp-tools-referenz)).
+
+---
+
+## MCP-Prompts
+
+BHGBrain deklariert die MCP-Fähigkeit `prompts` und stellt neben Tools und
+Ressourcen zwei Prompts über `ListPrompts`/`GetPrompt` bereit:
+
+| Prompt | Argumente | Beschreibung |
+|---|---|---|
+| `bootstrap-interview` | `section` (optional, `1`–`10`) | Führt durch das Bootstrap-Interview über das `bootstrap`-Tool. Ohne `section` gibt es eine Übersicht aller Abschnitte; mit `section` springt man direkt zu dessen Fragen. Eine ungültige oder außerhalb des Bereichs liegende `section` wird als JSON-RPC-InvalidParams-Fehler abgelehnt. |
+| `session-context` | `hint` (optional) | Liefert denselben budgetierten `memory://inject`- (bzw. `memory://inject/{hint}`-) Kontextblock als einzelne Prompt-Nachricht, zum Vorbereiten einer neuen Sitzung. |
+
+Beide Prompts liefern eine einzelne Nachricht mit Rolle `user`. Für Clients ohne
+Prompt-Unterstützung ist dieselbe Funktionalität direkt über das `bootstrap`-Tool
+bzw. die `memory://inject`-Ressource erreichbar — die Prompts sind eine
+Auffindbarkeits-Schicht, kein neues Verhalten.
+
+Beispiel:
+
+```json
+// Verfügbare Prompts auflisten
+{ "method": "prompts/list" }
+
+// Direkt zu Abschnitt 3 des Bootstrap-Interviews springen
+{ "method": "prompts/get", "params": { "name": "bootstrap-interview", "arguments": { "section": "3" } } }
+
+// Sitzungskontext-Block, thematisch fokussiert
+{ "method": "prompts/get", "params": { "name": "session-context", "arguments": { "hint": "deploy to production" } } }
+```
 
 ---
 
@@ -2293,6 +2339,23 @@ BHGBrain stellt 11 MCP-Tools bereit. Alle Tools validieren Eingaben mit Zod-Sche
 }
 ```
 
+**Titel und Annotationen:** Jedes Tool deklariert einen menschenlesbaren `title` und
+MCP-Verhaltens-`annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint` und
+`openWorldHint: false` — jedes Tool arbeitet auf dem lokalen Speicher, niemals auf
+einer offenen externen Domäne). `recall` und `search` sind `readOnlyHint: true` und
+lassen `destructiveHint`/`idempotentHint` weg (laut Spezifikation bedeutungslos,
+sobald `readOnlyHint` gesetzt ist). `forget`, `collections`, `category`, `backup` und
+`revisions` deklarieren `destructiveHint: true`. Dadurch behandelt ein
+spezifikationskonformer Client Lesevorgänge nicht mehr als genauso gefährlich wie
+ein Löschen — was unter den MCP-Spec-Standardwerten (`readOnlyHint: false`,
+`destructiveHint: true`) passiert, wenn ein Tool Annotationen ganz weglässt.
+
+**outputSchema:** `recall`, `search` und `remember` deklarieren ein `outputSchema`,
+das die Form ihres `structuredContent` beschreibt (angelehnt an die Typen
+`SearchResult`/`WriteResult`), sodass MCP-Clients Ergebnisse validieren können, statt
+nur den Text-Block als JSON zu parsen. Die Ergebnisformen der übrigen zehn Tools sind
+aktionsabhängig und noch nicht schema-beschrieben.
+
 ---
 
 ### `remember` — Erinnerung speichern
@@ -2326,6 +2389,18 @@ Inhalt in BHGBrain mit automatischer Deduplizierung, Normalisierung, Einbettung 
   "created_at": "2026-03-15T12:00:00Z"
 }
 ```
+
+> **Hinweis zum MCP-Umschlag (seit v1.17.0):** Das oben (und im
+> Multi-Kandidaten-Beispiel unten) gezeigte Objekt/Array ist das, was
+> `handleRemember` intern zurückgibt, und genau das, was `POST /tool/:name` (REST)
+> weiterhin zurückgibt. Über den **MCP-Transport** (stdio und Streamable-HTTP
+> `/mcp`) normalisiert die `CallTool`-Antwort ein erfolgreiches Ergebnis auf
+> `{ "results": [...] }` — ein einelementiges Array für einen einzelnen Kandidaten,
+> mehrere Elemente bei einer Aufteilung durch Multi-Kandidaten-Extraktion — sowohl in
+> `structuredContent` als auch im JSON-Text-Block, sodass ein einziges `outputSchema`
+> beide Fälle beschreiben kann. Ein spröder MCP-seitiger Parser, der das nackte Objekt
+> erwartet, muss angepasst werden, um `results[0]` zu lesen (oder über `results` zu
+> iterieren); REST-Clients sind nicht betroffen.
 
 `operation` ist eines von:
 - `ADD` — neue Erinnerung erstellt

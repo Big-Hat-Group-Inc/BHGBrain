@@ -126,6 +126,15 @@ async function main() {
   if (isStdio || !config.transport.http.enabled) {
     // MCP stdio transport
     const server = buildMcpServer(ctx, resources);
+    // Task 5.2: stdio serves exactly one client through one long-lived
+    // `Server`, so the notifier hook can point straight at it.
+    // Fire-and-forget — a notification failure never fails the tool call
+    // that triggered it, since the underlying mutation already succeeded.
+    ctx.notifyResourceListChanged = () => {
+      server.sendResourceListChanged().catch((err: unknown) => {
+        logger.debug({ event: 'resource_list_changed_notify_failed', error: (err as Error).message });
+      });
+    };
     const transport = new StdioServerTransport();
     await server.connect(transport);
     logger.info({ event: 'connected', transport: 'stdio' });

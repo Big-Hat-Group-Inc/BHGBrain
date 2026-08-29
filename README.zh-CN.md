@@ -46,11 +46,12 @@ BHGBrain 将记忆存储在 SQLite（元数据 + 全文搜索）和 Qdrant（语
 13. [健康状态与指标](#健康状态与指标)
 14. [安全性](#安全性)
 15. [MCP 资源](#mcp-资源)
-16. [引导提示词](#引导提示词)
-17. [CLI 参考](#cli-参考)
-18. [MCP 工具参考](#mcp-工具参考)
-19. [升级](#升级)
-20. [行为说明](#行为说明)
+16. [MCP 提示词](#mcp-提示词)
+17. [引导提示词](#引导提示词)
+18. [CLI 参考](#cli-参考)
+19. [MCP 工具参考](#mcp-工具参考)
+20. [升级](#升级)
+21. [行为说明](#行为说明)
 
 ---
 
@@ -2033,6 +2034,18 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 | `category://{name}` | 类别 | 通过名称获取完整类别内容 |
 | `collection://{name}` | 集合 | 特定集合中的记忆 |
 
+### 资源列表变更通知（list_changed）
+
+BHGBrain 声明了 `resources.listChanged` MCP 能力。当 `collections` 调用的
+`action: "create"` 或 `"delete"`，或 `category` 调用的 `action: "set"` 或
+`"delete"` 成功后，服务器会发送 `notifications/resources/list_changed` 通知，
+使已连接的客户端知道 `collection://list` / `category://list` 已发生变化，
+而不必依赖过期的缓存副本。只读操作（`list`、`get`）和失败的变更操作
+永远不会触发通知；普通的记忆写入（`remember`、`forget` 等）也不会——因为
+`memory://list` 每次调用变动过于频繁，通知在那里没有意义。该通知仅通过
+stdio 传输发送（每个 stdio 连接对应一个长期存活的 `Server`）；它没有接入
+基于会话的 Streamable HTTP `/mcp` 连接。
+
 ### `memory://list`——分页记忆列表
 
 查询参数：
@@ -2124,6 +2137,35 @@ BHGBrain 除了工具之外还通过 `ReadResource` 暴露 MCP 资源。
 ```
 
 对于不支持资源的 stdio 客户端，可改用 `revisions` 工具的 `list` 动作读取相同数据（参见 [MCP 工具参考](#mcp-工具参考)）。
+
+---
+
+## MCP 提示词
+
+除了工具与资源之外，BHGBrain 还声明了 `prompts` MCP 能力，并通过
+`ListPrompts`/`GetPrompt` 提供两个提示词：
+
+| 提示词 | 参数 | 说明 |
+|---|---|---|
+| `bootstrap-interview` | `section`（可选，`1`–`10`） | 通过 `bootstrap` 工具引导完成引导访谈。省略 `section` 会返回所有环节的概览；指定后会直接跳转到该环节的问题。超出范围或非整数的 `section` 会被拒绝，并返回 JSON-RPC InvalidParams 错误。 |
+| `session-context` | `hint`（可选） | 以单条提示消息的形式返回与 `memory://inject`（提供 `hint` 时为 `memory://inject/{hint}`）相同的预算上下文块，用于为新会话预热上下文。 |
+
+两个提示词都返回一条 `user` 角色的消息。对于不支持提示词的客户端，可以直接
+通过 `bootstrap` 工具和 `memory://inject` 资源获得相同的功能——提示词只是一层
+可发现性封装，并非新增行为。
+
+示例：
+
+```json
+// 列出可用提示词
+{ "method": "prompts/list" }
+
+// 直接跳转到引导访谈的第 3 环节
+{ "method": "prompts/get", "params": { "name": "bootstrap-interview", "arguments": { "section": "3" } } }
+
+// 获取偏向某个主题的会话上下文块
+{ "method": "prompts/get", "params": { "name": "session-context", "arguments": { "hint": "deploy to production" } } }
+```
 
 ---
 
@@ -2241,6 +2283,21 @@ BHGBrain 暴露 11 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 }
 ```
 
+**标题与标注：** 每个工具都声明了一个人类可读的 `title` 以及 MCP 行为
+`annotations`（`readOnlyHint`、`destructiveHint`、`idempotentHint` 与
+`openWorldHint: false`——每个工具都只操作本地存储，从不涉及开放的外部域）。
+`recall` 与 `search` 为 `readOnlyHint: true`，并省略 `destructiveHint`/
+`idempotentHint`（根据规范，一旦设置了 `readOnlyHint`，这两项即无意义）。
+`forget`、`collections`、`category`、`backup` 与 `revisions` 声明了
+`destructiveHint: true`。这意味着符合规范的客户端不会再把每一次读取都当作
+与删除同等危险——而这正是当某个工具完全省略标注时，MCP 规范默认值
+（`readOnlyHint: false`、`destructiveHint: true`）所导致的结果。
+
+**outputSchema：** `recall`、`search` 与 `remember` 声明了描述其
+`structuredContent` 形状的 `outputSchema`（对应 `SearchResult`/`WriteResult`
+类型），使 MCP 客户端可以校验结果，而不必只依赖对文本块做 JSON 解析。
+其余十个工具的结果形状取决于具体动作，目前尚未提供 schema 描述。
+
 ---
 
 ### `remember`——存储记忆
@@ -2274,6 +2331,16 @@ BHGBrain 暴露 11 个 MCP 工具。所有工具使用 Zod schema 验证输入�
   "created_at": "2026-03-15T12:00:00Z"
 }
 ```
+
+> **MCP 信封说明（自 v1.17.0 起）：** 上面（以及下方多候选示例中）展示的
+> 对象/数组，是 `handleRemember` 内部实际返回的内容，也正是 `POST
+> /tool/:name`（REST）目前仍然返回的内容。而在 **MCP 传输**（stdio 与
+> Streamable HTTP `/mcp`）上，`CallTool` 响应会将成功结果规范化为
+> `{ "results": [...] }`——单个候选对应一个元素的数组，多候选提取拆分内容时
+> 则包含多个元素——`structuredContent` 与 JSON 文本块均如此，从而使单一的
+> `outputSchema` 能同时描述这两种情况。若某个 MCP 侧的解析器脆弱地假定为
+> 裸对象，需要更新为读取 `results[0]`（或遍历 `results`）；REST 客户端不受
+> 影响。
 
 `operation` 为以下之一：
 - `ADD`——创建了新记忆

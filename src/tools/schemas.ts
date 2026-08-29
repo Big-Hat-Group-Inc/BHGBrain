@@ -1,6 +1,47 @@
+// Shared JSON-schema fragments for outputSchema declarations (task 2.2/2.3):
+// mirror `src/domain/types.ts` `SearchResult` and `WriteResult` so
+// `structuredContent` on `recall`/`search`/`remember` is validatable by
+// clients. Fields never emitted on these paths (e.g. `SearchResult.vector`)
+// are intentionally omitted.
+const SEARCH_RESULT_SCHEMA = {
+  type: 'object' as const,
+  properties: {
+    id: { type: 'string' },
+    content: { type: 'string' },
+    summary: { type: 'string' },
+    type: { type: 'string', enum: ['episodic', 'semantic', 'procedural'] },
+    tags: { type: 'array', items: { type: 'string' } },
+    score: { type: 'number' },
+    semantic_score: { type: 'number' },
+    fulltext_score: { type: 'number' },
+    retention_tier: { type: 'string', enum: ['T0', 'T1', 'T2', 'T3'] },
+    expires_at: { type: ['string', 'null'] },
+    expiring_soon: { type: 'boolean' },
+    device_id: { type: ['string', 'null'] },
+    created_at: { type: 'string' },
+    last_accessed: { type: 'string' },
+    archived: { type: 'boolean' },
+  },
+  required: ['id', 'content', 'summary', 'type', 'tags', 'score', 'retention_tier', 'created_at', 'last_accessed'],
+};
+
+const WRITE_RESULT_SCHEMA = {
+  type: 'object' as const,
+  properties: {
+    id: { type: 'string' },
+    summary: { type: 'string' },
+    type: { type: 'string', enum: ['episodic', 'semantic', 'procedural'] },
+    operation: { type: 'string', enum: ['ADD', 'UPDATE', 'DELETE', 'NOOP'] },
+    merged_with_id: { type: 'string' },
+    created_at: { type: 'string' },
+  },
+  required: ['id', 'summary', 'type', 'operation', 'created_at'],
+};
+
 export const MCP_TOOL_DEFINITIONS = [
   {
     name: 'remember',
+    title: 'Remember',
     description: 'Store a memory for long-term recall. Supports deduplication and automatic classification.',
     inputSchema: {
       type: 'object' as const,
@@ -18,9 +59,21 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['content'],
       additionalProperties: false,
     },
+    outputSchema: {
+      type: 'object' as const,
+      properties: {
+        results: { type: 'array', items: WRITE_RESULT_SCHEMA },
+      },
+      required: ['results'],
+    },
+    // additive upsert; dedup may UPDATE an existing memory but never discards
+    // user data outright, and repeat calls with the same content are not
+    // guaranteed to be no-ops (dedup thresholds/model drift).
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'recall',
+    title: 'Recall',
     description: 'Retrieve relevant memories by semantic similarity to a query.',
     inputSchema: {
       type: 'object' as const,
@@ -36,9 +89,20 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['query'],
       additionalProperties: false,
     },
+    outputSchema: {
+      type: 'object' as const,
+      properties: {
+        results: { type: 'array', items: SEARCH_RESULT_SCHEMA },
+      },
+      required: ['results'],
+    },
+    // Pure read: destructiveHint/idempotentHint are meaningless per spec when
+    // readOnlyHint is true, so only readOnlyHint/openWorldHint are declared.
+    annotations: { readOnlyHint: true, openWorldHint: false },
   },
   {
     name: 'forget',
+    title: 'Forget',
     description: 'Delete a specific memory by ID.',
     inputSchema: {
       type: 'object' as const,
@@ -48,9 +112,13 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['id'],
       additionalProperties: false,
     },
+    // Hard delete; repeat delete of the same id adds nothing beyond the
+    // first (idempotent), and is inherently destructive.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   {
     name: 'search',
+    title: 'Search',
     description: 'Search memories using semantic, fulltext, or hybrid search modes.',
     inputSchema: {
       type: 'object' as const,
@@ -65,9 +133,19 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['query'],
       additionalProperties: false,
     },
+    outputSchema: {
+      type: 'object' as const,
+      properties: {
+        results: { type: 'array', items: SEARCH_RESULT_SCHEMA },
+        degraded: { type: 'boolean' },
+      },
+      required: ['results'],
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false },
   },
   {
     name: 'tag',
+    title: 'Tag',
     description: 'Add or remove tags from a memory.',
     inputSchema: {
       type: 'object' as const,
@@ -79,9 +157,12 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['id'],
       additionalProperties: false,
     },
+    // Reversible metadata edit: tags can always be added/removed back.
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'collections',
+    title: 'Collections',
     description: 'List, create, or delete memory collections.',
     inputSchema: {
       type: 'object' as const,
@@ -94,9 +175,12 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['action'],
       additionalProperties: false,
     },
+    // `delete` with `force: true` cascades memory deletion.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'category',
+    title: 'Category',
     description: 'Manage persistent policy categories (company-values, architecture, coding-requirements, custom).',
     inputSchema: {
       type: 'object' as const,
@@ -109,9 +193,12 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['action'],
       additionalProperties: false,
     },
+    // `delete` removes policy context; `set` overwrites existing content.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'backup',
+    title: 'Backup',
     description: 'Create, list, or restore memory backups.',
     inputSchema: {
       type: 'object' as const,
@@ -122,9 +209,12 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['action'],
       additionalProperties: false,
     },
+    // `restore` overwrites both stores.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'bootstrap',
+    title: 'Bootstrap Interview',
     description: 'Interactive bootstrap interview for building your profile. Drives a stateful 10-section interview, storing memories as you go. Supports pause/resume across sessions.',
     inputSchema: {
       type: 'object' as const,
@@ -137,9 +227,12 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['action'],
       additionalProperties: false,
     },
+    // Writes interview memories; nothing is discarded.
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'import',
+    title: 'Import',
     description: 'Import a structured profile or freeform document as discrete memories. Supports the 10-section bootstrap format and arbitrary markdown text.',
     inputSchema: {
       type: 'object' as const,
@@ -152,9 +245,12 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['format', 'content'],
       additionalProperties: false,
     },
+    // Bulk additive writes.
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'revisions',
+    title: 'Revisions',
     description: 'List a memory\'s revision history, or revert its content to a prior revision.',
     inputSchema: {
       type: 'object' as const,
@@ -166,9 +262,12 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['action', 'id'],
       additionalProperties: false,
     },
+    // `revert` overwrites the memory's current content.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'review',
+    title: 'Review Queue',
     description: 'List and disposition the T1 review queue, and restore archived memories. action: "list" returns due memories oldest-first (paginated); "keep" confirms a memory and re-extends its review date/expiry; "archive" retires a memory through the archive path; "restore" recreates an active memory (a provenance-carrying stub) from an archived record.',
     inputSchema: {
       type: 'object' as const,
@@ -183,9 +282,12 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['action'],
       additionalProperties: false,
     },
+    // `archive` is reversible via `restore`.
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'repair',
+    title: 'Repair',
     description: 'Repair local state from external sources. mode: "from-qdrant" (default) recovers memories from Qdrant that are missing in SQLite. mode: "re-embed" migrates memories whose embedding stamp differs from the active embedding model/provider (run after changing embedding.provider or embedding.model).',
     inputSchema: {
       type: 'object' as const,
@@ -199,5 +301,12 @@ export const MCP_TOOL_DEFINITIONS = [
       },
       additionalProperties: false,
     },
+    // Reconstructive; safe to repeat (re-scans and only recovers what's missing).
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
 ];
+
+/** Task 2.4: single source of truth for "is this a known MCP tool name",
+ * kept in lockstep with `dispatch`'s switch in `src/tools/index.ts` by a
+ * unit test (`schemas.test.ts`). */
+export const MCP_TOOL_NAMES: ReadonlySet<string> = new Set(MCP_TOOL_DEFINITIONS.map(t => t.name));
