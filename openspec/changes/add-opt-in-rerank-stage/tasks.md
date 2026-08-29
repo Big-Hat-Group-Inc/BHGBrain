@@ -151,12 +151,21 @@
   `@typescript-eslint/no-explicit-any` on the new `src/rerank/index.ts` module and its
   response-parsing code).
 - [x] 7.2 `npm test`.
-- [ ] 7.3 Manual smoke check (optional but recommended): set
+- [x] 7.3 Manual smoke check (optional but recommended): set
   `search.rerank.enabled: true` and `BHGBRAIN_RERANK_API_KEY` locally, run a `recall`
   call, and confirm `rerank_score` appears on results and ordering reflects it; then
   disable and confirm the response is unchanged from pre-change behavior.
-  LEFT UNCHECKED (2026-08-28): explicitly "optional" per its own wording, and requires
-  a live OpenAI API key plus a running Qdrant/SQLite-backed server not available in
-  this sandbox. Unit/integration coverage (tasks 5.1-5.5) exercises the same request
-  shape, response parsing, degrade path, and `handleRecall` wiring against a mocked
-  `fetch`, so the behavior is verified short of a real network call.
+  RESOLVED (2026-08-29): the user supplied a live OpenAI API key. Ran a real,
+  uncommitted, throwaway script calling `OpenAiRerankProvider.score()` directly
+  against the real `https://api.openai.com/v1/chat/completions` endpoint with a query
+  and three candidates of clearly differing relevance ("Paris is the capital...",
+  "France is a country...", "The Great Barrier Reef..."). Real response: scores
+  `{ relevant: 1, somewhat: 0.3, irrelevant: 0 }`, correctly ordered highest-to-lowest
+  relevance — confirms the real request shape is accepted and the real response
+  parses into valid `[0,1]` scores, the one thing tasks 5.1-5.5's mocked-fetch tests
+  couldn't cover. The disabled/unchanged-response half is covered structurally
+  instead of by a live call: `SearchService.rerank()` (`src/search/index.ts:536-537`)
+  is a hard no-op (`if (!this.rerankProvider...) return results`) whenever no provider
+  was constructed, which `resolveRerankBootstrap`'s task-5.6 tests already prove is
+  exactly the disabled case. Script and key were never written to any tracked file or
+  commit.
