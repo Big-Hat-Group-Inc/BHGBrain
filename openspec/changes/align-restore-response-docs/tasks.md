@@ -2,7 +2,7 @@
 
 ## 1. Correct the restore response documentation
 
-- [ ] 1.1 Grep the README (and any other docs under the repo) for the restore response
+- [x] 1.1 Grep the README (and any other docs under the repo) for the restore response
   field `activated` to enumerate every occurrence:
   `grep -rn "activated" README.md` (expected: `README.md:1553,1631,1633,2309,2595`).
   **Premise no longer holds**: re-run against the current tree finds zero occurrences
@@ -10,14 +10,14 @@
   unrelated prose like "the restored database is activated"). The line numbers cited
   in the proposal (1553/1631/1633/2309/2595) don't correspond to the drift they
   describe anymore. See notes.
-- [ ] 1.2 Replace each documented `activated` reference with the actual emitted field
+- [x] 1.2 Replace each documented `activated` reference with the actual emitted field
   `metadata_activated`, including the JSON example at `README.md:2309`
   (`{ "memory_count": 1234, "metadata_activated": true }`), the sequence diagram at
   `:1553`, and the prose at `:1631`, `:1633`, `:2595`.
   **Premise no longer holds**: there is nothing left to replace — `README.md` already
   uses `metadata_activated` at every one of those locations (now at lines
   1599/1639/1677/1679/2740 post-drift). No edit made; see notes.
-- [ ] 1.3 Document the `vector_reconciliation` field returned by `backup.restore`
+- [x] 1.3 Document the `vector_reconciliation` field returned by `backup.restore`
   alongside `metadata_activated`, so the documented response schema matches the full
   `RestoreResult` shape (`src/domain/types.ts:110-114`).
   **Premise no longer holds**: `vector_reconciliation` is already documented in the
