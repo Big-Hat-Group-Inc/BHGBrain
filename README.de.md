@@ -2135,11 +2135,22 @@ Metriken ohne Labels, sodass die Ausgabe abwärtskompatibel zum vorherigen label
 | `bhgbrain_tool_handler_ms_count` | Zähler | Anzahl der Tool-Handler-Latenzmessungen, mit den Labels `tool` und `status` |
 | `embedding_embed_batch_ms_p95` | Histogramm | 95. Perzentil der Embedding-Batch-Latenz |
 | `search_total_ms_p95` | Histogramm | 95. Perzentil der End-to-End-Suchlatenz |
+| `search_result_count_avg` | Histogramm | Durchschnittliche Anzahl der pro `search`/`recall`-Aufruf zurückgegebenen Ergebnisse, mit `mode`-Label (`semantic`/`fulltext`/`hybrid`). Zählt nur modus-spezifische Ergebnisse - von `include_archived` angehängte archivierte Treffer sind ausgeschlossen. |
+| `search_result_count_p50` | Histogramm | 50. Perzentil der Ergebnisanzahl, mit `mode`-Label |
+| `search_result_count_p95` | Histogramm | 95. Perzentil der Ergebnisanzahl, mit `mode`-Label |
+| `search_result_count_p99` | Histogramm | 99. Perzentil der Ergebnisanzahl, mit `mode`-Label |
+| `search_result_count_count` | Zähler | Anzahl der `search_result_count`-Stichproben, mit `mode`-Label |
+| `search_result_score_avg` | Histogramm | Durchschnittlicher zusammengesetzter Ergebnis-Score pro `search`/`recall`-Aufruf, mit `mode`-Label. Ein Sample pro Ergebnis; archivierte Treffer sind ausgeschlossen, da sie einen Platzhalter-Score (keinen Relevanz-Score) tragen. |
+| `search_result_score_p50` | Histogramm | 50. Perzentil des zusammengesetzten Ergebnis-Scores, mit `mode`-Label |
+| `search_result_score_p95` | Histogramm | 95. Perzentil des zusammengesetzten Ergebnis-Scores, mit `mode`-Label |
+| `search_result_score_p99` | Histogramm | 99. Perzentil des zusammengesetzten Ergebnis-Scores, mit `mode`-Label |
+| `search_result_score_count` | Zähler | Anzahl der `search_result_score`-Stichproben, mit `mode`-Label |
 | `bhgbrain_memory_count` | Messuhr | Aktuelle Gesamt-Erinnerungsanzahl (bei Schreiben/Löschen aktualisiert) |
 | `bhgbrain_rate_limit_buckets` | Messuhr | Aktive Rate-Limit-Verfolgungseimer |
 | `bhgbrain_rate_limited_total` | Zähler | Gesamt rate-limitierte Anfragen |
 | `recall_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive Nachprüfung von `recall` (Typ/Tags/`after`/`before`) nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
 | `search_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive `after`/`before`-Nachprüfung von `search` nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
+| `search_embedding_degraded` | Zähler | Wird erhöht, wenn eine Suche im Modus `hybrid` auf reinen Volltext zurückfällt, weil der Embedding-Provider oder der Vektorspeicher nicht verfügbar ist, mit `namespace`-Label |
 
 Zum Beispiel:
 

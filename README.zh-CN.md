@@ -2079,11 +2079,22 @@ GET /metrics
 | `bhgbrain_tool_handler_ms_count` | counter | 工具处理程序延迟样本数量，带有 `tool` 和 `status` 标签 |
 | `embedding_embed_batch_ms_p95` | histogram | 嵌入批处理延迟的第 95 百分位 |
 | `search_total_ms_p95` | histogram | 端到端搜索延迟的第 95 百分位 |
+| `search_result_count_avg` | histogram | 每次 `search`/`recall` 调用返回结果数量的平均值，按 `mode`（`semantic`/`fulltext`/`hybrid`）分类。仅统计模式特定的结果——`include_archived` 附加的已归档匹配项不计入。 |
+| `search_result_count_p50` | histogram | 结果数量的第 50 百分位，按 `mode` 分类 |
+| `search_result_count_p95` | histogram | 结果数量的第 95 百分位，按 `mode` 分类 |
+| `search_result_count_p99` | histogram | 结果数量的第 99 百分位，按 `mode` 分类 |
+| `search_result_count_count` | counter | `search_result_count` 样本数量，按 `mode` 分类 |
+| `search_result_score_avg` | histogram | 每次 `search`/`recall` 调用结果综合得分的平均值，按 `mode` 分类。每个结果一个样本；已归档匹配项因携带占位得分（而非相关性得分）而被排除。 |
+| `search_result_score_p50` | histogram | 结果综合得分的第 50 百分位，按 `mode` 分类 |
+| `search_result_score_p95` | histogram | 结果综合得分的第 95 百分位，按 `mode` 分类 |
+| `search_result_score_p99` | histogram | 结果综合得分的第 99 百分位，按 `mode` 分类 |
+| `search_result_score_count` | counter | `search_result_score` 样本数量，按 `mode` 分类 |
 | `bhgbrain_memory_count` | gauge | 当前总记忆数量（写入/删除时更新） |
 | `bhgbrain_rate_limit_buckets` | gauge | 活跃的速率限制追踪桶 |
 | `bhgbrain_rate_limited_total` | counter | 被速率限制的请求总数 |
 | `recall_zero_after_filter` | counter | 当 `recall` 检索后的类型/标签/`after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
 | `search_zero_after_filter` | counter | 当 `search` 检索后的 `after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
+| `search_embedding_degraded` | counter | 当 `hybrid` 模式搜索因嵌入提供方或向量存储不可用而降级为仅全文搜索时递增，按 `namespace` 分类 |
 
 例如：
 

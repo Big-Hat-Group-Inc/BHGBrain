@@ -64,9 +64,20 @@ function histogramKey(name: string, labels?: Record<string, string>): string {
   return `${name}{${sorted}}`;
 }
 
+/**
+ * A counter is bucketed by metric name and label set, the same way histograms are
+ * (see `HistogramFamily`), so e.g. `search_embedding_degraded{namespace="team-a"}`
+ * and `search_embedding_degraded{namespace="team-b"}` accumulate independently.
+ */
+interface CounterEntry {
+  name: string;
+  labels?: Record<string, string>;
+  value: number;
+}
+
 export class MetricsCollector {
   private enabled: boolean;
-  private counters = new Map<string, number>();
+  private counters = new Map<string, CounterEntry>();
   private histograms = new Map<string, HistogramFamily>();
   private gauges = new Map<string, number>();
   private static readonly HISTOGRAM_CAPACITY = 1000;
@@ -75,10 +86,15 @@ export class MetricsCollector {
     this.enabled = config.observability.metrics_enabled;
   }
 
-  incCounter(name: string, amount = 1): void {
+  incCounter(name: string, amount = 1, labels?: Record<string, string>): void {
     if (!this.enabled) return;
-    const current = this.counters.get(name) ?? 0;
-    this.counters.set(name, current + amount);
+    const key = histogramKey(name, labels);
+    const current = this.counters.get(key);
+    if (current) {
+      current.value += amount;
+    } else {
+      this.counters.set(key, { name, labels, value: amount });
+    }
   }
 
   recordHistogram(name: string, value: number, labels?: Record<string, string>): void {
@@ -101,8 +117,8 @@ export class MetricsCollector {
     if (!this.enabled) return [];
     const entries: MetricEntry[] = [];
 
-    for (const [name, value] of this.counters) {
-      entries.push({ name, type: 'counter', value });
+    for (const { name, labels, value } of this.counters.values()) {
+      entries.push({ name, type: 'counter', value, labels });
     }
     for (const family of this.histograms.values()) {
       const { name, labels } = family;

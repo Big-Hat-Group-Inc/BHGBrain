@@ -215,6 +215,14 @@ export class SearchService {
         ? this.mmrRerank(results, this.config.search.mmr.lambda)
         : results;
 
+      // Recorded from the mode-specific `results` array, before archived
+      // matches (which carry a placeholder, non-relevance score - see
+      // `archiveRecordToSearchResult`) are appended below.
+      this.metrics?.recordHistogram('search_result_count', results.length, { mode });
+      for (const r of results) {
+        this.metrics?.recordHistogram('search_result_score', r.score, { mode });
+      }
+
       if (includeArchived) {
         const archivedMatches = this.storage.sqlite
           .searchArchived(namespace, query, limit)
@@ -352,7 +360,7 @@ export class SearchService {
       // degradation observable instead of silent (dependency outages are signal in
       // this project). Semantic mode raises EMBEDDING_UNAVAILABLE; hybrid stays
       // graceful but emits a metric + warning so operators can see it.
-      this.metrics?.incCounter('search_embedding_degraded');
+      this.metrics?.incCounter('search_embedding_degraded', 1, { namespace });
       this.logger?.warn({
         event: 'embedding_degraded',
         degraded: 'fulltext_only',

@@ -2136,11 +2136,22 @@ con el formato anterior sin etiquetas).
 | `bhgbrain_tool_handler_ms_count` | contador | Número de muestras de latencia del manejador de herramientas, etiquetada con `tool` y `status` |
 | `embedding_embed_batch_ms_p95` | histograma | Percentil 95 de la latencia del lote de embeddings |
 | `search_total_ms_p95` | histograma | Percentil 95 de la latencia de búsqueda de extremo a extremo |
+| `search_result_count_avg` | histograma | Número promedio de resultados devueltos por llamada a `search`/`recall`, etiquetado con `mode` (`semantic`/`fulltext`/`hybrid`). Cuenta solo los resultados específicos del modo - las coincidencias archivadas añadidas por `include_archived` quedan excluidas. |
+| `search_result_count_p50` | histograma | Percentil 50 del número de resultados, etiquetado con `mode` |
+| `search_result_count_p95` | histograma | Percentil 95 del número de resultados, etiquetado con `mode` |
+| `search_result_count_p99` | histograma | Percentil 99 del número de resultados, etiquetado con `mode` |
+| `search_result_count_count` | contador | Número de muestras de `search_result_count`, etiquetado con `mode` |
+| `search_result_score_avg` | histograma | Puntuación compuesta promedio de los resultados por llamada a `search`/`recall`, etiquetado con `mode`. Una muestra por resultado; excluye las coincidencias archivadas, que llevan una puntuación de marcador de posición (no de relevancia). |
+| `search_result_score_p50` | histograma | Percentil 50 de la puntuación compuesta de los resultados, etiquetado con `mode` |
+| `search_result_score_p95` | histograma | Percentil 95 de la puntuación compuesta de los resultados, etiquetado con `mode` |
+| `search_result_score_p99` | histograma | Percentil 99 de la puntuación compuesta de los resultados, etiquetado con `mode` |
+| `search_result_score_count` | contador | Número de muestras de `search_result_score`, etiquetado con `mode` |
 | `bhgbrain_memory_count` | medidor | Recuento total de memorias actual (actualizado en escritura/eliminación) |
 | `bhgbrain_rate_limit_buckets` | medidor | Cubos de seguimiento de límite de tasa activos |
 | `bhgbrain_rate_limited_total` | contador | Total de solicitudes con límite de tasa excedido |
 | `recall_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva de tipo/etiquetas/`after`/`before` posterior a la recuperación de `recall` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
 | `search_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva `after`/`before` posterior a la recuperación de `search` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
+| `search_embedding_degraded` | contador | Se incrementa cuando una búsqueda en modo `hybrid` recae en solo texto completo porque el proveedor de embeddings o el almacén de vectores no está disponible, etiquetado con `namespace` |
 
 Por ejemplo:
 

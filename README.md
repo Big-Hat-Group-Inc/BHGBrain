@@ -2177,11 +2177,22 @@ label-less format).
 | `bhgbrain_tool_handler_ms_count` | counter | Number of tool handler latency samples, labeled `tool` and `status` |
 | `embedding_embed_batch_ms_p95` | histogram | 95th percentile embedding batch latency |
 | `search_total_ms_p95` | histogram | 95th percentile end-to-end search latency |
+| `search_result_count_avg` | histogram | Average number of results returned per `search`/`recall` call, labeled `mode` (`semantic`/`fulltext`/`hybrid`). Counts mode-specific results only - archived matches appended by `include_archived` are excluded. |
+| `search_result_count_p50` | histogram | 50th percentile result count, labeled `mode` |
+| `search_result_count_p95` | histogram | 95th percentile result count, labeled `mode` |
+| `search_result_count_p99` | histogram | 99th percentile result count, labeled `mode` |
+| `search_result_count_count` | counter | Number of `search_result_count` samples, labeled `mode` |
+| `search_result_score_avg` | histogram | Average composite result score per `search`/`recall` call, labeled `mode`. One sample per result; excludes archived matches, which carry a placeholder (non-relevance) score. |
+| `search_result_score_p50` | histogram | 50th percentile composite result score, labeled `mode` |
+| `search_result_score_p95` | histogram | 95th percentile composite result score, labeled `mode` |
+| `search_result_score_p99` | histogram | 99th percentile composite result score, labeled `mode` |
+| `search_result_score_count` | counter | Number of `search_result_score` samples, labeled `mode` |
 | `bhgbrain_memory_count` | gauge | Current total memory count (updated on write/delete) |
 | `bhgbrain_rate_limit_buckets` | gauge | Active rate limit tracking buckets |
 | `bhgbrain_rate_limited_total` | counter | Total rate-limited requests |
 | `recall_zero_after_filter` | counter | Incremented when `recall`'s defensive post-retrieval type/tags/`after`/`before` re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
 | `search_zero_after_filter` | counter | Incremented when `search`'s defensive post-retrieval `after`/`before` re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
+| `search_embedding_degraded` | counter | Incremented when `hybrid`-mode search falls back to fulltext-only because the embedding provider or vector store is unavailable, labeled `namespace` |
 
 For example:
 

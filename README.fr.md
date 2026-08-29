@@ -2141,11 +2141,22 @@ rétrocompatible avec le format précédent sans étiquette).
 | `bhgbrain_tool_handler_ms_count` | compteur | Nombre d'échantillons de latence du gestionnaire d'outil, étiquetée `tool` et `status` |
 | `embedding_embed_batch_ms_p95` | histogramme | 95e centile de la latence des lots d'embeddings |
 | `search_total_ms_p95` | histogramme | 95e centile de la latence de recherche de bout en bout |
+| `search_result_count_avg` | histogramme | Nombre moyen de résultats renvoyés par appel `search`/`recall`, étiqueté `mode` (`semantic`/`fulltext`/`hybrid`). Ne compte que les résultats spécifiques au mode - les correspondances archivées ajoutées par `include_archived` sont exclues. |
+| `search_result_count_p50` | histogramme | 50e centile du nombre de résultats, étiqueté `mode` |
+| `search_result_count_p95` | histogramme | 95e centile du nombre de résultats, étiqueté `mode` |
+| `search_result_count_p99` | histogramme | 99e centile du nombre de résultats, étiqueté `mode` |
+| `search_result_count_count` | compteur | Nombre d'échantillons `search_result_count`, étiqueté `mode` |
+| `search_result_score_avg` | histogramme | Score composite moyen des résultats par appel `search`/`recall`, étiqueté `mode`. Un échantillon par résultat ; exclut les correspondances archivées, qui portent un score de remplacement (non un score de pertinence). |
+| `search_result_score_p50` | histogramme | 50e centile du score composite des résultats, étiqueté `mode` |
+| `search_result_score_p95` | histogramme | 95e centile du score composite des résultats, étiqueté `mode` |
+| `search_result_score_p99` | histogramme | 99e centile du score composite des résultats, étiqueté `mode` |
+| `search_result_score_count` | compteur | Nombre d'échantillons `search_result_score`, étiqueté `mode` |
 | `bhgbrain_memory_count` | jauge | Nombre total actuel de souvenirs (mis à jour à l'écriture/suppression) |
 | `bhgbrain_rate_limit_buckets` | jauge | Compartiments de suivi de la limitation de débit actifs |
 | `bhgbrain_rate_limited_total` | compteur | Total des requêtes avec limitation de débit |
 | `recall_zero_after_filter` | compteur | Incrémenté lorsque la revérification défensive de type/tags/`after`/`before` après récupération de `recall` supprime un résultat que le magasin avait déjà déclaré correspondant — un signal de famine de filtrage qui devrait rester à 0 en régime stable |
 | `search_zero_after_filter` | compteur | Incrémenté lorsque la revérification défensive `after`/`before` après récupération de `search` supprime un résultat que le magasin avait déjà déclaré correspondant — un signal de famine de filtrage qui devrait rester à 0 en régime stable |
+| `search_embedding_degraded` | compteur | Incrémenté lorsqu'une recherche en mode `hybrid` bascule vers le plein texte uniquement parce que le fournisseur d'embeddings ou le magasin vectoriel est indisponible, étiqueté `namespace` |
 
 Par exemple :
 

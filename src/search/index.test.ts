@@ -406,12 +406,104 @@ describe('SearchService', () => {
     const results = await service.search('hello', 'global', undefined, 'hybrid', 10);
     expect(results.length).toBeGreaterThan(0);
     // ...but the degradation is observable.
-    expect(metrics.incCounter).toHaveBeenCalledWith('search_embedding_degraded');
+    expect(metrics.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { namespace: 'global' });
     expect(logger.warn).toHaveBeenCalledWith(
       expect.objectContaining({ event: 'embedding_degraded', degraded: 'fulltext_only' }),
     );
     // Qdrant should not have been queried once embedding failed.
     expect(storage.qdrant.search).not.toHaveBeenCalled();
+  });
+
+  it('accumulates search_embedding_degraded independently per namespace (add-retrieval-quality-metrics 3.3)', async () => {
+    const { service: serviceA, embedding: embeddingA, metrics: metricsA } = createSearchService();
+    (embeddingA.embed as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('embeddings down'));
+    await serviceA.search('hello', 'team-a', undefined, 'hybrid', 10);
+    expect(metricsA.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { namespace: 'team-a' });
+
+    const { service: serviceB, embedding: embeddingB, metrics: metricsB } = createSearchService();
+    (embeddingB.embed as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('embeddings down'));
+    await serviceB.search('hello', 'team-b', undefined, 'hybrid', 10);
+    expect(metricsB.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { namespace: 'team-b' });
+  });
+
+  describe('retrieval quality metrics (add-retrieval-quality-metrics)', () => {
+    it('records search_result_count and search_result_score for a semantic-mode search', async () => {
+      const { service, storage, metrics } = createSearchService();
+      storage.qdrant.search.mockResolvedValue([
+        { id: 'mem-1', score: 0.8, payload: {} },
+      ]);
+
+      const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+
+      expect(results.length).toBeGreaterThan(0);
+      expect(metrics.recordHistogram).toHaveBeenCalledWith('search_result_count', results.length, { mode: 'semantic' });
+      for (const r of results) {
+        expect(metrics.recordHistogram).toHaveBeenCalledWith('search_result_score', r.score, { mode: 'semantic' });
+      }
+    });
+
+    it('records search_result_count and search_result_score for a fulltext-mode search', async () => {
+      const { service, metrics } = createSearchService();
+
+      const results = await service.search('hello', 'global', undefined, 'fulltext', 10);
+
+      expect(results.length).toBeGreaterThan(0);
+      expect(metrics.recordHistogram).toHaveBeenCalledWith('search_result_count', results.length, { mode: 'fulltext' });
+      for (const r of results) {
+        expect(metrics.recordHistogram).toHaveBeenCalledWith('search_result_score', r.score, { mode: 'fulltext' });
+      }
+    });
+
+    it('records search_result_count and search_result_score for a hybrid-mode search', async () => {
+      const { service, metrics } = createSearchService();
+
+      const results = await service.search('hello', 'global', undefined, 'hybrid', 10);
+
+      expect(results.length).toBeGreaterThan(0);
+      expect(metrics.recordHistogram).toHaveBeenCalledWith('search_result_count', results.length, { mode: 'hybrid' });
+      for (const r of results) {
+        expect(metrics.recordHistogram).toHaveBeenCalledWith('search_result_score', r.score, { mode: 'hybrid' });
+      }
+    });
+
+    it('records a zero search_result_count and no score samples for a zero-result search', async () => {
+      const { service, metrics } = createSearchService();
+      // Default fixture's semantic leg (storage.qdrant.search) resolves to
+      // [] and no memory named 'nothing-matches-this' exists in fulltext.
+      const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+
+      expect(results).toHaveLength(0);
+      expect(metrics.recordHistogram).toHaveBeenCalledWith('search_result_count', 0, { mode: 'semantic' });
+      expect(metrics.recordHistogram).not.toHaveBeenCalledWith('search_result_score', expect.anything(), { mode: 'semantic' });
+    });
+
+    it('does not add archived matches to search_result_score, even though they are appended to the return value', async () => {
+      const { service, storage, metrics } = createSearchService();
+      (storage.sqlite as unknown as { searchArchived: ReturnType<typeof vi.fn> }).searchArchived = vi.fn(
+        (_ns: string, _q: string, _limit: number) => [
+          {
+            id: 99, memory_id: 'archived-1', summary: 'an archived summary', tier: 'T2',
+            namespace: 'global', created_at: '2025-01-01T00:00:00Z', expired_at: '2025-06-01T00:00:00Z',
+            access_count: 2, tags: ['old'],
+          },
+        ],
+      );
+
+      const results = await service.search(
+        'hello', 'global', undefined, 'fulltext', 10, undefined, undefined, true,
+      );
+
+      // The active (non-archived) result count is recorded, not the
+      // post-archived-append total.
+      const activeCount = results.filter(r => !r.archived).length;
+      expect(metrics.recordHistogram).toHaveBeenCalledWith('search_result_count', activeCount, { mode: 'fulltext' });
+      // The archived match's placeholder score (0) is never recorded to
+      // search_result_score.
+      const scoreCalls = (metrics.recordHistogram as ReturnType<typeof vi.fn>).mock.calls.filter(
+        call => call[0] === 'search_result_score' && call[2]?.mode === 'fulltext',
+      );
+      expect(scoreCalls).toHaveLength(activeCount);
+    });
   });
 
   it('sets the degraded signal when hybrid falls back to fulltext-only', async () => {
