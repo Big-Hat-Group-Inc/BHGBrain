@@ -59,18 +59,16 @@
 - [x] 4.2 `README.md` § `import` (around line 2656-2687): add a short cross-reference
   note ("if `remember` rejected your content as too long, use `import` with
   `format: "freeform"` here") so the two tools' docs point at each other.
-- [ ] 4.3 Mirror both README changes into `README.de.md`, `README.es.md`,
-  `README.fr.md`, `README.zh-CN.md`, section-for-section. PARTIAL: the `remember`
-  threshold note was mirrored into all four translated READMEs' `### remember`
-  sections. The `import` cross-reference note could **not** be mirrored: none of the
-  four translated READMEs contain an `import` (or `bootstrap`) tool section at all —
-  that's a pre-existing translation gap (confirmed via
-  `grep -n "^### \`" README.*.md`, which shows `remember` through `repair` in English
-  but only up through `backup`/`revisions`/`review`/`repair` in the translations, with
-  `bootstrap` and `import` missing entirely) that predates this change and is out of
-  this proposal's scope to backfill (it would mean authoring four new translated tool
-  sections from scratch, not mirroring an edit). Left unchecked rather than
-  papering over the gap.
+- [x] 4.3 Mirror both README changes into `README.de.md`, `README.es.md`,
+  `README.fr.md`, `README.zh-CN.md`, section-for-section. The `remember` threshold
+  note was mirrored into all four translated READMEs' `### remember` sections. The
+  `import` cross-reference note was initially blocked because none of the four
+  translated READMEs contained an `import` (or `bootstrap`) tool section at all — a
+  pre-existing translation gap unrelated to this proposal. That gap was since closed
+  by a separate full README-parity sync (all four translations now have complete
+  `bootstrap`/`import` tool reference sections), and the cross-reference note is
+  confirmed present in all four (`grep -n long_content_threshold_chars README.*.md`
+  shows it in each translated `import` section). Nothing further to backfill.
 - [x] 4.4 Bump `package.json` `version` (currently `1.15.0`, was `1.11.0` when this
   task was written) to `1.16.0` — this is a user-visible, behavior-changing addition
   (existing long `remember` calls that used to succeed now fail).
