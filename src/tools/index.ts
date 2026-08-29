@@ -13,9 +13,12 @@ import {
   SearchInputSchema, TagInputSchema, CollectionsInputSchema,
   CategoryInputSchema, BackupInputSchema, RepairInputSchema,
   RevisionsInputSchema, ReviewInputSchema, ConsolidateInputSchema,
+  RelateInputSchema,
   type RepairInput, type ConsolidateInput,
 } from '../domain/schemas.js';
-import type { WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter } from '../domain/types.js';
+import type {
+  WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter,
+} from '../domain/types.js';
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
 import { computeChecksum } from '../domain/normalize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
@@ -130,6 +133,7 @@ async function dispatch(
     case 'import': return handleImport(ctx, args, logCtx);
     case 'revisions': return handleRevisions(ctx, args, clientId, logCtx);
     case 'review': return handleReview(ctx, args, clientId, logCtx);
+    case 'relate': return handleRelate(ctx, args, clientId, logCtx);
     case 'repair': return handleRepair(ctx, args);
     case 'consolidate': return handleConsolidate(ctx, args, clientId, logCtx);
     default:
@@ -240,7 +244,55 @@ async function handleRecall(
   // mode, but this keeps the comparison correct if that ever changes.
   filtered = filtered.filter(r => (r.semantic_score ?? r.score) >= input.min_score);
 
-  return { results: filtered.slice(0, input.limit) };
+  const sliced = filtered.slice(0, input.limit);
+
+  if (!input.follow_links) {
+    return { results: sliced };
+  }
+
+  // One-hop neighbor expansion (add-memory-links): runs on the final,
+  // limit-sliced result set (not the wider pre-slice candidate pool) so the
+  // number of memories whose links get looked up is bounded by `input.limit`
+  // regardless of how large `fetchLimit`'s over-fetch was. See design.md
+  // "`follow_links` expansion happens in `handleRecall`".
+  const baseIds = new Set(sliced.map(r => r.id));
+  const appendedIds = new Set<string>();
+  const neighbors: SearchResult[] = [];
+
+  for (const base of sliced) {
+    if (neighbors.length >= input.limit) break;
+    const links = ctx.storage.sqlite.listMemoryLinks(base.id);
+    for (const link of links) {
+      if (neighbors.length >= input.limit) break;
+      const otherId = link.direction === 'outgoing' ? link.to_id : link.from_id;
+      if (baseIds.has(otherId) || appendedIds.has(otherId)) continue;
+
+      // Default (non-archived-only) lookup: a link to a now-archived memory
+      // contributes nothing recallable, so it is silently skipped.
+      const neighborMem = ctx.storage.sqlite.getMemoryById(otherId);
+      if (!neighborMem) continue;
+
+      appendedIds.add(otherId);
+      neighbors.push({
+        id: neighborMem.id,
+        content: neighborMem.content,
+        summary: neighborMem.summary,
+        type: neighborMem.type,
+        tags: neighborMem.tags,
+        score: 0,
+        retention_tier: neighborMem.retention_tier,
+        expires_at: neighborMem.expires_at,
+        device_id: neighborMem.device_id ?? null,
+        created_at: neighborMem.created_at,
+        last_accessed: neighborMem.last_accessed,
+        linked_from: base.id,
+        link_relation: link.relation,
+        link_direction: link.direction,
+      });
+    }
+  }
+
+  return { results: [...sliced, ...neighbors] };
 }
 
 async function handleForget(
@@ -528,6 +580,91 @@ async function handleReview(
 
   ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
   return { id: restoredId, restored_from: archived.memory_id, archive_id: archived.id, restored: true };
+}
+
+// Directed, typed edges between memories (add-memory-links): `add`/`list`/
+// `remove` a general, caller-authored relationship alongside the write
+// pipeline's automatic `merged_from` replacement pointer (deliberately left
+// untouched — narrower, automatic concept). See design.md "Directed edges,
+// symmetric relations included".
+async function handleRelate(
+  ctx: ToolContext, args: unknown, clientId: string, logCtx: ToolLogContext,
+): Promise<unknown> {
+  const input = parseInput(RelateInputSchema, args);
+
+  if (input.action === 'add') {
+    const fromId = input.from_id!;
+    const toId = input.to_id!;
+    const relation = input.relation!;
+
+    if (fromId === toId) {
+      throw invalidInput('from_id and to_id must differ');
+    }
+
+    const fromMem = ctx.storage.sqlite.getMemoryById(fromId);
+    if (!fromMem) throw notFound(`Memory ${fromId} not found`);
+    const toMem = ctx.storage.sqlite.getMemoryById(toId);
+    if (!toMem) throw notFound(`Memory ${toId} not found`);
+
+    if (fromMem.namespace !== toMem.namespace) {
+      throw invalidInput(
+        `from_id ${fromId} belongs to namespace "${fromMem.namespace}", but to_id ${toId} belongs to "${toMem.namespace}"`,
+      );
+    }
+    logCtx.namespace = fromMem.namespace;
+
+    const { record, created } = ctx.storage.sqlite.addMemoryLink(
+      fromMem.namespace, fromId, toId, relation, clientId,
+    );
+    ctx.storage.sqlite.flushIfDirty();
+
+    return {
+      id: record.id,
+      namespace: record.namespace,
+      from_id: record.from_id,
+      to_id: record.to_id,
+      relation: record.relation,
+      created_at: record.created_at,
+      created,
+    };
+  }
+
+  if (input.action === 'remove') {
+    const fromId = input.from_id!;
+    const toId = input.to_id!;
+    const relation = input.relation!;
+    const removed = ctx.storage.sqlite.removeMemoryLink(fromId, toId, relation);
+    if (!removed) throw notFound(`Link ${fromId} -> ${toId} (${relation}) not found`);
+    ctx.storage.sqlite.flushIfDirty();
+    return { removed: true, from_id: fromId, to_id: toId, relation };
+  }
+
+  // 'list' — schema refine guarantees `id` is present here.
+  const id = input.id!;
+  // Archived-inclusive lookup so links on an about-to-be-archived memory
+  // remain listable.
+  const mem = ctx.storage.sqlite.getMemoryById(id, true);
+  if (!mem) throw notFound(`Memory ${id} not found`);
+  logCtx.namespace = mem.namespace;
+
+  let links = ctx.storage.sqlite.listMemoryLinks(id, input.relation ? { relation: input.relation } : undefined);
+  if (input.direction !== 'both') {
+    const wanted: 'outgoing' | 'incoming' = input.direction === 'from' ? 'outgoing' : 'incoming';
+    links = links.filter(l => l.direction === wanted);
+  }
+
+  return {
+    id,
+    links: links.map(l => ({
+      id: l.id,
+      from_id: l.from_id,
+      to_id: l.to_id,
+      relation: l.relation,
+      direction: l.direction,
+      created_at: l.created_at,
+      created_by: l.created_by,
+    })),
+  };
 }
 
 interface ConsolidateClusterMember {

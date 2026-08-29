@@ -21,6 +21,9 @@ const SEARCH_RESULT_SCHEMA = {
     created_at: { type: 'string' },
     last_accessed: { type: 'string' },
     archived: { type: 'boolean' },
+    linked_from: { type: 'string' },
+    link_relation: { type: 'string', enum: ['refines', 'contradicts', 'derived_from', 'about_same_entity', 'follows'] },
+    link_direction: { type: 'string', enum: ['outgoing', 'incoming'] },
   },
   required: ['id', 'content', 'summary', 'type', 'tags', 'score', 'retention_tier', 'created_at', 'last_accessed'],
 };
@@ -87,6 +90,7 @@ export const MCP_TOOL_DEFINITIONS = [
         min_score: { type: 'number', minimum: 0, maximum: 1, default: 0.6, description: 'Cosine-similarity threshold applied to the semantic score, not the fused/adjusted score' },
         after: { type: 'string', format: 'date-time', description: 'Only include memories with created_at >= this ISO 8601 timestamp (inclusive)' },
         before: { type: 'string', format: 'date-time', description: 'Only include memories with created_at <= this ISO 8601 timestamp (inclusive)' },
+        follow_links: { type: 'boolean', description: 'Also return each result\'s one-hop linked memories (relate tool edges, both directions, all relations), marked with linked_from/link_relation/link_direction. Default false.', default: false },
       },
       required: ['query'],
       additionalProperties: false,
@@ -287,6 +291,27 @@ export const MCP_TOOL_DEFINITIONS = [
       additionalProperties: false,
     },
     // `archive` is reversible via `restore`.
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  {
+    name: 'relate',
+    title: 'Relate',
+    description: 'Connect memories with typed, directed edges. action: "add" creates an edge between two memories (idempotent: re-adding an identical edge returns the existing one); "list" returns a memory\'s edges, either direction, optionally filtered by relation; "remove" deletes a specific edge. Relations: refines, contradicts, derived_from, about_same_entity, follows.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: { type: 'string', enum: ['add', 'list', 'remove'], description: 'The action to perform' },
+        from_id: { type: 'string', format: 'uuid', description: 'Source memory ID (required for add/remove)' },
+        to_id: { type: 'string', format: 'uuid', description: 'Target memory ID (required for add/remove)' },
+        relation: { type: 'string', enum: ['refines', 'contradicts', 'derived_from', 'about_same_entity', 'follows'], description: 'Edge type (required for add/remove)' },
+        id: { type: 'string', format: 'uuid', description: 'The memory whose links to list (required for list)' },
+        direction: { type: 'string', enum: ['from', 'to', 'both'], default: 'both', description: '(list only) Filter edges by direction relative to id' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    // `add` is idempotent (re-adding returns the existing edge); `remove` is
+    // a targeted, reversible-by-re-adding edge deletion, not a memory delete.
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {

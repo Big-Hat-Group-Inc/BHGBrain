@@ -115,6 +115,12 @@ export interface SearchResult {
   // (add-review-and-archive-recall). Absent (not `false`) on every active
   // result, so it never appears in default JSON responses.
   archived?: boolean;
+  // Set only on one-hop neighbors appended by `recall`'s `follow_links`
+  // (add-memory-links). Absent on every directly relevant result, same
+  // convention as `archived` above.
+  linked_from?: string;
+  link_relation?: MemoryLinkRelation;
+  link_direction?: 'outgoing' | 'incoming';
 }
 
 export interface WriteResult {
@@ -255,6 +261,20 @@ export interface MemoryRevisionRecord {
   content: string;
   updated_at: string;
   updated_by: string | null;
+}
+
+// Directed, typed edge between two memories (add-memory-links). See the
+// `relate` tool and `recall`'s `follow_links` parameter.
+export type MemoryLinkRelation = 'refines' | 'contradicts' | 'derived_from' | 'about_same_entity' | 'follows';
+
+export interface MemoryLinkRecord {
+  id: number;
+  namespace: string;
+  from_id: string;
+  to_id: string;
+  relation: MemoryLinkRelation;
+  created_at: string;
+  created_by: string | null;
 }
 
 export interface TierStats {

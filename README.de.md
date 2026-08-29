@@ -2391,7 +2391,7 @@ bhgbrain server token                 # Neues zufälliges Bearer-Token generiere
 
 ## MCP-Tools-Referenz
 
-BHGBrain stellt 11 MCP-Tools bereit. Alle Tools validieren Eingaben mit Zod-Schemas und geben strukturiertes JSON zurück. Fehler verwenden einen konsistenten Umschlag:
+BHGBrain stellt 12 MCP-Tools bereit. Alle Tools validieren Eingaben mit Zod-Schemas und geben strukturiertes JSON zurück. Fehler verwenden einen konsistenten Umschlag:
 
 ```json
 {
@@ -2554,6 +2554,7 @@ Die relevantesten Erinnerungen für eine Abfrage mithilfe semantischer (Vektor-)
 | `min_score` | `number (0–1)` | Nein | `0.6` | Mindestkosinus-Ähnlichkeitsscore, angewendet auf `semantic_score` (nicht auf den fusionierten/angepassten `score`). Ergebnisse unter diesem Schwellenwert werden ausgeschlossen. |
 | `after` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at >= after` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
 | `before` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at <= before` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
+| `follow_links` | `boolean` | Nein | `false` | Gibt zusätzlich die Ein-Hop-Nachbarn jedes Ergebnisses zurück (Kanten, die über das `relate`-Tool erstellt wurden, beide Richtungen, alle Relationen). Angehängte Einträge sind mit `linked_from`/`link_relation`/`link_direction` markiert, damit ein Client einen erweiterten Nachbarn von einem direkt relevanten Treffer unterscheiden kann; siehe `relate` unten. |
 
 **Ausgabe:**
 
@@ -2577,6 +2578,15 @@ Die relevantesten Erinnerungen für eine Abfrage mithilfe semantischer (Vektor-)
   ]
 }
 ```
+
+Mit `follow_links: true` werden die Ein-Hop-Nachbarn jedes Basisergebnisses nach den
+Basisergebnissen angehängt (ohne die Anzahl der von `limit` erlaubten Basisergebnisse
+zu verringern), dedupliziert gegen die Basismenge und untereinander, und insgesamt auf
+`limit` angehängte Einträge begrenzt. Angehängte Einträge tragen `score: 0` (ein
+Platzhalter, kein Relevanzscore — dieselbe Konvention wie bei `include_archived` von
+`search`) sowie `linked_from` (die ID des Basisergebnisses), `link_relation` und
+`link_direction` (`"outgoing"`, wenn das Basisergebnis die Quelle der Kante ist,
+`"incoming"`, wenn es das Ziel ist). Ein bereits archivierter Nachbar wird übersprungen.
 
 ---
 
@@ -2908,6 +2918,90 @@ Leitet die Erinnerung über denselben Archivierungsübergang, den auch GC nutzt:
 ```
 
 Erstellt eine aktive Erinnerung aus der gespeicherten Zusammenfassung und den Tags des Archiveintrags neu, auf der ursprünglichen Stufe — ein **Stub mit Herkunftsnachweis**, keine Wiederbelebung: der ursprüngliche Inhalt und Vektor wurden nie aufbewahrt, daher ist der Inhalt der wiederhergestellten Erinnerung ihre archivierte Zusammenfassung, versehen mit ihren ursprünglichen Tags plus einem `restored-from-archive`-Markierungs-Tag, und frisch eingebettet, damit sie an der Suche teilnimmt. Die Archivzeile wird beibehalten (nicht gelöscht), anders als beim CLI-Befehl `archive restore`. Protokolliert ein `RESTORE`-Audit-Ereignis, das den Archivursprung verknüpft. Liefert `NOT_FOUND`, falls für die angegebene ID kein Archiveintrag existiert.
+
+---
+
+### `relate` — Erinnerungen mit typisierten Kanten verbinden
+
+Verbindet Erinnerungen mit typisierten, gerichteten Kanten — einer allgemeinen,
+vom Aufrufer autorisierten Beziehung neben dem automatischen `merged_from`-Ersetzungs
+zeiger der Write-Pipeline (den `relate` unangetastet lässt). Fünf Relationen werden
+unterstützt: `refines`, `contradicts`, `derived_from`, `about_same_entity`, `follows`.
+Kanten sind gerichtet (`from_id` → `to_id`), aber `list` und `follow_links` von
+`recall` (siehe oben) durchlaufen beide Richtungen, sodass konzeptionell symmetrische
+Relationen (`contradicts`, `about_same_entity`) sich in der Praxis symmetrisch
+verhalten.
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `action` | `"add" \| "list" \| "remove"` | **Ja** | — | Die auszuführende Operation. |
+| `from_id` | `string (UUID)` | Erforderlich für `add`/`remove` | — | Quell-Erinnerungs-ID. |
+| `to_id` | `string (UUID)` | Erforderlich für `add`/`remove` | — | Ziel-Erinnerungs-ID. Muss sich von `from_id` unterscheiden. |
+| `relation` | `"refines" \| "contradicts" \| "derived_from" \| "about_same_entity" \| "follows"` | Erforderlich für `add`/`remove` | — | Kantentyp. |
+| `id` | `string (UUID)` | Erforderlich für `list` | — | Die Erinnerung, deren Kanten aufgelistet werden sollen. |
+| `direction` | `"from" \| "to" \| "both"` | Nein | `"both"` | (nur `list`) Kanten relativ zu `id` nach Richtung filtern. |
+
+**Ausgabe (`action: "add"`):**
+
+```json
+{
+  "id": 42,
+  "namespace": "global",
+  "from_id": "3f4a1b2c-...",
+  "to_id": "9c2e5f10-...",
+  "relation": "refines",
+  "created_at": "2026-03-01T00:00:00.000Z",
+  "created": true
+}
+```
+
+Idempotent: Das erneute Hinzufügen einer bereits vorhandenen Kante (gleiche `from_id`,
+`to_id` und `relation`) liefert die vorhandene Zeile mit `created: false` zurück, statt
+einen Fehler auszulösen oder ein Duplikat zu erstellen. Liefert `NOT_FOUND`, falls eine
+der beiden Erinnerungs-IDs nicht existiert, und `INVALID_INPUT`, falls `from_id === to_id`
+oder die beiden Erinnerungen zu unterschiedlichen Namensräumen gehören
+(Cross-Collection-Verknüpfungen innerhalb desselben Namensraums sind erlaubt).
+
+**Ausgabe (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "links": [
+    {
+      "id": 42,
+      "from_id": "3f4a1b2c-...",
+      "to_id": "9c2e5f10-...",
+      "relation": "refines",
+      "direction": "outgoing",
+      "created_at": "2026-03-01T00:00:00.000Z",
+      "created_by": "c1"
+    }
+  ]
+}
+```
+
+Liefert jede Kante, die `id` berührt, in beide Richtungen, sofern `direction` sie nicht
+einschränkt, jede markiert mit `outgoing` (`id` ist `from_id`) oder `incoming` (`id` ist
+`to_id`). Verwendet den archiv-inklusiven Lookup, sodass Kanten einer bald zu
+archivierenden Erinnerung weiterhin auflistbar bleiben. Liefert `NOT_FOUND`, falls `id`
+nicht existiert.
+
+**Ausgabe (`action: "remove"`):**
+
+```json
+{ "removed": true, "from_id": "3f4a1b2c-...", "to_id": "9c2e5f10-...", "relation": "refines" }
+```
+
+Löscht die benannte Kante. Liefert `NOT_FOUND`, falls sie nicht existiert.
+
+Das Löschen einer Erinnerung (über `forget` oder die `archive`-Aktion von `review`)
+löscht kaskadierend jede Kante, die auf sie verwiesen hat, sodass `memory_links` nie
+einen verwaisten Verweis auf eine fehlende Erinnerung enthält. Für `relate` wird keine
+neue `AuditOperation` protokolliert — die Kantentabelle selbst, mit `created_at`/
+`created_by` auf jeder Zeile, ist der dauerhafte Nachweis.
 
 ---
 

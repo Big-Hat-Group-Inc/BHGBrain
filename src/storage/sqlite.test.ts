@@ -271,6 +271,108 @@ describe('SqliteStore', () => {
     expect(store.countMemoriesInCollection('global', 'other')).toBe(1);
   });
 
+  // -- Memory links (add-memory-links) --
+
+  describe('memory_links', () => {
+    const memA = () => ({ ...sampleMemory(), id: '10000000-0000-0000-0000-000000000001', checksum: 'link-a' });
+    const memB = () => ({ ...sampleMemory(), id: '10000000-0000-0000-0000-000000000002', checksum: 'link-b' });
+    const memC = () => ({ ...sampleMemory(), id: '10000000-0000-0000-0000-000000000003', checksum: 'link-c' });
+
+    it('adds an edge and returns created: true', () => {
+      store.insertMemory(memA());
+      store.insertMemory(memB());
+      const { record, created } = store.addMemoryLink('global', memA().id, memB().id, 'refines', 'tester');
+      expect(created).toBe(true);
+      expect(record.from_id).toBe(memA().id);
+      expect(record.to_id).toBe(memB().id);
+      expect(record.relation).toBe('refines');
+      expect(record.namespace).toBe('global');
+      expect(record.created_by).toBe('tester');
+      expect(record.created_at).toBeTruthy();
+    });
+
+    it('re-adding an identical edge is idempotent, returning the existing row with created: false', () => {
+      store.insertMemory(memA());
+      store.insertMemory(memB());
+      const first = store.addMemoryLink('global', memA().id, memB().id, 'refines', 'tester');
+      const second = store.addMemoryLink('global', memA().id, memB().id, 'refines', 'someone-else');
+      expect(second.created).toBe(false);
+      expect(second.record).toEqual(first.record);
+    });
+
+    it('listMemoryLinks returns correct direction for both ends of an edge', () => {
+      store.insertMemory(memA());
+      store.insertMemory(memB());
+      store.addMemoryLink('global', memA().id, memB().id, 'refines', null);
+
+      const fromA = store.listMemoryLinks(memA().id);
+      expect(fromA).toHaveLength(1);
+      expect(fromA[0]!.direction).toBe('outgoing');
+
+      const fromB = store.listMemoryLinks(memB().id);
+      expect(fromB).toHaveLength(1);
+      expect(fromB[0]!.direction).toBe('incoming');
+    });
+
+    it('listMemoryLinks respects a relation filter', () => {
+      store.insertMemory(memA());
+      store.insertMemory(memB());
+      store.insertMemory(memC());
+      store.addMemoryLink('global', memA().id, memB().id, 'refines', null);
+      store.addMemoryLink('global', memA().id, memC().id, 'contradicts', null);
+
+      const refinesOnly = store.listMemoryLinks(memA().id, { relation: 'refines' });
+      expect(refinesOnly).toHaveLength(1);
+      expect(refinesOnly[0]!.to_id).toBe(memB().id);
+    });
+
+    it('removeMemoryLink deletes an existing edge and returns true', () => {
+      store.insertMemory(memA());
+      store.insertMemory(memB());
+      store.addMemoryLink('global', memA().id, memB().id, 'refines', null);
+      expect(store.removeMemoryLink(memA().id, memB().id, 'refines')).toBe(true);
+      expect(store.listMemoryLinks(memA().id)).toHaveLength(0);
+    });
+
+    it('removeMemoryLink returns false for a non-existent edge', () => {
+      store.insertMemory(memA());
+      store.insertMemory(memB());
+      expect(store.removeMemoryLink(memA().id, memB().id, 'refines')).toBe(false);
+    });
+
+    it('regression: review\'s archive action (archiveMemory then deleteMemory) leaves no orphaned links, same as direct deleteMemory', () => {
+      const a = memA();
+      const b = memB();
+      store.insertMemory(a);
+      store.insertMemory(b);
+      store.addMemoryLink('global', a.id, b.id, 'refines', null);
+
+      // Exactly the sequence `review`'s `archive` action runs
+      // (src/tools/index.ts handleReview): fetch, archiveMemory, then
+      // deleteMemory — fetched via getMemoryById so defaulted columns
+      // (e.g. retention_tier) are populated, same as the real handler.
+      const fetched = store.getMemoryById(a.id)!;
+      store.archiveMemory(fetched, new Date().toISOString());
+      store.deleteMemory(a.id);
+
+      expect(store.listMemoryLinks(b.id)).toHaveLength(0);
+    });
+
+    it('deleteMemory cascades: deleting either endpoint removes the memory_links row', () => {
+      store.insertMemory(memA());
+      store.insertMemory(memB());
+      store.insertMemory(memC());
+      store.addMemoryLink('global', memA().id, memB().id, 'refines', null);
+      store.addMemoryLink('global', memC().id, memA().id, 'derived_from', null);
+
+      store.deleteMemory(memA().id);
+
+      // memA no longer exists, so links naming it as either endpoint are gone.
+      expect(store.listMemoryLinks(memB().id)).toHaveLength(0);
+      expect(store.listMemoryLinks(memC().id)).toHaveLength(0);
+    });
+  });
+
   // -- Deferred flush --
 
   it('touchMemory does not synchronously flush', () => {

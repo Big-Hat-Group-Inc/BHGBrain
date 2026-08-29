@@ -2329,7 +2329,7 @@ bhgbrain server token                 # 生成新的随机 Bearer token
 
 ## MCP 工具参考
 
-BHGBrain 暴露 11 个 MCP 工具。所有工具使用 Zod schema 验证输入并返回结构化 JSON。错误使用统一的信封格式：
+BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入并返回结构化 JSON。错误使用统一的信封格式：
 
 ```json
 {
@@ -2484,6 +2484,7 @@ BHGBrain 暴露 11 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `min_score` | `number (0–1)` | 否 | `0.6` | 最低余弦相似度得分，作用于 `semantic_score`（而非融合/调整后的 `score`）。低于此阈值的结果被排除。 |
 | `after` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at >= after`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到存储层，使 `limit` 计算匹配的记忆数量。 |
 | `before` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at <= before`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到存储层，使 `limit` 计算匹配的记忆数量。 |
+| `follow_links` | `boolean` | 否 | `false` | 同时返回每条结果的单跳关联记忆（通过 `relate` 工具创建的边，双向，所有关系类型）。附加条目会标记 `linked_from`/`link_relation`/`link_direction`，便于客户端区分扩展出的关联记忆与直接相关的命中结果；参见下文的 `relate`。 |
 
 **输出：**
 
@@ -2507,6 +2508,13 @@ BHGBrain 暴露 11 个 MCP 工具。所有工具使用 Zod schema 验证输入�
   ]
 }
 ```
+
+当 `follow_links: true` 时，每条基础结果的单跳关联记忆会追加在基础结果之后（不会
+减少 `limit` 允许的基础结果数量），并对基础结果集及彼此之间去重，追加条目总数上限
+为 `limit`。追加的条目携带 `score: 0`（占位符，而非相关性得分——与 `search` 的
+`include_archived` 采用相同约定），以及 `linked_from`（基础结果的 id）、
+`link_relation` 和 `link_direction`（若基础结果是该边的源端则为 `"outgoing"`，若是
+目标端则为 `"incoming"`）。已归档的关联记忆会被跳过。
 
 ---
 
@@ -2838,6 +2846,84 @@ BHGBrain 暴露 11 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 ```
 
 根据归档记录中保留的摘要和标签，在原始层级重新创建一条活跃记忆——这是一个**带溯源信息的存根**，而非原样复活：原始内容和向量从未被保留，因此恢复后记忆的内容就是其归档摘要，标签为原始标签加上一个 `restored-from-archive` 标记标签，并重新生成嵌入以便参与搜索。归档记录行会被保留（不会删除），这与 CLI 的 `archive restore` 不同。记录一条关联归档来源的 `RESTORE` 审计事件。若给定 ID 没有对应的归档记录则返回 `NOT_FOUND`。
+
+---
+
+### `relate`——用类型化的边连接记忆
+
+用类型化、有向的边连接记忆——这是与写入流水线自动生成的 `merged_from` 替换指针
+（`relate` 不会改动它）并存的一种通用、由调用方声明的关系。支持五种关系类型：
+`refines`、`contradicts`、`derived_from`、`about_same_entity`、`follows`。边以有向
+方式存储（`from_id` → `to_id`），但 `list` 和 `recall` 的 `follow_links`（见上文）
+都会遍历两个方向，因此概念上对称的关系（`contradicts`、`about_same_entity`）在实践
+中表现为对称。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `action` | `"add" \| "list" \| "remove"` | **是** | — | 要执行的操作。 |
+| `from_id` | `string (UUID)` | `add`/`remove` 必需 | — | 源记忆 ID。 |
+| `to_id` | `string (UUID)` | `add`/`remove` 必需 | — | 目标记忆 ID，必须与 `from_id` 不同。 |
+| `relation` | `"refines" \| "contradicts" \| "derived_from" \| "about_same_entity" \| "follows"` | `add`/`remove` 必需 | — | 边的类型。 |
+| `id` | `string (UUID)` | `list` 必需 | — | 要列出其边的记忆。 |
+| `direction` | `"from" \| "to" \| "both"` | 否 | `"both"` | （仅 `list`）按相对于 `id` 的方向过滤边。 |
+
+**输出（`action: "add"`）：**
+
+```json
+{
+  "id": 42,
+  "namespace": "global",
+  "from_id": "3f4a1b2c-...",
+  "to_id": "9c2e5f10-...",
+  "relation": "refines",
+  "created_at": "2026-03-01T00:00:00.000Z",
+  "created": true
+}
+```
+
+幂等：重复添加与已存在的边完全相同（相同的 `from_id`、`to_id` 和 `relation`）的边，
+会返回已存在的那一行并附带 `created: false`，而不是报错或创建重复项。若两条记忆中
+任一不存在则返回 `NOT_FOUND`；若 `from_id === to_id` 或两条记忆属于不同的命名空间，
+则返回 `INVALID_INPUT`（同一命名空间内跨集合建立链接是允许的）。
+
+**输出（`action: "list"`）：**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "links": [
+    {
+      "id": 42,
+      "from_id": "3f4a1b2c-...",
+      "to_id": "9c2e5f10-...",
+      "relation": "refines",
+      "direction": "outgoing",
+      "created_at": "2026-03-01T00:00:00.000Z",
+      "created_by": "c1"
+    }
+  ]
+}
+```
+
+返回涉及 `id` 的所有边，除非 `direction` 加以限制，否则两个方向都会返回，每条边标
+记为 `outgoing`（`id` 是 `from_id`）或 `incoming`（`id` 是 `to_id`）。使用包含已归
+档记忆的查找方式，因此即将被归档的记忆的边仍然可以被列出。若 `id` 不存在则返回
+`NOT_FOUND`。
+
+**输出（`action: "remove"`）：**
+
+```json
+{ "removed": true, "from_id": "3f4a1b2c-...", "to_id": "9c2e5f10-...", "relation": "refines" }
+```
+
+删除指定的边。若该边不存在则返回 `NOT_FOUND`。
+
+删除一条记忆（通过 `forget`，或 `review` 的 `archive` 操作）会级联删除所有引用它的
+边，因此 `memory_links` 中不会留下指向已不存在记忆的悬空引用。`relate` 不会记录新的
+`AuditOperation`——边表本身，配合每一行的 `created_at`/`created_by`，就是持久化的
+记录。
 
 ---
 

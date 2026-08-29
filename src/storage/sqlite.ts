@@ -8,6 +8,8 @@ import type {
   AuditEntry,
   ArchiveRecord,
   MemoryRevisionRecord,
+  MemoryLinkRecord,
+  MemoryLinkRelation,
   RetentionTier,
   TierStats,
   RecallFilter,
@@ -131,6 +133,13 @@ export interface SqliteStorage {
   deleteArchive(memoryId: string): void;
   insertRevision(memoryId: string, revision: number, content: string, updatedAt: string, updatedBy?: string): void;
   listRevisions(memoryId: string): MemoryRevisionRecord[];
+  addMemoryLink(
+    namespace: string, fromId: string, toId: string, relation: MemoryLinkRelation, createdBy: string | null,
+  ): { record: MemoryLinkRecord; created: boolean };
+  listMemoryLinks(
+    memoryId: string, options?: { relation?: MemoryLinkRelation },
+  ): Array<MemoryLinkRecord & { direction: 'outgoing' | 'incoming' }>;
+  removeMemoryLink(fromId: string, toId: string, relation: MemoryLinkRelation): boolean;
   getDbSizeBytes(): number;
   isFts5Available(): boolean;
   setCategory(name: string, slot: string, content: string): CategoryRecord;
@@ -318,6 +327,27 @@ CREATE TABLE IF NOT EXISTS embedding_state (
   adopted_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+-- Directed, typed edges between memories (add-memory-links). A brand-new
+-- table, not a column on memories, so a plain CREATE TABLE IF NOT EXISTS
+-- covers existing databases on next startup with no ALTER TABLE step.
+-- namespace is denormalized onto the row (redundant with the memories it
+-- points at) following the memory_archive precedent above, so link
+-- listing/scoping never needs a join.
+CREATE TABLE IF NOT EXISTS memory_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  namespace TEXT NOT NULL,
+  from_id TEXT NOT NULL,
+  to_id TEXT NOT NULL,
+  relation TEXT NOT NULL CHECK(relation IN ('refines','contradicts','derived_from','about_same_entity','follows')),
+  created_at TEXT NOT NULL,
+  created_by TEXT,
+  UNIQUE(from_id, to_id, relation)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_links_from ON memory_links(from_id);
+CREATE INDEX IF NOT EXISTS idx_memory_links_to ON memory_links(to_id);
+CREATE INDEX IF NOT EXISTS idx_memory_links_namespace ON memory_links(namespace);
 `;
 
 // SQLite-lock retry/backoff (audit follow-up 2026-06-05, task 4.2): this
@@ -618,6 +648,10 @@ export class SqliteStore implements SqliteStorage {
     if (!mem) return false;
     this.db.run(`DELETE FROM memories WHERE id = ?`, [id]);
     this.db.run(`DELETE FROM memories_fts WHERE id = ?`, [id]);
+    // Cascade-clean edges (add-memory-links) so both `forget` and `review`'s
+    // `archive` action (which calls this same method after archiveMemory)
+    // never leave a memory_links row pointing at a now-missing memory.
+    this.db.run(`DELETE FROM memory_links WHERE from_id = ? OR to_id = ?`, [id, id]);
     this.markDirty();
     return true;
   }
@@ -1338,6 +1372,91 @@ export class SqliteStore implements SqliteStorage {
     }
     stmt.free();
     return results;
+  }
+
+  private rowToMemoryLink(row: SqlRow): MemoryLinkRecord {
+    return {
+      id: this.getNumber(row, 'id'),
+      namespace: this.getString(row, 'namespace'),
+      from_id: this.getString(row, 'from_id'),
+      to_id: this.getString(row, 'to_id'),
+      relation: this.getString(row, 'relation') as MemoryLinkRelation,
+      created_at: this.getString(row, 'created_at'),
+      created_by: this.getNullableString(row, 'created_by'),
+    };
+  }
+
+  addMemoryLink(
+    namespace: string, fromId: string, toId: string, relation: MemoryLinkRelation, createdBy: string | null,
+  ): { record: MemoryLinkRecord; created: boolean } {
+    this.assertMutableAllowed();
+    // Read-then-write (mirrors getArchiveByMemoryId's read-before-insert
+    // shape) rather than INSERT OR IGNORE + a second query, so an existing
+    // edge is returned verbatim including its original created_at/created_by.
+    const existingStmt = this.db.prepare(
+      `SELECT * FROM memory_links WHERE from_id = ? AND to_id = ? AND relation = ?`,
+    );
+    existingStmt.bind([fromId, toId, relation]);
+    if (existingStmt.step()) {
+      const row = this.rowToMemoryLink(this.getRow(existingStmt.getAsObject()));
+      existingStmt.free();
+      return { record: row, created: false };
+    }
+    existingStmt.free();
+
+    const now = new Date().toISOString();
+    this.db.run(
+      `INSERT INTO memory_links (namespace, from_id, to_id, relation, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?)`,
+      [namespace, fromId, toId, relation, now, createdBy],
+    );
+    this.markDirty();
+
+    const insertedStmt = this.db.prepare(
+      `SELECT * FROM memory_links WHERE from_id = ? AND to_id = ? AND relation = ?`,
+    );
+    insertedStmt.bind([fromId, toId, relation]);
+    insertedStmt.step();
+    const record = this.rowToMemoryLink(this.getRow(insertedStmt.getAsObject()));
+    insertedStmt.free();
+    return { record, created: true };
+  }
+
+  listMemoryLinks(
+    memoryId: string, options?: { relation?: MemoryLinkRelation },
+  ): Array<MemoryLinkRecord & { direction: 'outgoing' | 'incoming' }> {
+    const params: SqlParams = [memoryId, memoryId];
+    let sql = `SELECT * FROM memory_links WHERE (from_id = ? OR to_id = ?)`;
+    if (options?.relation) {
+      sql += ` AND relation = ?`;
+      params.push(options.relation);
+    }
+    const stmt = this.db.prepare(sql);
+    stmt.bind(params);
+    const results: Array<MemoryLinkRecord & { direction: 'outgoing' | 'incoming' }> = [];
+    while (stmt.step()) {
+      const record = this.rowToMemoryLink(this.getRow(stmt.getAsObject()));
+      results.push({ ...record, direction: record.from_id === memoryId ? 'outgoing' : 'incoming' });
+    }
+    stmt.free();
+    return results;
+  }
+
+  removeMemoryLink(fromId: string, toId: string, relation: MemoryLinkRelation): boolean {
+    this.assertMutableAllowed();
+    const existingStmt = this.db.prepare(
+      `SELECT 1 FROM memory_links WHERE from_id = ? AND to_id = ? AND relation = ?`,
+    );
+    existingStmt.bind([fromId, toId, relation]);
+    const exists = existingStmt.step();
+    existingStmt.free();
+    if (!exists) return false;
+
+    this.db.run(
+      `DELETE FROM memory_links WHERE from_id = ? AND to_id = ? AND relation = ?`,
+      [fromId, toId, relation],
+    );
+    this.markDirty();
+    return true;
   }
 
   getDbSizeBytes(): number {

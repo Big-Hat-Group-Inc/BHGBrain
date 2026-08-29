@@ -2398,7 +2398,7 @@ bhgbrain server token                 # Générer un nouveau token Bearer aléat
 
 ## Référence des outils MCP
 
-BHGBrain expose 11 outils MCP. Tous les outils valident les entrées avec des schémas Zod et renvoient du JSON structuré. Les erreurs utilisent une enveloppe cohérente :
+BHGBrain expose 12 outils MCP. Tous les outils valident les entrées avec des schémas Zod et renvoient du JSON structuré. Les erreurs utilisent une enveloppe cohérente :
 
 ```json
 {
@@ -2562,6 +2562,7 @@ Récupère les souvenirs les plus pertinents pour une requête en utilisant la r
 | `min_score` | `number (0–1)` | Non | `0,6` | Score de similarité cosinus minimal, appliqué à `semantic_score` (et non au `score` fusionné/ajusté). Les résultats en dessous de ce seuil sont exclus. |
 | `after` | `string (date-heure ISO 8601)` | Non | - | N'inclut que les souvenirs avec `created_at >= after` (inclusif). Filtre sur la date de création, pas `updated_at`. Propagé jusque dans le magasin afin que `limit` compte les souvenirs correspondants. |
 | `before` | `string (date-heure ISO 8601)` | Non | - | N'inclut que les souvenirs avec `created_at <= before` (inclusif). Filtre sur la date de création, pas `updated_at`. Propagé jusque dans le magasin afin que `limit` compte les souvenirs correspondants. |
+| `follow_links` | `boolean` | Non | `false` | Renvoie aussi les voisins à un saut de chaque résultat (arêtes créées via l'outil `relate`, dans les deux directions, toutes relations confondues). Les entrées ajoutées sont marquées `linked_from`/`link_relation`/`link_direction` afin qu'un client distingue un voisin étendu d'un résultat directement pertinent ; voir `relate` ci-dessous. |
 
 **Sortie :**
 
@@ -2585,6 +2586,15 @@ Récupère les souvenirs les plus pertinents pour une requête en utilisant la r
   ]
 }
 ```
+
+Avec `follow_links: true`, les voisins à un saut de chaque résultat de base sont
+ajoutés après les résultats de base (sans jamais réduire le nombre de résultats de
+base autorisés par `limit`), dédupliqués par rapport à l'ensemble de base et entre eux,
+et plafonnés à `limit` entrées ajoutées au total. Les entrées ajoutées portent
+`score: 0` (un espace réservé, pas un score de pertinence — la même convention que
+`include_archived` de `search`) ainsi que `linked_from` (l'id du résultat de base),
+`link_relation` et `link_direction` (`"outgoing"` si le résultat de base est la source
+de l'arête, `"incoming"` s'il en est la cible). Un voisin déjà archivé est ignoré.
 
 ---
 
@@ -2916,6 +2926,90 @@ Fait transiter le souvenir par la même transition d'archivage que le GC : son v
 ```
 
 Recrée un souvenir actif à partir du résumé et des tags conservés dans l'enregistrement d'archive, au niveau d'origine — un **stub porteur de provenance**, pas une résurrection : le contenu et le vecteur d'origine n'ont jamais été conservés, donc le contenu du souvenir restauré est son résumé archivé, étiqueté avec ses tags d'origine plus un tag marqueur `restored-from-archive`, et fraîchement ré-embeddé pour qu'il participe à la recherche. La ligne d'archive est conservée (non supprimée), contrairement à la commande CLI `archive restore`. Enregistre un événement d'audit `RESTORE` reliant l'origine de l'archive. Renvoie `NOT_FOUND` s'il n'existe aucun enregistrement d'archive pour l'ID donné.
+
+---
+
+### `relate` — Connecter des souvenirs par arêtes typées
+
+Connecte des souvenirs par des arêtes typées et dirigées — une relation générale,
+autorisée par l'appelant, à côté du pointeur automatique de remplacement `merged_from`
+du pipeline d'écriture (que `relate` laisse intact). Cinq relations sont prises en
+charge : `refines`, `contradicts`, `derived_from`, `about_same_entity`, `follows`. Les
+arêtes sont dirigées (`from_id` → `to_id`), mais `list` et le `follow_links` de
+`recall` (voir ci-dessus) parcourent les deux directions, si bien que les relations
+conceptuellement symétriques (`contradicts`, `about_same_entity`) se comportent de
+façon symétrique en pratique.
+
+**Entrée :**
+
+| Paramètre | Type | Obligatoire | Par défaut | Description |
+|---|---|---|---|---|
+| `action` | `"add" \| "list" \| "remove"` | **Oui** | — | L'opération à effectuer. |
+| `from_id` | `string (UUID)` | Requis pour `add`/`remove` | — | ID du souvenir source. |
+| `to_id` | `string (UUID)` | Requis pour `add`/`remove` | — | ID du souvenir cible. Doit différer de `from_id`. |
+| `relation` | `"refines" \| "contradicts" \| "derived_from" \| "about_same_entity" \| "follows"` | Requis pour `add`/`remove` | — | Type d'arête. |
+| `id` | `string (UUID)` | Requis pour `list` | — | Le souvenir dont les arêtes sont listées. |
+| `direction` | `"from" \| "to" \| "both"` | Non | `"both"` | (`list` uniquement) Filtre les arêtes par direction relative à `id`. |
+
+**Sortie (`action: "add"`) :**
+
+```json
+{
+  "id": 42,
+  "namespace": "global",
+  "from_id": "3f4a1b2c-...",
+  "to_id": "9c2e5f10-...",
+  "relation": "refines",
+  "created_at": "2026-03-01T00:00:00.000Z",
+  "created": true
+}
+```
+
+Idempotent : ré-ajouter une arête identique à une arête déjà existante (mêmes
+`from_id`, `to_id` et `relation`) renvoie la ligne existante avec `created: false` au
+lieu de générer une erreur ou de créer un doublon. Renvoie `NOT_FOUND` si l'un des deux
+souvenirs n'existe pas, et `INVALID_INPUT` si `from_id === to_id` ou si les deux
+souvenirs appartiennent à des espaces de noms différents (les liens entre collections
+au sein d'un même espace de noms sont autorisés).
+
+**Sortie (`action: "list"`) :**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "links": [
+    {
+      "id": 42,
+      "from_id": "3f4a1b2c-...",
+      "to_id": "9c2e5f10-...",
+      "relation": "refines",
+      "direction": "outgoing",
+      "created_at": "2026-03-01T00:00:00.000Z",
+      "created_by": "c1"
+    }
+  ]
+}
+```
+
+Renvoie toutes les arêtes touchant `id`, dans les deux directions sauf si `direction`
+les restreint, chacune marquée `outgoing` (`id` est `from_id`) ou `incoming` (`id` est
+`to_id`). Utilise la recherche incluant les archives, si bien que les arêtes d'un
+souvenir sur le point d'être archivé restent listables. Renvoie `NOT_FOUND` si `id`
+n'existe pas.
+
+**Sortie (`action: "remove"`) :**
+
+```json
+{ "removed": true, "from_id": "3f4a1b2c-...", "to_id": "9c2e5f10-...", "relation": "refines" }
+```
+
+Supprime l'arête nommée. Renvoie `NOT_FOUND` si elle n'existe pas.
+
+Supprimer un souvenir (via `forget`, ou l'action `archive` de `review`) supprime en
+cascade chaque arête qui le référençait, si bien que `memory_links` ne contient jamais
+de référence pendante vers un souvenir manquant. Aucune nouvelle `AuditOperation` n'est
+enregistrée pour `relate` — la table des arêtes elle-même, avec `created_at`/
+`created_by` sur chaque ligne, constitue l'enregistrement durable.
 
 ---
 

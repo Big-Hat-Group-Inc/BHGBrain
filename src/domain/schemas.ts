@@ -45,6 +45,12 @@ export const RecallInputSchema = z.object({
   min_score: z.number().min(0).max(1).default(0.6),
   after: z.string().datetime().optional(),
   before: z.string().datetime().optional(),
+  // Opt-in one-hop neighbor expansion (add-memory-links): appends each
+  // result's linked memories (relate tool edges, both directions, all
+  // relations), marked linked_from/link_relation/link_direction. Default
+  // false leaves recall's output unchanged from before this parameter
+  // existed.
+  follow_links: z.boolean().optional().default(false),
 }).strict().refine(
   data => data.after === undefined || data.before === undefined || data.after <= data.before,
   { message: 'after must not be later than before', path: ['after'] },
@@ -121,6 +127,34 @@ export const ReviewInputSchema = z.object({
   { message: 'id is required for keep, archive, and restore', path: ['id'] },
 );
 
+export const MemoryLinkRelationSchema = z.enum([
+  'refines', 'contradicts', 'derived_from', 'about_same_entity', 'follows',
+]);
+
+export const RelateInputSchema = z.object({
+  action: z.enum(['add', 'list', 'remove']),
+  from_id: z.string().uuid().optional(),
+  to_id: z.string().uuid().optional(),
+  relation: MemoryLinkRelationSchema.optional(),
+  // list only: the memory whose links to list.
+  id: z.string().uuid().optional(),
+  // list only: direction filter relative to `id`. Storage always returns
+  // both directions; the handler post-filters when this is not 'both'.
+  direction: z.enum(['from', 'to', 'both']).optional().default('both'),
+}).strict().refine(
+  data => data.action !== 'add' || (data.from_id !== undefined && data.to_id !== undefined && data.relation !== undefined),
+  { message: 'from_id, to_id, and relation are required for add', path: ['from_id'] },
+).refine(
+  data => data.action !== 'remove' || (data.from_id !== undefined && data.to_id !== undefined && data.relation !== undefined),
+  { message: 'from_id, to_id, and relation are required for remove', path: ['from_id'] },
+).refine(
+  data => data.action !== 'list' || data.id !== undefined,
+  { message: 'id is required for list', path: ['id'] },
+).refine(
+  data => (data.action !== 'add' && data.action !== 'remove') || data.from_id !== data.to_id,
+  { message: 'from_id and to_id must differ', path: ['to_id'] },
+);
+
 export const RepairInputSchema = z.object({
   // 'from-qdrant' (default): the pre-existing behavior — recover memories
   // missing from SQLite by scrolling Qdrant payloads. 're-embed': the
@@ -175,3 +209,4 @@ export type RepairInput = z.infer<typeof RepairInputSchema>;
 export type RevisionsInput = z.infer<typeof RevisionsInputSchema>;
 export type ReviewInput = z.infer<typeof ReviewInputSchema>;
 export type ConsolidateInput = z.infer<typeof ConsolidateInputSchema>;
+export type RelateInput = z.infer<typeof RelateInputSchema>;

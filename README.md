@@ -2461,7 +2461,7 @@ bhgbrain server token                 # Generate a new random bearer token
 
 ## MCP Tools Reference
 
-BHGBrain exposes 13 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
+BHGBrain exposes 15 MCP tools. All tools validate input with Zod schemas and return structured JSON. Errors use a consistent envelope:
 
 ```json
 {
@@ -2487,7 +2487,7 @@ annotations entirely.
 **outputSchema:** `recall`, `search`, and `remember` declare an `outputSchema`
 describing their `structuredContent` shape (mirroring the `SearchResult`/
 `WriteResult` types), so MCP clients can validate results instead of only
-JSON-parsing the text block. The other ten tools' result shapes are action-dependent
+JSON-parsing the text block. The other twelve tools' result shapes are action-dependent
 and are not yet schema-described.
 
 ---
@@ -2630,6 +2630,7 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
 | `min_score` | `number (0-1)` | No | `0.6` | Minimum cosine-similarity score, applied to `semantic_score` (not the fused/adjusted `score`). Results below this threshold are excluded. |
 | `after` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at >= after` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the store so `limit` counts matching memories. |
 | `before` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at <= before` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the store so `limit` counts matching memories. |
+| `follow_links` | `boolean` | No | `false` | Also return each result's one-hop linked memories (edges created via the `relate` tool, both directions, all relations). Appended entries are marked `linked_from`/`link_relation`/`link_direction` so a client can tell an expanded neighbor from a directly relevant hit; see `relate` below. |
 
 **Output:**
 
@@ -2653,6 +2654,15 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
   ]
 }
 ```
+
+With `follow_links: true`, each base result's one-hop neighbors are appended after the
+base results (never reducing how many base results `limit` allows), deduplicated
+against the base set and each other, and capped at `limit` appended entries total.
+Appended entries carry `score: 0` (a placeholder, not a relevance score — the same
+convention `search`'s `include_archived` uses) plus `linked_from` (the base result's
+id), `link_relation`, and `link_direction` (`"outgoing"` if the base result is the
+edge's source, `"incoming"` if it is the target). A neighbor that is itself archived
+is skipped.
 
 ---
 
@@ -3085,6 +3095,86 @@ tag, and freshly embedded so it participates in search. The archive row is retai
 (not deleted), unlike the CLI's `archive restore` command. Records a `RESTORE` audit
 event linking the archive origin. Returns `NOT_FOUND` if no archive record exists for
 the given ID.
+
+---
+
+### `relate` - Connect Memories with Typed Edges
+
+Connects memories with typed, directed edges — a general, caller-authored relationship
+alongside the write pipeline's automatic `merged_from` replacement pointer (which
+`relate` leaves untouched). Five relations are supported: `refines`, `contradicts`,
+`derived_from`, `about_same_entity`, `follows`. Edges are directed (`from_id` → `to_id`)
+but `list` and `recall`'s `follow_links` (see above) walk both directions, so
+conceptually symmetric relations (`contradicts`, `about_same_entity`) behave
+symmetrically in practice.
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `action` | `"add" \| "list" \| "remove"` | **Yes** | - | Which operation to perform. |
+| `from_id` | `string (UUID)` | Required for `add`/`remove` | - | Source memory ID. |
+| `to_id` | `string (UUID)` | Required for `add`/`remove` | - | Target memory ID. Must differ from `from_id`. |
+| `relation` | `"refines" \| "contradicts" \| "derived_from" \| "about_same_entity" \| "follows"` | Required for `add`/`remove` | - | Edge type. |
+| `id` | `string (UUID)` | Required for `list` | - | The memory whose edges to list. |
+| `direction` | `"from" \| "to" \| "both"` | No | `"both"` | (`list` only) Filter edges by direction relative to `id`. |
+
+**Output (`action: "add"`):**
+
+```json
+{
+  "id": 42,
+  "namespace": "global",
+  "from_id": "3f4a1b2c-...",
+  "to_id": "9c2e5f10-...",
+  "relation": "refines",
+  "created_at": "2026-03-01T00:00:00.000Z",
+  "created": true
+}
+```
+
+Idempotent: re-adding an edge identical to one that already exists (same `from_id`,
+`to_id`, and `relation`) returns the existing row with `created: false` instead of
+erroring or creating a duplicate. Returns `NOT_FOUND` if either memory ID does not
+exist, and `INVALID_INPUT` if `from_id === to_id` or the two memories belong to
+different namespaces (cross-collection links within the same namespace are allowed).
+
+**Output (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "links": [
+    {
+      "id": 42,
+      "from_id": "3f4a1b2c-...",
+      "to_id": "9c2e5f10-...",
+      "relation": "refines",
+      "direction": "outgoing",
+      "created_at": "2026-03-01T00:00:00.000Z",
+      "created_by": "c1"
+    }
+  ]
+}
+```
+
+Returns every edge touching `id`, in either direction unless `direction` narrows it,
+each marked `outgoing` (`id` is `from_id`) or `incoming` (`id` is `to_id`). Uses the
+archived-inclusive lookup, so edges on a memory about to be archived remain listable.
+Returns `NOT_FOUND` if `id` does not exist.
+
+**Output (`action: "remove"`):**
+
+```json
+{ "removed": true, "from_id": "3f4a1b2c-...", "to_id": "9c2e5f10-...", "relation": "refines" }
+```
+
+Deletes the named edge. Returns `NOT_FOUND` if it does not exist.
+
+Deleting a memory (via `forget`, or `review`'s `archive` action) cascade-deletes every
+edge that referenced it, so `memory_links` never carries a dangling reference to a
+missing memory. No new `AuditOperation` is recorded for `relate` — the edge table
+itself, with `created_at`/`created_by` on each row, is the durable record.
 
 ---
 

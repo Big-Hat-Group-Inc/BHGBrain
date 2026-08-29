@@ -2394,7 +2394,7 @@ bhgbrain server token                 # Generar un nuevo bearer token aleatorio
 
 ## Referencia de Herramientas MCP
 
-BHGBrain expone 11 herramientas MCP. Todas las herramientas validan la entrada con esquemas Zod y devuelven JSON estructurado. Los errores usan un sobre consistente:
+BHGBrain expone 12 herramientas MCP. Todas las herramientas validan la entrada con esquemas Zod y devuelven JSON estructurado. Los errores usan un sobre consistente:
 
 ```json
 {
@@ -2560,6 +2560,7 @@ Recupera las memorias más relevantes para una consulta usando búsqueda de simi
 | `min_score` | `number (0–1)` | No | `0.6` | Puntuación mínima de similitud coseno, aplicada a `semantic_score` (no al `score` fusionado/ajustado). Los resultados por debajo de este umbral se excluyen. |
 | `after` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at >= after` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén para que `limit` cuente memorias coincidentes. |
 | `before` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at <= before` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén para que `limit` cuente memorias coincidentes. |
+| `follow_links` | `boolean` | No | `false` | También devuelve los vecinos a un salto de cada resultado (bordes creados con la herramienta `relate`, en ambas direcciones, todas las relaciones). Las entradas añadidas se marcan con `linked_from`/`link_relation`/`link_direction` para que un cliente distinga un vecino expandido de una coincidencia directamente relevante; véase `relate` más abajo. |
 
 **Salida:**
 
@@ -2583,6 +2584,15 @@ Recupera las memorias más relevantes para una consulta usando búsqueda de simi
   ]
 }
 ```
+
+Con `follow_links: true`, los vecinos a un salto de cada resultado base se añaden
+después de los resultados base (sin reducir nunca cuántos resultados base permite
+`limit`), deduplicados frente al conjunto base y entre sí, y limitados a `limit`
+entradas añadidas en total. Las entradas añadidas llevan `score: 0` (un marcador de
+posición, no una puntuación de relevancia — la misma convención que usa
+`include_archived` de `search`) además de `linked_from` (el id del resultado base),
+`link_relation` y `link_direction` (`"outgoing"` si el resultado base es el origen del
+borde, `"incoming"` si es el destino). Un vecino ya archivado se omite.
 
 ---
 
@@ -2914,6 +2924,89 @@ Enruta la memoria por la misma transición de archivado que usa el GC: su vector
 ```
 
 Recrea una memoria activa a partir del resumen y las etiquetas conservados en el registro de archivo, en el nivel original — un **stub con procedencia**, no una resurrección: el contenido y el vector originales nunca se conservaron, así que el contenido de la memoria restaurada es su resumen archivado, etiquetado con sus etiquetas originales más una etiqueta marcadora `restored-from-archive`, y re-embebido para que participe en la búsqueda. La fila de archivo se conserva (no se elimina), a diferencia del comando `archive restore` de la CLI. Registra un evento de auditoría `RESTORE` que enlaza el origen del archivo. Devuelve `NOT_FOUND` si no existe un registro de archivo para el ID dado.
+
+---
+
+### `relate` — Conectar Memorias con Bordes Tipados
+
+Conecta memorias con bordes tipados y dirigidos — una relación general, autorada por
+quien llama, junto al puntero automático de reemplazo `merged_from` de la pipeline de
+escritura (que `relate` deja intacto). Se admiten cinco relaciones: `refines`,
+`contradicts`, `derived_from`, `about_same_entity`, `follows`. Los bordes se almacenan
+dirigidos (`from_id` → `to_id`), pero `list` y `follow_links` de `recall` (véase arriba)
+recorren ambas direcciones, así que las relaciones conceptualmente simétricas
+(`contradicts`, `about_same_entity`) se comportan de forma simétrica en la práctica.
+
+**Entrada:**
+
+| Parámetro | Tipo | Requerido | Predeterminado | Descripción |
+|---|---|---|---|---|
+| `action` | `"add" \| "list" \| "remove"` | **Sí** | — | La operación a realizar. |
+| `from_id` | `string (UUID)` | Requerido para `add`/`remove` | — | ID de la memoria origen. |
+| `to_id` | `string (UUID)` | Requerido para `add`/`remove` | — | ID de la memoria destino. Debe diferir de `from_id`. |
+| `relation` | `"refines" \| "contradicts" \| "derived_from" \| "about_same_entity" \| "follows"` | Requerido para `add`/`remove` | — | Tipo de borde. |
+| `id` | `string (UUID)` | Requerido para `list` | — | La memoria cuyos bordes se listan. |
+| `direction` | `"from" \| "to" \| "both"` | No | `"both"` | (solo `list`) Filtra bordes por dirección relativa a `id`. |
+
+**Salida (`action: "add"`):**
+
+```json
+{
+  "id": 42,
+  "namespace": "global",
+  "from_id": "3f4a1b2c-...",
+  "to_id": "9c2e5f10-...",
+  "relation": "refines",
+  "created_at": "2026-03-01T00:00:00.000Z",
+  "created": true
+}
+```
+
+Idempotente: volver a añadir un borde idéntico a uno ya existente (mismos `from_id`,
+`to_id` y `relation`) devuelve la fila existente con `created: false` en lugar de dar
+error o crear un duplicado. Devuelve `NOT_FOUND` si alguna de las dos memorias no
+existe, e `INVALID_INPUT` si `from_id === to_id` o si las dos memorias pertenecen a
+namespaces distintos (los enlaces entre colecciones dentro del mismo namespace están
+permitidos).
+
+**Salida (`action: "list"`):**
+
+```json
+{
+  "id": "3f4a1b2c-...",
+  "links": [
+    {
+      "id": 42,
+      "from_id": "3f4a1b2c-...",
+      "to_id": "9c2e5f10-...",
+      "relation": "refines",
+      "direction": "outgoing",
+      "created_at": "2026-03-01T00:00:00.000Z",
+      "created_by": "c1"
+    }
+  ]
+}
+```
+
+Devuelve todos los bordes que tocan a `id`, en cualquier dirección salvo que
+`direction` la restrinja, cada uno marcado `outgoing` (`id` es `from_id`) o `incoming`
+(`id` es `to_id`). Usa la búsqueda que incluye archivados, así que los bordes de una
+memoria a punto de archivarse siguen siendo listables. Devuelve `NOT_FOUND` si `id` no
+existe.
+
+**Salida (`action: "remove"`):**
+
+```json
+{ "removed": true, "from_id": "3f4a1b2c-...", "to_id": "9c2e5f10-...", "relation": "refines" }
+```
+
+Elimina el borde nombrado. Devuelve `NOT_FOUND` si no existe.
+
+Eliminar una memoria (mediante `forget`, o la acción `archive` de `review`) elimina en
+cascada cada borde que la referenciaba, de modo que `memory_links` nunca conserva una
+referencia colgante a una memoria inexistente. No se registra ninguna nueva
+`AuditOperation` para `relate` — la propia tabla de bordes, con `created_at`/
+`created_by` en cada fila, es el registro duradero.
 
 ---
 

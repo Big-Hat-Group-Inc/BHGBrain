@@ -1492,3 +1492,311 @@ describe('notifyResourceListChanged hook (complete-mcp-protocol-surface task 5.3
     expect((result as { ok: boolean }).ok).toBe(true);
   });
 });
+
+describe('relate tool (add-memory-links)', () => {
+  const FROM = '550e8400-e29b-41d4-a716-446655440020';
+  const TO = '550e8400-e29b-41d4-a716-446655440021';
+  type RelateStorage = StorageManager & {
+    sqlite: {
+      getMemoryById: ReturnType<typeof vi.fn>;
+      addMemoryLink: ReturnType<typeof vi.fn>;
+      removeMemoryLink: ReturnType<typeof vi.fn>;
+      listMemoryLinks: ReturnType<typeof vi.fn>;
+      flushIfDirty: ReturnType<typeof vi.fn>;
+    };
+  };
+  let ctx: ToolContext;
+  let storage: RelateStorage;
+
+  beforeEach(() => {
+    storage = {
+      sqlite: {
+        getMemoryById: vi.fn(() => null),
+        addMemoryLink: vi.fn(),
+        removeMemoryLink: vi.fn(() => false),
+        listMemoryLinks: vi.fn(() => []),
+        flushIfDirty: vi.fn(),
+      },
+    } as unknown as RelateStorage;
+
+    ctx = {
+      config: {} as ToolContext['config'],
+      storage,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  });
+
+  it('add creates an edge and returns the storage record with created: true', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      (id === FROM || id === TO ? { id, namespace: 'global' } : null));
+    (storage.sqlite.addMemoryLink as ReturnType<typeof vi.fn>).mockReturnValue({
+      record: { id: 1, namespace: 'global', from_id: FROM, to_id: TO, relation: 'refines', created_at: 'now', created_by: 'c1' },
+      created: true,
+    });
+
+    const result = await handleTool(ctx, 'relate', {
+      action: 'add', from_id: FROM, to_id: TO, relation: 'refines',
+    }, 'c1') as { id: number; created: boolean; from_id: string; to_id: string; relation: string };
+
+    expect(storage.sqlite.addMemoryLink).toHaveBeenCalledWith('global', FROM, TO, 'refines', 'c1');
+    expect(result.created).toBe(true);
+    expect(result.from_id).toBe(FROM);
+    expect(result.to_id).toBe(TO);
+    expect(result.relation).toBe('refines');
+  });
+
+  it('add is idempotent: re-adding an existing edge returns created: false', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      (id === FROM || id === TO ? { id, namespace: 'global' } : null));
+    (storage.sqlite.addMemoryLink as ReturnType<typeof vi.fn>).mockReturnValue({
+      record: { id: 1, namespace: 'global', from_id: FROM, to_id: TO, relation: 'refines', created_at: 'now', created_by: null },
+      created: false,
+    });
+
+    const result = await handleTool(ctx, 'relate', {
+      action: 'add', from_id: FROM, to_id: TO, relation: 'refines',
+    }, 'c1') as { created: boolean };
+
+    expect(result.created).toBe(false);
+  });
+
+  it('add rejects a self-link with INVALID_INPUT', async () => {
+    const result = await handleTool(ctx, 'relate', {
+      action: 'add', from_id: FROM, to_id: FROM, relation: 'refines',
+    }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(storage.sqlite.addMemoryLink).not.toHaveBeenCalled();
+  });
+
+  it('add rejects a cross-namespace link with INVALID_INPUT', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      if (id === FROM) return { id, namespace: 'global' };
+      if (id === TO) return { id, namespace: 'other' };
+      return null;
+    });
+
+    const result = await handleTool(ctx, 'relate', {
+      action: 'add', from_id: FROM, to_id: TO, relation: 'refines',
+    }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(storage.sqlite.addMemoryLink).not.toHaveBeenCalled();
+  });
+
+  it('add is NOT_FOUND when from_id does not exist', async () => {
+    const result = await handleTool(ctx, 'relate', {
+      action: 'add', from_id: FROM, to_id: TO, relation: 'refines',
+    }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('NOT_FOUND');
+  });
+
+  it('add is NOT_FOUND when to_id does not exist', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      (id === FROM ? { id, namespace: 'global' } : null));
+
+    const result = await handleTool(ctx, 'relate', {
+      action: 'add', from_id: FROM, to_id: TO, relation: 'refines',
+    }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('NOT_FOUND');
+  });
+
+  it('remove deletes an edge and returns removed: true', async () => {
+    (storage.sqlite.removeMemoryLink as ReturnType<typeof vi.fn>).mockReturnValue(true);
+
+    const result = await handleTool(ctx, 'relate', {
+      action: 'remove', from_id: FROM, to_id: TO, relation: 'refines',
+    }, 'c1') as { removed: boolean };
+
+    expect(storage.sqlite.removeMemoryLink).toHaveBeenCalledWith(FROM, TO, 'refines');
+    expect(result.removed).toBe(true);
+  });
+
+  it('remove on a non-existent edge is NOT_FOUND', async () => {
+    const result = await handleTool(ctx, 'relate', {
+      action: 'remove', from_id: FROM, to_id: TO, relation: 'refines',
+    }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('NOT_FOUND');
+  });
+
+  it('list is NOT_FOUND for a missing memory id', async () => {
+    const result = await handleTool(ctx, 'relate', { action: 'list', id: FROM }, 'c1') as BrainErrorEnvelope;
+    expect(result.error.code).toBe('NOT_FOUND');
+  });
+
+  it('list returns both-direction edges by default', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue({ id: FROM, namespace: 'global' });
+    (storage.sqlite.listMemoryLinks as ReturnType<typeof vi.fn>).mockReturnValue([
+      { id: 1, namespace: 'global', from_id: FROM, to_id: TO, relation: 'refines', direction: 'outgoing', created_at: 'a', created_by: null },
+      { id: 2, namespace: 'global', from_id: TO, to_id: FROM, relation: 'contradicts', direction: 'incoming', created_at: 'b', created_by: null },
+    ]);
+
+    const result = await handleTool(ctx, 'relate', { action: 'list', id: FROM }, 'c1') as { links: Array<{ direction: string }> };
+
+    expect(result.links).toHaveLength(2);
+  });
+
+  it('list respects a direction filter', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue({ id: FROM, namespace: 'global' });
+    (storage.sqlite.listMemoryLinks as ReturnType<typeof vi.fn>).mockReturnValue([
+      { id: 1, namespace: 'global', from_id: FROM, to_id: TO, relation: 'refines', direction: 'outgoing', created_at: 'a', created_by: null },
+      { id: 2, namespace: 'global', from_id: TO, to_id: FROM, relation: 'contradicts', direction: 'incoming', created_at: 'b', created_by: null },
+    ]);
+
+    const result = await handleTool(ctx, 'relate', { action: 'list', id: FROM, direction: 'from' }, 'c1') as { links: Array<{ direction: string }> };
+
+    expect(result.links).toHaveLength(1);
+    expect(result.links[0]!.direction).toBe('outgoing');
+  });
+
+  it('list respects a relation filter', async () => {
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockReturnValue({ id: FROM, namespace: 'global' });
+    (storage.sqlite.listMemoryLinks as ReturnType<typeof vi.fn>).mockReturnValue([
+      { id: 1, namespace: 'global', from_id: FROM, to_id: TO, relation: 'refines', direction: 'outgoing', created_at: 'a', created_by: null },
+    ]);
+
+    await handleTool(ctx, 'relate', { action: 'list', id: FROM, relation: 'refines' }, 'c1');
+
+    expect(storage.sqlite.listMemoryLinks).toHaveBeenCalledWith(FROM, { relation: 'refines' });
+  });
+});
+
+describe('handleRecall follow_links (add-memory-links)', () => {
+  let ctx: ToolContext;
+  let searchMock: ReturnType<typeof vi.fn>;
+  let listMemoryLinksMock: ReturnType<typeof vi.fn>;
+  let getMemoryByIdMock: ReturnType<typeof vi.fn>;
+
+  function makeResult(overrides: Partial<SearchResult> & { id: string }): SearchResult {
+    return {
+      content: 'content',
+      summary: 'summary',
+      type: 'semantic',
+      tags: [],
+      score: 0.9,
+      semantic_score: 0.9,
+      retention_tier: 'T2',
+      expires_at: null,
+      expiring_soon: false,
+      device_id: null,
+      created_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+      ...overrides,
+    };
+  }
+
+  function makeMemory(id: string) {
+    return {
+      id, namespace: 'global', collection: 'general', content: 'linked content', summary: 'linked summary',
+      type: 'semantic' as const, category: null, tags: [] as string[], source: 'cli' as const, checksum: 'x',
+      importance: 0.5, retention_tier: 'T2' as const, expires_at: null, decay_eligible: true, review_due: null,
+      access_count: 0, last_operation: 'ADD' as const, merged_from: null, archived: false, vector_synced: true,
+      device_id: null, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+    };
+  }
+
+  beforeEach(() => {
+    searchMock = vi.fn(async () => [] as SearchResult[]);
+    listMemoryLinksMock = vi.fn(() => []);
+    getMemoryByIdMock = vi.fn(() => null);
+    ctx = {
+      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
+      storage: {
+        sqlite: { listMemoryLinks: listMemoryLinksMock, getMemoryById: getMemoryByIdMock },
+      } as unknown as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: { search: searchMock } as unknown as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  });
+
+  it('default (follow_links omitted) leaves recall output unchanged: no linked_from field, no listMemoryLinks calls', async () => {
+    searchMock.mockResolvedValue([makeResult({ id: 'base-1' })]);
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5 }, 'c1') as { results: SearchResult[] };
+
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0]!.linked_from).toBeUndefined();
+    expect(listMemoryLinksMock).not.toHaveBeenCalled();
+  });
+
+  it('follow_links: true appends one-hop neighbors marked with linked_from/link_relation/link_direction', async () => {
+    searchMock.mockResolvedValue([makeResult({ id: 'base-1' })]);
+    listMemoryLinksMock.mockImplementation((id: string) => (id === 'base-1' ? [
+      { id: 1, namespace: 'global', from_id: 'base-1', to_id: 'neighbor-1', relation: 'refines', created_at: 'a', created_by: null, direction: 'outgoing' },
+    ] : []));
+    getMemoryByIdMock.mockImplementation((id: string) => (id === 'neighbor-1' ? makeMemory('neighbor-1') : null));
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5, follow_links: true }, 'c1') as { results: SearchResult[] };
+
+    expect(result.results).toHaveLength(2);
+    const neighbor = result.results[1]!;
+    expect(neighbor.id).toBe('neighbor-1');
+    expect(neighbor.linked_from).toBe('base-1');
+    expect(neighbor.link_relation).toBe('refines');
+    expect(neighbor.link_direction).toBe('outgoing');
+    expect(neighbor.score).toBe(0);
+  });
+
+  it('a neighbor reachable from two base results appears once', async () => {
+    searchMock.mockResolvedValue([makeResult({ id: 'base-1' }), makeResult({ id: 'base-2' })]);
+    listMemoryLinksMock.mockImplementation((id: string) => {
+      if (id === 'base-1') {
+        return [{ id: 1, namespace: 'global', from_id: 'base-1', to_id: 'shared-neighbor', relation: 'refines', created_at: 'a', created_by: null, direction: 'outgoing' }];
+      }
+      if (id === 'base-2') {
+        return [{ id: 2, namespace: 'global', from_id: 'base-2', to_id: 'shared-neighbor', relation: 'contradicts', created_at: 'b', created_by: null, direction: 'outgoing' }];
+      }
+      return [];
+    });
+    getMemoryByIdMock.mockImplementation((id: string) => (id === 'shared-neighbor' ? makeMemory('shared-neighbor') : null));
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5, follow_links: true }, 'c1') as { results: SearchResult[] };
+
+    expect(result.results).toHaveLength(3);
+    expect(result.results.filter(r => r.id === 'shared-neighbor')).toHaveLength(1);
+  });
+
+  it('total appended neighbors respect the limit cap', async () => {
+    searchMock.mockResolvedValue([makeResult({ id: 'base-1' })]);
+    listMemoryLinksMock.mockImplementation((id: string) => (id === 'base-1'
+      ? Array.from({ length: 5 }, (_, i) => ({
+        id: i, namespace: 'global', from_id: 'base-1', to_id: `neighbor-${i}`, relation: 'refines' as const, created_at: 'a', created_by: null, direction: 'outgoing' as const,
+      }))
+      : []));
+    getMemoryByIdMock.mockImplementation((id: string) => (id.startsWith('neighbor-') ? makeMemory(id) : null));
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 2, follow_links: true }, 'c1') as { results: SearchResult[] };
+
+    // 1 base result + at most `limit` (2) appended neighbors.
+    expect(result.results).toHaveLength(3);
+    expect(result.results.filter(r => r.linked_from)).toHaveLength(2);
+  });
+
+  it('an archived neighbor (absent from the default non-archived-only lookup) is skipped', async () => {
+    searchMock.mockResolvedValue([makeResult({ id: 'base-1' })]);
+    listMemoryLinksMock.mockImplementation((id: string) => (id === 'base-1' ? [
+      { id: 1, namespace: 'global', from_id: 'base-1', to_id: 'archived-neighbor', relation: 'refines', created_at: 'a', created_by: null, direction: 'outgoing' },
+    ] : []));
+    getMemoryByIdMock.mockReturnValue(null);
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5, follow_links: true }, 'c1') as { results: SearchResult[] };
+
+    expect(result.results).toHaveLength(1);
+    expect(result.results.every(r => !r.linked_from)).toBe(true);
+  });
+});
