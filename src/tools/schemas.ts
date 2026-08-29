@@ -59,6 +59,18 @@ export const MCP_TOOL_DEFINITIONS = [
         source: { type: 'string', enum: ['cli', 'api', 'agent', 'import'], description: 'Memory source' },
         retention_tier: { type: 'string', enum: ['T0', 'T1', 'T2', 'T3'], description: 'Optional explicit retention tier' },
         pinned: { type: 'boolean', description: 'Pin this memory so it is always included in memory://inject payloads, bounded by defaults.pin_limit_per_namespace. On ADD, defaults to false when omitted; on UPDATE (dedup merge), omitting preserves the existing memory\'s pin state — pass explicitly to change it.' },
+        origin: {
+          type: 'object' as const,
+          description: 'Caller-supplied content provenance: which session/tool/repo/branch produced this memory. All fields optional free-form strings.',
+          properties: {
+            session_id: { type: 'string', maxLength: 200 },
+            tool: { type: 'string', maxLength: 100 },
+            repo: { type: 'string', maxLength: 200 },
+            branch: { type: 'string', maxLength: 200 },
+          },
+          additionalProperties: false,
+        },
+        confidence: { type: 'number', minimum: 0, maximum: 1, description: 'How much to trust this memory\'s content, 0-1. Defaults per-source from pipeline.default_confidence when omitted.' },
       },
       required: ['content'],
       additionalProperties: false,

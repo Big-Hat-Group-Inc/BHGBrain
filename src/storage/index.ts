@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { SqliteStore } from './sqlite.js';
 import { QdrantStore } from './qdrant.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
-import type { MemoryRecord, WriteOperation, AuditEntry, LifecycleAuditDetails } from '../domain/types.js';
+import type { MemoryRecord, MemoryOrigin, WriteOperation, AuditEntry, LifecycleAuditDetails } from '../domain/types.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { BrainConfig } from '../config/index.js';
 import { internal, conflict, notFound } from '../errors/index.js';
@@ -810,8 +810,9 @@ function toQdrantPayload(
   mem: Pick<
     MemoryRecordWithoutEmbedding,
     'type' | 'tags' | 'collection' | 'content' | 'summary' | 'category' | 'source' |
-    'importance' | 'retention_tier' | 'decay_eligible' | 'expires_at' | 'created_at' | 'checksum' | 'pinned'
-  > & { device_id?: string | null; embedding_model?: string | null },
+    'importance' | 'retention_tier' | 'decay_eligible' | 'expires_at' | 'created_at' | 'checksum' | 'pinned' |
+    'confidence'
+  > & { device_id?: string | null; embedding_model?: string | null; origin?: MemoryOrigin | null },
 ): Record<string, unknown> {
   return {
     type: mem.type,
@@ -838,5 +839,10 @@ function toQdrantPayload(
     // add-inject-pinning). Persisted so `repair --mode from-qdrant` and the
     // cross-device fallback path restore pin state instead of resetting it.
     pinned: mem.pinned,
+    // Content provenance/trust (distinct from `embedding_model` above — see
+    // add-memory-provenance-metadata). Stored natively (no stringification),
+    // same as `tags`, since Qdrant payloads are JSON-native.
+    origin: mem.origin ?? null,
+    confidence: mem.confidence,
   };
 }

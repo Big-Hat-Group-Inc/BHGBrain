@@ -36,6 +36,16 @@ export const RememberInputSchema = z.object({
   // Explicit-set-wins on UPDATE (preserves existing state when omitted);
   // defaults to false on ADD when omitted. See add-inject-pinning.
   pinned: z.boolean().optional(),
+  // Caller-supplied content provenance and trust. Both optional and
+  // additive; omitted `confidence` resolves per-source from
+  // `pipeline.default_confidence`. See add-memory-provenance-metadata.
+  origin: z.object({
+    session_id: z.string().max(200).optional(),
+    tool: z.string().max(100).optional(),
+    repo: z.string().max(200).optional(),
+    branch: z.string().max(200).optional(),
+  }).strict().optional(),
+  confidence: z.number().min(0).max(1).optional(),
 }).strict();
 
 export const RecallInputSchema = z.object({

@@ -2046,6 +2046,61 @@ describe('remember tool pin cap enforcement (add-inject-pinning)', () => {
   });
 });
 
+// add-memory-provenance-metadata, task 8.7
+describe('remember tool origin/confidence (add-memory-provenance-metadata)', () => {
+  function makeCtx(process: ReturnType<typeof vi.fn>): ToolContext {
+    return {
+      config: {
+        device: { id: 'local-device' },
+        pipeline: { long_content_threshold_chars: 8000 },
+        defaults: { pin_limit_per_namespace: 20 },
+      } as unknown as ToolContext['config'],
+      storage: {
+        sqlite: {
+          countMemories: vi.fn(() => 3),
+          countPinnedMemories: vi.fn(() => 0),
+        },
+      } as unknown as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: { process } as unknown as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('passes caller-supplied origin/confidence through to the pipeline', async () => {
+    const process = vi.fn(async () => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
+    const ctx = makeCtx(process);
+
+    await handleTool(ctx, 'remember', {
+      content: 'a fact with provenance',
+      origin: { session_id: 'sess-1', tool: 'claude-code', repo: 'BHGBrain', branch: 'main' },
+      confidence: 0.9,
+    }, 'c1');
+
+    expect(process).toHaveBeenCalledWith(expect.objectContaining({
+      origin: { session_id: 'sess-1', tool: 'claude-code', repo: 'BHGBrain', branch: 'main' },
+      confidence: 0.9,
+    }));
+  });
+
+  it('a call omitting origin/confidence still succeeds unchanged (backward-compatibility regression)', async () => {
+    const process = vi.fn(async () => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
+    const ctx = makeCtx(process);
+
+    const result = await handleTool(ctx, 'remember', { content: 'ordinary content, no provenance' }, 'c1') as { id: string };
+
+    expect(result.id).toBe('a');
+    expect(process).toHaveBeenCalledTimes(1);
+    const call = process.mock.calls[0]![0] as { origin?: unknown; confidence?: number };
+    expect(call.origin).toBeUndefined();
+    expect(call.confidence).toBeUndefined();
+  });
+});
+
 describe('tag tool pinned toggle (add-inject-pinning)', () => {
   function makeCtx(mem: { id: string; namespace: string; tags: string[]; pinned: boolean }, pinnedCount = 0, limit = 20) {
     const updateMemory = vi.fn();

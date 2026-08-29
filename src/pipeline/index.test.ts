@@ -24,6 +24,7 @@ describe('WritePipeline NOOP handling', () => {
       // 4.6); the dedicated "WritePipeline contradiction detection" block
       // below opts it in per test.
       contradiction_detection: { enabled: false, timeout_ms: 5000 },
+      default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
     },
   } as unknown as BrainConfig;
 
@@ -334,6 +335,7 @@ describe('WritePipeline distillation derived_from (add-memory-distillation)', ()
       extraction_model: 'gpt-4o-mini',
       extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
       contradiction_detection: { enabled: false, timeout_ms: 5000 },
+      default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
     },
   } as unknown as BrainConfig;
 
@@ -434,6 +436,7 @@ describe('WritePipeline pinned (add-inject-pinning)', () => {
       extraction_model: 'gpt-4o-mini',
       extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
       contradiction_detection: { enabled: false, timeout_ms: 5000 },
+      default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
     },
   } as unknown as BrainConfig;
 
@@ -539,6 +542,149 @@ describe('WritePipeline pinned (add-inject-pinning)', () => {
   });
 });
 
+// add-memory-provenance-metadata, task 8.3
+describe('WritePipeline provenance (add-memory-provenance-metadata)', () => {
+  const config = {
+    deduplication: { similarity_threshold: 0.92 },
+    pipeline: {
+      extraction_enabled: true,
+      fallback_to_threshold_dedup: true,
+      extraction_model: 'gpt-4o-mini',
+      extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
+      contradiction_detection: { enabled: false, timeout_ms: 5000 },
+      default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
+    },
+  } as unknown as BrainConfig;
+
+  let embedding: EmbeddingProvider;
+  let storage: StorageManager;
+  let existingMemory: { origin: unknown; confidence: number } & Record<string, unknown>;
+
+  beforeEach(() => {
+    embedding = {
+      model: 'test-model',
+      dimensions: 2,
+      embed: vi.fn(async () => [0.1, 0.2]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
+      healthCheck: vi.fn(async () => true),
+    };
+    existingMemory = {
+      id: 'existing-id',
+      summary: 'existing summary',
+      type: 'semantic',
+      content: 'existing content',
+      created_at: '2026-01-01T00:00:00.000Z',
+      importance: 0.5,
+      tags: [],
+      origin: { tool: 'prior-tool' },
+      confidence: 0.6,
+    };
+    storage = {
+      sqlite: {
+        getMemoryByChecksum: vi.fn(() => null),
+        getMemoryById: vi.fn(() => existingMemory),
+        insertMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+        fullTextSearch: vi.fn(() => []),
+      },
+      qdrant: {
+        searchSimilar: vi.fn(async () => []),
+      },
+      updateMemory: vi.fn(),
+      writeMemory: vi.fn(),
+      writeMemoryWithoutVector: vi.fn(),
+      deleteMemory: vi.fn(async () => true),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+  });
+
+  it('ADD stamps the caller-supplied origin and confidence', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+    await pipeline.process({
+      content: 'brand new content', namespace: 'global', collection: 'general', tags: [], source: 'cli',
+      origin: { session_id: 'sess-1', tool: 'claude-code' }, confidence: 0.85,
+    });
+    expect(storage.writeMemory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        origin: { session_id: 'sess-1', tool: 'claude-code' },
+        confidence: 0.85,
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('ADD with omitted confidence resolves to the source\'s configured default', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+    await pipeline.process({
+      content: 'brand new agent content', namespace: 'global', collection: 'general', tags: [], source: 'agent',
+    });
+    expect(storage.writeMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ confidence: 0.7, origin: null }),
+      expect.anything(),
+    );
+  });
+
+  it('ADD with omitted origin stores null', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+    await pipeline.process({
+      content: 'brand new content with no origin', namespace: 'global', collection: 'general', tags: [], source: 'cli',
+    });
+    expect(storage.writeMemory).toHaveBeenCalledWith(
+      expect.objectContaining({ origin: null }),
+      expect.anything(),
+    );
+  });
+
+  it('UPDATE merges confidence via Math.max and keeps the prior origin when the incoming call supplies none', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'existing-id', score: 0.95 }]);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await pipeline.process({
+      content: 'a refinement of the existing memory', namespace: 'global', collection: 'general', tags: [], source: 'cli',
+      confidence: 0.4,
+    });
+
+    expect(storage.updateMemory).toHaveBeenCalledWith(
+      'existing-id',
+      expect.objectContaining({ confidence: 0.6, origin: { tool: 'prior-tool' } }),
+      expect.anything(),
+    );
+  });
+
+  it('UPDATE replaces origin when the incoming call supplies one', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'existing-id', score: 0.95 }]);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await pipeline.process({
+      content: 'a refinement of the existing memory', namespace: 'global', collection: 'general', tags: [], source: 'cli',
+      origin: { session_id: 'sess-2' }, confidence: 0.9,
+    });
+
+    expect(storage.updateMemory).toHaveBeenCalledWith(
+      'existing-id',
+      // A second confirmation never lowers trust: max(0.6, 0.9) = 0.9.
+      expect.objectContaining({ confidence: 0.9, origin: { session_id: 'sess-2' } }),
+      expect.anything(),
+    );
+  });
+
+  it('UPDATE with a lower incoming confidence never lowers the merged confidence', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'existing-id', score: 0.95 }]);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await pipeline.process({
+      content: 'a refinement of the existing memory', namespace: 'global', collection: 'general', tags: [], source: 'cli',
+      confidence: 0.1,
+    });
+
+    expect(storage.updateMemory).toHaveBeenCalledWith(
+      'existing-id',
+      expect.objectContaining({ confidence: 0.6 }),
+      expect.anything(),
+    );
+  });
+});
+
 describe('WritePipeline dedup candidate window corroboration', () => {
   // Tier T2 (source: 'cli') resolves thresholds to { noop: 0.98, update: 0.92 }
   // via dedupThresholdFor with similarity_threshold: 0.92 (see
@@ -558,6 +704,7 @@ describe('WritePipeline dedup candidate window corroboration', () => {
       extraction_model: 'gpt-4o-mini',
       extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
       contradiction_detection: { enabled: false, timeout_ms: 5000 },
+      default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
     },
   } as unknown as BrainConfig;
 
@@ -746,6 +893,7 @@ describe('WritePipeline contradiction detection', () => {
       extraction_model: 'gpt-4o-mini',
       extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
       contradiction_detection: { enabled: true, timeout_ms: 5000 },
+      default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
     },
   } as unknown as BrainConfig;
 
@@ -871,6 +1019,7 @@ describe('WritePipeline contradiction detection', () => {
         extraction_model: 'gpt-4o-mini',
         extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
         contradiction_detection: { enabled: false, timeout_ms: 5000 },
+        default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
       },
     } as unknown as BrainConfig;
     const pipeline = new WritePipeline(disabledConfig, storage, embedding);
@@ -925,6 +1074,7 @@ describe('WritePipeline multi-candidate extraction', () => {
       extraction_max_candidates: 6,
       extraction_timeout_ms: 4000,
       contradiction_detection: { enabled: false, timeout_ms: 5000 },
+      default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
     },
   } as unknown as BrainConfig;
 
@@ -1101,6 +1251,7 @@ describe('WritePipeline summarization', () => {
       fallback_to_threshold_dedup: true,
       contradiction_detection: { enabled: false, timeout_ms: 5000 },
       summarization_enabled: false,
+      default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
     },
     auto_summarize: true,
   } as unknown as BrainConfig;
@@ -1218,6 +1369,7 @@ describe('WritePipeline auto-tagging (add-auto-tagging)', () => {
       contradiction_detection: { enabled: false, timeout_ms: 5000 },
       auto_tag_enabled: true,
       auto_tag_max_per_memory: 6,
+      default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
     },
   } as unknown as BrainConfig;
 

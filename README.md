@@ -30,6 +30,7 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
    - [Tier Lifecycle - Assignment, Promotion, Sliding Window](#tier-lifecycle--assignment-promotion-sliding-window)
    - [Deduplication](#deduplication)
    - [Auto-Tagging](#auto-tagging)
+   - [Content Provenance](#content-provenance)
    - [Content Normalization](#content-normalization)
    - [Importance Scoring](#importance-scoring)
    - [Categories - Persistent Policy Slots](#categories--persistent-policy-slots)
@@ -1518,6 +1519,49 @@ entirely.
 
 ---
 
+### Content Provenance
+
+`remember`'s `origin`/`confidence` fields let a caller record *where a memory's
+content came from* and *how much to trust it* — distinct from `embedding_model`
+(see [Embedding Model Migration](#embedding-model-migration)), which records which
+embedding model produced the *vector*, not where the belief came from.
+
+- **`origin`** (`{ session_id?, tool?, repo?, branch? }`, all optional free-form
+  strings) identifies the session/tool/repo/branch that produced a memory. `null`
+  when the caller supplies nothing — the common case, and always the case for
+  memories written before this field existed. Not derived automatically from the
+  MCP transport: there is no standardized session/tool identity across clients
+  (Claude CLI, Codex, Gemini, ...), so this is caller-supplied only.
+- **`confidence`** (`number`, `[0, 1]`) is how much to trust a memory's content.
+  When a `remember` call omits it, it defaults per-`source` from
+  `pipeline.default_confidence` (config, defaults `cli: 1.0, api: 1.0, agent: 0.7,
+  import: 0.5`) — an explicit user statement defaults to full trust, an agent's
+  inference defaults lower. On a dedup **UPDATE**, `confidence` merges via
+  `max(existing, incoming)` (a second confirmation never lowers trust, same policy
+  as `importance`); `origin` is replaced only when the incoming call supplies one,
+  otherwise the existing origin is kept.
+
+Both fields are surfaced on every read path that already returns memory records —
+`recall`, `search`, `memory://{id}`, `memory://list` — no new tool or resource.
+Example `remember` call:
+
+```json
+{
+  "content": "The user said the deploy window is Tuesdays 2-4pm UTC.",
+  "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+  "confidence": 1.0
+}
+```
+
+| Config field | Default | Meaning |
+|---|---|---|
+| `pipeline.default_confidence.cli` | `1.0` | Default `confidence` for `source: "cli"` writes that omit it. |
+| `pipeline.default_confidence.api` | `1.0` | Default `confidence` for `source: "api"` writes that omit it. |
+| `pipeline.default_confidence.agent` | `0.7` | Default `confidence` for `source: "agent"` writes that omit it. |
+| `pipeline.default_confidence.import` | `0.5` | Default `confidence` for `source: "import"` writes that omit it. |
+
+---
+
 ### Content Normalization
 
 Before checksumming, embedding, or storing, all content goes through the normalization pipeline:
@@ -2862,6 +2906,8 @@ Store content in BHGBrain with automatic deduplication, normalization, embedding
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | No | `"cli"` | Source of the memory. Affects default tier (e.g., agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | No | auto-assigned | Explicit tier override. Takes precedence over all heuristics. |
 | `pinned` | `boolean` | No | `false` on ADD; preserved on UPDATE | Pin this memory so it is always included in `memory://inject` payloads (see [Session Inject](#memoryinject---session-context-injection)), bounded by `defaults.pin_limit_per_namespace` (default 20). On a dedup **UPDATE**, omitting `pinned` preserves the existing memory's pin state — pass it explicitly to change it. Exceeding the per-namespace cap when newly pinning returns `INVALID_INPUT`. |
+| `origin` | `object` | No | `null` | Caller-supplied content provenance: `{ session_id?, tool?, repo?, branch? }`, all optional free-form strings (max 200/100/200/200 chars respectively). Unknown keys are rejected. Distinct from the vector-identity `embedding_model` field — see [Content Provenance](#content-provenance). On a dedup **UPDATE**, omitting `origin` preserves the existing memory's origin; passing one replaces it. |
+| `confidence` | `number (0-1)` | No | per-`source` (see below) | How much to trust this memory's content. Defaults from `pipeline.default_confidence[source]` (config, defaults `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`) when omitted. On a dedup **UPDATE**, the merged value is `max(existing, incoming)` — a second confirmation never lowers trust. See [Content Provenance](#content-provenance). |
 
 **Long content is rejected, not silently mush-embedded:** content longer than
 `pipeline.long_content_threshold_chars` (config, default `8,000` characters ≈ 1–2
@@ -3002,11 +3048,17 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
       "expires_at": null,
       "expiring_soon": false,
       "created_at": "2026-01-01T00:00:00Z",
-      "last_accessed": "2026-03-15T12:00:00Z"
+      "last_accessed": "2026-03-15T12:00:00Z",
+      "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+      "confidence": 1.0
     }
   ]
 }
 ```
+
+Every result also carries `origin`/`confidence` (see [Content Provenance](#content-provenance)
+under `remember`) — `origin` is `null` when the memory was written without one; `confidence`
+defaults per-source when the writer omitted it.
 
 With `follow_links: true`, each base result's one-hop neighbors are appended after the
 base results (never reducing how many base results `limit` allows), deduplicated

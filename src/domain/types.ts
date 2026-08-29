@@ -36,6 +36,18 @@ export interface RecallFilter {
   before?: string;
 }
 
+// Caller-supplied identity of the session/tool/repo that produced a memory's
+// *content* (not its vector — see `embedding_model` below for that). All
+// fields optional free-form strings: MCP has no standardized identity for
+// any of session/tool/repo/branch across clients (Claude CLI, Codex,
+// Gemini). See add-memory-provenance-metadata.
+export interface MemoryOrigin {
+  session_id?: string;
+  tool?: string;
+  repo?: string;
+  branch?: string;
+}
+
 export type ErrorCode =
   | 'INVALID_INPUT'
   | 'NOT_FOUND'
@@ -90,6 +102,14 @@ export interface MemoryRecord {
   // deterministic-fallback ADD path) — both are treated as "unknown" by
   // mismatch detection and re-embed selection. See embedding-provenance.
   embedding_model?: string | null;
+  // Content provenance (who/where this memory's *belief* came from), distinct
+  // from `embedding_model` above (which vector-provenance field identifies
+  // what produced the *vector*). `origin` is null when the caller supplied
+  // none (the common case, and always the case for pre-existing rows).
+  // `confidence` defaults per-source from `pipeline.default_confidence` when
+  // the caller omits it. See add-memory-provenance-metadata.
+  origin: MemoryOrigin | null;
+  confidence: number;
   created_at: string;
   updated_at: string;
   last_accessed: string;
@@ -152,6 +172,14 @@ export interface SearchResult {
   linked_from?: string;
   link_relation?: MemoryLinkRelation;
   link_direction?: 'outgoing' | 'incoming';
+  // Content provenance, mirrored from `MemoryRecord` — see the comment there.
+  // Optional here (unlike the required fields on `MemoryRecord`) so existing
+  // `SearchResult` object literals across the codebase don't all require an
+  // update for one additive field, matching `device_id`'s convention; both
+  // are populated on every active result in practice, not conditionally like
+  // `archived`/`vector`.
+  origin?: MemoryOrigin | null;
+  confidence?: number;
 }
 
 export interface WriteResult {

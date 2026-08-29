@@ -388,6 +388,20 @@ const ConfigSchema = z.object({
     // Cap on auto-derived tags added per memory (before merging with
     // caller-supplied tags and trimming to the 20-tag `TagsSchema` cap).
     auto_tag_max_per_memory: z.number().int().min(0).max(20).default(6),
+    // Per-source default for `MemoryRecord.confidence` when a `remember`
+    // call omits it — operationalizes "explicit user statement > agent
+    // inference" without requiring every caller to compute a value.
+    // `distillation` isn't listed: `WritePipeline.decide` falls back to 1.0
+    // for that source (a distilled memory consolidates already-trusted
+    // sources, so full confidence is the reasonable default) rather than
+    // indexing this map with a key it doesn't have.
+    // See add-memory-provenance-metadata.
+    default_confidence: z.object({
+      cli: z.number().min(0).max(1).default(1.0),
+      api: z.number().min(0).max(1).default(1.0),
+      agent: z.number().min(0).max(1).default(0.7),
+      import: z.number().min(0).max(1).default(0.5),
+    }).default({}),
   }).default({}),
   // Controls whether summarization quality tiers (extractive, or LLM when
   // `pipeline.summarization_enabled`) apply. `true` (default): tiered

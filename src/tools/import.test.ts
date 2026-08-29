@@ -178,6 +178,7 @@ describe('import tool auto-tagging (add-auto-tagging)', () => {
         contradiction_detection: { enabled: false, timeout_ms: 5000 },
         auto_tag_enabled: true,
         auto_tag_max_per_memory: 6,
+        default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
       },
       device: { id: 'dev-1' },
     } as unknown as ToolContext['config'];

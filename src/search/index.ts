@@ -1,7 +1,7 @@
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
-import type { SearchMode, SearchResult, MemoryRecord, MemoryType, RetentionTier, RecallFilter, ArchiveRecord } from '../domain/types.js';
+import type { SearchMode, SearchResult, MemoryRecord, MemoryOrigin, MemoryType, RetentionTier, RecallFilter, ArchiveRecord } from '../domain/types.js';
 import type { AccessUpdate } from '../storage/sqlite.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
@@ -33,6 +33,13 @@ function isMemoryType(value: unknown): value is MemoryType {
 
 function isRetentionTier(value: unknown): value is RetentionTier {
   return typeof value === 'string' && (RETENTION_TIERS as readonly string[]).includes(value);
+}
+
+// A malformed/absent `origin` payload field narrows to `null` — "unknown",
+// not an error, matching `SqliteStore.parseOrigin`'s fail-soft posture. See
+// add-memory-provenance-metadata.
+function narrowOrigin(value: unknown): MemoryOrigin | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as MemoryOrigin : null;
 }
 
 // Maps a retained archive row into the SearchResult shape so `include_archived`
@@ -595,6 +602,8 @@ export class SearchService {
         device_id: mem.device_id ?? null,
         created_at: mem.created_at,
         last_accessed: nowIso,
+        origin: mem.origin,
+        confidence: mem.confidence,
         // `undefined` for every caller except `searchForInject`; JSON.stringify
         // drops undefined-valued keys, so this never appears in tool responses.
         vector: item.vector,
@@ -642,6 +651,8 @@ export class SearchService {
       device_id: narrowString(payload.device_id) ?? null,
       created_at: narrowString(payload.created_at) ?? nowIso,
       last_accessed: nowIso,
+      origin: narrowOrigin(payload.origin),
+      confidence: typeof payload.confidence === 'number' ? payload.confidence : 1.0,
     };
   }
 

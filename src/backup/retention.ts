@@ -376,6 +376,12 @@ export class RetentionService {
       // Archive rows carry no pin state (ArchiveRecord has no `pinned`
       // field), so a restore never resurrects a memory as pinned.
       pinned: false,
+      // Archive rows carry no origin/confidence either (ArchiveRecord has
+      // neither field) — a restore has no provenance to recover, so this
+      // matches the "legacy row" default (origin: null, confidence: 1.0).
+      // See add-memory-provenance-metadata.
+      origin: null,
+      confidence: 1.0,
       created_at: now,
       updated_at: now,
       last_accessed: now,

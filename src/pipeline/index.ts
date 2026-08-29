@@ -3,7 +3,7 @@ import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
-import type { MemoryType, MemorySource, WriteOperation, MemoryRecord, WriteResult, RetentionTier } from '../domain/types.js';
+import type { MemoryType, MemorySource, WriteOperation, MemoryRecord, MemoryOrigin, WriteResult, RetentionTier } from '../domain/types.js';
 import { normalizeContent, computeChecksum, generateSummary, containsSecret, detectsInvalidation } from '../domain/normalize.js';
 import { extractAutoTags } from '../domain/auto-tag.js';
 import { summarizeContent } from '../domain/summarize.js';
@@ -70,6 +70,11 @@ export class WritePipeline {
     // Explicit-set-wins on UPDATE (preserves existing pin state when
     // omitted); defaults to false on ADD when omitted. See add-inject-pinning.
     pinned?: boolean;
+    // Caller-supplied content provenance and trust. `confidence` omitted
+    // resolves per-source from `pipeline.default_confidence` inside
+    // `decide`. See add-memory-provenance-metadata.
+    origin?: MemoryOrigin;
+    confidence?: number;
     // Set only by `DistillationService`: the archived source memory ids this
     // write consolidates. On ADD, stamped directly. On UPDATE (a re-forming
     // cluster distilled a second time — see design.md Decision #7), unioned
@@ -186,11 +191,20 @@ export class WritePipeline {
       retention_tier?: RetentionTier;
       device_id?: string | null;
       pinned?: boolean;
+      origin?: MemoryOrigin;
+      confidence?: number;
       derived_from?: string[] | null;
     },
   ): Promise<WriteResult> {
     const checksum = computeChecksum(candidate.content);
     const now = new Date().toISOString();
+    // Resolved once, available on every branch below (NOOP/UPDATE/DELETE-then-ADD/ADD).
+    // `distillation` isn't a key in `pipeline.default_confidence` (see the
+    // comment there); a distilled memory consolidating already-trusted
+    // sources defaults to full confidence.
+    const confidence = input.confidence ?? (
+      input.source === 'distillation' ? 1.0 : this.config.pipeline.default_confidence[input.source]
+    );
     const tier = this.lifecycle.assignTier({
       category: input.category,
       source: input.source,
@@ -296,6 +310,12 @@ export class WritePipeline {
         // overrides; omitted preserves the existing memory's pin state.
         pinned: input.pinned !== undefined ? input.pinned : existing.pinned,
         derived_from: mergeDerivedFrom(existing.derived_from, input.derived_from),
+        // A second confirmation should never lower trust (mirrors
+        // `importance`'s Math.max policy). `origin` isn't ordered, so it's
+        // replaced only when this call supplies one, otherwise the prior
+        // origin survives the merge.
+        confidence: Math.max(existing.confidence, confidence),
+        origin: input.origin ?? existing.origin ?? null,
         updated_at: now,
       }, vector);
 
@@ -348,6 +368,8 @@ export class WritePipeline {
         vector_synced: true,
         pinned: input.pinned ?? false,
         device_id: input.device_id ?? null,
+        origin: input.origin ?? null,
+        confidence,
         created_at: now,
         updated_at: now,
         last_accessed: now,
@@ -392,6 +414,8 @@ export class WritePipeline {
       vector_synced: true,
       pinned: input.pinned ?? false,
       device_id: input.device_id ?? null,
+      origin: input.origin ?? null,
+      confidence,
       created_at: now,
       updated_at: now,
       last_accessed: now,
@@ -534,6 +558,8 @@ export class WritePipeline {
       retention_tier?: RetentionTier;
       device_id?: string | null;
       pinned?: boolean;
+      origin?: MemoryOrigin;
+      confidence?: number;
     },
     checksum: string,
     now: string,
@@ -548,6 +574,10 @@ export class WritePipeline {
     const resolvedType = candidate.type ?? 'semantic';
     const summary = await summarizeContent(candidate.content, this.config, this.summarizer, this.logger);
     const importance = candidate.importance ?? 0.5;
+    // Mirrors `decide`'s resolution (see the comment there).
+    const confidence = input.confidence ?? (
+      input.source === 'distillation' ? 1.0 : this.config.pipeline.default_confidence[input.source]
+    );
     const tier = this.lifecycle.assignTier({
       category: input.category,
       source: input.source,
@@ -594,6 +624,8 @@ export class WritePipeline {
         // Explicit-set-wins: an explicit `pinned` on this remember call
         // overrides; omitted preserves the existing memory's pin state.
         pinned: input.pinned !== undefined ? input.pinned : existing.pinned,
+        confidence: Math.max(existing.confidence, confidence),
+        origin: input.origin ?? existing.origin ?? null,
         updated_at: now,
       });
 
@@ -634,6 +666,8 @@ export class WritePipeline {
       vector_synced: false,
       pinned: input.pinned ?? false,
       device_id: input.device_id ?? null,
+      origin: input.origin ?? null,
+      confidence,
       created_at: now,
       updated_at: now,
       last_accessed: now,

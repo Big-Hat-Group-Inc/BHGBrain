@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync, renameSync, statSync } from 'n
 import { join } from 'node:path';
 import type {
   MemoryRecord,
+  MemoryOrigin,
   MemoryType,
   CategoryRecord,
   AuditEntry,
@@ -215,6 +216,8 @@ CREATE TABLE IF NOT EXISTS memories (
   pinned INTEGER NOT NULL DEFAULT 0,
   device_id TEXT,
   embedding_model TEXT,
+  origin TEXT,
+  confidence REAL NOT NULL DEFAULT 1.0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_accessed TEXT NOT NULL
@@ -535,12 +538,14 @@ export class SqliteStore implements SqliteStorage {
     const deviceId = mem.device_id ?? null;
     const embeddingModel = mem.embedding_model ?? null;
     const derivedFrom = mem.derived_from ?? null;
+    const origin = mem.origin ? JSON.stringify(mem.origin) : null;
+    const confidence = mem.confidence ?? 1.0;
     this.db.run(
       `INSERT INTO memories (
         id, namespace, collection, type, category, content, summary, tags, source, checksum,
         importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
-        last_operation, merged_from, derived_from, stale, archived, vector_synced, pinned, device_id, embedding_model, created_at, updated_at, last_accessed
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        last_operation, merged_from, derived_from, stale, archived, vector_synced, pinned, device_id, embedding_model, origin, confidence, created_at, updated_at, last_accessed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         mem.id,
         mem.namespace,
@@ -567,6 +572,8 @@ export class SqliteStore implements SqliteStorage {
         pinned ? 1 : 0,
         deviceId,
         embeddingModel,
+        origin,
+        confidence,
         mem.created_at,
         mem.updated_at,
         mem.last_accessed,
@@ -610,6 +617,13 @@ export class SqliteStore implements SqliteStorage {
     // so a `repair --mode from-qdrant` rebuild (or the cross-device fallback
     // path) preserves it. See add-inject-pinning.
     const pinned = typeof payload.pinned === 'boolean' ? payload.pinned : false;
+    // Narrow to a plain object (not array/null) or fall back to null, mirroring
+    // `embeddingModel`'s narrowing above — a malformed/missing field is
+    // "unknown", not an error. See add-memory-provenance-metadata.
+    const origin = payload.origin !== null && typeof payload.origin === 'object' && !Array.isArray(payload.origin)
+      ? JSON.stringify(payload.origin)
+      : null;
+    const confidence = typeof payload.confidence === 'number' ? payload.confidence : 1.0;
 
     // Handle expires_at which may be stored as epoch seconds in Qdrant
     let expiresAt: string | null = null;
@@ -635,13 +649,13 @@ export class SqliteStore implements SqliteStorage {
         `INSERT INTO memories (
           id, namespace, collection, type, category, content, summary, tags, source, checksum,
           importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
-          last_operation, merged_from, stale, archived, vector_synced, pinned, device_id, embedding_model, created_at, updated_at, last_accessed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          last_operation, merged_from, stale, archived, vector_synced, pinned, device_id, embedding_model, origin, confidence, created_at, updated_at, last_accessed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id, namespace, collection, type, category, content, summary,
           JSON.stringify(tags), source, checksum, importance, retentionTier,
           expiresAt, decayEligible ? 1 : 0, null, 0,
-          'ADD', null, 0, 0, 1, pinned ? 1 : 0, deviceId, embeddingModel, createdAt, now, now,
+          'ADD', null, 0, 0, 1, pinned ? 1 : 0, deviceId, embeddingModel, origin, confidence, createdAt, now, now,
         ],
       );
       this.db.run(
@@ -672,12 +686,18 @@ export class SqliteStore implements SqliteStorage {
       } else if (key === 'derived_from') {
         sets.push('derived_from = ?');
         vals.push(val === null ? null : JSON.stringify(val));
+      } else if (key === 'origin') {
+        sets.push('origin = ?');
+        vals.push(val === null ? null : JSON.stringify(val));
       } else if (key === 'decay_eligible' || key === 'archived' || key === 'vector_synced' || key === 'pinned') {
         sets.push(`${key} = ?`);
         vals.push(val ? 1 : 0);
       } else {
+        // `origin` (the one non-primitive field left) is handled by the
+        // dedicated branch above, so every value reaching here is one
+        // `toSqlValue` already accepts.
         sets.push(`${key} = ?`);
-        vals.push(this.toSqlValue(val, key));
+        vals.push(this.toSqlValue(val as string | number | boolean | string[] | null, key));
       }
     }
     if (sets.length === 0) return;
@@ -1969,10 +1989,29 @@ export class SqliteStore implements SqliteStorage {
       pinned: row.pinned === undefined ? false : this.getBoolean(row, 'pinned'),
       device_id: this.getNullableString(row, 'device_id'),
       embedding_model: this.getNullableString(row, 'embedding_model'),
+      origin: this.parseOrigin(this.getNullableString(row, 'origin')),
+      confidence: row.confidence === undefined ? 1.0 : this.getNumber(row, 'confidence'),
       created_at: this.getString(row, 'created_at'),
       updated_at: this.getString(row, 'updated_at'),
       last_accessed: this.getString(row, 'last_accessed'),
     };
+  }
+
+  // Fail-soft on corrupt/legacy JSON: a malformed `origin` column must never
+  // block a memory read, matching the project's general fail-soft-on-read
+  // posture for optional metadata (see `derived_from`/`tags` parsing above).
+  // See add-memory-provenance-metadata.
+  private parseOrigin(raw: string | null): MemoryOrigin | null {
+    if (raw === null) return null;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as MemoryOrigin;
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   private rowToArchive(row: SqlRow): ArchiveRecord {
@@ -2113,6 +2152,8 @@ export class SqliteStore implements SqliteStorage {
       { name: 'embedding_model', sql: `ALTER TABLE memories ADD COLUMN embedding_model TEXT` },
       { name: 'pinned', sql: `ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0` },
       { name: 'derived_from', sql: `ALTER TABLE memories ADD COLUMN derived_from TEXT` },
+      { name: 'origin', sql: `ALTER TABLE memories ADD COLUMN origin TEXT` },
+      { name: 'confidence', sql: `ALTER TABLE memories ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0` },
     ];
 
     for (const column of requiredColumns) {

@@ -379,6 +379,80 @@ describe('SearchService', () => {
     expect(results).toHaveLength(0);
   });
 
+  // add-memory-provenance-metadata, task 8.6
+  it('carries origin/confidence from the hydrated memory into the search result', async () => {
+    const memories = new Map<string, StoredMemory>([
+      ['mem-1', {
+        id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic',
+        content: 'hello world', summary: 'hello', tags: [], source: 'agent',
+        checksum: 'mem-1',
+        importance: 0.9,
+        retention_tier: 'T2',
+        expires_at: '2026-12-31T00:00:00Z',
+        decay_eligible: true,
+        review_due: null,
+        access_count: 0,
+        last_operation: 'ADD',
+        merged_from: null,
+        archived: false,
+        vector_synced: true,
+        origin: { session_id: 'sess-1', tool: 'claude-code' },
+        confidence: 0.7,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+        last_accessed: '2026-01-01T00:00:00Z',
+      }],
+    ]);
+    const { service } = createSearchService({ memories });
+
+    const results = await service.search('hello', 'global', undefined, 'fulltext', 10);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.origin).toEqual({ session_id: 'sess-1', tool: 'claude-code' });
+    expect(results[0]!.confidence).toBe(0.7);
+  });
+
+  it('narrows origin/confidence safely on the Qdrant-payload fallback path', async () => {
+    const { service, storage } = createSearchService({ memories: new Map() });
+    storage.qdrant.search.mockResolvedValue([
+      {
+        id: 'mem-cross-device',
+        score: 0.87,
+        payload: {
+          content: 'cross-device content',
+          summary: 'cross-device summary',
+          type: 'episodic',
+          origin: { tool: 'recovered-tool' },
+          confidence: 0.55,
+        },
+      },
+    ]);
+
+    const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.origin).toEqual({ tool: 'recovered-tool' });
+    expect(results[0]!.confidence).toBe(0.55);
+  });
+
+  it('falls back to origin: null, confidence: 1.0 on a malformed Qdrant fallback payload', async () => {
+    const { service, storage } = createSearchService({ memories: new Map() });
+    storage.qdrant.search.mockResolvedValue([
+      {
+        id: 'mem-cross-device',
+        score: 0.5,
+        payload: {
+          content: 'partial content',
+          origin: 'not-an-object',
+          confidence: 'not-a-number',
+        },
+      },
+    ]);
+
+    const results = await service.search('hello', 'global', undefined, 'semantic', 10);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.origin).toBeNull();
+    expect(results[0]!.confidence).toBe(1.0);
+  });
+
   it('preserves existing expiry on read when sliding window is disabled', async () => {
     // Regression: non-sliding access updates must not clear T2/T3 TTLs.
     const { service, storage } = createSearchService({ slidingWindowEnabled: false });

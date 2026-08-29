@@ -30,6 +30,7 @@ BHGBrain 将记忆存储在 SQLite（元数据 + 全文搜索）和 Qdrant（语
     - [层级生命周期——分配、晋升与滑动窗口](#层级生命周期分配晋升与滑动窗口)
     - [去重](#去重)
     - [自动标记](#自动标记)
+    - [内容溯源](#内容溯源)
     - [内容规范化](#内容规范化)
     - [重要性评分](#重要性评分)
     - [类别——持久化策略槽](#类别持久化策略槽)
@@ -1417,6 +1418,45 @@ camelCase/PascalCase 形态的品牌名称标记为标签（例如 `GitHub` → 
 
 ---
 
+### 内容溯源
+
+`remember` 的 `origin`/`confidence` 字段用于记录*一条记忆的内容来自哪里*以及*应该
+在多大程度上信任它*——这与 `embedding_model`（见[嵌入模型迁移](#嵌入模型迁移)）不
+同：后者记录的是哪个嵌入模型生成了*向量*，而不是这条陈述来自哪里。
+
+- **`origin`**（`{ session_id?, tool?, repo?, branch? }`，所有字段均为可选的自由
+  文本字符串）标识产生该记忆的会话/工具/仓库/分支。如果调用方未提供任何内容，则
+  为 `null`——这是常见情况，也是此字段引入之前所写记忆的固定情况。不会从 MCP
+  传输层自动推导：不同客户端（Claude CLI、Codex、Gemini……）之间没有标准化的会
+  话/工具身份，因此该字段仅由调用方提供。
+- **`confidence`**（`number`，`[0, 1]`）表示应在多大程度上信任一条记忆的内容。当
+  `remember` 调用省略该字段时，会按 `source` 从 `pipeline.default_confidence`
+  取默认值（配置项，默认值为 `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`）——用
+  户的明确陈述默认获得完全信任，而智能体的推断默认信任度更低。在去重
+  `UPDATE` 时，`confidence` 通过 `max(现有值, 新值)` 合并（二次确认永远不会降低
+  信任度，与 `importance` 采用相同策略）；`origin` 仅在传入调用提供了新值时才会
+  被替换，否则保留现有的 `origin`。
+
+这两个字段会出现在所有已经返回记忆记录的读取路径上——`recall`、`search`、
+`memory://{id}`、`memory://list`——无需新增工具或资源。`remember` 调用示例：
+
+```json
+{
+  "content": "The user said the deploy window is Tuesdays 2-4pm UTC.",
+  "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+  "confidence": 1.0
+}
+```
+
+| 配置字段 | 默认值 | 含义 |
+|---|---|---|
+| `pipeline.default_confidence.cli` | `1.0` | `source: "cli"` 写入省略时的默认 `confidence`。 |
+| `pipeline.default_confidence.api` | `1.0` | `source: "api"` 写入省略时的默认 `confidence`。 |
+| `pipeline.default_confidence.agent` | `0.7` | `source: "agent"` 写入省略时的默认 `confidence`。 |
+| `pipeline.default_confidence.import` | `0.5` | `source: "import"` 写入省略时的默认 `confidence`。 |
+
+---
+
 ### 内容规范化
 
 在校验和计算、嵌入或存储之前，所有内容都经过规范化管道处理：
@@ -2692,6 +2732,8 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | 否 | `"cli"` | 记忆来源。影响默认层级（例如 agent+procedural → T1）。 |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | 否 | 自动分配 | 显式层级覆盖。优先于所有启发式规则。 |
 | `pinned` | `boolean` | 否 | ADD 时为 `false`；UPDATE 时保留 | 固定该记忆，使其始终包含在 `memory://inject` 载荷中，受 `defaults.pin_limit_per_namespace`（默认 20）限制。在去重 `UPDATE` 时，省略 `pinned` 会保留该记忆现有的固定状态——需显式传入才能更改。新固定记忆时超过每命名空间上限会返回 `INVALID_INPUT`。 |
+| `origin` | `object` | 否 | `null` | 调用方提供的内容溯源信息：`{ session_id?, tool?, repo?, branch? }`，所有字段均为可选的自由文本字符串（分别最多 200/100/200/200 字符）。未知键会被拒绝。与表示向量身份的 `embedding_model` 字段不同——详见[内容溯源](#内容溯源)。在去重 `UPDATE` 时，省略 `origin` 会保留该记忆现有的溯源信息；传入则会替换它。 |
+| `confidence` | `number (0–1)` | 否 | 按 `source` 而定（见下文） | 应在多大程度上信任该记忆的内容。省略时按 `pipeline.default_confidence[source]`（配置项，默认值为 `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`）取默认值。在去重 `UPDATE` 时，合并后的值为 `max(现有值, 新值)`——二次确认永远不会降低信任度。详见[内容溯源](#内容溯源)。 |
 
 **超长内容会被拒绝，而不是被静默嵌入为低质量的"糊状向量"：** 超过 `pipeline.long_content_threshold_chars`（配置项，默认 `8,000` 字符，约 1–2 页）的内容会被拒绝，并返回 `INVALID_INPUT` 错误，其中说明了实际字符数、配置的阈值以及解决方法：改用 `format: "freeform"` 调用 `import` 工具，或将内容拆分为多次较小的 `remember` 调用。这是有意为之：将数千字的文本嵌入为单个向量会产生低质量的"糊状向量"，它会与许多不相关的查询产生弱匹配，而不是与某一个查询产生强匹配。上表中 100,000 字符的硬性上限仍然适用，作为绝对上限，但调用者实际会先触及 `long_content_threshold_chars` 这一限制。
 
@@ -2820,11 +2862,17 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
       "expires_at": null,
       "expiring_soon": false,
       "created_at": "2026-01-01T00:00:00Z",
-      "last_accessed": "2026-03-15T12:00:00Z"
+      "last_accessed": "2026-03-15T12:00:00Z",
+      "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+      "confidence": 1.0
     }
   ]
 }
 ```
+
+每条结果还携带 `origin`/`confidence`（详见 `remember` 下的[内容溯源](#内容溯源)）——
+如果写入该记忆时未提供 `origin`，则为 `null`；如果调用方省略了 `confidence`，则
+使用按来源确定的默认值。
 
 当 `follow_links: true` 时，每条基础结果的单跳关联记忆会追加在基础结果之后（不会
 减少 `limit` 允许的基础结果数量），并对基础结果集及彼此之间去重，追加条目总数上限

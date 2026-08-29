@@ -30,6 +30,7 @@ BHGBrain stocke les souvenirs dans SQLite (métadonnées + recherche plein texte
     - [Cycle de vie des niveaux — Attribution, Promotion, Fenêtre glissante](#cycle-de-vie-des-niveaux--attribution-promotion-fenêtre-glissante)
     - [Déduplication](#déduplication)
     - [Étiquetage automatique](#étiquetage-automatique)
+    - [Provenance du contenu](#provenance-du-contenu)
     - [Normalisation du contenu](#normalisation-du-contenu)
     - [Score d'importance](#score-dimportance)
     - [Catégories — Emplacements de politique persistants](#catégories--emplacements-de-politique-persistants)
@@ -1510,6 +1511,54 @@ l'action `remove` de l'outil `tag` pour corriger les cas atypiques, ou définiss
 
 ---
 
+### Provenance du contenu
+
+Les champs `origin`/`confidence` de `remember` permettent d'enregistrer *d'où provient
+le contenu d'un souvenir* et *à quel point lui faire confiance* — distinct de
+`embedding_model` (voir [Migration du modèle
+d'embedding](#migration-du-modèle-dembedding)), qui enregistre quel modèle
+d'embedding a produit le *vecteur*, pas d'où vient l'affirmation.
+
+- **`origin`** (`{ session_id?, tool?, repo?, branch? }`, tous les champs sont des
+  chaînes libres optionnelles) identifie la session/l'outil/le dépôt/la branche qui
+  a produit un souvenir. `null` lorsque l'appelant ne fournit rien — le cas courant,
+  et toujours le cas pour les souvenirs écrits avant l'existence de ce champ. N'est
+  pas dérivé automatiquement du transport MCP : il n'existe pas d'identité
+  session/outil standardisée entre clients (Claude CLI, Codex, Gemini, ...), donc
+  ceci est fourni exclusivement par l'appelant.
+- **`confidence`** (`number`, `[0, 1]`) indique à quel point faire confiance au
+  contenu d'un souvenir. Lorsqu'un appel à `remember` l'omet, la valeur par défaut
+  est prise par `source` depuis `pipeline.default_confidence` (configuration,
+  valeurs par défaut `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`) — une
+  affirmation explicite de l'utilisateur reçoit par défaut une confiance totale,
+  une inférence d'agent reçoit par défaut une confiance moindre. Lors d'un `UPDATE`
+  de déduplication, `confidence` fusionne via `max(existant, entrant)` (une seconde
+  confirmation ne réduit jamais la confiance, même politique que `importance`) ;
+  `origin` n'est remplacé que si l'appel entrant en fournit un, sinon l'`origin`
+  existant est conservé.
+
+Les deux champs sont exposés sur chaque chemin de lecture qui renvoie déjà des
+enregistrements de souvenirs — `recall`, `search`, `memory://{id}`,
+`memory://list` — sans nouvel outil ni nouvelle ressource. Exemple d'appel à
+`remember` :
+
+```json
+{
+  "content": "The user said the deploy window is Tuesdays 2-4pm UTC.",
+  "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+  "confidence": 1.0
+}
+```
+
+| Champ de configuration | Par défaut | Signification |
+|---|---|---|
+| `pipeline.default_confidence.cli` | `1.0` | `confidence` par défaut pour les écritures `source: "cli"` qui l'omettent. |
+| `pipeline.default_confidence.api` | `1.0` | `confidence` par défaut pour les écritures `source: "api"` qui l'omettent. |
+| `pipeline.default_confidence.agent` | `0.7` | `confidence` par défaut pour les écritures `source: "agent"` qui l'omettent. |
+| `pipeline.default_confidence.import` | `0.5` | `confidence` par défaut pour les écritures `source: "import"` qui l'omettent. |
+
+---
+
 ### Normalisation du contenu
 
 Avant la vérification de somme de contrôle, l'embedding ou le stockage, tout le contenu passe par le pipeline de normalisation :
@@ -2840,6 +2889,8 @@ Stocke du contenu dans BHGBrain avec déduplication automatique, normalisation, 
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | Non | `"cli"` | Source du souvenir. Affecte le niveau par défaut (ex. agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | Non | auto-attribué | Remplacement de niveau explicite. Prend le dessus sur toutes les heuristiques. |
 | `pinned` | `boolean` | Non | `false` en ADD ; conservé en UPDATE | Épingle ce souvenir pour qu'il soit toujours inclus dans les charges utiles `memory://inject`, limité par `defaults.pin_limit_per_namespace` (par défaut 20). Lors d'un `UPDATE` de déduplication, omettre `pinned` conserve l'état d'épinglage existant du souvenir — passez-le explicitement pour le modifier. Dépasser la limite par namespace en épinglant un nouveau souvenir renvoie `INVALID_INPUT`. |
+| `origin` | `object` | Non | `null` | Provenance du contenu fournie par l'appelant : `{ session_id?, tool?, repo?, branch? }`, tous les champs sont des chaînes libres optionnelles (max 200/100/200/200 caractères respectivement). Les clés inconnues sont rejetées. Distinct du champ d'identité vectorielle `embedding_model` — voir [Provenance du contenu](#provenance-du-contenu). Lors d'un `UPDATE` de déduplication, omettre `origin` conserve la provenance existante du souvenir ; en fournir un la remplace. |
+| `confidence` | `number (0–1)` | Non | par `source` (voir ci-dessous) | À quel point faire confiance au contenu de ce souvenir. Valeur par défaut issue de `pipeline.default_confidence[source]` (configuration, valeurs par défaut `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`) si omis. Lors d'un `UPDATE` de déduplication, la valeur fusionnée est `max(existant, entrant)` — une seconde confirmation ne réduit jamais la confiance. Voir [Provenance du contenu](#provenance-du-contenu). |
 
 **Le contenu long est rejeté, pas transformé silencieusement en « vecteur bouillie » :** le contenu plus long que `pipeline.long_content_threshold_chars` (configuration, valeur par défaut `8 000` caractères ≈ 1–2 pages) est rejeté avec une erreur `INVALID_INPUT` indiquant le nombre de caractères, le seuil, et la solution : appelez `import` avec `format: "freeform"` à la place, ou divisez le contenu en plusieurs appels `remember` plus petits. Ceci est intentionnel : intégrer plusieurs milliers de mots en un seul vecteur produit un « vecteur bouillie » de mauvaise qualité qui correspond faiblement à de nombreuses requêtes non liées plutôt que fortement à une seule. Le plafond absolu de 100 000 caractères du tableau ci-dessus s'applique toujours, mais `long_content_threshold_chars` est la limite que les appelants atteindront en premier.
 
@@ -2973,11 +3024,18 @@ Récupère les souvenirs les plus pertinents pour une requête en utilisant la r
       "expires_at": null,
       "expiring_soon": false,
       "created_at": "2026-01-01T00:00:00Z",
-      "last_accessed": "2026-03-15T12:00:00Z"
+      "last_accessed": "2026-03-15T12:00:00Z",
+      "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+      "confidence": 1.0
     }
   ]
 }
 ```
+
+Chaque résultat porte aussi `origin`/`confidence` (voir [Provenance du
+contenu](#provenance-du-contenu) sous `remember`) — `origin` vaut `null` lorsque le
+souvenir a été écrit sans en fournir un ; `confidence` prend la valeur par défaut
+par source lorsque l'appelant l'a omise.
 
 Avec `follow_links: true`, les voisins à un saut de chaque résultat de base sont
 ajoutés après les résultats de base (sans jamais réduire le nombre de résultats de

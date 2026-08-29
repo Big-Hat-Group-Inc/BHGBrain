@@ -223,6 +223,43 @@ describe('StorageManager cross-store consistency', () => {
     });
   });
 
+  // add-memory-provenance-metadata, task 8.5
+  describe('content provenance (origin/confidence) round-trip', () => {
+    it('includes origin/confidence in the Qdrant payload on writeMemory', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory(
+        { ...baseMem, origin: { session_id: 'sess-1', tool: 'claude-code' }, confidence: 0.8 },
+        [1, 2, 3],
+      );
+
+      expect(qdrant.upsert).toHaveBeenCalledWith(
+        'global', 'general', 'mem-1', [1, 2, 3],
+        expect.objectContaining({
+          origin: { session_id: 'sess-1', tool: 'claude-code' },
+          confidence: 0.8,
+        }),
+      );
+    });
+
+    it('includes a null origin in the Qdrant payload when the writer did not supply one', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant();
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory({ ...baseMem, confidence: 1.0 }, [1, 2, 3]);
+
+      expect(qdrant.upsert).toHaveBeenCalledWith(
+        'global', 'general', 'mem-1', [1, 2, 3],
+        expect.objectContaining({ origin: null }),
+      );
+    });
+  });
+
   describe('updateMemory rollback', () => {
     it('rolls back SQLite update when Qdrant upsert fails', async () => {
       const sqlite = createMockSqlite();

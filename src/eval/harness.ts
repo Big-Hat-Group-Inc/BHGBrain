@@ -148,6 +148,8 @@ export async function seedCorpusEntries(
         pinned: false,
         device_id: null,
         embedding_model: null,
+        origin: null,
+        confidence: 1.0,
         created_at: nowIso,
         updated_at: nowIso,
         last_accessed: nowIso,

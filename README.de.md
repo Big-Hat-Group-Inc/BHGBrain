@@ -30,6 +30,7 @@ BHGBrain speichert Erinnerungen in SQLite (Metadaten + Volltextsuche) und Qdrant
     - [Stufenlebenszyklus – Zuweisung, Beförderung, Gleitendes Fenster](#stufenlebenszyklus--zuweisung-beförderung-gleitendes-fenster)
     - [Deduplizierung](#deduplizierung)
     - [Automatisches Taggen](#automatisches-taggen)
+    - [Inhaltsherkunft](#inhaltsherkunft)
     - [Inhaltsnormalisierung](#inhaltsnormalisierung)
     - [Wichtigkeitsbewertung](#wichtigkeitsbewertung)
     - [Kategorien – Persistente Richtlinien-Slots](#kategorien--persistente-richtlinien-slots)
@@ -1500,6 +1501,52 @@ Extraktion vollständig zu deaktivieren.
 
 ---
 
+### Inhaltsherkunft
+
+Die Felder `origin`/`confidence` von `remember` erlauben es, festzuhalten, *woher der
+Inhalt einer Erinnerung stammt* und *wie sehr ihm vertraut werden soll* — zu
+unterscheiden von `embedding_model` (siehe [Migration des
+Einbettungsmodells](#migration-des-einbettungsmodells)), das festhält, welches
+Einbettungsmodell den *Vektor* erzeugt hat, nicht woher die Aussage stammt.
+
+- **`origin`** (`{ session_id?, tool?, repo?, branch? }`, alle Felder optionale
+  Freitext-Strings) identifiziert die Sitzung/das Tool/das Repository/den Branch, aus
+  dem eine Erinnerung stammt. `null`, wenn der Aufrufer nichts angibt — der
+  Normalfall, und immer der Fall bei Erinnerungen, die vor Einführung dieses Feldes
+  geschrieben wurden. Wird nicht automatisch aus dem MCP-Transport abgeleitet: es
+  gibt keine standardisierte Sitzungs-/Tool-Identität über Clients hinweg (Claude
+  CLI, Codex, Gemini, ...), daher ist dies ausschließlich vom Aufrufer anzugeben.
+- **`confidence`** (`number`, `[0, 1]`) gibt an, wie sehr dem Inhalt einer Erinnerung
+  vertraut werden soll. Lässt ein `remember`-Aufruf dies weg, wird der Standardwert
+  pro `source` aus `pipeline.default_confidence` verwendet (Konfiguration, Standard
+  `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`) — eine explizite Nutzeraussage erhält
+  standardmäßig volles Vertrauen, eine Schlussfolgerung eines Agenten standardmäßig
+  weniger. Bei einem Dedup-`UPDATE` wird `confidence` über `max(bestehend, neu)`
+  zusammengeführt (eine erneute Bestätigung senkt das Vertrauen nie, dieselbe Regel
+  wie bei `importance`); `origin` wird nur ersetzt, wenn der eingehende Aufruf eine
+  Herkunft angibt, andernfalls bleibt die bestehende Herkunft erhalten.
+
+Beide Felder werden auf jedem Lesepfad zurückgegeben, der bereits Erinnerungsdatensätze
+liefert — `recall`, `search`, `memory://{id}`, `memory://list` — kein neues Tool, keine
+neue Ressource. Beispiel für einen `remember`-Aufruf:
+
+```json
+{
+  "content": "The user said the deploy window is Tuesdays 2-4pm UTC.",
+  "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+  "confidence": 1.0
+}
+```
+
+| Konfigurationsfeld | Standard | Bedeutung |
+|---|---|---|
+| `pipeline.default_confidence.cli` | `1.0` | Standard-`confidence` für `source: "cli"`-Schreibvorgänge ohne Angabe. |
+| `pipeline.default_confidence.api` | `1.0` | Standard-`confidence` für `source: "api"`-Schreibvorgänge ohne Angabe. |
+| `pipeline.default_confidence.agent` | `0.7` | Standard-`confidence` für `source: "agent"`-Schreibvorgänge ohne Angabe. |
+| `pipeline.default_confidence.import` | `0.5` | Standard-`confidence` für `source: "import"`-Schreibvorgänge ohne Angabe. |
+
+---
+
 ### Inhaltsnormalisierung
 
 Vor der Prüfsummenbildung, Einbettung oder Speicherung durchläuft jeder Inhalt die Normalisierungspipeline:
@@ -2831,6 +2878,8 @@ Inhalt in BHGBrain mit automatischer Deduplizierung, Normalisierung, Einbettung 
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | Nein | `"cli"` | Quelle der Erinnerung. Beeinflusst die Standard-Stufe (z. B. agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | Nein | automatisch zugewiesen | Explizite Stufenüberschreibung. Hat Vorrang vor allen Heuristiken. |
 | `pinned` | `boolean` | Nein | `false` bei ADD; bei UPDATE beibehalten | Pinnt diese Erinnerung, sodass sie immer in `memory://inject`-Payloads enthalten ist, begrenzt durch `defaults.pin_limit_per_namespace` (Standard 20). Bei einem Dedup-`UPDATE` bleibt der bestehende Pin-Status der Erinnerung erhalten, wenn `pinned` weggelassen wird — zum Ändern explizit angeben. Wird beim Neu-Pinnen die Obergrenze pro Namespace überschritten, wird `INVALID_INPUT` zurückgegeben. |
+| `origin` | `object` | Nein | `null` | Vom Aufrufer angegebene Inhaltsherkunft: `{ session_id?, tool?, repo?, branch? }`, alle Felder optionale Freitext-Strings (max. 200/100/200/200 Zeichen). Unbekannte Schlüssel werden abgelehnt. Zu unterscheiden vom vektor-bezogenen Feld `embedding_model` — siehe [Inhaltsherkunft](#inhaltsherkunft). Bei einem Dedup-`UPDATE` bleibt die bestehende Herkunft erhalten, wenn `origin` weggelassen wird; wird es angegeben, ersetzt es die vorherige. |
+| `confidence` | `number (0–1)` | Nein | pro `source` (siehe unten) | Wie sehr dem Inhalt dieser Erinnerung vertraut werden soll. Standardwert aus `pipeline.default_confidence[source]` (Konfiguration, Standard `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`), wenn weggelassen. Bei einem Dedup-`UPDATE` ist der zusammengeführte Wert `max(bestehend, neu)` — eine erneute Bestätigung senkt das Vertrauen nie. Siehe [Inhaltsherkunft](#inhaltsherkunft). |
 
 **Lange Inhalte werden abgelehnt, nicht stillschweigend zu einem „Mush-Vektor" verarbeitet:** Inhalte, die länger sind als `pipeline.long_content_threshold_chars` (Konfiguration, Standard `8.000` Zeichen ≈ 1–2 Seiten), werden mit einem `INVALID_INPUT`-Fehler abgelehnt, der die Zeichenanzahl, den Schwellenwert und die Lösung nennt: Verwenden Sie stattdessen das `import`-Tool mit `format: "freeform"`, oder teilen Sie den Inhalt in mehrere `remember`-Aufrufe auf. Dies ist beabsichtigt: Die Einbettung mehrerer tausend Wörter als einzelner Vektor erzeugt einen minderwertigen „Mush-Vektor", der viele unterschiedliche Anfragen schwach statt einer Anfrage präzise trifft. Die Obergrenze von 100.000 Zeichen aus der Tabelle oben gilt weiterhin als absolutes Maximum, aber `long_content_threshold_chars` ist die Grenze, auf die Aufrufer zuerst stoßen.
 
@@ -2965,11 +3014,18 @@ Die relevantesten Erinnerungen für eine Abfrage mithilfe semantischer (Vektor-)
       "expires_at": null,
       "expiring_soon": false,
       "created_at": "2026-01-01T00:00:00Z",
-      "last_accessed": "2026-03-15T12:00:00Z"
+      "last_accessed": "2026-03-15T12:00:00Z",
+      "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+      "confidence": 1.0
     }
   ]
 }
 ```
+
+Jedes Ergebnis enthält außerdem `origin`/`confidence` (siehe [Inhaltsherkunft](#inhaltsherkunft)
+unter `remember`) — `origin` ist `null`, wenn die Erinnerung ohne Herkunftsangabe
+gespeichert wurde; `confidence` verwendet den Quellen-Standardwert, wenn der Aufrufer
+ihn weggelassen hat.
 
 Mit `follow_links: true` werden die Ein-Hop-Nachbarn jedes Basisergebnisses nach den
 Basisergebnissen angehängt (ohne die Anzahl der von `limit` erlaubten Basisergebnisse

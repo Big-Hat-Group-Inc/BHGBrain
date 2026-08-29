@@ -58,6 +58,35 @@ describe('RememberInputSchema', () => {
     const result = RememberInputSchema.parse({ content: 'hello\x00world' });
     expect(result.content).toBe('helloworld');
   });
+
+  // add-memory-provenance-metadata, task 8.1
+  it('accepts valid origin/confidence and defaults both to absent when omitted', () => {
+    const withDefaults = RememberInputSchema.parse({ content: 'x' });
+    expect(withDefaults.origin).toBeUndefined();
+    expect(withDefaults.confidence).toBeUndefined();
+
+    const result = RememberInputSchema.parse({
+      content: 'x',
+      origin: { session_id: 'sess-1', tool: 'claude-code', repo: 'BHGBrain', branch: 'main' },
+      confidence: 0.9,
+    });
+    expect(result.origin).toEqual({ session_id: 'sess-1', tool: 'claude-code', repo: 'BHGBrain', branch: 'main' });
+    expect(result.confidence).toBe(0.9);
+  });
+
+  it('accepts a partial origin object (all fields optional)', () => {
+    const result = RememberInputSchema.parse({ content: 'x', origin: { tool: 'codex' } });
+    expect(result.origin).toEqual({ tool: 'codex' });
+  });
+
+  it('rejects out-of-range confidence', () => {
+    expect(() => RememberInputSchema.parse({ content: 'x', confidence: -0.1 })).toThrow();
+    expect(() => RememberInputSchema.parse({ content: 'x', confidence: 1.1 })).toThrow();
+  });
+
+  it('rejects unknown origin keys (.strict())', () => {
+    expect(() => RememberInputSchema.parse({ content: 'x', origin: { session_id: 'a', bogus: 'nope' } })).toThrow();
+  });
 });
 
 describe('RecallInputSchema', () => {

@@ -211,6 +211,62 @@ describe('pipeline.contradiction_detection config', () => {
   });
 });
 
+// add-memory-provenance-metadata, task 8.2
+describe('pipeline.default_confidence config', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 when omitted', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.default_confidence).toEqual({
+      cli: 1.0, api: 1.0, agent: 0.7, import: 0.5,
+    });
+  });
+
+  it('honors explicit per-source overrides', () => {
+    const configPath = writeConfig({
+      pipeline: {
+        default_confidence: { agent: 0.3 },
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.default_confidence.agent).toBe(0.3);
+    // Unspecified sources keep their own defaults.
+    expect(config.pipeline.default_confidence.cli).toBe(1.0);
+  });
+
+  it('rejects out-of-[0,1] bounds per source', () => {
+    const configPath = writeConfig({
+      pipeline: {
+        default_confidence: { agent: 1.5 },
+      },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
 describe('search.rerank config (add-opt-in-rerank-stage)', () => {
   const tempDirs: string[] = [];
 

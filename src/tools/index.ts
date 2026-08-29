@@ -192,6 +192,8 @@ async function handleRemember(
     retention_tier: input.retention_tier,
     device_id: ctx.config.device.id ?? null,
     pinned: input.pinned,
+    origin: input.origin ?? undefined,
+    confidence: input.confidence,
     clientId,
   });
 
@@ -623,6 +625,10 @@ async function handleReview(
     // resurrects a memory as pinned.
     pinned: false,
     device_id: ctx.config.device.id ?? null,
+    // Archive rows carry no origin/confidence either, so this restore has
+    // no provenance to recover — same "legacy row" default as elsewhere.
+    origin: null,
+    confidence: 1.0,
     created_at: nowIso,
     updated_at: nowIso,
     last_accessed: nowIso,
@@ -1183,6 +1189,16 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
         // configuration's identity. Missing on the payload means the point
         // predates provenance stamping and stays "unknown" (null).
         embedding_model: typeof payload.embedding_model === 'string' ? payload.embedding_model : null,
+        // Same recovery posture as `embedding_model` above: carry forward
+        // whatever content provenance the payload already carries rather
+        // than inventing new provenance for a reconstructed row. A missing
+        // or malformed field narrows to "unknown" (null / 1.0), mirroring
+        // `SqliteStore.upsertMemoryFromPayload`. See
+        // add-memory-provenance-metadata.
+        origin: payload.origin !== null && typeof payload.origin === 'object' && !Array.isArray(payload.origin)
+          ? payload.origin as MemoryRecord['origin']
+          : null,
+        confidence: typeof payload.confidence === 'number' ? payload.confidence : 1.0,
         created_at: (payload.created_at as string) ?? now,
         updated_at: now,
         last_accessed: now,

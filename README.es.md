@@ -30,6 +30,7 @@ BHGBrain almacena memorias en SQLite (metadatos + búsqueda de texto completo) y
     - [Ciclo de Vida por Nivel — Asignación, Promoción, Ventana Deslizante](#ciclo-de-vida-por-nivel--asignación-promoción-ventana-deslizante)
     - [Deduplicación](#deduplicación)
     - [Etiquetado Automático](#etiquetado-automático)
+    - [Procedencia del Contenido](#procedencia-del-contenido)
     - [Normalización de Contenido](#normalización-de-contenido)
     - [Puntuación de Importancia](#puntuación-de-importancia)
     - [Categorías — Slots de Política Persistente](#categorías--slots-de-política-persistente)
@@ -1504,6 +1505,52 @@ de la herramienta `tag` para corregir casos atípicos, o establece
 
 ---
 
+### Procedencia del Contenido
+
+Los campos `origin`/`confidence` de `remember` permiten registrar *de dónde proviene
+el contenido de una memoria* y *cuánto confiar en él* — algo distinto de
+`embedding_model` (ver [Migración de Modelo de
+Embedding](#migración-de-modelo-de-embedding)), que registra qué modelo de
+embeddings produjo el *vector*, no de dónde proviene la afirmación.
+
+- **`origin`** (`{ session_id?, tool?, repo?, branch? }`, todos los campos strings
+  libres opcionales) identifica la sesión/herramienta/repositorio/rama que produjo
+  una memoria. `null` cuando el llamador no proporciona nada — el caso común, y
+  siempre el caso para memorias escritas antes de que existiera este campo. No se
+  deriva automáticamente del transporte MCP: no existe una identidad
+  estandarizada de sesión/herramienta entre clientes (Claude CLI, Codex, Gemini,
+  ...), por lo que esto es exclusivamente proporcionado por el llamador.
+- **`confidence`** (`number`, `[0, 1]`) es cuánto confiar en el contenido de una
+  memoria. Cuando una llamada a `remember` lo omite, toma el valor predeterminado
+  por `source` de `pipeline.default_confidence` (configuración, predeterminados
+  `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`) — una afirmación explícita del
+  usuario obtiene confianza total por defecto, una inferencia de un agente obtiene
+  menos por defecto. En un `UPDATE` de deduplicación, `confidence` se fusiona vía
+  `max(existente, entrante)` (una segunda confirmación nunca reduce la confianza,
+  la misma política que `importance`); `origin` solo se reemplaza cuando la llamada
+  entrante proporciona uno, de lo contrario se conserva el `origin` existente.
+
+Ambos campos se exponen en cada ruta de lectura que ya devuelve registros de
+memoria — `recall`, `search`, `memory://{id}`, `memory://list` — sin nueva
+herramienta ni recurso. Ejemplo de llamada a `remember`:
+
+```json
+{
+  "content": "The user said the deploy window is Tuesdays 2-4pm UTC.",
+  "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+  "confidence": 1.0
+}
+```
+
+| Campo de configuración | Predeterminado | Significado |
+|---|---|---|
+| `pipeline.default_confidence.cli` | `1.0` | `confidence` predeterminada para escrituras `source: "cli"` que lo omiten. |
+| `pipeline.default_confidence.api` | `1.0` | `confidence` predeterminada para escrituras `source: "api"` que lo omiten. |
+| `pipeline.default_confidence.agent` | `0.7` | `confidence` predeterminada para escrituras `source: "agent"` que lo omiten. |
+| `pipeline.default_confidence.import` | `0.5` | `confidence` predeterminada para escrituras `source: "import"` que lo omiten. |
+
+---
+
 ### Normalización de Contenido
 
 Antes de calcular el checksum, embeder o almacenar, todo el contenido pasa por el pipeline de normalización:
@@ -2830,6 +2877,8 @@ Almacena contenido en BHGBrain con deduplicación automática, normalización, e
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | No | `"cli"` | Fuente de la memoria. Afecta al nivel predeterminado (p.ej., agent+procedural → T1). |
 | `retention_tier` | `"T0" \| "T1" \| "T2" \| "T3"` | No | auto-asignado | Anulación explícita del nivel. Tiene precedencia sobre todas las heurísticas. |
 | `pinned` | `boolean` | No | `false` en ADD; se conserva en UPDATE | Fija esta memoria para que siempre se incluya en los payloads de `memory://inject`, limitado por `defaults.pin_limit_per_namespace` (predeterminado 20). En un `UPDATE` de dedup, omitir `pinned` conserva el estado de fijado existente de la memoria — pásalo explícitamente para cambiarlo. Superar el límite por namespace al fijar una memoria nueva devuelve `INVALID_INPUT`. |
+| `origin` | `object` | No | `null` | Procedencia del contenido proporcionada por el llamador: `{ session_id?, tool?, repo?, branch? }`, todos los campos strings libres opcionales (máx. 200/100/200/200 chars respectivamente). Las claves desconocidas se rechazan. Distinto del campo de identidad de vector `embedding_model` — ver [Procedencia del Contenido](#procedencia-del-contenido). En un `UPDATE` de dedup, omitir `origin` conserva la procedencia existente de la memoria; pasarlo la reemplaza. |
+| `confidence` | `number (0–1)` | No | por `source` (ver abajo) | Cuánto confiar en el contenido de esta memoria. Toma el valor predeterminado de `pipeline.default_confidence[source]` (configuración, predeterminados `cli: 1.0, api: 1.0, agent: 0.7, import: 0.5`) si se omite. En un `UPDATE` de dedup, el valor fusionado es `max(existente, entrante)` — una segunda confirmación nunca reduce la confianza. Ver [Procedencia del Contenido](#procedencia-del-contenido). |
 
 **El contenido largo se rechaza, no se convierte silenciosamente en un "vector mush":** el contenido más largo que `pipeline.long_content_threshold_chars` (configuración, predeterminado `8.000` caracteres ≈ 1–2 páginas) se rechaza con un error `INVALID_INPUT` que indica el recuento de caracteres, el umbral y la solución: llame a `import` con `format: "freeform"` en su lugar, o divida el contenido en llamadas `remember` más pequeñas. Esto es intencional: incrustar varios miles de palabras como un solo vector produce un "vector mush" de baja calidad que coincide débilmente con muchas consultas no relacionadas en lugar de coincidir fuertemente con una sola. El límite absoluto de 100.000 caracteres de la tabla anterior sigue aplicándose como techo absoluto, pero `long_content_threshold_chars` es el límite que los llamantes alcanzarán primero.
 
@@ -2965,11 +3014,18 @@ Recupera las memorias más relevantes para una consulta usando búsqueda de simi
       "expires_at": null,
       "expiring_soon": false,
       "created_at": "2026-01-01T00:00:00Z",
-      "last_accessed": "2026-03-15T12:00:00Z"
+      "last_accessed": "2026-03-15T12:00:00Z",
+      "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
+      "confidence": 1.0
     }
   ]
 }
 ```
+
+Cada resultado también incluye `origin`/`confidence` (ver [Procedencia del
+Contenido](#procedencia-del-contenido) bajo `remember`) — `origin` es `null` cuando
+la memoria se escribió sin uno; `confidence` toma el valor predeterminado por
+fuente cuando el llamador lo omitió.
 
 Con `follow_links: true`, los vecinos a un salto de cada resultado base se añaden
 después de los resultados base (sin reducir nunca cuántos resultados base permite

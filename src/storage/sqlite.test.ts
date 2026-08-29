@@ -1079,6 +1079,150 @@ describe('SqliteStore embedding provenance', () => {
   });
 });
 
+// add-memory-provenance-metadata, task 8.4
+describe('SqliteStore origin/confidence (add-memory-provenance-metadata)', () => {
+  let store: SqliteStore;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-'));
+    store = new SqliteStore(tempDir);
+    await store.init();
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function baseMemory() {
+    return {
+      id: '550e8400-e29b-41d4-a716-446655440000',
+      namespace: 'global',
+      collection: 'general',
+      type: 'semantic' as const,
+      category: null,
+      content: 'test content',
+      summary: 'test content',
+      tags: [] as string[],
+      source: 'cli' as const,
+      checksum: 'abc123',
+      importance: 0.5,
+      access_count: 0,
+      last_operation: 'ADD' as const,
+      merged_from: null,
+      origin: null as { session_id?: string; tool?: string; repo?: string; branch?: string } | null,
+      confidence: 1.0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      last_accessed: new Date().toISOString(),
+    };
+  }
+  const sampleMemory = (overrides: Partial<ReturnType<typeof baseMemory>> = {}) => ({ ...baseMemory(), ...overrides });
+
+  it('round-trips a null origin and default confidence', () => {
+    store.insertMemory(sampleMemory());
+    const mem = store.getMemoryById('550e8400-e29b-41d4-a716-446655440000');
+    expect(mem?.origin).toBeNull();
+    expect(mem?.confidence).toBe(1.0);
+  });
+
+  it('round-trips a populated origin and explicit confidence', () => {
+    store.insertMemory(sampleMemory({
+      origin: { session_id: 'sess-1', tool: 'claude-code', repo: 'BHGBrain', branch: 'main' },
+      confidence: 0.42,
+    }));
+    const mem = store.getMemoryById('550e8400-e29b-41d4-a716-446655440000');
+    expect(mem?.origin).toEqual({ session_id: 'sess-1', tool: 'claude-code', repo: 'BHGBrain', branch: 'main' });
+    expect(mem?.confidence).toBe(0.42);
+  });
+
+  it('a pre-migration row (insert omitting origin/confidence entirely) hydrates as origin: null, confidence: 1.0', () => {
+    // Simulates a row written by a pre-migration INSERT that never named the
+    // origin/confidence columns at all — relying purely on the column
+    // defaults the additive migration establishes (`origin` nullable,
+    // `confidence REAL NOT NULL DEFAULT 1.0`), not on any application code
+    // path that explicitly sets them.
+    const dbInternal = (store as unknown as { db: { run: (sql: string, params?: unknown[]) => void } }).db;
+    const now = new Date().toISOString();
+    dbInternal.run(
+      `INSERT INTO memories (
+        id, namespace, collection, type, category, content, summary, tags, source, checksum,
+        importance, retention_tier, decay_eligible, access_count, last_operation, stale, archived,
+        vector_synced, pinned, created_at, updated_at, last_accessed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        'pre-migration-id', 'global', 'general', 'semantic', null, 'legacy content', 'legacy content',
+        '[]', 'cli', 'legacy-checksum', 0.5, 'T2', 1, 0, 'ADD', 0, 0, 1, 0, now, now, now,
+      ],
+    );
+    const mem = store.getMemoryById('pre-migration-id');
+    expect(mem?.origin).toBeNull();
+    expect(mem?.confidence).toBe(1.0);
+  });
+
+  it('updateMemory replaces origin and confidence', () => {
+    store.insertMemory(sampleMemory({ origin: { tool: 'old-tool' }, confidence: 0.5 }));
+    store.updateMemory('550e8400-e29b-41d4-a716-446655440000', {
+      origin: { tool: 'new-tool' }, confidence: 0.9,
+    });
+    const mem = store.getMemoryById('550e8400-e29b-41d4-a716-446655440000');
+    expect(mem?.origin).toEqual({ tool: 'new-tool' });
+    expect(mem?.confidence).toBe(0.9);
+  });
+
+  it('updateMemory can clear origin back to null', () => {
+    store.insertMemory(sampleMemory({ origin: { tool: 'old-tool' }, confidence: 0.5 }));
+    store.updateMemory('550e8400-e29b-41d4-a716-446655440000', { origin: null });
+    const mem = store.getMemoryById('550e8400-e29b-41d4-a716-446655440000');
+    expect(mem?.origin).toBeNull();
+  });
+
+  it('upsertMemoryFromPayload narrows a malformed payload.origin/payload.confidence without throwing', () => {
+    const inserted = store.upsertMemoryFromPayload('660e8400-e29b-41d4-a716-446655440001', {
+      content: 'recovered content',
+      summary: 'recovered',
+      namespace: 'global',
+      collection: 'general',
+      origin: 'not-an-object',
+      confidence: 'not-a-number',
+    });
+    expect(inserted).toBe(true);
+    const mem = store.getMemoryById('660e8400-e29b-41d4-a716-446655440001');
+    expect(mem?.origin).toBeNull();
+    expect(mem?.confidence).toBe(1.0);
+  });
+
+  it('upsertMemoryFromPayload narrows a null payload.origin without throwing', () => {
+    const inserted = store.upsertMemoryFromPayload('770e8400-e29b-41d4-a716-446655440002', {
+      content: 'recovered content 2',
+      summary: 'recovered',
+      namespace: 'global',
+      collection: 'general',
+      origin: null,
+    });
+    expect(inserted).toBe(true);
+    const mem = store.getMemoryById('770e8400-e29b-41d4-a716-446655440002');
+    expect(mem?.origin).toBeNull();
+    expect(mem?.confidence).toBe(1.0);
+  });
+
+  it('upsertMemoryFromPayload carries forward a well-formed payload.origin/payload.confidence', () => {
+    const inserted = store.upsertMemoryFromPayload('880e8400-e29b-41d4-a716-446655440003', {
+      content: 'recovered content 3',
+      summary: 'recovered',
+      namespace: 'global',
+      collection: 'general',
+      origin: { tool: 'recovered-tool' },
+      confidence: 0.77,
+    });
+    expect(inserted).toBe(true);
+    const mem = store.getMemoryById('880e8400-e29b-41d4-a716-446655440003');
+    expect(mem?.origin).toEqual({ tool: 'recovered-tool' });
+    expect(mem?.confidence).toBe(0.77);
+  });
+});
+
 describe('SqliteStore pinned memories (add-inject-pinning)', () => {
   let store: SqliteStore;
   let tempDir: string;
