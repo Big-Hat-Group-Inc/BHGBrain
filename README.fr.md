@@ -50,11 +50,12 @@ BHGBrain stocke les souvenirs dans SQLite (métadonnées + recherche plein texte
 14. [Sécurité](#sécurité)
 15. [Ressources MCP](#ressources-mcp)
 16. [Prompts MCP](#prompts-mcp)
-17. [Prompt d'amorçage](#prompt-damorçage)
+17. [Amorçage](#amorçage)
 18. [Référence CLI](#référence-cli)
 19. [Référence des outils MCP](#référence-des-outils-mcp)
-20. [Mise à jour](#mise-à-jour)
-21. [Notes de comportement](#notes-de-comportement)
+20. [Docker](#docker)
+21. [Mise à jour](#mise-à-jour)
+22. [Notes de comportement](#notes-de-comportement)
 
 ---
 
@@ -191,6 +192,12 @@ Définissez `qdrant.mode` sur `external` dans votre configuration et pointez `ex
 }
 ```
 
+Pour Azure, `embedding.model` correspond au nom de déploiement transmis en amont, pas à l'étiquette publique de la famille de modèles. Les identifiants Azure sont chargés une seule fois au démarrage depuis `AZURE_FOUNDRY_API_KEY` ; faire tourner ce secret nécessite un redémarrage ou un rechargement explicite de la configuration.
+
+`embedding.model` DOIT être l'un des modèles pris en charge — `text-embedding-ada-002`, `text-embedding-3-small` ou `text-embedding-3-large` — pour **les deux** fournisseurs `openai` et `azure-foundry`. Ceci est vérifié au démarrage : un modèle non pris en charge ou mal orthographié (ou, pour Azure, un nom de déploiement qui ne correspond à aucune famille de modèles prise en charge) fait échouer immédiatement la validation de la configuration avec une erreur listant les modèles pris en charge, plutôt que de démarrer et de produire silencieusement des vecteurs de mauvaise dimension.
+
+> **Provisionnement depuis zéro ?** Les scripts PowerShell dans [`scripts/azure/`](./scripts/azure/README.md) créent une ressource Azure AI Foundry / Azure OpenAI, déploient un modèle d'embedding (avec le nom de déploiement calqué sur le nom du modèle, comme requis), et configurent le `config.json` de BHGBrain ainsi que `AZURE_FOUNDRY_API_KEY` pour vous — en partant de rien d'autre qu'un abonnement Azure.
+
 ---
 
 ## Installation
@@ -237,18 +244,28 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
 
   // Configuration du fournisseur d'embeddings
   "embedding": {
-    // Seul "openai" est pris en charge actuellement
+    // Fournisseur : "openai" ou "azure-foundry"
     "provider": "openai",
-    // Modèle OpenAI à utiliser pour les embeddings. Doit être l'un des modèles pris
-    // en charge : "text-embedding-ada-002", "text-embedding-3-small",
-    // "text-embedding-3-large". Un modèle non pris en charge provoque un échec de
-    // validation de la configuration au démarrage.
+    // Nom du modèle (pour OpenAI) ou nom de déploiement Azure (pour Azure).
+    // Doit être l'un des modèles pris en charge : "text-embedding-ada-002",
+    // "text-embedding-3-small", "text-embedding-3-large". Une valeur non prise
+    // en charge fait échouer la validation de la configuration au démarrage,
+    // pour l'un ou l'autre fournisseur.
     "model": "text-embedding-3-small",
-    // Nom de la variable d'environnement contenant la clé API OpenAI
+    // Nom de la variable d'environnement contenant la clé API OpenAI (ignoré pour Azure)
     "api_key_env": "OPENAI_API_KEY",
     // Dimensions vectorielles produites par le modèle. Doit correspondre à la sortie du modèle.
     // IMPORTANT : Modifier cette valeur après la création de collections nécessite de les recréer.
     "dimensions": 1536,
+    // Délai d'expiration des requêtes en millisecondes
+    "request_timeout_ms": 30000,
+    // Nombre maximal d'entrées par requête d'embedding (seuil de découpage en blocs)
+    "max_batch_inputs": 2048,
+    // Configuration des nouvelles tentatives pour les échecs transitoires
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 1000
+    },
     // Chaque vecteur est estampillé à l'écriture avec une identité qualifiée par
     // fournisseur (`<provider>/<model>@<dimensions>`). Si l'identité attendue
     // enregistrée par le store (adoptée à la première écriture suivant le
@@ -259,7 +276,14 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     // `repair`. Ne le mettez à false que si vous voulez intentionnellement que
     // les écritures mélangent des espaces d'embedding. Voir « Migration du
     // modèle d'embedding » ci-dessous.
-    "refuse_writes_on_model_mismatch": true
+    "refuse_writes_on_model_mismatch": true,
+    // Configuration spécifique à Azure (requise quand provider = "azure-foundry")
+    "azure": {
+      // Nom de la ressource Azure utilisé pour construire l'URL du point de terminaison
+      "resource_name": "my-foundry-resource",
+      // Nom de la variable d'environnement contenant la clé API Azure
+      "api_key_env": "AZURE_FOUNDRY_API_KEY"
+    }
   },
 
   // Configuration de connexion Qdrant
@@ -639,7 +663,8 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
 
 | Variable | Obligatoire | Défaut | Description |
 |---|---|---|---|
-| `OPENAI_API_KEY` | Oui (pour les embeddings) | — | Clé API OpenAI. Le serveur démarre en **mode dégradé** si elle est absente — la recherche sémantique et l'ingestion échoueront, mais la recherche plein texte et les lectures de catégories fonctionneront encore. |
+| `OPENAI_API_KEY` | Oui (pour le fournisseur OpenAI) | — | Clé API OpenAI. Le serveur démarre en **mode dégradé** si elle est absente — la recherche sémantique et l'ingestion échoueront, mais la recherche plein texte et les lectures de catégories fonctionneront encore. |
+| `AZURE_FOUNDRY_API_KEY` | Oui (pour le fournisseur Azure) | — | Clé API Azure pour le point de terminaison d'embeddings compatible Azure OpenAI. Requise quand `embedding.provider = "azure-foundry"`. |
 | `BHGBRAIN_TOKEN` | Obligatoire pour HTTP non-loopback | — | Token Bearer pour l'authentification HTTP. Le serveur **refuse de démarrer** si l'hôte est non-loopback et que ce token n'est pas défini (sauf si `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Obligatoire pour Qdrant Cloud | — | Définissez `qdrant.api_key_env` dans la configuration sur le nom de cette variable. Le nom de champ de configuration par défaut est `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | Non | Auto-généré à partir du hostname | Remplace l'identifiant de l'appareil pour les configurations multi-appareils. Voir [Résolution de l'identité de l'appareil](#résolution-de-lidentité-de-lappareil). |
@@ -2707,7 +2732,7 @@ BHGBrain déclare la capacité MCP `prompts` et sert deux prompts via
 
 | Prompt | Arguments | Description |
 |---|---|---|
-| `bootstrap-interview` | `section` (optionnel, `1`–`10`) | Guide l'entretien d'amorçage via l'outil `bootstrap`. Omettre `section` donne un aperçu de toutes les sections ; la préciser saute directement aux questions de cette section. Une `section` hors limites ou non entière est rejetée comme une erreur JSON-RPC InvalidParams. |
+| `bootstrap-interview` | `section` (optionnel, `1`–`10`) | Guide l'[entretien d'amorçage](#option-1--outil-damorçage-interactif-recommandé) via l'outil `bootstrap`. Omettre `section` donne un aperçu de toutes les sections ; la préciser saute directement aux questions de cette section. Une `section` hors limites ou non entière est rejetée comme une erreur JSON-RPC InvalidParams. |
 | `session-context` | `hint` (optionnel) | Renvoie le même bloc de contexte budgété `memory://inject` (ou `memory://inject/{hint}` si `hint` est fourni) sous forme d'un unique message de prompt, pour préparer une nouvelle session. |
 
 Les deux prompts renvoient un unique message de rôle `user`. Pour les clients sans
@@ -2730,22 +2755,54 @@ Exemple :
 
 ---
 
-## Prompt d'amorçage
+## Amorçage
 
-`BootstrapPrompt.txt` contient un prompt d'entretien structuré pour construire un **profil de second cerveau professionnel** avec un agent IA.
+BHGBrain propose trois façons de construire votre profil de travail, de l'entretien entièrement guidé à l'import en masse.
 
-Utilisez-le lors de l'intégration d'un nouvel assistant IA ou lorsque vous souhaitez alimenter BHGBrain avec un profil riche et structuré de votre contexte de travail, entités, locataires et règles de désambiguïsation.
+### Option 1 : Outil d'amorçage interactif (recommandé)
 
-### Comment l'utiliser
+L'outil MCP `bootstrap` mène un entretien à état persistant en 10 sections directement au sein de BHGBrain. Il suit la progression, stocke les souvenirs au fur et à mesure, et prend en charge la pause/reprise entre sessions.
 
-1. Démarrez une nouvelle conversation avec votre assistant IA (Claude, GPT-4, etc.).
-2. Collez l'intégralité du contenu de `BootstrapPrompt.txt` comme premier message.
-3. Laissez l'agent vous interviewer section par section.
-4. À la fin, l'agent produira un profil structuré que vous pourrez sauvegarder dans BHGBrain via des appels `bhgbrain.remember` (ou `mcporter call bhgbrain.remember`).
+```json
+// Démarrer (ou reprendre) l'entretien
+{ "name": "bootstrap", "arguments": { "action": "start" } }
+
+// Soumettre les réponses d'une section
+{ "name": "bootstrap", "arguments": { "action": "submit", "section": 1, "answers": "Jane Doe, CTO chez Acme Corp..." } }
+
+// Vérifier la progression
+{ "name": "bootstrap", "arguments": { "action": "status" } }
+
+// Refaire une section
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+```
+
+L'outil renvoie les questions de la section suivante après chaque soumission, ce qui permet à l'agent de mener la conversation naturellement. Les sessions persistent en SQLite — vous pouvez fermer votre client et reprendre là où vous en étiez.
+
+### Option 2 : Import de profil en masse
+
+Si vous disposez déjà d'un document de profil complet (issu d'un amorçage précédent, d'un wiki, ou de notes structurées), utilisez l'outil `import` pour l'ingérer en une seule fois :
+
+```json
+// Importer un profil d'amorçage en 10 sections
+{ "name": "import", "arguments": { "format": "profile", "content": "## 1. Identity & Role\n..." } }
+
+// Importer du markdown libre sous forme de souvenirs
+{ "name": "import", "arguments": { "format": "freeform", "content": "## Architecture\nWe use microservices..." } }
+
+// Prévisualiser ce qui serait stocké, sans écrire
+{ "name": "import", "arguments": { "format": "profile", "content": "...", "dry_run": true } }
+```
+
+L'outil découpe le document en souvenirs distincts avec la collection, le niveau, le type, l'importance et les tags corrects par section. La déduplication s'applique — réimporter après des mises à jour est sûr.
+
+### Option 3 : Prompt d'amorçage manuel
+
+`BootstrapPrompt.txt` contient un prompt d'entretien autonome que vous pouvez coller dans n'importe quelle conversation IA. L'agent vous interviewe section par section et appelle `bhgbrain.remember` pour chaque fait. Cela fonctionne avec n'importe quel client connecté au MCP, sans nécessiter les outils `bootstrap` ou `import`.
 
 ### Ce qu'il couvre
 
-L'entretien parcourt 10 sections :
+Les trois méthodes parcourent les mêmes 10 sections :
 
 | Section | Ce qu'elle capture |
 |---|---|
@@ -2760,9 +2817,7 @@ L'entretien parcourt 10 sections :
 | 9. Carte des locataires et environnements | Locataires Azure, dev/staging/prod |
 | 10. Règles de fonctionnement | Conventions de nommage, désambiguïsation, hypothèses par défaut |
 
-La sortie produit un profil structuré propre avec les 10 sections plus un guide de désambiguïsation — exactement ce dont BHGBrain a besoin pour répondre de façon fiable aux questions sur votre travail.
-
-**Les souvenirs d'amorçage sont T0 par défaut.** Le contenu ingéré via le flux d'amorçage doit être étiqueté avec `source: import` et `tags: ["bootstrap", "profile"]`. Le classificateur heuristique reconnaît ces signaux et attribue le niveau T0 (fondamental).
+**Les souvenirs d'amorçage sont T0 par défaut.** Le contenu ingéré via le flux d'amorçage est étiqueté avec la source appropriée (`agent` pour l'outil bootstrap, `import` pour l'import en masse) et se voit attribuer les niveaux selon le tableau de correspondance des sections.
 
 ---
 
@@ -3266,6 +3321,81 @@ Créer, lister ou restaurer des sauvegardes de mémoire.
 
 ---
 
+### `bootstrap` — Amorçage interactif
+
+Mène un entretien à état persistant en 10 sections pour construire votre profil de travail. Prend en charge la pause/reprise entre sessions.
+
+**Entrée :**
+
+| Paramètre | Type | Obligatoire | Par défaut | Description |
+|---|---|---|---|---|
+| `action` | `"start" \| "submit" \| "status" \| "reset"` | **Oui** | — | Action à effectuer. |
+| `section` | `integer (1-10)` | Pour submit/reset | — | Numéro de section pour laquelle soumettre des réponses ou à réinitialiser. |
+| `answers` | `string` | Pour submit | — | Vos réponses pour la section. Max 500 000 caractères. |
+| `namespace` | `string` | Non | `"profile"` | Portée de l'espace de noms. |
+
+**Actions :**
+
+- **`start`** — Crée une nouvelle session ou reprend une session existante. Renvoie le titre, les questions et les instructions de la première section incomplète.
+- **`submit`** — Stocke les réponses sous forme de souvenirs distincts pour la section donnée, la marque comme complète, et renvoie la section suivante.
+- **`status`** — Renvoie un aperçu de la progression : quelles sections sont complètes, le nombre de souvenirs, la dernière mise à jour.
+- **`reset`** — Supprime tous les souvenirs d'une section et la marque comme en attente pour une nouvelle collecte.
+
+**Sortie (start) :**
+
+```json
+{
+  "complete": false,
+  "current_section": 1,
+  "title": "Identity & Role",
+  "questions": ["What is your full name...?", "..."],
+  "progress": { "complete": 0, "total": 10 }
+}
+```
+
+**Notes :**
+- Les sessions sont persistées en SQLite — survivent aux redémarrages du client.
+- Une session par espace de noms. Appeler `start` sur une session existante la reprend.
+- Soumettre à une section déjà complète renvoie une erreur ; utilisez `reset` d'abord.
+
+---
+
+### `import` — Import de profil en masse
+
+Importe un profil structuré ou un document libre sous forme de souvenirs distincts en une seule fois.
+
+**Entrée :**
+
+| Paramètre | Type | Obligatoire | Par défaut | Description |
+|---|---|---|---|---|
+| `format` | `"profile" \| "freeform"` | **Oui** | — | `"profile"` pour une sortie d'amorçage en 10 sections, `"freeform"` pour du markdown libre. |
+| `content` | `string` | **Oui** | — | Le texte du document à importer. Max 500 000 caractères. |
+| `namespace` | `string` | Non | `"profile"` | Portée de l'espace de noms. |
+| `dry_run` | `boolean` | Non | `false` | Si `true`, renvoie un aperçu de ce qui serait stocké sans écrire. |
+
+**Sortie :**
+
+```json
+{
+  "dry_run": false,
+  "format": "profile",
+  "memories_created": 24,
+  "duplicates_skipped": 2,
+  "collections": ["identity", "goals", "entities", "..."],
+  "sections_processed": 10
+}
+```
+
+**Notes :**
+- `format: "profile"` reconnaît les titres de section `## N.` et associe chacun à la collection, au niveau, au type, à l'importance et aux tags corrects.
+- `format: "freeform"` découpe selon les titres et les limites de paragraphes avec des métadonnées par défaut (collection : `general`, niveau : `T2`).
+- La déduplication s'applique via le pipeline d'écriture existant — réimporter est sûr.
+- `dry_run: true` renvoie des aperçus de souvenirs sans aucune écriture.
+- Les titres numérotés en dehors des 10 sections mappées au stockage (par exemple un document rédigé selon un ancien modèle à 12 sections) ne sont pas ignorés silencieusement — leurs numéros sont signalés dans `sections_ignored` afin que vous sachiez qu'un contenu a été sauté plutôt que de le perdre sans avertissement.
+- Si [`remember`](#remember--stocker-un-souvenir) a rejeté votre contenu pour dépassement de `pipeline.long_content_threshold_chars`, utilisez ici `import` avec `format: "freeform"` à la place — il découpe le document selon les limites de titres/paragraphes et embedde chaque fragment indépendamment, évitant le problème du vecteur unique bouillie contre lequel le seuil de `remember` protège.
+
+---
+
 ### `revisions` — Lister ou restaurer l'historique des révisions d'un souvenir
 
 Liste l'historique des révisions d'un souvenir, ou restaure son contenu à une révision antérieure. La visibilité par espace de noms est résolue comme pour `forget` et `tag` (le souvenir est d'abord recherché par ID). Seuls les souvenirs T0 accumulent des révisions — voir [Historique des révisions T0](#historique-des-révisions-t0).
@@ -3638,7 +3768,150 @@ En cas de succès, les `tags` de la cible deviennent l'union de ses propres tags
 
 ---
 
+## Docker
+
+BHGBrain fournit un support Docker officiel avec deux modes de déploiement : Qdrant auto-hébergé (conteneur sidecar) et Qdrant Cloud (externe).
+
+### Démarrage rapide
+
+```bash
+# 1. Copiez et configurez l'environnement (optionnel — un .env manquant n'interrompt
+#    plus le démarrage ; vous avez toujours besoin d'OPENAI_API_KEY pour les embeddings).
+cp .env.example .env
+# Éditez .env avec votre OPENAI_API_KEY et vos autres paramètres
+
+# 2a. Qdrant auto-hébergé (inclut le sidecar Qdrant)
+docker compose --profile self-hosted up
+
+# 2b. Qdrant Cloud (pas de sidecar, configurez BHGBRAIN_QDRANT_URL dans .env)
+docker compose up
+```
+
+Le serveur est disponible sur `http://localhost:3721` (publié sur le loopback de
+l'hôte uniquement par défaut). Vérifiez la santé avec :
+
+```bash
+curl http://localhost:3721/health
+```
+
+### Paramètres de sécurité par défaut
+
+Le conteneur lie l'API à `0.0.0.0` afin que le port publié soit joignable, et
+est **authentifié par défaut** :
+
+- Si `BHGBRAIN_TOKEN` n'est pas défini, le point d'entrée **génère un token bearer**
+  au premier démarrage, le persiste dans `/data/bhgbrain-token`, et l'affiche dans les
+  journaux. Récupérez-le avec :
+
+  ```bash
+  docker compose logs bhgbrain | grep token
+  # ou
+  docker compose exec bhgbrain cat /data/bhgbrain-token
+  ```
+
+- Fournissez votre propre token stable en définissant `BHGBRAIN_TOKEN` dans `.env` :
+
+  ```bash
+  echo "BHGBRAIN_TOKEN=$(openssl rand -hex 24)" >> .env
+  ```
+
+- Le port publié est mappé sur le loopback de l'hôte (`127.0.0.1:3721:3721`), donc
+  l'API n'est pas joignable depuis le réseau local par défaut. Modifiez le mapping
+  dans `docker-compose.yml` pour l'exposer à l'extérieur.
+
+- Pour exécuter intentionnellement le serveur **sans** authentification, définissez
+  `BHGBRAIN_ALLOW_UNAUTHENTICATED=true` (le serveur journalise un avertissement ;
+  non recommandé pour des liaisons non-loopback).
+
+Le conteneur s'exécute également en tant qu'utilisateur non-root (`node`).
+
+### Profils Compose
+
+| Commande | Ce qui s'exécute |
+|---------|-----------|
+| `docker compose --profile self-hosted up` | BHGBrain + sidecar Qdrant (port 6333) |
+| `docker compose up` | BHGBrain seul (connexion à Qdrant Cloud via variables d'environnement) |
+
+### Variables d'environnement Docker
+
+Ces variables `BHGBRAIN_*` remplacent les valeurs de `config.json` lorsqu'elles sont définies :
+
+| Variable | Champ de config | Défaut dans le conteneur | Description |
+|----------|-------------|---------------------|-------------|
+| `BHGBRAIN_DATA_DIR` | `data_dir` | `/data` | Chemin du volume du conteneur |
+| `BHGBRAIN_HTTP_HOST` | `transport.http.host` | `0.0.0.0` | Adresse de liaison |
+| `BHGBRAIN_HTTP_PORT` | `transport.http.port` | `3721` | Port HTTP |
+| `BHGBRAIN_QDRANT_MODE` | `qdrant.mode` | `embedded` | `embedded` ou `external` |
+| `BHGBRAIN_QDRANT_URL` | `qdrant.external_url` | — | URL du point de terminaison Qdrant |
+| `BHGBRAIN_REQUIRE_LOOPBACK` | `security.require_loopback_http` | `false` | Restriction au loopback |
+| `BHGBRAIN_ALLOW_UNAUTHENTICATED` | `security.allow_unauthenticated_http` | `false` | Ignorer la vérification d'authentification |
+| `BHGBRAIN_LOG_LEVEL` | `observability.log_level` | `info` | Verbosité des journaux |
+
+Plus les variables d'exécution existantes : `OPENAI_API_KEY`, `BHGBRAIN_TOKEN`, `QDRANT_API_KEY`, `BHGBRAIN_DEVICE_ID`.
+
+### Volume
+
+Le volume `/data` persiste la base de données SQLite, le `config.json` résolu, et les sauvegardes entre les redémarrages du conteneur. Cela correspond à `BHGBRAIN_DATA_DIR`.
+
+### Amorçage au premier démarrage
+
+Lorsqu'un conteneur démarre avec un volume `/data` vide et se connecte à une instance Qdrant qui contient déjà des souvenirs, BHGBrain hydrate automatiquement la base de données SQLite locale depuis Qdrant via `bootstrapFromQdrant()`. Aucune étape manuelle de `repair` n'est nécessaire. Cette hydratation automatique n'est délibérément pas limitée par appareil — elle récupère les souvenirs de chaque appareil sur la base de données fraîche et vide. Exécuter manuellement `bhgbrain repair --from-qdrant` par la suite se limite par défaut aux souvenirs de l'appareil courant (passez `--all-devices` pour l'élargir) ; voir [Référence CLI](#référence-cli).
+
+### Construction de l'image
+
+```bash
+docker build -t bhgbrain .
+```
+
+L'image utilise un build multi-étapes sur `node:22-slim` (~200 Mo en taille finale). Le healthcheck utilise le `fetch()` natif de Node.js — `curl` n'est pas requis.
+
+---
+
 ## Mise à jour
+
+### 1.3 → 1.4 (Résilience et observabilité)
+
+**Aucune migration manuelle requise.** Toutes les nouvelles fonctionnalités utilisent des valeurs par défaut rétrocompatibles.
+
+Nouveautés :
+
+- **Disjoncteurs (circuit breakers)** pour OpenAI et Qdrant. Lorsque les échecs consécutifs dépassent le seuil (par défaut 5), le disjoncteur s'ouvre et court-circuite les requêtes pendant 30 secondes avant de sonder la récupération. Les états sont visibles dans le point de terminaison de santé (champ `circuitBreakers`). Configurable via `resilience.circuit_breaker` dans `config.json`.
+- **Fournisseur d'embedding Azure.** Ajout du support pour Azure AI Foundry (point de terminaison d'embeddings compatible Azure OpenAI). Configurez `embedding.provider: "azure-foundry"` et fournissez `embedding.azure.resource_name` ainsi que la variable d'environnement `AZURE_FOUNDRY_API_KEY`.
+- **Conseils de déploiement Azure.** Traitez `embedding.model` comme le nom du déploiement Azure, validez la qualité de récupération dans un namespace ou une collection canari avant la bascule, et effectuez un retour en arrière en repassant `embedding.provider` à `"openai"` et en redémarrant le processus.
+- **Métriques par percentile.** Les métriques d'histogramme émettent désormais des suffixes `_p50`, `_p95` et `_p99` en plus des `_avg` et `_count` existants.
+- **Renforcement de la réconciliation post-restauration.** `backup.restore` acquiert désormais une protection de sécurité via `beginRestoreOperation()`, isole les erreurs de réconciliation vectorielle par étape, et publie la progression de façon incrémentale. Un échec du magasin vectoriel pendant la réconciliation renvoie une disponibilité dégradée plutôt qu'un échec complet de la restauration.
+- **Routage des journaux stdio.** Les journaux structurés Pino sont redirigés vers stderr quand `--stdio` est actif, ce qui évite de corrompre la poignée de main JSON-RPC du MCP sur stdout.
+- **Sécurité des types.** Les casts internes `as any` ont été remplacés par des interfaces typées et `SqlParams` dans l'ensemble du code.
+- **Couverture de tests.** Nouvelles suites de tests pour les modules embedding, transport HTTP, métriques, logger, santé et CLI.
+
+**Nouvelle section de configuration** :
+```jsonc
+{
+  "resilience": {
+    "circuit_breaker": {
+      "failure_threshold": 5,       // échecs consécutifs pour ouvrir
+      "open_window_ms": 30000,      // ms avant la sonde half-open
+      "half_open_probe_count": 1    // sondes pour fermer
+    }
+  }
+}
+```
+
+**Configuration de l'embedding Azure** (ajoute `embedding.azure`) :
+```jsonc
+{
+  "embedding": {
+    "provider": "azure-foundry",
+    "model": "my-embedding-deployment",
+    "dimensions": 1536,
+    "azure": {
+      "resource_name": "my-foundry-resource"
+    }
+  }
+}
+```
+
+---
 
 ### 1.2 → 1.3 (Mémoire multi-appareils et résilience des données)
 
@@ -3767,7 +4040,26 @@ Lorsqu'un souvenir T0 (fondamental) est mis à jour, la version précédente est
 
 Les collections verrouillent leur modèle d'embedding et leurs dimensions au moment de la création. Si vous modifiez `embedding.model` ou `embedding.dimensions` dans la configuration, les nouveaux souvenirs dans les collections existantes seront rejetés avec une erreur `CONFLICT` jusqu'à ce que vous créiez une nouvelle collection. Cela empêche le mélange d'espaces d'embedding incompatibles dans le même index Qdrant.
 
-**Modèles pris en charge et validation au démarrage :** `embedding.model` est validé au démarrage par rapport à un ensemble fixe de modèles pris en charge — `text-embedding-ada-002` (1536 dimensions fixes), `text-embedding-3-small` (jusqu'à 1536 dimensions), `text-embedding-3-large` (jusqu'à 3072 dimensions). Un modèle non pris en charge, ou des `dimensions` hors du plafond du modèle choisi, provoque un échec de validation de la configuration avant le démarrage du serveur, avec une erreur nommant le modèle configuré et listant les modèles pris en charge.
+**Notes spécifiques au fournisseur :**
+- **OpenAI** : Le champ `embedding.model` spécifie le nom du modèle OpenAI (ex. `text-embedding-3-small`).
+- **Azure Foundry** : Le champ `embedding.model` spécifie le nom du déploiement Azure. `embedding.dimensions` doit correspondre aux dimensions de sortie configurées pour ce déploiement.
+
+Assurez-vous de définir `embedding.provider` sur `"openai"` ou `"azure-foundry"` en conséquence.
+
+**Modèles pris en charge et validation au démarrage :** `embedding.model` est validé au démarrage par rapport à un ensemble fixe de modèles pris en charge, pour les deux fournisseurs — `text-embedding-ada-002` (1536 dimensions fixes), `text-embedding-3-small` (jusqu'à 1536 dimensions), `text-embedding-3-large` (jusqu'à 3072 dimensions). Un modèle non pris en charge, ou des `dimensions` hors du plafond du modèle choisi, provoque un échec de validation de la configuration avant le démarrage du serveur, avec une erreur nommant le modèle configuré et listant les modèles pris en charge. Pour Azure, le nom du déploiement configuré dans `embedding.model` doit correspondre à l'une de ces familles de modèles prises en charge ; les déploiements nommés d'après des modèles non pris en charge ne démarreront pas. Ceci remplace un comportement silencieux où un modèle non reconnu pouvait produire des vecteurs avec une dimensionnalité incorrecte par rapport à la collection Qdrant.
+
+**Conseils de migration :**
+- Utilisez un namespace ou une collection canari avant de basculer le trafic de production vers Azure.
+- Effectuez un retour en arrière en repassant `embedding.provider` à `"openai"` et en redémarrant BHGBrain.
+- Ne réutilisez une collection existante que lorsque la famille de modèle et les dimensions configurées restent compatibles ; sinon créez une nouvelle collection pour éviter de mélanger des espaces d'embedding.
+
+### Routage des journaux stdio
+
+En mode de transport stdio (`--stdio`), les journaux structurés pino sont écrits sur **stderr** plutôt que sur stdout. Ceci n'est pas négociable pour la correction du protocole MCP : le SDK MCP utilise stdout exclusivement pour le framing JSON-RPC. Toute sortie non-JSON sur stdout (comme des lignes de journal) ferait échouer la poignée de main d'initialisation des clients MCP.
+
+- En mode HTTP, les journaux continuent d'être écrits sur stdout normalement.
+- La fonction `createLogger()` accepte un flux `destination` optionnel ; `index.ts` passe `process.stderr` quand `isStdio` est détecté.
+- Pour capturer les journaux du mode stdio dans un fichier : `node dist/index.js --stdio 2>bhgbrain.log`
 
 ### Détection de secrets
 
