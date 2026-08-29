@@ -4,9 +4,11 @@ import {
   DegradedRerankProvider,
   createRerankProvider,
   warnIfRerankDegraded,
+  resolveRerankBootstrap,
 } from './index.js';
 import type { BrainConfig } from '../config/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
+import { CircuitBreaker } from '../resilience/index.js';
 
 function createConfig(overrides: Partial<BrainConfig['search']['rerank']> = {}): BrainConfig {
   return {
@@ -213,5 +215,48 @@ describe('warnIfRerankDegraded', () => {
     const logger = { warn: vi.fn() };
     warnIfRerankDegraded(provider, config, logger);
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
+// add-opt-in-rerank-stage task 5.6: `src/index.ts`'s bootstrap wiring is
+// extracted into `resolveRerankBootstrap` specifically so it can be unit
+// tested without instantiating the rest of `main()`'s dependency graph.
+describe('resolveRerankBootstrap', () => {
+  afterEach(() => {
+    delete process.env.BHGBRAIN_RERANK_API_KEY;
+  });
+
+  function breaker(): CircuitBreaker {
+    return new CircuitBreaker({ failureThreshold: 5, openWindowMs: 30000, halfOpenProbeCount: 1 });
+  }
+
+  it('does not construct a provider or surface a health breaker when disabled', () => {
+    const config = createConfig({ enabled: false });
+    const logger = { warn: vi.fn() };
+    const result = resolveRerankBootstrap(config, { breaker: breaker(), logger });
+    expect(result.rerank).toBeUndefined();
+    expect(result.healthBreaker).toBeUndefined();
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('constructs a live provider and surfaces its breaker when enabled with valid credentials', () => {
+    process.env.BHGBRAIN_RERANK_API_KEY = 'test-key';
+    const config = createConfig({ enabled: true });
+    const logger = { warn: vi.fn() };
+    const rerankBreaker = breaker();
+    const result = resolveRerankBootstrap(config, { breaker: rerankBreaker, logger });
+    expect(result.rerank).toBeInstanceOf(OpenAiRerankProvider);
+    expect(result.healthBreaker).toBe(rerankBreaker);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the degraded provider and does NOT surface a health breaker when credentials are missing', () => {
+    delete process.env.BHGBRAIN_RERANK_API_KEY;
+    const config = createConfig({ enabled: true });
+    const logger = { warn: vi.fn() };
+    const result = resolveRerankBootstrap(config, { breaker: breaker(), logger });
+    expect(result.rerank).toBeInstanceOf(DegradedRerankProvider);
+    expect(result.healthBreaker).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'rerank_degraded_startup' }));
   });
 });

@@ -230,3 +230,41 @@ export function warnIfRerankDegraded(
     });
   }
 }
+
+export interface RerankBootstrapResult {
+  rerank: RerankProvider | undefined;
+  /**
+   * The breaker to register in `HealthService`'s breakers map, or `undefined`
+   * when reranking is disabled or resolved to `DegradedRerankProvider` — an
+   * unreachable or turned-off feature must not be able to degrade aggregate
+   * health (add-opt-in-rerank-stage design.md "Bootstrap wiring").
+   */
+  healthBreaker: CircuitBreaker | undefined;
+}
+
+/**
+ * `src/index.ts` bootstrap wiring for the opt-in rerank stage, extracted so
+ * it is unit-testable without instantiating the rest of `main()`'s
+ * dependency graph (task 5.6): a provider is constructed only when
+ * `search.rerank.enabled`, and the breaker is surfaced for health tracking
+ * only when a live (non-degraded) provider actually came back.
+ */
+export function resolveRerankBootstrap(
+  config: BrainConfig,
+  options: {
+    breaker: CircuitBreaker;
+    metrics?: MetricsCollector;
+    logger: { warn: (obj: Record<string, unknown>) => void };
+  },
+): RerankBootstrapResult {
+  const rerank = config.search.rerank.enabled
+    ? createRerankProvider(config, { breaker: options.breaker, metrics: options.metrics })
+    : undefined;
+  if (rerank) {
+    warnIfRerankDegraded(rerank, config, options.logger);
+  }
+  return {
+    rerank,
+    healthBreaker: rerank instanceof OpenAiRerankProvider ? options.breaker : undefined,
+  };
+}

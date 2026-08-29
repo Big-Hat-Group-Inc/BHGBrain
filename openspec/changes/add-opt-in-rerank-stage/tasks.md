@@ -112,19 +112,20 @@
   (`enabled: false`, `provider: 'openai'`, `candidate_pool: 20`, `model: 'gpt-4o-mini'`,
   `model_env: 'BHGBRAIN_RERANK_API_KEY'`, `timeout_ms: 3000`), and out-of-range
   overrides (e.g. `candidate_pool: 0` or `51`) fail validation.
-- [ ] 5.6 `src/index.test.ts` (or equivalent bootstrap test, if one exists for
+- [x] 5.6 `src/index.test.ts` (or equivalent bootstrap test, if one exists for
   embedding wiring): rerank provider is not constructed, and `rerankBreaker` is not
   added to the health breakers map, when `search.rerank.enabled` is false.
-  LEFT UNCHECKED (2026-08-28): no `src/index.test.ts` exists, and no "equivalent
-  bootstrap test... for embedding wiring" exists either — `main()` in `src/index.ts`
-  is untested end-to-end (unexported, directly instantiates real SqliteStore/
-  QdrantStore/etc.), so the task's stated premise ("if one exists") doesn't hold.
-  Building a harness from scratch to cover just this one conditional would mean
-  mocking every dependency `main()` touches — disproportionate to the change. The
-  conditional itself (`rerank` only constructed / `rerankBreaker` only added to
-  `healthBreakers` when `config.search.rerank.enabled`) is a straight `if` mirroring
-  the existing `summarizationBreaker` pattern one block above it in `src/index.ts`;
-  reviewed by inspection rather than by a new test file.
+  RESOLVED (2026-08-29): rather than mocking all of `main()`'s dependency graph,
+  extracted the exact conditional (`rerank` only constructed, `healthBreaker` only
+  surfaced, when `config.search.rerank.enabled` and the provider isn't degraded) into
+  a new exported `resolveRerankBootstrap()` in `src/rerank/index.ts`, called from
+  `src/index.ts` in place of the inline logic (behavior-preserving refactor, same
+  ternary/if just relocated). Added 3 unit tests in `src/rerank/index.test.ts`
+  covering: disabled -> no provider constructed, no health breaker; enabled with
+  valid credentials -> live provider, health breaker surfaced; enabled with missing
+  credentials -> degraded provider, no health breaker (matches
+  `embeddingBreaker`/`qdrantBreaker`'s "an unreachable/off feature must not degrade
+  aggregate health" pattern). `npm run lint` and `npm test` (953/953) both clean.
 
 ## 6. Docs
 

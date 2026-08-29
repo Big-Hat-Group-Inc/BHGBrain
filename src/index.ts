@@ -12,7 +12,7 @@ import { createExtractionProvider, warnIfExtractionDegraded } from './pipeline/e
 import { createSummarizationProvider, warnIfSummarizationDegraded } from './summarization/index.js';
 import { SearchService } from './search/index.js';
 import { createQueryExpansionProvider, warnIfQueryExpansionDegraded } from './search/query-expansion.js';
-import { createRerankProvider, warnIfRerankDegraded, OpenAiRerankProvider } from './rerank/index.js';
+import { resolveRerankBootstrap } from './rerank/index.js';
 import { BackupService } from './backup/index.js';
 import { RetentionService } from './backup/retention.js';
 import { CleanupScheduler, DistillationScheduler } from './backup/scheduler.js';
@@ -112,13 +112,14 @@ async function main() {
   // stock installs never construct a `RerankProvider`, so `SearchService`
   // gets `undefined` and `recall` stays byte-for-byte unchanged. Enabling it
   // with a missing/invalid `search.rerank.model_env` value falls back to the
-  // degraded provider (logged below) rather than crashing startup.
-  const rerank = config.search.rerank.enabled
-    ? createRerankProvider(config, { breaker: rerankBreaker, metrics })
-    : undefined;
-  if (rerank) {
-    warnIfRerankDegraded(rerank, config, logger);
-  }
+  // degraded provider (logged below) rather than crashing startup. Extracted
+  // to `resolveRerankBootstrap` (task 5.6) so this wiring is unit-testable
+  // without instantiating the rest of `main()`'s dependency graph.
+  const { rerank, healthBreaker: rerankHealthBreaker } = resolveRerankBootstrap(config, {
+    breaker: rerankBreaker,
+    metrics,
+    logger,
+  });
   const storage = new StorageManager(sqlite, qdrant, embedding, metrics, config, summarization);
 
   // Bootstrap: hydrate SQLite from Qdrant if this is a new device
@@ -163,8 +164,8 @@ async function main() {
   // provider was actually constructed, so an open breaker here degrades
   // aggregate health precisely when reranking is configured and failing —
   // not on every stock install where reranking is off.
-  if (rerank instanceof OpenAiRerankProvider) {
-    healthBreakers.rerank = rerankBreaker;
+  if (rerankHealthBreaker) {
+    healthBreakers.rerank = rerankHealthBreaker;
   }
   const healthService = new HealthService(storage, embedding, config, healthBreakers, logger);
 
