@@ -317,6 +317,23 @@ describe('StorageManager cross-store consistency', () => {
       expect(sqlite.insertRevision).not.toHaveBeenCalled();
       expect(sqlite.insertAudit).not.toHaveBeenCalled();
     });
+
+    it('produces an extractive summary of the reverted revision content, not its first line (improve-memory-summarization)', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      await storage.writeMemory({ ...baseMem, retention_tier: 'T0' }, [1, 2, 3]);
+      const revisionContent = 'Meeting notes:\nAlice owns the infra repo and handles all deploys.';
+      sqlite.listRevisions.mockReturnValue([
+        { id: 1, memory_id: 'mem-1', revision: 1, content: revisionContent, updated_at: '2026-01-01T00:00:00.000Z', updated_by: null },
+      ]);
+
+      const result = await storage.revertMemory('mem-1', 1, 'client-x');
+
+      expect(result.summary).toBe('Alice owns the infra repo and handles all deploys');
+    });
   });
 
   describe('degraded writes', () => {

@@ -9,6 +9,7 @@ import { StorageManager } from './storage/index.js';
 import { createEmbeddingProvider, getEmbeddingBreakerKey, warnIfEmbeddingDegraded } from './embedding/index.js';
 import { WritePipeline } from './pipeline/index.js';
 import { createExtractionProvider, warnIfExtractionDegraded } from './pipeline/extraction.js';
+import { createSummarizationProvider, warnIfSummarizationDegraded } from './summarization/index.js';
 import { SearchService } from './search/index.js';
 import { BackupService } from './backup/index.js';
 import { RetentionService } from './backup/retention.js';
@@ -67,7 +68,16 @@ async function main() {
   warnIfEmbeddingDegraded(embedding, config, logger);
   const extraction = createExtractionProvider(config, { breaker: extractionBreaker, metrics, logger });
   warnIfExtractionDegraded(extraction, config, logger);
-  const storage = new StorageManager(sqlite, qdrant, embedding, metrics, config);
+  // Not included in HealthService's `breakers` record below, same rationale as
+  // `extractionBreaker`: summarization is a best-effort enhancement with a
+  // fully-functional (extractive) fallback, so an open breaker here should
+  // not degrade the server's aggregate health status.
+  const summarizationBreaker = config.pipeline.summarization_enabled
+    ? new CircuitBreaker({ ...breakerOptions, key: 'summarization', logger })
+    : undefined;
+  const summarization = createSummarizationProvider(config, { breaker: summarizationBreaker, metrics });
+  warnIfSummarizationDegraded(summarization, config, logger);
+  const storage = new StorageManager(sqlite, qdrant, embedding, metrics, config, summarization);
 
   // Bootstrap: hydrate SQLite from Qdrant if this is a new device
   try {
@@ -100,7 +110,7 @@ async function main() {
   }
 
   // Initialize services
-  const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics);
+  const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics, summarization);
   const searchService = new SearchService(config, storage, embedding, metrics, logger);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {

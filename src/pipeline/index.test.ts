@@ -5,6 +5,7 @@ import type { EmbeddingProvider } from '../embedding/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { ExtractionProvider } from './extraction.js';
 import { checkEntailment } from './entailment.js';
+import type { SummarizationProvider } from '../summarization/index.js';
 
 vi.mock('./entailment.js', () => ({
   checkEntailment: vi.fn(),
@@ -864,5 +865,126 @@ describe('WritePipeline multi-candidate extraction', () => {
     ).rejects.toThrow('vector store unavailable');
 
     expect(storage.writeMemory).not.toHaveBeenCalled();
+  });
+});
+
+describe('WritePipeline summarization', () => {
+  // Heading-then-substance shape: the bug improve-memory-summarization
+  // fixes is that first-line truncation picks "Meeting notes:" (no signal)
+  // over the sentence that actually carries the fact.
+  const multiSentenceContent = 'Meeting notes:\nAlice owns the infra repo and handles all deploys.';
+
+  const config = {
+    deduplication: { similarity_threshold: 0.92 },
+    pipeline: {
+      extraction_enabled: false,
+      fallback_to_threshold_dedup: true,
+      contradiction_detection: { enabled: false, timeout_ms: 5000 },
+      summarization_enabled: false,
+    },
+    auto_summarize: true,
+  } as unknown as BrainConfig;
+
+  let embedding: EmbeddingProvider;
+  let storage: StorageManager;
+
+  beforeEach(() => {
+    embedding = {
+      model: 'test-model',
+      dimensions: 2,
+      embed: vi.fn(async () => [0.1, 0.2]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
+      healthCheck: vi.fn(async () => true),
+    };
+    storage = {
+      sqlite: {
+        getMemoryByChecksum: vi.fn(() => null),
+        getMemoryById: vi.fn(() => null),
+        insertMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+        fullTextSearch: vi.fn(() => []),
+      },
+      qdrant: {
+        searchSimilar: vi.fn(async () => []),
+      },
+      updateMemory: vi.fn(),
+      writeMemory: vi.fn(),
+      writeMemoryWithoutVector: vi.fn(),
+      deleteMemory: vi.fn(async () => true),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+  });
+
+  it('persists an extractive (not first-line) summary for multi-sentence content when no summarizer is configured', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const [result] = await pipeline.process({
+      content: multiSentenceContent,
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result!.summary).toBe('Alice owns the infra repo and handles all deploys');
+  });
+
+  it('restores literal first-line truncation when auto_summarize is false', async () => {
+    const disabledConfig = { ...config, auto_summarize: false } as unknown as BrainConfig;
+    const pipeline = new WritePipeline(disabledConfig, storage, embedding);
+
+    const [result] = await pipeline.process({
+      content: multiSentenceContent,
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result!.summary).toBe('Meeting notes:');
+  });
+
+  it('falls back to the extractive summary when the configured LLM summarizer rejects', async () => {
+    const enabledConfig = {
+      ...config,
+      pipeline: { ...config.pipeline, summarization_enabled: true },
+    } as unknown as BrainConfig;
+    const summarizer: SummarizationProvider = {
+      summarize: vi.fn(async () => { throw new Error('summarizer unavailable'); }),
+    };
+    const pipeline = new WritePipeline(enabledConfig, storage, embedding, undefined, undefined, undefined, summarizer);
+
+    const [result] = await pipeline.process({
+      content: multiSentenceContent,
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(summarizer.summarize).toHaveBeenCalled();
+    expect(storage.writeMemory).toHaveBeenCalledTimes(1);
+    expect(result!.summary).toBe('Alice owns the infra repo and handles all deploys');
+  });
+
+  it('persists the LLM summarizer output when it resolves', async () => {
+    const enabledConfig = {
+      ...config,
+      pipeline: { ...config.pipeline, summarization_enabled: true },
+    } as unknown as BrainConfig;
+    const summarizer: SummarizationProvider = {
+      summarize: vi.fn(async () => 'LLM-produced summary'),
+    };
+    const pipeline = new WritePipeline(enabledConfig, storage, embedding, undefined, undefined, undefined, summarizer);
+
+    const [result] = await pipeline.process({
+      content: multiSentenceContent,
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result!.summary).toBe('LLM-produced summary');
   });
 });

@@ -288,7 +288,23 @@ const ConfigSchema = z.object({
       enabled: z.boolean().default(false),
       timeout_ms: z.number().int().positive().default(5000),
     }).default({}),
+    // Optional LLM-backed summarization tier (improve-memory-summarization).
+    // Default `false`: this is a new external call with cost/latency
+    // implications, unlike `auto_summarize` (which gates the free extractive
+    // tier and defaults on). Mirrors `extraction_model`/`extraction_model_env`
+    // in shape; defaults to the same env var as extraction since both are
+    // cheap-model write-path calls against the same OpenAI account.
+    summarization_enabled: z.boolean().default(false),
+    summarization_model: z.string().default('gpt-4o-mini'),
+    summarization_model_env: z.string().default('BHGBRAIN_EXTRACTION_API_KEY'),
+    // Enforced via AbortController on the chat-completions fetch.
+    summarization_timeout_ms: z.number().positive().default(3000),
   }).default({}),
+  // Controls whether summarization quality tiers (extractive, or LLM when
+  // `pipeline.summarization_enabled`) apply. `true` (default): tiered
+  // summarizer. `false`: literal first-line truncation (`generateSummary`),
+  // regardless of `pipeline.summarization_enabled`. See
+  // improve-memory-summarization.
   auto_summarize: z.boolean().default(true),
 });
 

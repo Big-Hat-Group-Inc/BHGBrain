@@ -472,10 +472,28 @@ BHGBrain 从以下位置加载配置文件：
     // 提取请求超时（毫秒），通过 AbortController 强制执行
     "extraction_timeout_ms": 4000,
     // 为 true 时，若嵌入不可用则回退到校验和 + 全文相似度去重
-    "fallback_to_threshold_dedup": true
+    "fallback_to_threshold_dedup": true,
+    // 启用可选的 LLM 摘要层：用一次低成本的 chat-completion 调用生成记忆的
+    // `summary` 字段，取代免费的内置抽取式摘要器。默认值为 false——与提取
+    // 功能一样，这是一次新的外部调用，涉及成本/延迟影响，需要主动启用。任何
+    // 失败（缺少 key、非 2xx 响应、超时、网络错误）都会在本次写入时回退到
+    // 抽取式摘要层；摘要生成永远不会阻塞或导致 `remember`/`revert` 调用失败。
+    "summarization_enabled": false,
+    // 用于摘要的 chat-completions 模型
+    "summarization_model": "gpt-4o-mini",
+    // 摘要模型 API key 的环境变量名称。默认与 extraction_model_env 相同
+    // （两者都是针对同一 OpenAI 账户的低成本写入路径模型调用）——如需使用
+    // 独立的 key，可指向另一个变量。
+    "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // 摘要请求超时（毫秒），通过 AbortController 强制执行
+    "summarization_timeout_ms": 3000
   },
 
-  // 摄入时自动摘要记忆内容
+  // 控制用于生成每条记忆 `summary` 字段的质量层级。true（默认）：一个无依赖
+  // 的抽取式摘要器按词频对内容中的每个句子打分，并选出最具代表性的句子
+  // （当 pipeline.summarization_enabled 为 true 且请求成功时，会进一步回退到
+  // 上面的 LLM 层）。false：最低成本的路径——summary 仅为内容的第一行，
+  // 截断至 120 字符——与 pipeline.summarization_enabled 无关。
   "auto_summarize": true
 }
 ```
@@ -490,7 +508,7 @@ BHGBrain 从以下位置加载配置文件：
 | `BHGBRAIN_TOKEN` | 非回环 HTTP 时必需 | — | HTTP 认证的 Bearer token。若主机地址为非回环且此变量未设置，服务器**拒绝启动**（除非 `allow_unauthenticated_http: true`）。 |
 | `QDRANT_API_KEY` | Qdrant Cloud 时必需 | — | 在配置中将 `qdrant.api_key_env` 设置为此变量名称。默认配置字段名为 `QDRANT_API_KEY`。 |
 | `BHGBRAIN_DEVICE_ID` | 否 | 从主机名自动生成 | 覆盖多设备设置的设备标识符。参见[设备身份解析](#设备身份解析)。 |
-| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key，在 `pipeline.extraction_enabled` 为 `true` 时使用。 |
+| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key，在 `pipeline.extraction_enabled` 为 `true` 时使用。也是 `pipeline.summarization_model_env` 的默认值（在 `pipeline.summarization_enabled` 为 `true` 时使用）——如需为摘要使用独立的 key，可将该字段指向其他变量。 |
 
 生成安全的 Bearer token：
 

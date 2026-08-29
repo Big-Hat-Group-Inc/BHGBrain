@@ -6,7 +6,9 @@ import type { MemoryRecord, WriteOperation, AuditEntry, LifecycleAuditDetails } 
 import type { MetricsCollector } from '../health/metrics.js';
 import type { BrainConfig } from '../config/index.js';
 import { internal, conflict, notFound } from '../errors/index.js';
-import { computeChecksum, generateSummary } from '../domain/normalize.js';
+import { computeChecksum } from '../domain/normalize.js';
+import { summarizeContent } from '../domain/summarize.js';
+import type { SummarizationProvider } from '../summarization/index.js';
 
 type MemoryRecordWithoutEmbedding = Omit<MemoryRecord, 'embedding'>;
 
@@ -66,6 +68,11 @@ export class StorageManager {
     // compiling; a missing config falls back to the schema default
     // (refuse_writes_on_model_mismatch: true) wherever it's consulted.
     private readonly config?: BrainConfig,
+    // Optional LLM-backed summarization provider (improve-memory-summarization).
+    // Undefined when `pipeline.summarization_enabled` is false — `revertMemory`
+    // falls back to the extractive tier via `summarizeContent`, which handles
+    // an undefined provider the same way it handles an undefined `config`.
+    private readonly summarizer?: SummarizationProvider,
   ) {}
 
   /**
@@ -258,10 +265,11 @@ export class StorageManager {
     if (!target) throw notFound(`Revision ${revision} not found for memory ${id}`);
 
     const vector = await this.embedding.embed(target.content);
+    const summary = await summarizeContent(target.content, this.config, this.summarizer);
 
     await this.updateMemory(id, {
       content: target.content,
-      summary: generateSummary(target.content),
+      summary,
       checksum: computeChecksum(target.content),
       last_operation: 'UPDATE',
       updated_at: new Date().toISOString(),

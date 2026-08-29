@@ -488,10 +488,34 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Timeout für die Extraktionsanfrage in Millisekunden, per AbortController erzwungen
     "extraction_timeout_ms": 4000,
     // Wenn true, Fallback auf Prüfsummen- + Volltext-Ähnlichkeits-Deduplizierung, falls Einbettung nicht verfügbar
-    "fallback_to_threshold_dedup": true
+    "fallback_to_threshold_dedup": true,
+    // Aktiviert eine optionale LLM-gestützte Zusammenfassungsstufe: ein günstiger
+    // Chat-Completion-Aufruf erzeugt das `summary`-Feld der Erinnerung statt des
+    // kostenlosen, eingebauten extraktiven Summarizers. Standard false — wie bei
+    // der Extraktion ist dies ein neuer externer Aufruf mit Kosten-/Latenz-
+    // Auswirkungen, bewusst opt-in. Jeder Fehlschlag (fehlender Schlüssel,
+    // Nicht-2xx, Timeout, Netzwerkfehler) fällt für diesen Schreibvorgang auf die
+    // extraktive Stufe zurück; die Zusammenfassung blockiert oder verhindert nie
+    // einen `remember`-/`revert`-Aufruf.
+    "summarization_enabled": false,
+    // Chat-Completions-Modell für die Zusammenfassung
+    "summarization_model": "gpt-4o-mini",
+    // Name der Umgebungsvariable für den API-Schlüssel des Zusammenfassungsmodells.
+    // Standardmäßig dieselbe Variable wie extraction_model_env (beide sind
+    // günstige Modellaufrufe im Schreibpfad gegen dasselbe OpenAI-Konto) — bei
+    // Bedarf auf eine andere Variable für einen separaten Schlüssel verweisen.
+    "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // Timeout für die Zusammenfassungsanfrage in Millisekunden, per AbortController erzwungen
+    "summarization_timeout_ms": 3000
   },
 
-  // Speicherinhalt bei der Ingestion automatisch zusammenfassen
+  // Steuert die Qualitätsstufe zur Erzeugung des `summary`-Felds jeder Erinnerung.
+  // true (Standard): ein abhängigkeitsfreier extraktiver Summarizer bewertet
+  // jeden Satz im Inhalt nach Termhäufigkeit und wählt den repräsentativsten aus
+  // (mit Fallback auf die obige LLM-Stufe, wenn pipeline.summarization_enabled
+  // true ist und sie erfolgreich antwortet). false: der günstigste mögliche Weg —
+  // summary ist einfach die erste Zeile des Inhalts, auf 120 Zeichen gekürzt —
+  // unabhängig von pipeline.summarization_enabled.
   "auto_summarize": true
 }
 ```
@@ -506,7 +530,7 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
 | `BHGBRAIN_TOKEN` | Erforderlich für nicht-Loopback-HTTP | — | Bearer-Token für HTTP-Authentifizierung. Der Server **verweigert den Start**, wenn der Host nicht Loopback ist und dieser Wert nicht gesetzt ist (außer `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Erforderlich für Qdrant Cloud | — | Setzen Sie `qdrant.api_key_env` in der Konfiguration auf den Namen dieser Variable. Der Standard-Konfigurationsfeldname ist `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | Nein | Automatisch aus dem Hostnamen generiert | Überschreibt den Gerätebezeichner für Multi-Device-Setups. Siehe [Geräteidentitätsauflösung](#geräteidentitätsauflösung). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | Nein | Fällt auf `OPENAI_API_KEY` zurück | API-Schlüssel für das LLM-Extraktionsmodell, verwendet wenn `pipeline.extraction_enabled` auf `true` steht. |
+| `BHGBRAIN_EXTRACTION_API_KEY` | Nein | Fällt auf `OPENAI_API_KEY` zurück | API-Schlüssel für das LLM-Extraktionsmodell, verwendet wenn `pipeline.extraction_enabled` auf `true` steht. Auch der Standardwert von `pipeline.summarization_model_env` (verwendet wenn `pipeline.summarization_enabled` auf `true` steht) — auf eine andere Variable verweisen, wenn ein separater Schlüssel für die Zusammenfassung gewünscht ist. |
 
 Sicheres Bearer-Token generieren:
 

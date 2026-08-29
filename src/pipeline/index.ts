@@ -5,10 +5,12 @@ import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { MemoryType, MemorySource, WriteOperation, MemoryRecord, WriteResult, RetentionTier } from '../domain/types.js';
 import { normalizeContent, computeChecksum, generateSummary, containsSecret, detectsInvalidation } from '../domain/normalize.js';
+import { summarizeContent } from '../domain/summarize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { invalidInput, internal } from '../errors/index.js';
 import { checkEntailment } from './entailment.js';
 import { NoopExtractionProvider, type ExtractionProvider } from './extraction.js';
+import type { SummarizationProvider } from '../summarization/index.js';
 
 interface MemoryCandidate {
   content: string;
@@ -28,6 +30,7 @@ export class WritePipeline {
     private logger?: { warn: (obj: Record<string, unknown>) => void },
     extraction?: ExtractionProvider,
     private metrics?: MetricsCollector,
+    private summarizer?: SummarizationProvider,
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
     this.extraction = extraction ?? new NoopExtractionProvider();
@@ -161,11 +164,22 @@ export class WritePipeline {
       };
     }
 
-    // Step 2: Get embedding
-    let vector: number[];
-    try {
-      vector = await this.embedding.embed(candidate.content);
-    } catch (err) {
+    // Step 2: Get embedding, started concurrently with summarization — both
+    // depend only on `candidate.content` and neither needs the other's
+    // result, so kicking them off together caps the added latency of the
+    // (optional, config-gated) LLM summarization tier at
+    // max(embed_latency, summarize_latency) instead of their sum. Embed's
+    // rejection is re-thrown/handled exactly as before this change;
+    // summarization's rejection is never observed here since
+    // `summarizeContent` itself never rejects (it catches internally and
+    // falls back to the extractive tier).
+    const [embedResult, summaryResult] = await Promise.allSettled([
+      this.embedding.embed(candidate.content),
+      summarizeContent(candidate.content, this.config, this.summarizer, this.logger),
+    ]);
+
+    if (embedResult.status === 'rejected') {
+      const err = embedResult.reason;
       if (this.config.pipeline.fallback_to_threshold_dedup) {
         this.logger?.warn({
           event: 'degraded_write',
@@ -177,6 +191,7 @@ export class WritePipeline {
       }
       throw err;
     }
+    const vector = embedResult.value;
 
     // Step 3: Similarity search for near-dedup
     const similar = await this.storage.qdrant.searchSimilar(
@@ -188,7 +203,10 @@ export class WritePipeline {
 
     const operation = await this.classifyOperation(candidate.content, similar, tier, input.namespace, input.collection);
     const resolvedType = candidate.type ?? 'semantic';
-    const summary = generateSummary(candidate.content);
+    // `summarizeContent` never rejects (it catches internally), so this
+    // branch is unreachable in practice; kept as a truncation-safe fallback
+    // for type-safety against `Promise.allSettled`'s union result type.
+    const summary = summaryResult.status === 'fulfilled' ? summaryResult.value : generateSummary(candidate.content);
     const importance = candidate.importance ?? 0.5;
 
     if (operation.op === 'NOOP' && operation.targetId) {
@@ -470,7 +488,7 @@ export class WritePipeline {
     // "Below-threshold candidate yields ADD in fallback mode" in
     // write-decision-pipeline/spec.md.
     const resolvedType = candidate.type ?? 'semantic';
-    const summary = generateSummary(candidate.content);
+    const summary = await summarizeContent(candidate.content, this.config, this.summarizer, this.logger);
     const importance = candidate.importance ?? 0.5;
     const tier = this.lifecycle.assignTier({
       category: input.category,

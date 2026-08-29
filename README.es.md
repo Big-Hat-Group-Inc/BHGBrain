@@ -489,10 +489,34 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     // Tiempo de espera de la solicitud de extracción en milisegundos, forzado vía AbortController
     "extraction_timeout_ms": 4000,
     // Cuando es true, recurre a dedup por checksum + similitud de texto completo si el embedding no está disponible
-    "fallback_to_threshold_dedup": true
+    "fallback_to_threshold_dedup": true,
+    // Habilita un nivel opcional de resumen basado en LLM: una llamada de
+    // chat-completion económica produce el campo `summary` de la memoria en
+    // lugar del resumidor extractivo gratuito e integrado. Por defecto false —
+    // igual que la extracción, esto es una llamada externa nueva con
+    // implicaciones de coste/latencia, opt-in deliberado. Cualquier fallo
+    // (clave ausente, respuesta no-2xx, timeout, error de red) recurre al nivel
+    // extractivo para esa escritura; el resumen nunca bloquea ni hace fallar
+    // una llamada a `remember`/`revert`.
+    "summarization_enabled": false,
+    // Modelo de chat-completions usado para el resumen
+    "summarization_model": "gpt-4o-mini",
+    // Nombre de la variable de entorno para la clave API del modelo de resumen.
+    // Por defecto la misma variable que extraction_model_env (ambas son
+    // llamadas de modelo económico en la ruta de escritura contra la misma
+    // cuenta de OpenAI) — apúntala a otra variable si quieres una clave separada.
+    "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // Tiempo de espera de la solicitud de resumen en milisegundos, forzado vía AbortController
+    "summarization_timeout_ms": 3000
   },
 
-  // Auto-resumir el contenido de la memoria en la ingesta
+  // Controla el nivel de calidad usado para generar el campo `summary` de cada
+  // memoria. true (por defecto): un resumidor extractivo sin dependencias
+  // puntúa cada frase del contenido por frecuencia de términos y elige la más
+  // representativa (recurriendo además al nivel LLM anterior cuando
+  // pipeline.summarization_enabled es true y responde correctamente). false: la
+  // ruta más económica posible — summary es simplemente la primera línea del
+  // contenido, truncada a 120 caracteres — sin importar pipeline.summarization_enabled.
   "auto_summarize": true
 }
 ```
@@ -507,7 +531,7 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
 | `BHGBRAIN_TOKEN` | Requerida para HTTP no-loopback | — | Bearer token para autenticación HTTP. El servidor **se niega a iniciar** si el host es no-loopback y esto no está configurado (a menos que `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Requerida para Qdrant Cloud | — | Establece `qdrant.api_key_env` en la configuración con el nombre de esta variable. El nombre predeterminado del campo de configuración es `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generado desde el hostname | Anular el identificador de dispositivo para configuraciones multi-dispositivo. Ver [Resolución de Identidad de Dispositivo](#resolución-de-identidad-de-dispositivo). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | No | Usa `OPENAI_API_KEY` como respaldo | Clave API para el modelo de extracción LLM, usada cuando `pipeline.extraction_enabled` es `true`. |
+| `BHGBRAIN_EXTRACTION_API_KEY` | No | Usa `OPENAI_API_KEY` como respaldo | Clave API para el modelo de extracción LLM, usada cuando `pipeline.extraction_enabled` es `true`. También el valor por defecto de `pipeline.summarization_model_env` (usado cuando `pipeline.summarization_enabled` es `true`) — apunta ese campo a otra variable si quieres una clave separada para el resumen. |
 
 Generar un bearer token seguro:
 

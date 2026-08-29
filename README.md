@@ -532,10 +532,32 @@ The file is created automatically on first run with all defaults applied. Edit i
     // Extraction request timeout in milliseconds, enforced via AbortController
     "extraction_timeout_ms": 4000,
     // When true, fall back to checksum + full-text-similarity dedup if embedding is unavailable
-    "fallback_to_threshold_dedup": true
+    "fallback_to_threshold_dedup": true,
+    // Enable an optional LLM-backed summarization tier: a cheap chat-completion
+    // call produces the memory's `summary` field instead of the free, built-in
+    // extractive summarizer. Defaults to false — like extraction, this is a new
+    // external call with cost/latency implications, opt in deliberately. Any
+    // failure (missing key, non-2xx, timeout, network error) falls back to the
+    // extractive tier for that write; summarization never blocks or fails a
+    // `remember`/`revert` call.
+    "summarization_enabled": false,
+    // Chat-completions model used for summarization
+    "summarization_model": "gpt-4o-mini",
+    // Env var name for the summarization model API key. Defaults to the same
+    // variable as extraction_model_env (both are cheap-model write-path calls
+    // against the same OpenAI account) — point it elsewhere for a separate key.
+    "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // Summarization request timeout in milliseconds, enforced via AbortController
+    "summarization_timeout_ms": 3000
   },
 
-  // Auto-summarize memory content on ingestion
+  // Controls the quality tier used to generate each memory's `summary` field.
+  // true (default): a dependency-free extractive summarizer scores every
+  // sentence in the content by term frequency and picks the most representative
+  // one (falling back further to the LLM tier above when
+  // pipeline.summarization_enabled is true and it resolves). false: the
+  // cheapest possible path — summary is just the first line of content,
+  // truncated to 120 chars — regardless of pipeline.summarization_enabled.
   "auto_summarize": true
 }
 ```
@@ -551,7 +573,7 @@ The file is created automatically on first run with all defaults applied. Edit i
 | `BHGBRAIN_TOKEN` | Required for non-loopback HTTP | — | Bearer token for HTTP authentication. Server **refuses to start** if the host is non-loopback and this is unset (unless `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Required for Qdrant Cloud | — | Set `qdrant.api_key_env` in config to the name of this variable. The default config field name is `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generated from hostname | Override the device identifier for multi-device setups. See [Device Identity Resolution](#device-identity-resolution). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model, used when `pipeline.extraction_enabled` is `true`. |
+| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model, used when `pipeline.extraction_enabled` is `true`. Also the default value of `pipeline.summarization_model_env` (used when `pipeline.summarization_enabled` is `true`) — point that field at a different variable if you want a separate key for summarization. |
 
 Generate a secure bearer token:
 
