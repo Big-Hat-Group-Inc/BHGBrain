@@ -761,6 +761,14 @@ export class SqliteStore implements SqliteStorage {
         params.push(`%"${tag}"%`);
       }
     }
+    if (filter?.after !== undefined) {
+      conditions.push('m.created_at >= ?');
+      params.push(filter.after);
+    }
+    if (filter?.before !== undefined) {
+      conditions.push('m.created_at <= ?');
+      params.push(filter.before);
+    }
 
     // Over-fetch a bounded candidate pool so the relevance ranker below has rows to
     // order; the matching predicate is non-sargable LIKE, so keep the cap modest.

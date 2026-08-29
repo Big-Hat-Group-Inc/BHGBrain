@@ -582,6 +582,45 @@ describe('SqliteStore', () => {
     expect(filtered.map(r => r.id)).toEqual(['00000000-0000-0000-0000-0000000000e1']);
   });
 
+  it('fullTextSearch after/before filter excludes memories outside the window and includes ones inside it', () => {
+    // add-time-scoped-recall: created_at >= after / created_at <= before pushed
+    // down into the query, including boundary (exactly-equal) cases.
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000f1', checksum: 'time-before-window',
+      content: 'archive summary of decisions', summary: 'archive summary', tags: [],
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000f2', checksum: 'time-lower-bound',
+      content: 'archive summary of decisions', summary: 'archive summary', tags: [],
+      created_at: '2026-02-01T00:00:00.000Z',
+    });
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000f3', checksum: 'time-in-window',
+      content: 'archive summary of decisions', summary: 'archive summary', tags: [],
+      created_at: '2026-03-01T00:00:00.000Z',
+    });
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000f4', checksum: 'time-upper-bound',
+      content: 'archive summary of decisions', summary: 'archive summary', tags: [],
+      created_at: '2026-04-01T00:00:00.000Z',
+    });
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000f5', checksum: 'time-after-window',
+      content: 'archive summary of decisions', summary: 'archive summary', tags: [],
+      created_at: '2026-05-01T00:00:00.000Z',
+    });
+
+    const filtered = store.fullTextSearch('global', 'archive summary', 10, undefined, {
+      after: '2026-02-01T00:00:00.000Z', before: '2026-04-01T00:00:00.000Z',
+    });
+    expect(new Set(filtered.map(r => r.id))).toEqual(new Set([
+      '00000000-0000-0000-0000-0000000000f2',
+      '00000000-0000-0000-0000-0000000000f3',
+      '00000000-0000-0000-0000-0000000000f4',
+    ]));
+  });
+
   it('getMemoryByChecksum scopes to collection when provided', () => {
     const inGeneral = { ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000b1', collection: 'general', checksum: 'dup-chk' };
     const inWork = { ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000b2', collection: 'work', checksum: 'dup-chk' };

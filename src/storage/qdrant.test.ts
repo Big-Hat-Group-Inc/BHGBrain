@@ -151,6 +151,65 @@ describe('QdrantStore.search type/tags filter pushdown', () => {
   });
 });
 
+describe('QdrantStore.search created_at (after/before) filter pushdown', () => {
+  // add-time-scoped-recall: after/before are translated to a Qdrant `must`
+  // range clause on the created_at payload field so the store narrows the
+  // candidate set instead of the caller discarding out-of-window results
+  // after `limit` is already spent.
+  it('translates an after-only bound into a range clause with gte only', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10, { after: '2026-01-01T00:00:00Z' });
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    expect(call.filter?.must).toEqual(expect.arrayContaining([
+      { key: 'created_at', range: { gte: '2026-01-01T00:00:00Z', lte: undefined } },
+    ]));
+  });
+
+  it('translates a before-only bound into a range clause with lte only', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10, { before: '2026-06-01T00:00:00Z' });
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    expect(call.filter?.must).toEqual(expect.arrayContaining([
+      { key: 'created_at', range: { gte: undefined, lte: '2026-06-01T00:00:00Z' } },
+    ]));
+  });
+
+  it('translates both bounds into a single range clause', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10, {
+      after: '2026-01-01T00:00:00Z', before: '2026-06-01T00:00:00Z',
+    });
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    expect(call.filter?.must).toEqual(expect.arrayContaining([
+      { key: 'created_at', range: { gte: '2026-01-01T00:00:00Z', lte: '2026-06-01T00:00:00Z' } },
+    ]));
+  });
+
+  it('omits the created_at clause when neither bound is passed', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+    await store.search('global', 'work', [1, 2, 3], 10);
+    const call = client.query.mock.calls[0]![1] as { filter?: { must: Array<Record<string, unknown>> } };
+    const keys = call.filter?.must.map(m => m.key);
+    expect(keys).not.toContain('created_at');
+  });
+});
+
 describe('QdrantStore.searchSimilar', () => {
   it('returns mapped results from a populated query response', async () => {
     const client: MockClient = {
@@ -341,6 +400,70 @@ describe('QdrantStore.ensureCollection device_id index migration', () => {
     await expect(store.ensureCollection('global', 'general')).rejects.toThrow(
       'this.client.createPayloadIndex is not a function',
     );
+  });
+});
+
+describe('QdrantStore.ensureCollection created_at datetime index migration', () => {
+  // add-time-scoped-recall: same retroactive-indexing rationale as the
+  // device_id migration above — collections created before this change
+  // shipped still need the created_at datetime index applied.
+  it('creates the created_at datetime index when the collection already exists', async () => {
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => ({}) as never),
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await store.ensureCollection('global', 'general');
+
+    expect(createPayloadIndex).toHaveBeenCalledWith(
+      'bhgbrain_global_general',
+      { field_name: 'created_at', field_schema: 'datetime' },
+    );
+  });
+
+  it('still creates the created_at index (plus the rest) when the collection is newly created', async () => {
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => {
+        const err = new Error('Collection `bhgbrain_global_general` doesn\'t exist!') as Error & { status?: number };
+        err.status = 404;
+        throw err;
+      }),
+      createCollection: vi.fn<QdrantClient['createCollection']>(async () => ({}) as never),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await store.ensureCollection('global', 'general');
+
+    const createdAtCalls = createPayloadIndex.mock.calls.filter(c => c[1]?.field_name === 'created_at');
+    expect(createdAtCalls).toHaveLength(1);
+    expect(createdAtCalls[0]![1]).toEqual({ field_name: 'created_at', field_schema: 'datetime' });
+  });
+
+  it('is idempotent: tolerates an already-exists conflict from a repeat call', async () => {
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => {
+      const err = new Error('Index already exists') as Error & { status?: number };
+      err.status = 409;
+      throw err;
+    });
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => ({}) as never),
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await expect(store.ensureCollection('global', 'general')).resolves.toBeUndefined();
   });
 });
 

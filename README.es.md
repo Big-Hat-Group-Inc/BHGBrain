@@ -1712,7 +1712,7 @@ El parámetro `min_score` (predeterminado 0.6) actúa como una compuerta de cali
 
 ### Filtrado
 
-Tanto `recall` como `search` admiten alcance por namespace y colección. `recall` además admite filtrado por tipo y etiqueta.
+Tanto `recall` como `search` admiten alcance por namespace y colección, además de filtrado por rango temporal (`after`/`before`). `recall` además admite filtrado por tipo y etiqueta.
 
 **Filtrado por namespace:** Siempre aplicado. Todas las búsquedas se limitan a un solo namespace. No hay búsqueda entre namespaces.
 
@@ -1723,6 +1723,8 @@ Tanto `recall` como `search` admiten alcance por namespace y colección. `recall
 **Filtrado por tipo (solo `recall`):** Pasa `"type": "episodic"` | `"semantic"` | `"procedural"` para restringir los resultados a un solo tipo de memoria. El filtro se empuja hacia el almacén (un filtro de payload de Qdrant en la ruta semántica, un predicado SQL en la ruta de texto completo), de modo que `limit` cuenta memorias coincidentes en lugar de gastarse en candidatos no coincidentes antes de que se aplique el filtrado. Una revalidación defensiva posterior a la recuperación sigue ejecutándose y se espera que sea un no-op en estado estable; si alguna vez elimina un resultado devuelto por el almacén, se incrementa un contador `recall_zero_after_filter` para que la inanición de filtros siga siendo observable.
 
 **Filtrado por etiquetas (solo `recall`):** Pasa `"tags": ["auth", "security"]` para restringir los resultados a memorias que tienen al menos una de las etiquetas especificadas (coincidencia de cualquiera). Al igual que el filtrado por tipo, esto se empuja hacia el almacén en lugar de aplicarse solo después de la recuperación.
+
+**Filtrado por rango temporal (`recall` y `search`):** Pasa `after` y/o `before` (marcas de tiempo ISO 8601) para restringir los resultados a memorias cuyo `created_at` cae dentro de la ventana solicitada — ambos límites son inclusivos, y cualquiera puede omitirse para una ventana abierta. Los límites se comparan contra `created_at` (cuándo se registró la memoria por primera vez), no contra `updated_at` (que impulsa la señal separada de decaimiento por recencia en el ranking compuesto). Al igual que tipo/etiquetas, el filtro se empuja hacia el almacén, de modo que `limit` cuenta coincidencias dentro de la ventana. Una marca de tiempo malformada o un `after` posterior a `before` se rechaza antes de consultar cualquier almacén.
 
 ---
 
@@ -1951,7 +1953,8 @@ con el formato anterior sin etiquetas).
 | `bhgbrain_memory_count` | medidor | Recuento total de memorias actual (actualizado en escritura/eliminación) |
 | `bhgbrain_rate_limit_buckets` | medidor | Cubos de seguimiento de límite de tasa activos |
 | `bhgbrain_rate_limited_total` | contador | Total de solicitudes con límite de tasa excedido |
-| `recall_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva de tipo/etiquetas posterior a la recuperación de `recall` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
+| `recall_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva de tipo/etiquetas/`after`/`before` posterior a la recuperación de `recall` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
+| `search_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva `after`/`before` posterior a la recuperación de `search` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
 
 Por ejemplo:
 
@@ -2493,6 +2496,8 @@ Recupera las memorias más relevantes para una consulta usando búsqueda de simi
 | `tags` | `string[]` | No | — | Filtrar a memorias con al menos una etiqueta coincidente (coincidencia de cualquiera). Empujado hacia el almacén, de modo que `limit` cuenta memorias coincidentes. |
 | `limit` | `integer (1–20)` | No | `5` | Número máximo de resultados. |
 | `min_score` | `number (0–1)` | No | `0.6` | Puntuación mínima de similitud coseno, aplicada a `semantic_score` (no al `score` fusionado/ajustado). Los resultados por debajo de este umbral se excluyen. |
+| `after` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at >= after` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén para que `limit` cuente memorias coincidentes. |
+| `before` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at <= before` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén para que `limit` cuente memorias coincidentes. |
 
 **Salida:**
 
@@ -2556,6 +2561,8 @@ Busca memorias usando modos semántico, de texto completo o híbrido. Ofrece má
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | No | `"hybrid"` | Algoritmo de búsqueda. |
 | `limit` | `integer (1–50)` | No | `10` | Número máximo de resultados. |
 | `include_archived` | `boolean` | No | `false` | También busca en memorias archivadas (ver [Decaimiento, Limpieza y Archivado](#decaimiento-limpieza-y-archivado)) mediante coincidencia de términos en el resumen/etiquetas. Las coincidencias se añaden después de los resultados activos, marcadas con `archived: true`, y nunca reducen cuántos resultados activos permite `limit`. Las coincidencias archivadas no se registran como acceso. |
+| `after` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at >= after` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén vectorial/de texto completo — el primer filtro empujado hacia el almacén en `search`. |
+| `before` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at <= before` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén vectorial/de texto completo. |
 
 **Salida:** Misma estructura que `recall` — `{ "results": [...] }` — pero sin la compuerta `min_score` y admitiendo hasta 50 resultados. Las coincidencias archivadas (cuando `include_archived: true`) llevan `archived: true`, usan el resumen conservado como `content` y no tienen un `score` significativo (son coincidencias de términos en metadatos, no resultados clasificados).
 

@@ -1716,7 +1716,7 @@ Le paramètre `min_score` (par défaut 0,6) agit comme un filtre de qualité —
 
 ### Filtrage
 
-`recall` et `search` prennent tous deux en charge la portée par espace de noms et collection. `recall` prend en charge en outre le filtrage par type et par tags.
+`recall` et `search` prennent tous deux en charge la portée par espace de noms et collection, ainsi que le filtrage temporel (`after`/`before`). `recall` prend en charge en outre le filtrage par type et par tags.
 
 **Filtrage par espace de noms :** Toujours appliqué. Toutes les recherches sont limitées à un seul espace de noms. Il n'y a pas de recherche inter-espaces de noms.
 
@@ -1727,6 +1727,8 @@ Le paramètre `min_score` (par défaut 0,6) agit comme un filtre de qualité —
 **Filtrage par type (`recall` uniquement) :** Passez `"type": "episodic"` | `"semantic"` | `"procedural"` pour restreindre les résultats à un seul type de mémoire. Le filtre est propagé jusque dans le magasin (un filtre de payload Qdrant sur le chemin sémantique, un prédicat SQL sur le chemin plein texte), afin que `limit` compte les mémoires correspondantes au lieu d'être consommé par des candidats non correspondants avant que le filtrage n'intervienne. Une revérification défensive après récupération continue de s'exécuter et devrait rester un no-op en régime stable ; si elle supprime un jour un résultat renvoyé par le magasin, un compteur `recall_zero_after_filter` est incrémenté afin que la famine de filtrage reste observable.
 
 **Filtrage par tags (`recall` uniquement) :** Passez `"tags": ["auth", "security"]` pour restreindre les résultats aux souvenirs ayant au moins l'un des tags spécifiés (correspondance sur l'un quelconque). Comme le filtrage par type, ceci est propagé jusque dans le magasin plutôt qu'appliqué seulement après récupération.
+
+**Filtrage temporel (`recall` et `search`) :** Passez `after` et/ou `before` (horodatages ISO 8601) pour restreindre les résultats aux souvenirs dont `created_at` se situe dans la fenêtre demandée — les deux bornes sont inclusives, et l'une ou l'autre peut être omise pour une fenêtre ouverte. Les bornes se comparent à `created_at` (quand le souvenir a été enregistré pour la première fois), pas à `updated_at` (qui pilote le signal distinct de décroissance par récence dans le classement composite). Comme pour type/tags, le filtre est propagé jusque dans le magasin, de sorte que `limit` compte les correspondances dans la fenêtre. Un horodatage malformé ou un `after` postérieur à `before` est rejeté avant toute interrogation du magasin.
 
 ---
 
@@ -1955,7 +1957,8 @@ rétrocompatible avec le format précédent sans étiquette).
 | `bhgbrain_memory_count` | jauge | Nombre total actuel de souvenirs (mis à jour à l'écriture/suppression) |
 | `bhgbrain_rate_limit_buckets` | jauge | Compartiments de suivi de la limitation de débit actifs |
 | `bhgbrain_rate_limited_total` | compteur | Total des requêtes avec limitation de débit |
-| `recall_zero_after_filter` | compteur | Incrémenté lorsque la revérification défensive de type/tags après récupération de `recall` supprime un résultat que le magasin avait déjà déclaré correspondant — un signal de famine de filtrage qui devrait rester à 0 en régime stable |
+| `recall_zero_after_filter` | compteur | Incrémenté lorsque la revérification défensive de type/tags/`after`/`before` après récupération de `recall` supprime un résultat que le magasin avait déjà déclaré correspondant — un signal de famine de filtrage qui devrait rester à 0 en régime stable |
+| `search_zero_after_filter` | compteur | Incrémenté lorsque la revérification défensive `after`/`before` après récupération de `search` supprime un résultat que le magasin avait déjà déclaré correspondant — un signal de famine de filtrage qui devrait rester à 0 en régime stable |
 
 Par exemple :
 
@@ -2494,6 +2497,8 @@ Récupère les souvenirs les plus pertinents pour une requête en utilisant la r
 | `tags` | `string[]` | Non | — | Filtrer sur les souvenirs ayant au moins un tag correspondant (correspondance sur l'un quelconque). Propagé jusque dans le magasin, afin que `limit` compte les mémoires correspondantes. |
 | `limit` | `integer (1–20)` | Non | `5` | Nombre maximum de résultats. |
 | `min_score` | `number (0–1)` | Non | `0,6` | Score de similarité cosinus minimal, appliqué à `semantic_score` (et non au `score` fusionné/ajusté). Les résultats en dessous de ce seuil sont exclus. |
+| `after` | `string (date-heure ISO 8601)` | Non | - | N'inclut que les souvenirs avec `created_at >= after` (inclusif). Filtre sur la date de création, pas `updated_at`. Propagé jusque dans le magasin afin que `limit` compte les souvenirs correspondants. |
+| `before` | `string (date-heure ISO 8601)` | Non | - | N'inclut que les souvenirs avec `created_at <= before` (inclusif). Filtre sur la date de création, pas `updated_at`. Propagé jusque dans le magasin afin que `limit` compte les souvenirs correspondants. |
 
 **Sortie :**
 
@@ -2557,6 +2562,8 @@ Recherche des souvenirs en utilisant les modes sémantique, plein texte ou hybri
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | Non | `"hybrid"` | Algorithme de recherche. |
 | `limit` | `integer (1–50)` | Non | `10` | Nombre maximum de résultats. |
 | `include_archived` | `boolean` | Non | `false` | Recherche aussi dans les souvenirs archivés (voir [Déclin, nettoyage et archivage](#déclin-nettoyage-et-archivage)) par correspondance de termes sur le résumé/les tags. Les correspondances sont ajoutées après les résultats actifs, marquées `archived: true`, et ne réduisent jamais le nombre de résultats actifs autorisés par `limit`. Les correspondances archivées ne sont jamais enregistrées comme accès. |
+| `after` | `string (date-heure ISO 8601)` | Non | - | N'inclut que les souvenirs avec `created_at >= after` (inclusif). Filtre sur la date de création, pas `updated_at`. Propagé jusque dans le magasin vectoriel/plein texte — le premier filtre propagé de `search`. |
+| `before` | `string (date-heure ISO 8601)` | Non | - | N'inclut que les souvenirs avec `created_at <= before` (inclusif). Filtre sur la date de création, pas `updated_at`. Propagé jusque dans le magasin vectoriel/plein texte. |
 
 **Sortie :** Même structure que `recall` — `{ "results": [...] }` — mais sans le filtre `min_score` et supportant jusqu'à 50 résultats. Les correspondances archivées (quand `include_archived: true`) portent `archived: true`, utilisent le résumé conservé comme `content`, et n'ont pas de `score` significatif (ce sont des correspondances de termes sur les métadonnées, pas des résultats classés).
 

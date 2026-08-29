@@ -1673,7 +1673,7 @@ BHGBrain 提供两种具有不同语义的记忆检索工具：
 
 ### 过滤
 
-`recall` 和 `search` 都支持命名空间和集合作用域。`recall` 还额外支持类型和标签过滤。
+`recall` 和 `search` 都支持命名空间和集合作用域，以及时间范围过滤（`after`/`before`）。`recall` 还额外支持类型和标签过滤。
 
 **命名空间过滤：** 始终应用。所有搜索都限定在单个命名空间内。不支持跨命名空间搜索。
 
@@ -1684,6 +1684,8 @@ BHGBrain 提供两种具有不同语义的记忆检索工具：
 **类型过滤（仅 `recall`）：** 传入 `"type": "episodic"` | `"semantic"` | `"procedural"` 以将结果限制为单一记忆类型。过滤条件被下推到存储层（语义路径上是 Qdrant 负载过滤器，全文路径上是 SQL 谓词），因此 `limit` 计算的是匹配的记忆数量，而不是在过滤生效前被不匹配的候选项消耗掉。检索后仍会运行一次防御性复查，稳态下应为空操作；一旦它移除了存储层已返回的结果，`recall_zero_after_filter` 计数器就会递增，使过滤饥饿问题保持可观测。
 
 **标签过滤（仅 `recall`）：** 传入 `"tags": ["auth", "security"]` 以将结果限制为具有至少一个指定标签的记忆（任意匹配）。与类型过滤一样，这也被下推到存储层，而不是仅在检索后应用。
+
+**时间范围过滤（`recall` 和 `search`）：** 传入 `after` 和/或 `before`（ISO 8601 时间戳），将结果限制为 `created_at` 落在所请求窗口内的记忆——两个边界都是含边界的，任一都可省略以表示开放端。边界比较的是 `created_at`（记忆首次被记录的时间），而非 `updated_at`（后者驱动复合排名中另一个独立的近因衰减信号）。与类型/标签一样，该过滤条件被下推到存储层，使 `limit` 计算窗口内的匹配数量。格式错误的时间戳或 `after` 晚于 `before` 会在查询任何存储层之前被拒绝。
 
 ---
 
@@ -1911,7 +1913,8 @@ GET /metrics
 | `bhgbrain_memory_count` | gauge | 当前总记忆数量（写入/删除时更新） |
 | `bhgbrain_rate_limit_buckets` | gauge | 活跃的速率限制追踪桶 |
 | `bhgbrain_rate_limited_total` | counter | 被速率限制的请求总数 |
-| `recall_zero_after_filter` | counter | 当 `recall` 检索后的类型/标签防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
+| `recall_zero_after_filter` | counter | 当 `recall` 检索后的类型/标签/`after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
+| `search_zero_after_filter` | counter | 当 `search` 检索后的 `after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
 
 例如：
 
@@ -2424,6 +2427,8 @@ BHGBrain 暴露 11 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `tags` | `string[]` | 否 | — | 过滤到具有至少一个匹配标签的记忆（任意匹配）。下推到存储层，因此 `limit` 计算的是匹配的记忆数量。 |
 | `limit` | `integer (1–20)` | 否 | `5` | 最大结果数量。 |
 | `min_score` | `number (0–1)` | 否 | `0.6` | 最低余弦相似度得分，作用于 `semantic_score`（而非融合/调整后的 `score`）。低于此阈值的结果被排除。 |
+| `after` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at >= after`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到存储层，使 `limit` 计算匹配的记忆数量。 |
+| `before` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at <= before`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到存储层，使 `limit` 计算匹配的记忆数量。 |
 
 **输出：**
 
@@ -2487,6 +2492,8 @@ BHGBrain 暴露 11 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | 否 | `"hybrid"` | 搜索算法。 |
 | `limit` | `integer (1–50)` | 否 | `10` | 最大结果数量。 |
 | `include_archived` | `boolean` | 否 | `false` | 同时搜索已归档的记忆（参见[衰减、清理与归档](#衰减清理与归档)），按摘要/标签进行词条匹配。归档命中会追加在活跃结果之后，标记为 `archived: true`，且从不减少 `limit` 允许的活跃结果数量。归档命中不会记录访问。 |
+| `after` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at >= after`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到向量/全文存储层——这是 `search` 的第一个下推过滤条件。 |
+| `before` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at <= before`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到向量/全文存储层。 |
 
 **输出：** 与 `recall` 相同的结构——`{ "results": [...] }`——但没有 `min_score` 关卡，支持最多 50 条结果。归档命中（当 `include_archived: true` 时）带有 `archived: true`，使用保留的摘要作为 `content`，且没有有意义的 `score`（它们是元数据词条匹配，而非排序结果）。
 

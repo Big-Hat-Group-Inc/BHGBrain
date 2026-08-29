@@ -87,6 +87,14 @@ export class QdrantStore {
     // index. Idempotent: a second call against an already-indexed collection
     // is a tolerated no-op.
     await this.ensureDeviceIdIndex(name);
+
+    // Same retroactive-indexing rationale as `ensureDeviceIdIndex`: collections
+    // created before add-time-scoped-recall shipped still get the `created_at`
+    // datetime index so `after`/`before` range filters run indexed rather than
+    // linearly scanned. Unindexed range filtering is still correct (Qdrant
+    // filters on unindexed fields, just slower), so this is a performance
+    // addition, not a correctness dependency.
+    await this.ensureCreatedAtIndex(name);
   }
 
   private async ensureDeviceIdIndex(name: string): Promise<void> {
@@ -94,6 +102,20 @@ export class QdrantStore {
       await this.client.createPayloadIndex(name, {
         field_name: 'device_id',
         field_schema: 'keyword',
+      });
+    } catch (err) {
+      if (this.isAlreadyExistsError(err)) {
+        return;
+      }
+      throw err;
+    }
+  }
+
+  private async ensureCreatedAtIndex(name: string): Promise<void> {
+    try {
+      await this.client.createPayloadIndex(name, {
+        field_name: 'created_at',
+        field_schema: 'datetime',
       });
     } catch (err) {
       if (this.isAlreadyExistsError(err)) {
@@ -179,6 +201,13 @@ export class QdrantStore {
       // least one of the requested tags (mirrors recall's pre-existing OR
       // semantics over provided tags).
       must.push({ key: 'tags', match: { any: filters.tags } });
+    }
+    if (filters?.after !== undefined || filters?.before !== undefined) {
+      // Native RFC 3339 datetime range filter on the `created_at` payload
+      // field (ISO 8601 string, unmodified since `toQdrantPayload`'s
+      // inception — see add-time-scoped-recall). Omitted entirely when
+      // neither bound is requested, so unfiltered calls are unchanged.
+      must.push({ key: 'created_at', range: { gte: filters.after, lte: filters.before } });
     }
     must.push({
       should: [

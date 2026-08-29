@@ -1757,7 +1757,7 @@ The `min_score` parameter (default 0.6) acts as a quality gate - it is applied t
 
 ### Filtering
 
-Both `recall` and `search` support namespace and collection scoping. `recall` additionally supports type and tag filtering.
+Both `recall` and `search` support namespace and collection scoping, plus time-scoped (`after`/`before`) filtering. `recall` additionally supports type and tag filtering.
 
 **Namespace filtering:** Always applied. All searches are scoped to a single namespace. There is no cross-namespace search.
 
@@ -1768,6 +1768,8 @@ Both `recall` and `search` support namespace and collection scoping. `recall` ad
 **Type filtering (`recall` only):** Pass `"type": "episodic"` | `"semantic"` | `"procedural"` to restrict results to a single memory type. The filter is pushed down into the store (a Qdrant payload filter on the semantic path, a SQL predicate on the fulltext path) so `limit` counts matching memories instead of being spent on non-matching candidates before filtering runs. A defensive post-retrieval re-check still runs and is expected to be a no-op in steady state; if it ever removes a store-returned result, a `recall_zero_after_filter` counter increments so filter starvation stays observable.
 
 **Tag filtering (`recall` only):** Pass `"tags": ["auth", "security"]` to restrict results to memories that have at least one of the specified tags (match-any). Like type filtering, this is pushed down into the store rather than applied only after retrieval.
+
+**Time-scoped filtering (`recall` and `search`):** Pass `after` and/or `before` (ISO 8601 timestamps) to restrict results to memories whose `created_at` falls within the requested window - both bounds are inclusive, and either may be omitted for an open-ended window. Bounds compare against `created_at` (when the memory was first recorded), not `updated_at` (which drives the separate recency-decay signal in composite ranking) - "what did we decide last week" means filtering on when it was recorded, not when it was last touched. Like type/tags, the filter is pushed down into the store: a Qdrant `range` payload filter on `created_at` (backed by a `datetime` payload index) on the semantic/hybrid path, and `created_at >= ?` / `created_at <= ?` SQL predicates on the fulltext path - so `limit` counts in-window matches rather than being spent on out-of-window candidates before filtering runs. A malformed timestamp or an `after` later than `before` is rejected before any store is queried. A defensive post-retrieval re-check still runs (`recall_zero_after_filter` / `search_zero_after_filter`), mirroring type/tags.
 
 ---
 
@@ -2001,7 +2003,8 @@ label-less format).
 | `bhgbrain_memory_count` | gauge | Current total memory count (updated on write/delete) |
 | `bhgbrain_rate_limit_buckets` | gauge | Active rate limit tracking buckets |
 | `bhgbrain_rate_limited_total` | counter | Total rate-limited requests |
-| `recall_zero_after_filter` | counter | Incremented when `recall`'s defensive post-retrieval type/tags re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
+| `recall_zero_after_filter` | counter | Incremented when `recall`'s defensive post-retrieval type/tags/`after`/`before` re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
+| `search_zero_after_filter` | counter | Incremented when `search`'s defensive post-retrieval `after`/`before` re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
 
 For example:
 
@@ -2566,6 +2569,8 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
 | `tags` | `string[]` | No | - | Filter to memories with at least one matching tag (match-any). Pushed down into the store so `limit` counts matching memories. |
 | `limit` | `integer (1-20)` | No | `5` | Maximum number of results. |
 | `min_score` | `number (0-1)` | No | `0.6` | Minimum cosine-similarity score, applied to `semantic_score` (not the fused/adjusted `score`). Results below this threshold are excluded. |
+| `after` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at >= after` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the store so `limit` counts matching memories. |
+| `before` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at <= before` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the store so `limit` counts matching memories. |
 
 **Output:**
 
@@ -2629,6 +2634,8 @@ Search memories using semantic, fulltext, or hybrid modes. Offers more control t
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | No | `"hybrid"` | Search algorithm. |
 | `limit` | `integer (1-50)` | No | `10` | Maximum number of results. |
 | `include_archived` | `boolean` | No | `false` | Also search archived memories (see [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving)) for a summary/tag term match. Matches are appended after active results, marked `archived: true`, and never reduce how many active results `limit` allows. Archived hits are not access-recorded. |
+| `after` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at >= after` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the vector/fulltext store so `limit` counts matching memories - `search`'s first pushed-down filter. |
+| `before` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at <= before` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the vector/fulltext store so `limit` counts matching memories. |
 
 **Output:** Same structure as `recall` - `{ "results": [...] }` - but without the `min_score` gate and supporting up to 50 results. Archived matches (when `include_archived: true`) carry `archived: true`, use the retained summary as `content`, and have no meaningful `score` (they're metadata-term matches, not ranked).
 

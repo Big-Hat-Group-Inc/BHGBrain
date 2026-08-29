@@ -1712,7 +1712,7 @@ Der Parameter `min_score` (Standard 0.6) fungiert als Qualitätssicherung – er
 
 ### Filterung
 
-Sowohl `recall` als auch `search` unterstützen Namensraum- und Sammlungs-Scoping. `recall` unterstützt zusätzlich Typ- und Tag-Filterung.
+Sowohl `recall` als auch `search` unterstützen Namensraum- und Sammlungs-Scoping sowie Zeitraum-Filterung (`after`/`before`). `recall` unterstützt zusätzlich Typ- und Tag-Filterung.
 
 **Namensraum-Filterung:** Wird immer angewendet. Alle Suchen sind auf einen einzelnen Namensraum beschränkt. Es gibt keine namensraumübergreifende Suche.
 
@@ -1723,6 +1723,8 @@ Sowohl `recall` als auch `search` unterstützen Namensraum- und Sammlungs-Scopin
 **Typ-Filterung (nur `recall`):** Übergeben Sie `"type": "episodic"` | `"semantic"` | `"procedural"`, um Ergebnisse auf einen einzelnen Speichertyp zu beschränken. Der Filter wird in den Speicher hinuntergereicht (ein Qdrant-Payload-Filter auf dem semantischen Pfad, ein SQL-Prädikat auf dem Volltext-Pfad), sodass `limit` passende Erinnerungen zählt, statt für nicht passende Kandidaten verbraucht zu werden, bevor die Filterung greift. Eine defensive Nachprüfung nach dem Abruf läuft weiterhin und sollte im Normalfall wirkungslos bleiben; entfernt sie doch einmal ein vom Speicher zurückgegebenes Ergebnis, erhöht sich ein `recall_zero_after_filter`-Zähler, damit Filter-Aushungerung beobachtbar bleibt.
 
 **Tag-Filterung (nur `recall`):** Übergeben Sie `"tags": ["auth", "security"]`, um Ergebnisse auf Erinnerungen zu beschränken, die mindestens einen der angegebenen Tags haben (beliebige Übereinstimmung). Wie bei der Typ-Filterung wird dies in den Speicher hinuntergereicht, statt erst nach dem Abruf angewendet zu werden.
+
+**Zeitraum-Filterung (`recall` und `search`):** Übergeben Sie `after` und/oder `before` (ISO-8601-Zeitstempel), um Ergebnisse auf Erinnerungen zu beschränken, deren `created_at` im angeforderten Zeitraum liegt – beide Grenzen sind einschließlich, und jede kann für ein offenes Ende weggelassen werden. Die Grenzen vergleichen mit `created_at` (wann die Erinnerung erstmals aufgezeichnet wurde), nicht mit `updated_at` (das das separate Recency-Decay-Signal im Composite Ranking steuert). Wie bei Typ/Tags wird der Filter in den Speicher hinuntergereicht, sodass `limit` Treffer innerhalb des Zeitraums zählt. Ein fehlerhafter Zeitstempel oder ein `after` nach `before` wird abgelehnt, bevor ein Speicher abgefragt wird.
 
 ---
 
@@ -1951,7 +1953,8 @@ Metriken ohne Labels, sodass die Ausgabe abwärtskompatibel zum vorherigen label
 | `bhgbrain_memory_count` | Messuhr | Aktuelle Gesamt-Erinnerungsanzahl (bei Schreiben/Löschen aktualisiert) |
 | `bhgbrain_rate_limit_buckets` | Messuhr | Aktive Rate-Limit-Verfolgungseimer |
 | `bhgbrain_rate_limited_total` | Zähler | Gesamt rate-limitierte Anfragen |
-| `recall_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive Nachprüfung von `recall` (Typ/Tags) nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
+| `recall_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive Nachprüfung von `recall` (Typ/Tags/`after`/`before`) nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
+| `search_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive `after`/`before`-Nachprüfung von `search` nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
 
 Zum Beispiel:
 
@@ -2488,6 +2491,8 @@ Die relevantesten Erinnerungen für eine Abfrage mithilfe semantischer (Vektor-)
 | `tags` | `string[]` | Nein | — | Auf Erinnerungen mit mindestens einem übereinstimmenden Tag filtern (beliebige Übereinstimmung). In den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
 | `limit` | `integer (1–20)` | Nein | `5` | Maximale Anzahl der Ergebnisse. |
 | `min_score` | `number (0–1)` | Nein | `0.6` | Mindestkosinus-Ähnlichkeitsscore, angewendet auf `semantic_score` (nicht auf den fusionierten/angepassten `score`). Ergebnisse unter diesem Schwellenwert werden ausgeschlossen. |
+| `after` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at >= after` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
+| `before` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at <= before` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
 
 **Ausgabe:**
 
@@ -2551,6 +2556,8 @@ Erinnerungen mithilfe semantischer, Volltext- oder Hybrid-Modi durchsuchen. Biet
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | Nein | `"hybrid"` | Suchalgorithmus. |
 | `limit` | `integer (1–50)` | Nein | `10` | Maximale Anzahl der Ergebnisse. |
 | `include_archived` | `boolean` | Nein | `false` | Durchsucht zusätzlich archivierte Erinnerungen (siehe [Verfall, Bereinigung und Archivierung](#verfall-bereinigung-und-archivierung)) per Zusammenfassungs-/Tag-Textabgleich. Treffer werden nach den aktiven Ergebnissen angehängt, mit `archived: true` markiert und reduzieren nie, wie viele aktive Ergebnisse `limit` zulässt. Archivtreffer werden nicht als Zugriff protokolliert. |
+| `after` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at >= after` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Vektor-/Volltextspeicher hinuntergereicht — der erste hinuntergereichte Filter von `search`. |
+| `before` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at <= before` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Vektor-/Volltextspeicher hinuntergereicht. |
 
 **Ausgabe:** Gleiche Struktur wie `recall` — `{ "results": [...] }` — aber ohne den `min_score`-Filter und mit Unterstützung von bis zu 50 Ergebnissen. Archivtreffer (bei `include_archived: true`) tragen `archived: true`, verwenden die gespeicherte Zusammenfassung als `content` und haben keinen aussagekräftigen `score` (es sind Metadaten-Texttreffer, keine gerankten Ergebnisse).
 

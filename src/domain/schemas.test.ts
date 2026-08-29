@@ -71,6 +71,36 @@ describe('RecallInputSchema', () => {
   it('rejects query over 500 chars', () => {
     expect(() => RecallInputSchema.parse({ query: 'x'.repeat(501) })).toThrow();
   });
+
+  it('accepts after-only', () => {
+    const result = RecallInputSchema.parse({ query: 'test', after: '2026-01-01T00:00:00Z' });
+    expect(result.after).toBe('2026-01-01T00:00:00Z');
+    expect(result.before).toBeUndefined();
+  });
+
+  it('accepts before-only', () => {
+    const result = RecallInputSchema.parse({ query: 'test', before: '2026-01-01T00:00:00Z' });
+    expect(result.before).toBe('2026-01-01T00:00:00Z');
+    expect(result.after).toBeUndefined();
+  });
+
+  it('rejects after later than before', () => {
+    expect(() => RecallInputSchema.parse({
+      query: 'test', after: '2026-06-01T00:00:00Z', before: '2026-01-01T00:00:00Z',
+    })).toThrow();
+  });
+
+  it('accepts after equal to before', () => {
+    const result = RecallInputSchema.parse({
+      query: 'test', after: '2026-01-01T00:00:00Z', before: '2026-01-01T00:00:00Z',
+    });
+    expect(result.after).toBe(result.before);
+  });
+
+  it('rejects a non-ISO-8601 timestamp', () => {
+    expect(() => RecallInputSchema.parse({ query: 'test', after: '2026-01-01' })).toThrow();
+    expect(() => RecallInputSchema.parse({ query: 'test', before: 'not-a-date' })).toThrow();
+  });
 });
 
 describe('ForgetInputSchema', () => {
@@ -110,6 +140,28 @@ describe('SearchInputSchema', () => {
   it('accepts an explicit include_archived: true', () => {
     const result = SearchInputSchema.parse({ query: 'test', include_archived: true });
     expect(result.include_archived).toBe(true);
+  });
+
+  it('accepts after-only', () => {
+    const result = SearchInputSchema.parse({ query: 'test', after: '2026-01-01T00:00:00Z' });
+    expect(result.after).toBe('2026-01-01T00:00:00Z');
+    expect(result.before).toBeUndefined();
+  });
+
+  it('accepts before-only', () => {
+    const result = SearchInputSchema.parse({ query: 'test', before: '2026-01-01T00:00:00Z' });
+    expect(result.before).toBe('2026-01-01T00:00:00Z');
+    expect(result.after).toBeUndefined();
+  });
+
+  it('rejects after later than before', () => {
+    expect(() => SearchInputSchema.parse({
+      query: 'test', after: '2026-06-01T00:00:00Z', before: '2026-01-01T00:00:00Z',
+    })).toThrow();
+  });
+
+  it('rejects a non-ISO-8601 timestamp', () => {
+    expect(() => SearchInputSchema.parse({ query: 'test', after: '2026-01-01' })).toThrow();
   });
 });
 

@@ -797,6 +797,171 @@ describe('handleRecall filter pushdown and score semantics (push-down-recall-fil
   });
 });
 
+describe('handleRecall after/before pushdown (add-time-scoped-recall)', () => {
+  let ctx: ToolContext;
+  let searchMock: ReturnType<typeof vi.fn>;
+
+  function makeResult(overrides: Partial<SearchResult> & { id: string }): SearchResult {
+    return {
+      content: 'content',
+      summary: 'summary',
+      type: 'semantic',
+      tags: [],
+      score: 0.9,
+      semantic_score: 0.9,
+      retention_tier: 'T2',
+      expires_at: null,
+      expiring_soon: false,
+      device_id: null,
+      created_at: '2026-03-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    searchMock = vi.fn(async () => [] as SearchResult[]);
+    ctx = {
+      config: {} as ToolContext['config'],
+      storage: {} as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: { search: searchMock } as unknown as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  });
+
+  it('pushes after/before into the search call filter', async () => {
+    await handleTool(ctx, 'recall', {
+      query: 'q', after: '2026-01-01T00:00:00Z', before: '2026-06-01T00:00:00Z', limit: 5,
+    }, 'c1');
+    expect(searchMock).toHaveBeenCalledWith(
+      'q', 'global', undefined, 'semantic', 10, undefined,
+      { type: undefined, tags: undefined, after: '2026-01-01T00:00:00Z', before: '2026-06-01T00:00:00Z' },
+    );
+  });
+
+  it('returns up to limit in-window matches instead of starving on out-of-window top candidates (regression)', async () => {
+    const matches = Array.from({ length: 5 }, (_, i) =>
+      makeResult({ id: `m${i}`, score: 0.9 - i * 0.01, semantic_score: 0.9 - i * 0.01 }));
+    searchMock.mockResolvedValue(matches);
+
+    const result = await handleTool(ctx, 'recall', {
+      query: 'q', after: '2026-01-01T00:00:00Z', before: '2026-06-01T00:00:00Z', limit: 5,
+    }, 'c1') as { results: SearchResult[] };
+
+    expect(result.results).toHaveLength(5);
+  });
+
+  it('increments recall_zero_after_filter when the defensive re-check removes an out-of-window result', async () => {
+    searchMock.mockResolvedValue([
+      makeResult({ id: 'too-old', created_at: '2025-01-01T00:00:00Z' }),
+    ]);
+
+    await handleTool(ctx, 'recall', { query: 'q', after: '2026-01-01T00:00:00Z', limit: 5 }, 'c1');
+
+    expect(ctx.metrics.incCounter).toHaveBeenCalledWith('recall_zero_after_filter');
+  });
+
+  it('does not increment recall_zero_after_filter when the store already returned only in-window results', async () => {
+    searchMock.mockResolvedValue([
+      makeResult({ id: 'in-window', created_at: '2026-03-01T00:00:00Z' }),
+    ]);
+
+    await handleTool(ctx, 'recall', { query: 'q', after: '2026-01-01T00:00:00Z', limit: 5 }, 'c1');
+
+    expect(ctx.metrics.incCounter).not.toHaveBeenCalledWith('recall_zero_after_filter');
+  });
+});
+
+describe('handleSearch after/before pushdown (add-time-scoped-recall)', () => {
+  let ctx: ToolContext;
+  let searchMock: ReturnType<typeof vi.fn>;
+
+  function makeResult(overrides: Partial<SearchResult> & { id: string }): SearchResult {
+    return {
+      content: 'content',
+      summary: 'summary',
+      type: 'semantic',
+      tags: [],
+      score: 0.9,
+      retention_tier: 'T2',
+      expires_at: null,
+      expiring_soon: false,
+      device_id: null,
+      created_at: '2026-03-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    searchMock = vi.fn(async () => [] as SearchResult[]);
+    ctx = {
+      config: {} as ToolContext['config'],
+      storage: {} as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: { search: searchMock } as unknown as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  });
+
+  it('builds and passes a filter when after/before bounds are given', async () => {
+    await handleTool(ctx, 'search', {
+      query: 'q', after: '2026-01-01T00:00:00Z', before: '2026-06-01T00:00:00Z',
+    }, 'c1');
+    expect(searchMock).toHaveBeenCalledWith(
+      'q', 'global', undefined, 'hybrid', 10, expect.any(Object),
+      { after: '2026-01-01T00:00:00Z', before: '2026-06-01T00:00:00Z' }, false,
+    );
+  });
+
+  it('still passes undefined for the filter when neither bound is given', async () => {
+    await handleTool(ctx, 'search', { query: 'q' }, 'c1');
+    expect(searchMock).toHaveBeenCalledWith(
+      'q', 'global', undefined, 'hybrid', 10, expect.any(Object), undefined, false,
+    );
+  });
+
+  it('returns up to limit in-window matches instead of starving on out-of-window top candidates (regression)', async () => {
+    const matches = Array.from({ length: 5 }, (_, i) => makeResult({ id: `m${i}`, score: 0.9 - i * 0.01 }));
+    searchMock.mockResolvedValue(matches);
+
+    const result = await handleTool(ctx, 'search', {
+      query: 'q', after: '2026-01-01T00:00:00Z', before: '2026-06-01T00:00:00Z', limit: 5,
+    }, 'c1') as { results: SearchResult[] };
+
+    expect(result.results).toHaveLength(5);
+  });
+
+  it('increments search_zero_after_filter when the defensive re-check removes an out-of-window result', async () => {
+    searchMock.mockResolvedValue([
+      makeResult({ id: 'too-old', created_at: '2025-01-01T00:00:00Z' }),
+    ]);
+
+    await handleTool(ctx, 'search', { query: 'q', after: '2026-01-01T00:00:00Z' }, 'c1');
+
+    expect(ctx.metrics.incCounter).toHaveBeenCalledWith('search_zero_after_filter');
+  });
+
+  it('does not increment search_zero_after_filter when the store already returned only in-window results', async () => {
+    searchMock.mockResolvedValue([
+      makeResult({ id: 'in-window', created_at: '2026-03-01T00:00:00Z' }),
+    ]);
+
+    await handleTool(ctx, 'search', { query: 'q', after: '2026-01-01T00:00:00Z' }, 'c1');
+
+    expect(ctx.metrics.incCounter).not.toHaveBeenCalledWith('search_zero_after_filter');
+  });
+});
+
 // add-multi-candidate-extraction task 5.5: `handleRemember` already collapses
 // a length-1 result array but returns the array unchanged otherwise
 // (src/tools/index.ts:153) — exercised here with a live multi-candidate

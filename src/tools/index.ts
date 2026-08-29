@@ -182,12 +182,16 @@ async function handleRecall(
   const input = parseInput(RecallInputSchema, args);
   logCtx.namespace = input.namespace;
 
-  // Push type/tags down into the store instead of discovering the mismatch
-  // only after `limit` candidates are already spent (push-down-recall-filters):
-  // omitted entirely when neither filter is requested, so an unfiltered
-  // recall's store call is identical to before this parameter existed.
-  const filter: RecallFilter | undefined = (input.type !== undefined || (input.tags?.length ?? 0) > 0)
-    ? { type: input.type, tags: input.tags }
+  // Push type/tags/after/before down into the store instead of discovering the
+  // mismatch only after `limit` candidates are already spent
+  // (push-down-recall-filters, extended by add-time-scoped-recall): omitted
+  // entirely when nothing was requested, so an unfiltered recall's store call
+  // is identical to before this parameter existed.
+  const filter: RecallFilter | undefined = (
+    input.type !== undefined || (input.tags?.length ?? 0) > 0
+    || input.after !== undefined || input.before !== undefined
+  )
+    ? { type: input.type, tags: input.tags, after: input.after, before: input.before }
     : undefined;
 
   // Over-fetch modestly beyond `limit` so the expired-memory exclusion inside
@@ -212,6 +216,12 @@ async function handleRecall(
   }
   if (input.tags && input.tags.length > 0) {
     filtered = filtered.filter(r => input.tags!.some(t => r.tags.includes(t)));
+  }
+  if (input.after !== undefined) {
+    filtered = filtered.filter(r => r.created_at >= input.after!);
+  }
+  if (input.before !== undefined) {
+    filtered = filtered.filter(r => r.created_at <= input.before!);
   }
   if (filtered.length < beforeDefensiveCheck) {
     ctx.metrics.incCounter('recall_zero_after_filter');
@@ -250,13 +260,39 @@ async function handleSearch(
   const input = parseInput(SearchInputSchema, args);
   logCtx.namespace = input.namespace;
   const signal: { degraded?: boolean } = {};
+
+  // `search` gains its first pushed-down filter here (add-time-scoped-recall):
+  // still `undefined` when neither bound is requested, so an unfiltered
+  // search's store call is unchanged. `search` has no `type`/`tags`
+  // parameters, so this filter is `after`/`before` only.
+  const filter: RecallFilter | undefined = (input.after !== undefined || input.before !== undefined)
+    ? { after: input.after, before: input.before }
+    : undefined;
+
   const results = await ctx.search.search(
     input.query, input.namespace, input.collection, input.mode, input.limit, signal,
-    undefined, input.include_archived,
+    filter, input.include_archived,
   );
+
+  // Defensive post-retrieval re-check for after/before, mirroring `handleRecall`'s
+  // type/tags re-check: the store is the primary filtering mechanism, so this
+  // should be a no-op in steady state, and its removals are counted separately
+  // from `recall`'s counter since they are scoped to a different tool.
+  const beforeDefensiveCheck = results.length;
+  let filtered = results;
+  if (input.after !== undefined) {
+    filtered = filtered.filter(r => r.created_at >= input.after!);
+  }
+  if (input.before !== undefined) {
+    filtered = filtered.filter(r => r.created_at <= input.before!);
+  }
+  if (filtered.length < beforeDefensiveCheck) {
+    ctx.metrics.incCounter('search_zero_after_filter');
+  }
+
   // `degraded` is true when hybrid mode fell back to fulltext-only (embedding /
   // vector store unavailable), so callers can tell it from a healthy result.
-  return { results, degraded: signal.degraded ?? false };
+  return { results: filtered, degraded: signal.degraded ?? false };
 }
 
 async function handleTag(

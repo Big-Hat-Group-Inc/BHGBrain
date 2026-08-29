@@ -15,14 +15,20 @@ export type HealthStatus = 'healthy' | 'degraded' | 'unhealthy';
 export type VectorReconciliationState = 'reconciled' | 'reconciling' | 'pending';
 
 /**
- * Type/tags predicate pushed down into the vector and fulltext stores so a
+ * Type/tags/time predicate pushed down into the vector and fulltext stores so a
  * recall's `limit` counts matching memories instead of unfiltered top-K
  * candidates (see `push-down-recall-filters`). Tag matching is OR (match
- * any provided tag), matching the pre-existing recall semantics.
+ * any provided tag), matching the pre-existing recall semantics. `after`/
+ * `before` (ISO 8601, inclusive) bound a memory's `created_at` — not
+ * `updated_at` — so they answer "when was this recorded", independent of the
+ * separate recency-decay signal `updated_at` drives elsewhere (see
+ * `add-time-scoped-recall`).
  */
 export interface RecallFilter {
   type?: MemoryType;
   tags?: string[];
+  after?: string;
+  before?: string;
 }
 
 export type ErrorCode =

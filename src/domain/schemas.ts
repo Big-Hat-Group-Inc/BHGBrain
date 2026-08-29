@@ -43,7 +43,12 @@ export const RecallInputSchema = z.object({
   tags: TagsSchema.optional(),
   limit: z.number().int().min(1).max(20).default(5),
   min_score: z.number().min(0).max(1).default(0.6),
-}).strict();
+  after: z.string().datetime().optional(),
+  before: z.string().datetime().optional(),
+}).strict().refine(
+  data => data.after === undefined || data.before === undefined || data.after <= data.before,
+  { message: 'after must not be later than before', path: ['after'] },
+);
 
 export const ForgetInputSchema = z.object({
   id: z.string().uuid(),
@@ -59,7 +64,12 @@ export const SearchInputSchema = z.object({
   // appended after active results, marked `archived: true`, and never count
   // against `limit`'s reduction of active results — see `search/index.ts`.
   include_archived: z.boolean().optional().default(false),
-}).strict();
+  after: z.string().datetime().optional(),
+  before: z.string().datetime().optional(),
+}).strict().refine(
+  data => data.after === undefined || data.before === undefined || data.after <= data.before,
+  { message: 'after must not be later than before', path: ['after'] },
+);
 
 export const TagInputSchema = z.object({
   id: z.string().uuid(),
