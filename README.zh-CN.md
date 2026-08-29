@@ -398,6 +398,21 @@ BHGBrain 从以下位置加载配置文件：
         "T3": 0.02
       }
     },
+    // 可选的 LLM 重排序阶段，仅用于 `recall`（详见下方"重排序"）。
+    // 默认禁用：启用后，会将查询和每个候选项的文本发送给配置的 LLM
+    // 进行相关性判断，替换 `score`（不影响 `semantic_score`，因此
+    // min_score 过滤不受影响）。需要单独配置 BHGBRAIN_RERANK_API_KEY。
+    "rerank": {
+      "enabled": false,
+      "provider": "openai",
+      // 每次调用发送给 LLM 的 recall 已排名候选项数量。1-50。
+      "candidate_pool": 20,
+      "model": "gpt-4o-mini",
+      "model_env": "BHGBRAIN_RERANK_API_KEY",
+      // 任何失败（超时、非 2xx 响应、格式错误的响应）都会降级为
+      // 重排序前的顺序，而不会导致 recall 调用失败。
+      "timeout_ms": 3000
+    },
     // 最大边际相关性（MMR）多样性重排序，在复合排名之后应用
     // （详见下方"MMR 多样性重排序"）。enabled 设为 false 可精确恢复
     // 纯复合相关性排序。
@@ -533,6 +548,7 @@ BHGBrain 从以下位置加载配置文件：
 | `QDRANT_API_KEY` | Qdrant Cloud 时必需 | — | 在配置中将 `qdrant.api_key_env` 设置为此变量名称。默认配置字段名为 `QDRANT_API_KEY`。 |
 | `BHGBRAIN_DEVICE_ID` | 否 | 从主机名自动生成 | 覆盖多设备设置的设备标识符。参见[设备身份解析](#设备身份解析)。 |
 | `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key，在 `pipeline.extraction_enabled` 为 `true` 时使用。也是 `pipeline.summarization_model_env` 的默认值（在 `pipeline.summarization_enabled` 为 `true` 时使用）——如需为摘要使用独立的 key，可将该字段指向其他变量。多查询扩展的 LLM 改写/HyDE 阶段（`search.query_expansion.llm_paraphrase.enabled`，详见[多查询扩展](#多查询扩展)）也会读取此变量，其解析方式与此相同：先读取 `pipeline.extraction_model_env`，未设置时回退到 `OPENAI_API_KEY`。 |
+| `BHGBRAIN_RERANK_API_KEY` | 否 | 无（**不会**回退到 `OPENAI_API_KEY`） | 可选的 `recall` 重排序阶段使用的 API key，在 `search.rerank.enabled` 为 `true` 时使用。与 `BHGBRAIN_EXTRACTION_API_KEY` 不同，它没有隐式回退——启用重排序是一次刻意的、使用独立 key 的选择，绝不会悄悄消耗嵌入或提取的 key/预算。详见[重排序](#重排序)。 |
 
 生成安全的 Bearer token：
 
@@ -1685,6 +1701,40 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | 应用于 `age_days` 的各层级指数衰减率。`T2` 的默认值给出约 87 天的半衰期，与其 90 天 TTL 相吻合。 |
 
 **复合排名*不*影响的内容：** 每条结果上原始的 `semantic_score` 和 `fulltext_score` 字段，以及 `recall` 的 `min_score` 阈值所作用的字段（`semantic_score`）——参见 [Recall 与 Search 的区别](#recall-与-search-的区别)。复合排名改变的是结果的*排序*，绝不会改变哪些记忆能通过 `min_score` 关卡。
+
+---
+
+### 重排序
+
+`recall` 支持一个可选阶段，在 `min_score` 过滤和截断到 `limit` 之前，用 LLM 相关性判断对候选池重新打分。上文的复合排名和 MMR 都完全依据查询嵌入来决定排序——这是一个粗略的代理，能可靠地把候选范围收窄到一个合理的前 20，但经常把这前 20 的顺序排错。重排序为每次 `recall` 多付出一次 LLM 调用，把查询和每个候选项的*文本*放在一起判断，代价是额外的延迟。
+
+**默认禁用。** 标准安装永远不会发起这次额外调用——在设置 `search.rerank.enabled: true` 之前，`recall` 与此前完全一致，逐字节不变。
+
+**排名流水线顺序：** 相关性 → 复合先验 → MMR 多样性重排序 → **重排序**（仅 `recall`）→ `min_score` 过滤和截断到 `limit`。
+
+**工作原理：**
+1. 启用后，`recall` 会将其获取的候选池扩大到至少 `search.rerank.candidate_pool`。
+2. 排名靠前的 `candidate_pool` 个候选项（按重排序前的分数）与查询文本一起，通过一次批量调用发送给配置的 LLM。
+3. LLM 为每个候选项返回一个 `[0, 1]` 范围的相关性判断。每个成功打分的候选项的 `score` 会被替换为限幅后的判断值（其原始值同时作为 `rerank_score` 暴露在结果中），整个列表按新的 `score` 重新排序。
+4. 响应中遗漏的候选项，或无法解析的候选项，会保留其重排序前的分数，而不会被丢弃。
+5. 之后 `min_score` 和 `limit` 的应用方式与之前完全相同——`min_score` 是针对 `semantic_score` 校准的，重排序从不改动它，因此无论是否运行了重排序，过滤和结果归属都不受影响。
+
+**失败总是优雅降级：** 提供方错误、超时或格式错误的响应都会降级为重排序前的顺序——`recall` 绝不会因重排序失败而失败。这种降级可通过 `search_rerank_degraded` 指标计数器和结构化的 `rerank_degraded` 警告日志观察到。
+
+**仅限于 `recall`：** 在此版本中，`search` 以及 `memory://inject`/`memory://inject/{hint}` 不受 `search.rerank` 配置影响。
+
+**配置**（`config.json` 中的 `search.rerank`，参见[配置](#配置)）：
+
+| 字段 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `false` | 设为 `true` 以为 `recall` 启用重排序阶段。 |
+| `provider` | `"openai"` | 重排序提供方。目前唯一支持的值。 |
+| `candidate_pool` | `20` | 每次调用发送给 LLM 的 recall 已排名候选项数量，`1`-`50`。 |
+| `model` | `"gpt-4o-mini"` | 用于打分的 chat-completions 模型。 |
+| `model_env` | `"BHGBRAIN_RERANK_API_KEY"` | 持有 API key 的环境变量名称。**不会**回退到 `OPENAI_API_KEY`——参见[环境变量](#环境变量)。 |
+| `timeout_ms` | `3000` | 请求超时时间；超时和其他任何失败一样会降级为重排序前的顺序。 |
+
+**独立于提取流水线：** 重排序解析自己的 `search.rerank.model`/`model_env`，绝不会读取 `pipeline.extraction_model`/`extraction_model_env`——无论 `pipeline.extraction_enabled` 是否设置，它都能正常工作。
 
 ---
 

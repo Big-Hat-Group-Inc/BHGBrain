@@ -450,6 +450,23 @@ The file is created automatically on first run with all defaults applied. Edit i
         "T3": 0.02
       }
     },
+    // Opt-in LLM rerank stage for `recall` only (see "Rerank" below). Disabled
+    // by default: when enabled, sends the query and each candidate's text to
+    // the configured LLM for a relevance judgment, replacing `score` (never
+    // `semantic_score`, so min_score filtering is unaffected) for scored
+    // candidates. Requires its own BHGBRAIN_RERANK_API_KEY.
+    "rerank": {
+      "enabled": false,
+      "provider": "openai",
+      // How many of recall's (already-ranked) candidates to send to the LLM
+      // per call. 1-50.
+      "candidate_pool": 20,
+      "model": "gpt-4o-mini",
+      "model_env": "BHGBRAIN_RERANK_API_KEY",
+      // Any failure (timeout, non-2xx, malformed response) degrades to the
+      // pre-rerank order rather than failing the recall call.
+      "timeout_ms": 3000
+    },
     // Maximal Marginal Relevance diversity reordering, applied after composite
     // ranking (see "MMR Diversity Reranking" below). Set enabled: false to
     // restore composite-relevance-only ordering exactly.
@@ -600,6 +617,7 @@ The file is created automatically on first run with all defaults applied. Edit i
 | `QDRANT_API_KEY` | Required for Qdrant Cloud | — | Set `qdrant.api_key_env` in config to the name of this variable. The default config field name is `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generated from hostname | Override the device identifier for multi-device setups. See [Device Identity Resolution](#device-identity-resolution). |
 | `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model, used when `pipeline.extraction_enabled` is `true`. Also the default value of `pipeline.summarization_model_env` (used when `pipeline.summarization_enabled` is `true`) — point that field at a different variable if you want a separate key for summarization. Also read by multi-query expansion's LLM paraphrase/HyDE phase (`search.query_expansion.llm_paraphrase.enabled`, see [Multi-Query Expansion](#multi-query-expansion)), which resolves the key from `pipeline.extraction_model_env` the same way, falling back to `OPENAI_API_KEY` when unset. |
+| `BHGBRAIN_RERANK_API_KEY` | No | — (**no** fallback to `OPENAI_API_KEY`) | API key for the opt-in `recall` rerank stage, used when `search.rerank.enabled` is `true`. Unlike `BHGBRAIN_EXTRACTION_API_KEY`, this has no implicit fallback — enabling reranking is a deliberate, separately-keyed opt-in that never silently consumes the embedding or extraction key/budget. See [Rerank](#rerank). |
 
 Generate a secure bearer token:
 
@@ -1775,6 +1793,40 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Per-tier exponential decay rate applied to `age_days`. `T2`'s default gives a half-life of roughly 87 days, aligned with its 90-day TTL. |
 
 **What composite ranking does *not* affect:** the raw `semantic_score` and `fulltext_score` fields on each result, and the field `recall`'s `min_score` threshold applies to (`semantic_score`) - see [Recall vs Search](#recall-vs-search---differences). Composite ranking changes result *ordering*, never which memories clear the `min_score` gate.
+
+---
+
+### Rerank
+
+`recall` supports an opt-in stage that re-scores its candidate pool with an LLM relevance judgment before `min_score` filtering and truncation to `limit`. Composite ranking and MMR (above) both derive their ordering entirely from the query embedding — a coarse proxy that reliably narrows the field to a plausible top 20 but routinely misorders that top 20. Reranking spends one extra LLM call per `recall` to judge the query and each candidate's *text* together, at the cost of added latency.
+
+**Disabled by default.** Stock installs never make the extra call — `recall` is byte-for-byte unchanged until `search.rerank.enabled: true` is set.
+
+**Ranking pipeline order:** relevance → composite prior → MMR diversity reorder → **rerank** (`recall` only) → `min_score` filtering and truncation to `limit`.
+
+**How it works:**
+1. When enabled, `recall` widens its fetched candidate pool to at least `search.rerank.candidate_pool`.
+2. The top `candidate_pool` candidates (by pre-rerank score) are sent to the configured LLM in a single batched call, alongside the query text.
+3. The LLM returns a relevance judgment in `[0, 1]` per candidate. Each successfully-scored candidate's `score` is replaced with the clamped judgment (its raw value is also exposed as `rerank_score` on the result), and the full list is re-sorted by the new `score`.
+4. Any candidate the response omits, or that fails to parse, keeps its pre-rerank `score` rather than being dropped.
+5. `min_score` and `limit` are then applied exactly as before — `min_score` is calibrated against `semantic_score`, which reranking never touches, so filtering and result membership are unaffected by whether reranking ran.
+
+**Failure is always graceful:** a provider error, timeout, or malformed response degrades to the pre-rerank order — `recall` never fails because reranking failed. The degradation is observable via a `search_rerank_degraded` metric counter and a structured `rerank_degraded` warning log.
+
+**Scoped to `recall` only:** `search` and `memory://inject`/`memory://inject/{hint}` are unaffected by `search.rerank` configuration in this release.
+
+**Configuration** (`search.rerank` in `config.json`, see [Configuration](#configuration)):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Set `true` to turn on the rerank stage for `recall`. |
+| `provider` | `"openai"` | Rerank provider. Currently the only supported value. |
+| `candidate_pool` | `20` | How many of `recall`'s (already-ranked) candidates to send to the LLM per call, `1`-`50`. |
+| `model` | `"gpt-4o-mini"` | Chat-completions model used for scoring. |
+| `model_env` | `"BHGBRAIN_RERANK_API_KEY"` | Name of the environment variable holding the API key. **No fallback** to `OPENAI_API_KEY` — see [Environment Variables](#environment-variables). |
+| `timeout_ms` | `3000` | Request timeout; a timeout degrades to the pre-rerank order like any other failure. |
+
+**Independent of the extraction pipeline:** reranking resolves its own `search.rerank.model`/`model_env` and never reads `pipeline.extraction_model`/`extraction_model_env` — it works regardless of whether `pipeline.extraction_enabled` is set.
 
 ---
 

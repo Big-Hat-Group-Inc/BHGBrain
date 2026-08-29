@@ -211,6 +211,87 @@ describe('pipeline.contradiction_detection config', () => {
   });
 });
 
+describe('search.rerank config (add-opt-in-rerank-stage)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to disabled with the documented defaults when omitted', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.search.rerank).toEqual({
+      enabled: false,
+      provider: 'openai',
+      candidate_pool: 20,
+      model: 'gpt-4o-mini',
+      model_env: 'BHGBRAIN_RERANK_API_KEY',
+      timeout_ms: 3000,
+    });
+  });
+
+  it('honors explicit overrides', () => {
+    const configPath = writeConfig({
+      search: {
+        rerank: {
+          enabled: true,
+          candidate_pool: 10,
+          model: 'gpt-4o',
+          model_env: 'MY_RERANK_KEY',
+          timeout_ms: 1500,
+        },
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.search.rerank).toEqual({
+      enabled: true,
+      provider: 'openai',
+      candidate_pool: 10,
+      model: 'gpt-4o',
+      model_env: 'MY_RERANK_KEY',
+      timeout_ms: 1500,
+    });
+  });
+
+  it('rejects candidate_pool: 0 (below the minimum)', () => {
+    const configPath = writeConfig({ search: { rerank: { candidate_pool: 0 } } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects candidate_pool: 51 (above the maximum)', () => {
+    const configPath = writeConfig({ search: { rerank: { candidate_pool: 51 } } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects an unsupported provider value', () => {
+    const configPath = writeConfig({ search: { rerank: { provider: 'anthropic' } } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a non-positive timeout_ms', () => {
+    const configPath = writeConfig({ search: { rerank: { timeout_ms: 0 } } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
 describe('consolidation config (add-duplicate-cluster-consolidation)', () => {
   const tempDirs: string[] = [];
 

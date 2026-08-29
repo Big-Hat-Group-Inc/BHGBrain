@@ -8,6 +8,7 @@ import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { embeddingUnavailable, internal } from '../errors/index.js';
 import { cosineSimilarity } from './similarity.js';
 import { buildVariants, type QueryExpansionProvider } from './query-expansion.js';
+import type { RerankProvider } from '../rerank/index.js';
 
 const RRF_K = 60;
 
@@ -83,6 +84,10 @@ export class SearchService {
     // (deterministic keyword-stripped variant) exactly as if
     // `llm_paraphrase.enabled` were false.
     private queryExpansion?: QueryExpansionProvider,
+    // Optional opt-in rerank provider (add-opt-in-rerank-stage). Undefined
+    // for every caller that predates this parameter, and whenever
+    // `search.rerank.enabled` is false — `rerank()` is a no-op in that case.
+    private rerankProvider?: RerankProvider,
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
   }
@@ -497,6 +502,47 @@ export class SearchService {
     }
 
     return selected;
+  }
+
+  // Opt-in LLM rerank stage (add-opt-in-rerank-stage), called only from
+  // `handleRecall` when `search.rerank.enabled`. Scores the top `poolSize`
+  // of `results` (already composite/MMR-ranked) against `query`, replacing
+  // `score` (never `semantic_score`, so `min_score` filtering stays
+  // unaffected) for every candidate the provider actually scored, and
+  // re-sorts the *full* list by the resulting `score` descending. Candidates
+  // outside the pool, or omitted from a partial provider response, keep
+  // their pre-rerank `score` and no `rerank_score` — never dropped.
+  //
+  // Mirrors `hybridSearch`'s embedding-degradation shape
+  // (`src/search/index.ts:345-357`): any provider failure (network error,
+  // timeout, malformed/invalid response) is caught here, counted, logged,
+  // and degrades to the pre-rerank order — `recall` never fails because
+  // reranking failed.
+  async rerank(query: string, results: SearchResult[], poolSize: number): Promise<SearchResult[]> {
+    if (!this.rerankProvider || results.length === 0) return results;
+
+    const pool = results.slice(0, poolSize);
+    const rest = results.slice(poolSize);
+
+    try {
+      const scores = await this.rerankProvider.score(
+        query,
+        pool.map(r => ({ id: r.id, text: r.content })),
+      );
+      const rerankedPool = pool.map(r => {
+        const score = scores.get(r.id);
+        if (score === undefined) return r;
+        return { ...r, score, rerank_score: score };
+      });
+      return [...rerankedPool, ...rest].sort((a, b) => b.score - a.score);
+    } catch (err) {
+      this.metrics?.incCounter('search_rerank_degraded');
+      this.logger?.warn({
+        event: 'rerank_degraded',
+        message: (err as Error).message,
+      });
+      return results;
+    }
   }
 
   private buildSearchResults(

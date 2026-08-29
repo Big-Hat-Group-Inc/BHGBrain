@@ -208,6 +208,22 @@ const ConfigSchema = z.object({
         T3: z.number().nonnegative().default(0.02),
       }).default({}),
     }).default({}),
+    // Opt-in LLM rerank stage: re-scores `recall`'s candidate pool by sending
+    // the query and each candidate's text to a configured LLM, replacing
+    // `score` (not `semantic_score`, so `min_score` filtering is unaffected)
+    // for successfully-scored candidates. `enabled: false` (default) means
+    // `recall` is byte-for-byte unchanged from before this capability
+    // existed — no network call, no ordering change. Independent of
+    // `pipeline.extraction_model`/`extraction_model_env`: resolves its own
+    // `model`/`model_env`. See add-opt-in-rerank-stage.
+    rerank: z.object({
+      enabled: z.boolean().default(false),
+      provider: z.enum(['openai']).default('openai'),
+      candidate_pool: z.number().int().min(1).max(50).default(20),
+      model: z.string().default('gpt-4o-mini'),
+      model_env: z.string().default('BHGBRAIN_RERANK_API_KEY'),
+      timeout_ms: z.number().int().positive().default(3000),
+    }).default({}),
     // Maximal Marginal Relevance diversity reordering applied to `recall`/
     // `search`'s composite-ranked candidate pool (never a truncator — see
     // `add-mmr-diversity-reranking`). `enabled: false` restores

@@ -12,6 +12,7 @@ import { createExtractionProvider, warnIfExtractionDegraded } from './pipeline/e
 import { createSummarizationProvider, warnIfSummarizationDegraded } from './summarization/index.js';
 import { SearchService } from './search/index.js';
 import { createQueryExpansionProvider, warnIfQueryExpansionDegraded } from './search/query-expansion.js';
+import { createRerankProvider, warnIfRerankDegraded, OpenAiRerankProvider } from './rerank/index.js';
 import { BackupService } from './backup/index.js';
 import { RetentionService } from './backup/retention.js';
 import { CleanupScheduler } from './backup/scheduler.js';
@@ -70,6 +71,13 @@ async function main() {
   // but a failing paraphrase/HyDE call must not trip the breaker guarding the
   // write-pipeline's extraction call, or vice versa.
   const queryExpansionBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
+  // Always constructed (cheap, stateless until used) so it exists regardless
+  // of `search.rerank.enabled`, mirroring `embeddingBreaker`/`qdrantBreaker`
+  // (add-opt-in-rerank-stage design.md "Bootstrap wiring"). Only added to
+  // `HealthService`'s breakers map below when a live provider is actually
+  // constructed, so `health://status` reports it exactly when reranking is
+  // configured.
+  const rerankBreaker = new CircuitBreaker({ ...breakerOptions, key: 'rerank', logger });
   const metrics = new MetricsCollector(config);
   const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
@@ -92,6 +100,17 @@ async function main() {
   // aggregate health status.
   const queryExpansion = createQueryExpansionProvider(config, { breaker: queryExpansionBreaker, metrics, logger });
   warnIfQueryExpansionDegraded(queryExpansion, config, logger);
+  // Only instantiated when reranking is opted in (add-opt-in-rerank-stage):
+  // stock installs never construct a `RerankProvider`, so `SearchService`
+  // gets `undefined` and `recall` stays byte-for-byte unchanged. Enabling it
+  // with a missing/invalid `search.rerank.model_env` value falls back to the
+  // degraded provider (logged below) rather than crashing startup.
+  const rerank = config.search.rerank.enabled
+    ? createRerankProvider(config, { breaker: rerankBreaker, metrics })
+    : undefined;
+  if (rerank) {
+    warnIfRerankDegraded(rerank, config, logger);
+  }
   const storage = new StorageManager(sqlite, qdrant, embedding, metrics, config, summarization);
 
   // Bootstrap: hydrate SQLite from Qdrant if this is a new device
@@ -126,12 +145,20 @@ async function main() {
 
   // Initialize services
   const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics, summarization);
-  const searchService = new SearchService(config, storage, embedding, metrics, logger, queryExpansion);
+  const searchService = new SearchService(config, storage, embedding, metrics, logger, queryExpansion, rerank);
   const backupService = new BackupService(config, storage, logger);
-  const healthService = new HealthService(storage, embedding, config, {
+  const healthBreakers: Record<string, CircuitBreaker> = {
     [embeddingBreakerKey]: embeddingBreaker,
     qdrant: qdrantBreaker,
-  }, logger);
+  };
+  // Reported in `health://status` only when a live (non-degraded) rerank
+  // provider was actually constructed, so an open breaker here degrades
+  // aggregate health precisely when reranking is configured and failing —
+  // not on every stock install where reranking is off.
+  if (rerank instanceof OpenAiRerankProvider) {
+    healthBreakers.rerank = rerankBreaker;
+  }
+  const healthService = new HealthService(storage, embedding, config, healthBreakers, logger);
 
   // Scheduled cleanup: same execution path as `bhgbrain gc`, run on
   // `retention.cleanup_schedule` for the lifetime of this long-running

@@ -206,9 +206,18 @@ async function handleRecall(
   // When MMR is eligible (recall is semantic-only, so no mode check is
   // needed), widen the pool further using the config-driven formula so there
   // is genuine diversity headroom beyond `limit` (add-mmr-diversity-reranking).
-  const fetchLimit = ctx.config.search.mmr.enabled
+  const baseFetchLimit = ctx.config.search.mmr.enabled
     ? Math.min(input.limit * ctx.config.search.mmr.candidate_pool_multiplier, ctx.config.search.mmr.candidate_pool_cap)
     : Math.min(input.limit * 2, 40);
+
+  // When reranking is enabled, widen the pool at least up to
+  // `search.rerank.candidate_pool` (capped at 40, the same ceiling the
+  // pre-rerank formula already used) so the rerank stage has a meaningful
+  // pool to score even for a small `limit`, without ever narrowing whatever
+  // MMR already widened it to (add-opt-in-rerank-stage).
+  const fetchLimit = ctx.config.search.rerank.enabled
+    ? Math.max(baseFetchLimit, Math.min(ctx.config.search.rerank.candidate_pool, 40))
+    : baseFetchLimit;
 
   const results = await ctx.search.search(
     input.query, input.namespace, input.collection, 'semantic', fetchLimit, undefined, filter,
@@ -235,6 +244,26 @@ async function handleRecall(
   }
   if (filtered.length < beforeDefensiveCheck) {
     ctx.metrics.incCounter('recall_zero_after_filter');
+  }
+
+  // Opt-in LLM rerank stage (add-opt-in-rerank-stage): runs after the
+  // defensive type/tag/date re-check and before `min_score` filtering, so a
+  // rerank score never influences filter membership — only ordering.
+  // `SearchService.rerank` already degrades to the pre-rerank list
+  // internally on any provider failure (mirroring `hybridSearch`'s
+  // embedding-degradation path), so this try/catch is defense in depth —
+  // it guarantees `recall` cannot fail because reranking failed even if
+  // that internal contract is ever violated.
+  if (ctx.config.search.rerank.enabled) {
+    try {
+      filtered = await ctx.search.rerank(input.query, filtered, ctx.config.search.rerank.candidate_pool);
+    } catch (err) {
+      ctx.metrics.incCounter('search_rerank_degraded');
+      ctx.logger.warn({
+        event: 'rerank_degraded',
+        message: (err as Error).message,
+      });
+    }
   }
 
   // min_score is calibrated for cosine similarity, so it is applied to

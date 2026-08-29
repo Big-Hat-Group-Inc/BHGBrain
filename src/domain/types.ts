@@ -96,6 +96,16 @@ export interface SearchResult {
   score: number;
   semantic_score?: number;
   fulltext_score?: number;
+  // Populated only when `recall`'s opt-in rerank stage
+  // (`SearchService.rerank`, gated on `search.rerank.enabled`) actually
+  // scored this candidate — the raw, clamped LLM relevance judgment in
+  // `[0, 1]` that `score` was overwritten with. Absent (not `false`/`null`)
+  // for every result reranking did not touch, same "absent, not
+  // false/null" convention `archived`/`vector` already use on this
+  // interface. `semantic_score` is left untouched by reranking, so
+  // `min_score` filtering (which reads `semantic_score ?? score`) is
+  // unaffected. See add-opt-in-rerank-stage.
+  rerank_score?: number;
   retention_tier: RetentionTier;
   expires_at?: string | null;
   expiring_soon?: boolean;

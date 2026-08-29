@@ -3,7 +3,7 @@ import { SearchService } from './index.js';
 import type { BrainConfig } from '../config/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
-import type { MemoryRecord } from '../domain/types.js';
+import type { MemoryRecord, SearchResult } from '../domain/types.js';
 import type { StorageManager } from '../storage/index.js';
 
 type StoredMemory = Omit<MemoryRecord, 'embedding'>;
@@ -17,6 +17,7 @@ describe('SearchService', () => {
     mmr?: BrainConfig['search']['mmr'];
     queryExpansion?: BrainConfig['search']['query_expansion'];
     queryExpansionProvider?: import('./query-expansion.js').QueryExpansionProvider;
+    rerankProvider?: import('../rerank/index.js').RerankProvider;
   } = {}) {
     const memories = opts.memories ?? new Map([
       ['mem-1', {
@@ -118,7 +119,9 @@ describe('SearchService', () => {
     const logger = { warn: vi.fn() };
 
     return {
-      service: new SearchService(config, storage, embedding, metrics, logger, opts.queryExpansionProvider),
+      service: new SearchService(
+        config, storage, embedding, metrics, logger, opts.queryExpansionProvider, opts.rerankProvider,
+      ),
       storage,
       embedding,
       metrics,
@@ -1064,6 +1067,93 @@ describe('SearchService', () => {
       // caller.
       const results = await service.search('how do we deploy', 'global', undefined, 'semantic', 10);
       expect(results.map(r => r.id).sort()).toEqual(['mem-keyword-only', 'mem-literal']);
+    });
+  });
+
+  // add-opt-in-rerank-stage
+  describe('rerank', () => {
+    function fakeResult(id: string, score: number): SearchResult {
+      return {
+        id,
+        content: `content for ${id}`,
+        summary: id,
+        type: 'semantic',
+        tags: [],
+        score,
+        retention_tier: 'T2',
+        created_at: '2026-01-01T00:00:00Z',
+        last_accessed: '2026-01-01T00:00:00Z',
+      };
+    }
+
+    it('is a no-op when no rerank provider is injected', async () => {
+      const { service } = createSearchService();
+      const results = [fakeResult('a', 0.5), fakeResult('b', 0.9)];
+      const reranked = await service.rerank('q', results, 20);
+      expect(reranked).toBe(results);
+    });
+
+    it('replaces score and sets rerank_score only for scored candidates within poolSize', async () => {
+      const rerankProvider = {
+        provider: 'openai',
+        score: vi.fn(async () => new Map([['a', 0.1], ['b', 0.95]])),
+      };
+      const { service } = createSearchService({ rerankProvider });
+      const results = [fakeResult('a', 0.5), fakeResult('b', 0.4), fakeResult('c', 0.3)];
+      const reranked = await service.rerank('q', results, 2);
+
+      expect(rerankProvider.score).toHaveBeenCalledWith('q', [
+        { id: 'a', text: 'content for a' },
+        { id: 'b', text: 'content for b' },
+      ]);
+
+      const byId = new Map(reranked.map(r => [r.id, r]));
+      expect(byId.get('a')).toMatchObject({ score: 0.1, rerank_score: 0.1 });
+      expect(byId.get('b')).toMatchObject({ score: 0.95, rerank_score: 0.95 });
+      // Outside the pool: untouched, no rerank_score.
+      expect(byId.get('c')).toMatchObject({ score: 0.3 });
+      expect(byId.get('c')?.rerank_score).toBeUndefined();
+    });
+
+    it('keeps unscored candidates from a partial response at their pre-rerank score', async () => {
+      const rerankProvider = {
+        provider: 'openai',
+        // Only scores 'a'; 'b' is omitted (simulating a partial LLM response).
+        score: vi.fn(async () => new Map([['a', 0.2]])),
+      };
+      const { service } = createSearchService({ rerankProvider });
+      const results = [fakeResult('a', 0.5), fakeResult('b', 0.6)];
+      const reranked = await service.rerank('q', results, 20);
+
+      const byId = new Map(reranked.map(r => [r.id, r]));
+      expect(byId.get('a')).toMatchObject({ score: 0.2, rerank_score: 0.2 });
+      expect(byId.get('b')).toMatchObject({ score: 0.6 });
+      expect(byId.get('b')?.rerank_score).toBeUndefined();
+    });
+
+    it('re-sorts the full list by the resulting score descending', async () => {
+      const rerankProvider = {
+        provider: 'openai',
+        score: vi.fn(async () => new Map([['a', 0.1], ['b', 0.9]])),
+      };
+      const { service } = createSearchService({ rerankProvider });
+      const results = [fakeResult('a', 0.99), fakeResult('b', 0.01)];
+      const reranked = await service.rerank('q', results, 20);
+      expect(reranked.map(r => r.id)).toEqual(['b', 'a']);
+    });
+
+    it('degrades to the pre-rerank list, counts, and logs on provider failure', async () => {
+      const rerankProvider = {
+        provider: 'openai',
+        score: vi.fn(async () => { throw new Error('rerank api down'); }),
+      };
+      const { service, metrics, logger } = createSearchService({ rerankProvider });
+      const results = [fakeResult('a', 0.5), fakeResult('b', 0.9)];
+      const reranked = await service.rerank('q', results, 20);
+
+      expect(reranked).toEqual(results);
+      expect(metrics.incCounter).toHaveBeenCalledWith('search_rerank_degraded');
+      expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'rerank_degraded' }));
     });
   });
 });

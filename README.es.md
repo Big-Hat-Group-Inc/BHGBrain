@@ -405,6 +405,24 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
         "T3": 0.02
       }
     },
+    // Etapa opcional de rerank con LLM, solo para `recall` (ver "Rerank" más
+    // abajo). Deshabilitada por defecto: cuando está activa, envía la
+    // consulta y el texto de cada candidato al LLM configurado para obtener
+    // un juicio de relevancia, reemplazando `score` (nunca `semantic_score`,
+    // por lo que el filtrado por min_score no se ve afectado) para los
+    // candidatos puntuados. Requiere su propia BHGBRAIN_RERANK_API_KEY.
+    "rerank": {
+      "enabled": false,
+      "provider": "openai",
+      // Cuántos de los candidatos ya rankeados de `recall` se envían al LLM
+      // por llamada. 1-50.
+      "candidate_pool": 20,
+      "model": "gpt-4o-mini",
+      "model_env": "BHGBRAIN_RERANK_API_KEY",
+      // Cualquier fallo (timeout, respuesta no 2xx, respuesta malformada)
+      // degrada al orden previo al rerank en lugar de fallar la llamada a recall.
+      "timeout_ms": 3000
+    },
     // Reordenamiento por diversidad de Maximal Marginal Relevance, aplicado
     // después del ranking compuesto (ver "Reordenamiento por Diversidad MMR"
     // más abajo). enabled: false restaura exactamente el orden por
@@ -563,6 +581,7 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
 | `QDRANT_API_KEY` | Requerida para Qdrant Cloud | — | Establece `qdrant.api_key_env` en la configuración con el nombre de esta variable. El nombre predeterminado del campo de configuración es `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generado desde el hostname | Anular el identificador de dispositivo para configuraciones multi-dispositivo. Ver [Resolución de Identidad de Dispositivo](#resolución-de-identidad-de-dispositivo). |
 | `BHGBRAIN_EXTRACTION_API_KEY` | No | Usa `OPENAI_API_KEY` como respaldo | Clave API para el modelo de extracción LLM, usada cuando `pipeline.extraction_enabled` es `true`. También el valor por defecto de `pipeline.summarization_model_env` (usado cuando `pipeline.summarization_enabled` es `true`) — apunta ese campo a otra variable si quieres una clave separada para el resumen. También la lee la fase de paráfrasis/HyDE con LLM de la expansión de consultas múltiples (`search.query_expansion.llm_paraphrase.enabled`, ver [Expansión de Consultas Múltiples](#expansión-de-consultas-múltiples)), que resuelve la clave de la misma forma desde `pipeline.extraction_model_env`, usando `OPENAI_API_KEY` como respaldo si no está definida. |
+| `BHGBRAIN_RERANK_API_KEY` | No | — (**sin** respaldo a `OPENAI_API_KEY`) | Clave API para la etapa opcional de rerank de `recall`, usada cuando `search.rerank.enabled` es `true`. A diferencia de `BHGBRAIN_EXTRACTION_API_KEY`, no tiene respaldo implícito — activar el rerank es una decisión deliberada con clave propia, que nunca consume silenciosamente la clave/presupuesto de embeddings o extracción. Ver [Rerank](#rerank). |
 
 Generar un bearer token seguro:
 
@@ -1738,6 +1757,40 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Tasa de decadencia exponencial por nivel aplicada a `age_days`. El predeterminado de `T2` da una vida media de aproximadamente 87 días, alineada con su TTL de 90 días. |
 
 **Lo que el ranking compuesto *no* afecta:** los campos crudos `semantic_score` y `fulltext_score` de cada resultado, y el campo al que se aplica el umbral `min_score` de `recall` (`semantic_score`) — ver [Recall vs Search](#recall-vs-search--diferencias). El ranking compuesto cambia el *orden* de los resultados, nunca qué memorias superan el filtro `min_score`.
+
+---
+
+### Rerank
+
+`recall` admite una etapa opcional que vuelve a puntuar su pool de candidatos con un juicio de relevancia del LLM antes del filtrado por `min_score` y el corte a `limit`. Tanto el ranking compuesto como el MMR (arriba) derivan su orden completamente del embedding de la consulta — un proxy tosco que reduce de forma fiable el campo a un top-20 plausible, pero que frecuentemente ordena mal ese top-20. El rerank invierte una llamada adicional al LLM por cada `recall` para juzgar juntos la consulta y el *texto* de cada candidato, a costa de latencia adicional.
+
+**Deshabilitado por defecto.** Las instalaciones estándar nunca hacen la llamada adicional — `recall` permanece exactamente igual hasta que se establece `search.rerank.enabled: true`.
+
+**Orden de la canalización de ranking:** relevancia → prior compuesto → reordenamiento de diversidad MMR → **rerank** (solo `recall`) → filtrado por `min_score` y corte a `limit`.
+
+**Cómo funciona:**
+1. Cuando está activo, `recall` amplía su pool de candidatos obtenidos a al menos `search.rerank.candidate_pool`.
+2. Los `candidate_pool` candidatos principales (según su puntuación previa al rerank) se envían al LLM configurado en una sola llamada agrupada, junto con el texto de la consulta.
+3. El LLM devuelve un juicio de relevancia en `[0, 1]` por candidato. El `score` de cada candidato puntuado con éxito se reemplaza por el juicio recortado (su valor bruto también se expone como `rerank_score` en el resultado), y la lista completa se reordena según el nuevo `score`.
+4. Cualquier candidato que la respuesta omita, o que no se pueda parsear, conserva su puntuación previa al rerank en lugar de ser descartado.
+5. `min_score` y `limit` se aplican después exactamente igual que antes — `min_score` está calibrado contra `semantic_score`, que el rerank nunca toca, por lo que el filtrado y la pertenencia de resultados no se ven afectados por si el rerank se ejecutó o no.
+
+**El fallo siempre degrada con elegancia:** un error del proveedor, un timeout o una respuesta malformada degradan al orden previo al rerank — `recall` nunca falla porque el rerank haya fallado. La degradación es observable mediante el contador de métrica `search_rerank_degraded` y un log de advertencia estructurado `rerank_degraded`.
+
+**Limitado únicamente a `recall`:** `search` y `memory://inject`/`memory://inject/{hint}` no se ven afectados por la configuración de `search.rerank` en esta versión.
+
+**Configuración** (`search.rerank` en `config.json`, ver [Configuración](#configuración)):
+
+| Campo | Predeterminado | Significado |
+|---|---|---|
+| `enabled` | `false` | Establecer `true` para activar la etapa de rerank en `recall`. |
+| `provider` | `"openai"` | Proveedor de rerank. Actualmente el único valor soportado. |
+| `candidate_pool` | `20` | Cuántos de los candidatos ya rankeados de `recall` se envían al LLM por llamada, `1`-`50`. |
+| `model` | `"gpt-4o-mini"` | Modelo de chat-completions usado para puntuar. |
+| `model_env` | `"BHGBRAIN_RERANK_API_KEY"` | Nombre de la variable de entorno con la clave API. **Sin respaldo** a `OPENAI_API_KEY` — ver [Variables de Entorno](#variables-de-entorno). |
+| `timeout_ms` | `3000` | Timeout de la solicitud; un timeout degrada al orden previo al rerank como cualquier otro fallo. |
+
+**Independiente de la canalización de extracción:** el rerank resuelve su propio `search.rerank.model`/`model_env` y nunca lee `pipeline.extraction_model`/`extraction_model_env` — funciona sin importar si `pipeline.extraction_enabled` está activo.
 
 ---
 

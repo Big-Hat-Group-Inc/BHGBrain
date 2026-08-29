@@ -194,7 +194,7 @@ describe('search tool include_archived wiring', () => {
   it('passes include_archived through to SearchService.search', async () => {
     const search = vi.fn(async () => []);
     const ctx: ToolContext = {
-      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
+      config: { search: { mmr: { enabled: false }, rerank: { enabled: false, candidate_pool: 20 } } } as unknown as ToolContext['config'],
       storage: {} as StorageManager,
       embedding: {} as EmbeddingProvider,
       pipeline: {} as WritePipeline,
@@ -215,7 +215,7 @@ describe('search tool include_archived wiring', () => {
   it('defaults include_archived to false', async () => {
     const search = vi.fn(async () => []);
     const ctx: ToolContext = {
-      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
+      config: { search: { mmr: { enabled: false }, rerank: { enabled: false, candidate_pool: 20 } } } as unknown as ToolContext['config'],
       storage: {} as StorageManager,
       embedding: {} as EmbeddingProvider,
       pipeline: {} as WritePipeline,
@@ -974,7 +974,7 @@ describe('handleRecall filter pushdown and score semantics (push-down-recall-fil
   beforeEach(() => {
     searchMock = vi.fn(async () => [] as SearchResult[]);
     ctx = {
-      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
+      config: { search: { mmr: { enabled: false }, rerank: { enabled: false, candidate_pool: 20 } } } as unknown as ToolContext['config'],
       storage: {} as StorageManager,
       embedding: {} as EmbeddingProvider,
       pipeline: {} as WritePipeline,
@@ -1059,7 +1059,7 @@ describe('handleRecall filter pushdown and score semantics (push-down-recall-fil
       ...ctx,
       config: { search: { mmr: {
         enabled: true, lambda: 0.7, candidate_pool_multiplier: 3, candidate_pool_cap: 50,
-      } } } as unknown as ToolContext['config'],
+      }, rerank: { enabled: false, candidate_pool: 20 } } } as unknown as ToolContext['config'],
     };
     // 6 qualifying (semantic_score >= 0.5) interleaved with 2 non-qualifying,
     // in an order that does not follow relevance ranking (as MMR's reorder
@@ -1082,6 +1082,101 @@ describe('handleRecall filter pushdown and score semantics (push-down-recall-fil
     expect(result.results).toHaveLength(5);
     expect(result.results.every(r => (r.semantic_score ?? r.score) >= 0.5)).toBe(true);
     expect(result.results.some(r => r.id === 'bad-1' || r.id === 'bad-2')).toBe(false);
+  });
+});
+
+describe('handleRecall rerank stage (add-opt-in-rerank-stage)', () => {
+  function makeResult(overrides: Partial<SearchResult> & { id: string }): SearchResult {
+    return {
+      content: 'content',
+      summary: 'summary',
+      type: 'semantic',
+      tags: [],
+      score: 0.9,
+      retention_tier: 'T2',
+      expires_at: null,
+      expiring_soon: false,
+      device_id: null,
+      created_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+      ...overrides,
+    };
+  }
+
+  function makeCtx(
+    rerankEnabled: boolean,
+    searchMock: ReturnType<typeof vi.fn>,
+    rerankMock: ReturnType<typeof vi.fn>,
+  ): ToolContext {
+    return {
+      config: {
+        search: {
+          mmr: { enabled: false },
+          rerank: { enabled: rerankEnabled, candidate_pool: 20 },
+        },
+      } as unknown as ToolContext['config'],
+      storage: {} as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: { search: searchMock, rerank: rerankMock } as unknown as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('calls ctx.search.rerank with the candidate pool and applies min_score/limit to the reranked list when enabled', async () => {
+    const preRerank = [
+      makeResult({ id: 'a', score: 0.5, semantic_score: 0.5 }),
+      makeResult({ id: 'b', score: 0.4, semantic_score: 0.4 }),
+    ];
+    const searchMock = vi.fn(async () => preRerank);
+    // Simulates SearchService.rerank's contract: full list, re-sorted, with
+    // rerank_score populated on the (here, both) scored candidates.
+    const reranked = [
+      makeResult({ id: 'b', score: 0.95, semantic_score: 0.4, rerank_score: 0.95 }),
+      makeResult({ id: 'a', score: 0.1, semantic_score: 0.5, rerank_score: 0.1 }),
+    ];
+    const rerankMock = vi.fn(async () => reranked);
+    const ctx = makeCtx(true, searchMock, rerankMock);
+
+    const result = await handleTool(
+      ctx, 'recall', { query: 'q', limit: 5, min_score: 0 }, 'c1',
+    ) as { results: SearchResult[] };
+
+    expect(rerankMock).toHaveBeenCalledWith('q', preRerank, 20);
+    // Ordering reflects the reranked list, not the pre-rerank order.
+    expect(result.results.map(r => r.id)).toEqual(['b', 'a']);
+    expect(result.results[0]?.rerank_score).toBe(0.95);
+  });
+
+  it('does not call ctx.search.rerank and is unaffected when disabled (default)', async () => {
+    const preRerank = [makeResult({ id: 'a', score: 0.9, semantic_score: 0.9 })];
+    const searchMock = vi.fn(async () => preRerank);
+    const rerankMock = vi.fn();
+    const ctx = makeCtx(false, searchMock, rerankMock);
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5 }, 'c1') as { results: SearchResult[] };
+
+    expect(rerankMock).not.toHaveBeenCalled();
+    expect(result.results).toEqual(preRerank);
+  });
+
+  it('does not throw, increments search_rerank_degraded, and returns pre-rerank ordering on rerank failure', async () => {
+    const preRerank = [
+      makeResult({ id: 'a', score: 0.9, semantic_score: 0.9 }),
+      makeResult({ id: 'b', score: 0.8, semantic_score: 0.8 }),
+    ];
+    const searchMock = vi.fn(async () => preRerank);
+    const rerankMock = vi.fn(async () => { throw new Error('rerank api down'); });
+    const ctx = makeCtx(true, searchMock, rerankMock);
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5 }, 'c1') as { results: SearchResult[] };
+
+    expect(result.results.map(r => r.id)).toEqual(['a', 'b']);
+    expect(ctx.metrics.incCounter).toHaveBeenCalledWith('search_rerank_degraded');
+    expect(ctx.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'rerank_degraded' }));
   });
 });
 
@@ -1110,7 +1205,7 @@ describe('handleRecall after/before pushdown (add-time-scoped-recall)', () => {
   beforeEach(() => {
     searchMock = vi.fn(async () => [] as SearchResult[]);
     ctx = {
-      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
+      config: { search: { mmr: { enabled: false }, rerank: { enabled: false, candidate_pool: 20 } } } as unknown as ToolContext['config'],
       storage: {} as StorageManager,
       embedding: {} as EmbeddingProvider,
       pipeline: {} as WritePipeline,
@@ -1189,7 +1284,7 @@ describe('handleSearch after/before pushdown (add-time-scoped-recall)', () => {
   beforeEach(() => {
     searchMock = vi.fn(async () => [] as SearchResult[]);
     ctx = {
-      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
+      config: { search: { mmr: { enabled: false }, rerank: { enabled: false, candidate_pool: 20 } } } as unknown as ToolContext['config'],
       storage: {} as StorageManager,
       embedding: {} as EmbeddingProvider,
       pipeline: {} as WritePipeline,
@@ -1710,7 +1805,7 @@ describe('handleRecall follow_links (add-memory-links)', () => {
     listMemoryLinksMock = vi.fn(() => []);
     getMemoryByIdMock = vi.fn(() => null);
     ctx = {
-      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
+      config: { search: { mmr: { enabled: false }, rerank: { enabled: false, candidate_pool: 20 } } } as unknown as ToolContext['config'],
       storage: {
         sqlite: { listMemoryLinks: listMemoryLinksMock, getMemoryById: getMemoryByIdMock },
       } as unknown as StorageManager,
