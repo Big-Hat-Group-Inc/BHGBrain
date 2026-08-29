@@ -3,6 +3,7 @@ import { WritePipeline } from './index.js';
 import type { BrainConfig } from '../config/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { StorageManager } from '../storage/index.js';
+import type { ExtractionProvider } from './extraction.js';
 import { checkEntailment } from './entailment.js';
 
 vi.mock('./entailment.js', () => ({
@@ -490,5 +491,180 @@ describe('WritePipeline contradiction detection', () => {
       collection: 'general',
       error: 'entailment check timed out after 5000ms',
     }));
+  });
+});
+
+describe('WritePipeline multi-candidate extraction', () => {
+  const config = {
+    deduplication: { similarity_threshold: 0.92 },
+    pipeline: {
+      extraction_enabled: true,
+      fallback_to_threshold_dedup: true,
+      extraction_model: 'gpt-4o-mini',
+      extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
+      extraction_min_chars: 20,
+      extraction_max_candidates: 6,
+      extraction_timeout_ms: 4000,
+      contradiction_detection: { enabled: false, timeout_ms: 5000 },
+    },
+  } as unknown as BrainConfig;
+
+  let embedding: EmbeddingProvider;
+  let storage: StorageManager;
+  let extraction: ExtractionProvider;
+
+  beforeEach(() => {
+    vi.mocked(checkEntailment).mockReset();
+    embedding = {
+      model: 'test-model',
+      dimensions: 2,
+      embed: vi.fn(async () => [0.1, 0.2]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
+      healthCheck: vi.fn(async () => true),
+    };
+    storage = {
+      sqlite: {
+        getMemoryByChecksum: vi.fn(() => null),
+        getMemoryById: vi.fn(() => null),
+        insertMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+        fullTextSearch: vi.fn(() => []),
+      },
+      qdrant: {
+        searchSimilar: vi.fn(async () => []),
+      },
+      updateMemory: vi.fn(),
+      writeMemory: vi.fn(),
+      writeMemoryWithoutVector: vi.fn(),
+      deleteMemory: vi.fn(async () => true),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+    extraction = { extractCandidates: vi.fn(async () => null) };
+  });
+
+  it('never invokes the extraction provider below extraction_min_chars, emitting a single candidate', async () => {
+    extraction.extractCandidates = vi.fn(async () => [{ content: 'should not be used' }]);
+    const pipeline = new WritePipeline(config, storage, embedding, undefined, extraction);
+
+    const result = await pipeline.process({
+      content: 'short',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(extraction.extractCandidates).not.toHaveBeenCalled();
+    expect(result).toHaveLength(1);
+    expect(storage.writeMemory).toHaveBeenCalledTimes(1);
+  });
+
+  it('invokes the extraction provider at or above extraction_min_chars and writes N independent candidates', async () => {
+    extraction.extractCandidates = vi.fn(async () => [
+      { content: 'Alice owns the infra repo', type: 'semantic', importance: 0.7 },
+      { content: 'Deploys go through GitHub Actions' },
+      { content: 'We use pnpm instead of npm' },
+    ]);
+    const pipeline = new WritePipeline(config, storage, embedding, undefined, extraction);
+
+    const result = await pipeline.process({
+      content: 'We use pnpm not npm, deploys go through GitHub Actions, and Alice owns the infra repo',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(extraction.extractCandidates).toHaveBeenCalledTimes(1);
+    expect(result).toHaveLength(3);
+    expect(result.every(r => r.operation === 'ADD')).toBe(true);
+    expect(storage.writeMemory).toHaveBeenCalledTimes(3);
+  });
+
+  it('falls back to the single-candidate path when the extraction provider returns null', async () => {
+    extraction.extractCandidates = vi.fn(async () => null);
+    const pipeline = new WritePipeline(config, storage, embedding, undefined, extraction);
+
+    const result = await pipeline.process({
+      content: 'a sufficiently long single-fact piece of content to clear the gate',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result).toHaveLength(1);
+    expect(storage.writeMemory).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to the single-candidate path when the extraction provider throws', async () => {
+    extraction.extractCandidates = vi.fn(async () => { throw new Error('extraction backend down'); });
+    const pipeline = new WritePipeline(config, storage, embedding, undefined, extraction);
+
+    const result = await pipeline.process({
+      content: 'a sufficiently long single-fact piece of content to clear the gate',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result).toHaveLength(1);
+    expect(storage.writeMemory).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns the successful WriteResults and logs/counts a mid-batch candidate failure without losing siblings', async () => {
+    extraction.extractCandidates = vi.fn(async () => [
+      { content: 'candidate one' },
+      { content: 'candidate two' },
+      { content: 'candidate three' },
+    ]);
+    storage.qdrant.searchSimilar = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockRejectedValueOnce(new Error('vector store unavailable'))
+      .mockResolvedValueOnce([]);
+    const logger = { warn: vi.fn() };
+    const metrics = { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as import('../health/metrics.js').MetricsCollector;
+    const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics);
+
+    const result = await pipeline.process({
+      content: 'three candidates where the middle one fails during similarity search',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result).toHaveLength(2);
+    expect(storage.writeMemory).toHaveBeenCalledTimes(2);
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'candidate_write_failed',
+      namespace: 'global',
+      collection: 'general',
+      candidate_index: 1,
+      error: 'vector store unavailable',
+    }));
+    expect(metrics.incCounter).toHaveBeenCalledWith('extraction_candidate_failed_total');
+  });
+
+  it('rethrows when every candidate in the batch fails', async () => {
+    extraction.extractCandidates = vi.fn(async () => [
+      { content: 'candidate one' },
+      { content: 'candidate two' },
+    ]);
+    storage.qdrant.searchSimilar = vi.fn(async () => { throw new Error('vector store unavailable'); });
+    const pipeline = new WritePipeline(config, storage, embedding, undefined, extraction);
+
+    await expect(
+      pipeline.process({
+        content: 'two candidates where both fail during similarity search',
+        namespace: 'global',
+        collection: 'general',
+        tags: [],
+        source: 'cli',
+      }),
+    ).rejects.toThrow('vector store unavailable');
+
+    expect(storage.writeMemory).not.toHaveBeenCalled();
   });
 });

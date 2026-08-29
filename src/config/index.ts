@@ -209,9 +209,22 @@ const ConfigSchema = z.object({
     log_level: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
   }).default({}),
   pipeline: z.object({
-    extraction_enabled: z.boolean().default(true),
+    // Default is `false`: this flag was previously live configuration that
+    // had zero effect (extraction was always deterministic single-candidate).
+    // Now that it actually gates an LLM call, every existing install would
+    // silently start spending on extraction if this defaulted on — see
+    // add-multi-candidate-extraction proposal.
+    extraction_enabled: z.boolean().default(false),
     extraction_model: z.string().default('gpt-4o-mini'),
     extraction_model_env: z.string().default('BHGBRAIN_EXTRACTION_API_KEY'),
+    // Cost/latency bounds for the extraction LLM call (add-multi-candidate-extraction).
+    // Content shorter than this skips the LLM call entirely and goes straight
+    // to single-candidate extraction.
+    extraction_min_chars: z.number().int().nonnegative().default(120),
+    // Candidates beyond this cap are dropped (not merged) and logged/counted.
+    extraction_max_candidates: z.number().int().positive().default(6),
+    // Enforced via AbortController on the chat-completions fetch.
+    extraction_timeout_ms: z.number().int().positive().default(4000),
     fallback_to_threshold_dedup: z.boolean().default(true),
     // Opt-in LLM entailment check for UPDATE-band writes that don't already
     // trip the regex-based `detectsInvalidation` fast path (see

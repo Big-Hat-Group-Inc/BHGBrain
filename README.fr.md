@@ -449,12 +449,24 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
 
   // Paramètres du pipeline d'ingestion
   "pipeline": {
-    // Activer le passage d'extraction (exécute actuellement une extraction déterministe à candidat unique)
-    "extraction_enabled": true,
-    // Modèle utilisé pour l'extraction basée sur LLM (prévu pour un usage futur)
+    // Active l'extraction multi-candidats basée sur LLM : divise le contenu
+    // `remember` à faits multiples en souvenirs candidats atomiques avant
+    // déduplication/écriture. Par défaut false — opt-in délibéré, car
+    // l'activer dépense un appel LLM (coût + latence) sur chaque `remember`
+    // suffisamment long. Quand false, ou si aucune clé API ne se résout,
+    // l'extraction émet toujours exactement un candidat (comportement actuel).
+    "extraction_enabled": false,
+    // Modèle de chat-completions utilisé pour l'extraction
     "extraction_model": "gpt-4o-mini",
-    // Nom de la variable d'env pour la clé API du modèle d'extraction
+    // Nom de la variable d'env pour la clé API du modèle d'extraction ; se rabat sur OPENAI_API_KEY
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // Un contenu plus court que ceci (caractères) saute l'appel LLM et passe
+    // directement à l'extraction à candidat unique
+    "extraction_min_chars": 120,
+    // Les candidats au-delà de cette limite sont abandonnés (pas fusionnés), journalisés et comptés
+    "extraction_max_candidates": 6,
+    // Délai d'expiration de la requête d'extraction en millisecondes, appliqué via AbortController
+    "extraction_timeout_ms": 4000,
     // Quand true, se rabat sur la déduplication par somme de contrôle + similarité plein texte si l'embedding est indisponible
     "fallback_to_threshold_dedup": true
   },
@@ -474,7 +486,7 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
 | `BHGBRAIN_TOKEN` | Obligatoire pour HTTP non-loopback | — | Token Bearer pour l'authentification HTTP. Le serveur **refuse de démarrer** si l'hôte est non-loopback et que ce token n'est pas défini (sauf si `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Obligatoire pour Qdrant Cloud | — | Définissez `qdrant.api_key_env` dans la configuration sur le nom de cette variable. Le nom de champ de configuration par défaut est `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | Non | Auto-généré à partir du hostname | Remplace l'identifiant de l'appareil pour les configurations multi-appareils. Voir [Résolution de l'identité de l'appareil](#résolution-de-lidentité-de-lappareil). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | Non | Se rabat sur `OPENAI_API_KEY` | Clé API pour le modèle d'extraction LLM (usage futur). |
+| `BHGBRAIN_EXTRACTION_API_KEY` | Non | Se rabat sur `OPENAI_API_KEY` | Clé API pour le modèle d'extraction LLM, utilisée quand `pipeline.extraction_enabled` vaut `true`. |
 
 Générez un token Bearer sécurisé :
 
@@ -2303,6 +2315,38 @@ Stocke du contenu dans BHGBrain avec déduplication automatique, normalisation, 
 - `NOOP` — doublon exact ou quasi-exact ; souvenir existant renvoyé
 
 Pour les opérations `UPDATE`, `merged_with_id` contient l'ID du souvenir qui a été mis à jour.
+
+**Extraction multi-candidats :** quand `pipeline.extraction_enabled` vaut `true`
+(par défaut `false`) et que le contenu fait au moins `pipeline.extraction_min_chars`
+caractères, `remember` peut diviser un contenu à faits multiples en plusieurs
+souvenirs candidats atomiques via un appel LLM, chacun dédupliqué/classé
+indépendamment. Dans ce cas, l'outil renvoie un **tableau JSON** des mêmes objets
+par candidat que ci-dessus — une entrée par candidat — au lieu d'un seul objet :
+
+```json
+[
+  {
+    "id": "3f4a1b2c-...",
+    "summary": "Alice owns the infra repo",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  },
+  {
+    "id": "9c7d2e5f-...",
+    "summary": "Deploys go through GitHub Actions",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  }
+]
+```
+
+Tout échec d'extraction (erreur réseau, timeout, réponse malformée/vide) se replie
+de manière transparente sur la réponse à objet unique actuelle — l'extraction ne
+bloque ni ne fait jamais échouer un appel `remember`. Tout appelant qui suppose que
+`remember` renvoie toujours un objet unique doit être mis à jour pour distinguer
+tableau et objet avant d'activer `extraction_enabled`.
 
 **Exemples :**
 

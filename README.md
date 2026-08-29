@@ -490,12 +490,24 @@ The file is created automatically on first run with all defaults applied. Edit i
 
   // Ingestion pipeline settings
   "pipeline": {
-    // Enable the extraction pass (currently runs deterministic single-candidate extraction)
-    "extraction_enabled": true,
-    // Model used for LLM-based extraction (planned for future use)
+    // Enable LLM-backed multi-candidate extraction: splits multi-fact `remember`
+    // content into atomic candidate memories before dedup/write. Defaults to
+    // false — opt in deliberately, since enabling it spends an LLM call (cost +
+    // latency) on every sufficiently long `remember`. When false, or when no API
+    // key resolves, extraction always emits exactly one candidate (today's
+    // behavior).
+    "extraction_enabled": false,
+    // Chat-completions model used for extraction
     "extraction_model": "gpt-4o-mini",
-    // Env var name for the extraction model API key
+    // Env var name for the extraction model API key; falls back to OPENAI_API_KEY
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // Content shorter than this (chars) skips the LLM call entirely and goes
+    // straight to single-candidate extraction
+    "extraction_min_chars": 120,
+    // Candidates beyond this cap are dropped (not merged), logged, and counted
+    "extraction_max_candidates": 6,
+    // Extraction request timeout in milliseconds, enforced via AbortController
+    "extraction_timeout_ms": 4000,
     // When true, fall back to checksum + full-text-similarity dedup if embedding is unavailable
     "fallback_to_threshold_dedup": true
   },
@@ -516,7 +528,7 @@ The file is created automatically on first run with all defaults applied. Edit i
 | `BHGBRAIN_TOKEN` | Required for non-loopback HTTP | — | Bearer token for HTTP authentication. Server **refuses to start** if the host is non-loopback and this is unset (unless `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Required for Qdrant Cloud | — | Set `qdrant.api_key_env` in config to the name of this variable. The default config field name is `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generated from hostname | Override the device identifier for multi-device setups. See [Device Identity Resolution](#device-identity-resolution). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model (future use). |
+| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model, used when `pipeline.extraction_enabled` is `true`. |
 
 Generate a secure bearer token:
 
@@ -2373,6 +2385,37 @@ Store content in BHGBrain with automatic deduplication, normalization, embedding
 - `NOOP` - exact or near-exact duplicate; existing memory returned
 
 For `UPDATE` operations, `merged_with_id` contains the ID of the memory that was updated.
+
+**Multi-candidate extraction:** when `pipeline.extraction_enabled` is `true` (default
+`false`) and the content is at least `pipeline.extraction_min_chars` long, `remember`
+may split multi-fact content into several atomic candidate memories via an LLM call,
+each independently deduplicated/classified. In that case the tool returns a **JSON
+array** of the same per-candidate object shown above — one entry per candidate —
+instead of a single object:
+
+```json
+[
+  {
+    "id": "3f4a1b2c-...",
+    "summary": "Alice owns the infra repo",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  },
+  {
+    "id": "9c7d2e5f-...",
+    "summary": "Deploys go through GitHub Actions",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  }
+]
+```
+
+Extraction failure of any kind (network error, timeout, malformed/empty response) falls
+back to today's single-object response transparently — extraction never blocks or fails
+a `remember` call. Any caller that assumes `remember` always returns a single object
+must be updated to branch on array-vs-object before enabling `extraction_enabled`.
 
 **Examples:**
 

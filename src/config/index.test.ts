@@ -211,6 +211,72 @@ describe('pipeline.contradiction_detection config', () => {
   });
 });
 
+describe('pipeline extraction config (add-multi-candidate-extraction)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults extraction_enabled to false and the three bounded-cost fields to their documented defaults', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.extraction_enabled).toBe(false);
+    expect(config.pipeline.extraction_min_chars).toBe(120);
+    expect(config.pipeline.extraction_max_candidates).toBe(6);
+    expect(config.pipeline.extraction_timeout_ms).toBe(4000);
+  });
+
+  it('accepts explicit overrides for the three bounded-cost fields', () => {
+    const configPath = writeConfig({
+      pipeline: {
+        extraction_enabled: true,
+        extraction_min_chars: 50,
+        extraction_max_candidates: 3,
+        extraction_timeout_ms: 8000,
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.pipeline.extraction_enabled).toBe(true);
+    expect(config.pipeline.extraction_min_chars).toBe(50);
+    expect(config.pipeline.extraction_max_candidates).toBe(3);
+    expect(config.pipeline.extraction_timeout_ms).toBe(8000);
+  });
+
+  it('rejects a non-positive extraction_max_candidates', () => {
+    const configPath = writeConfig({
+      pipeline: { extraction_max_candidates: 0 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a negative extraction_min_chars', () => {
+    const configPath = writeConfig({
+      pipeline: { extraction_min_chars: -1 },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
 const ENV_KEYS = [
   'BHGBRAIN_DATA_DIR',
   'BHGBRAIN_HTTP_HOST',

@@ -446,12 +446,24 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
 
   // Configuración del pipeline de ingesta
   "pipeline": {
-    // Habilitar el paso de extracción (actualmente ejecuta extracción determinística de un solo candidato)
-    "extraction_enabled": true,
-    // Modelo usado para extracción basada en LLM (planificado para uso futuro)
+    // Habilita la extracción multi-candidato basada en LLM: divide contenido de
+    // `remember` con múltiples hechos en memorias candidatas atómicas antes de
+    // deduplicar/escribir. Por defecto false — opt-in deliberado, ya que
+    // habilitarlo gasta una llamada LLM (coste + latencia) en cada `remember`
+    // suficientemente largo. Cuando es false, o si no se resuelve ninguna clave
+    // API, la extracción siempre emite exactamente un candidato (comportamiento actual).
+    "extraction_enabled": false,
+    // Modelo de chat-completions usado para la extracción
     "extraction_model": "gpt-4o-mini",
-    // Nombre de la variable de entorno para la clave API del modelo de extracción
+    // Nombre de la variable de entorno para la clave API del modelo de extracción; recurre a OPENAI_API_KEY
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // El contenido más corto que esto (caracteres) omite la llamada LLM y va
+    // directamente a la extracción de un solo candidato
+    "extraction_min_chars": 120,
+    // Los candidatos que superen este límite se descartan (no se fusionan), se registran y se cuentan
+    "extraction_max_candidates": 6,
+    // Tiempo de espera de la solicitud de extracción en milisegundos, forzado vía AbortController
+    "extraction_timeout_ms": 4000,
     // Cuando es true, recurre a dedup por checksum + similitud de texto completo si el embedding no está disponible
     "fallback_to_threshold_dedup": true
   },
@@ -471,7 +483,7 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
 | `BHGBRAIN_TOKEN` | Requerida para HTTP no-loopback | — | Bearer token para autenticación HTTP. El servidor **se niega a iniciar** si el host es no-loopback y esto no está configurado (a menos que `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Requerida para Qdrant Cloud | — | Establece `qdrant.api_key_env` en la configuración con el nombre de esta variable. El nombre predeterminado del campo de configuración es `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generado desde el hostname | Anular el identificador de dispositivo para configuraciones multi-dispositivo. Ver [Resolución de Identidad de Dispositivo](#resolución-de-identidad-de-dispositivo). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | No | Usa `OPENAI_API_KEY` como respaldo | Clave API para el modelo de extracción LLM (uso futuro). |
+| `BHGBRAIN_EXTRACTION_API_KEY` | No | Usa `OPENAI_API_KEY` como respaldo | Clave API para el modelo de extracción LLM, usada cuando `pipeline.extraction_enabled` es `true`. |
 
 Generar un bearer token seguro:
 
@@ -2300,6 +2312,39 @@ Almacena contenido en BHGBrain con deduplicación automática, normalización, e
 - `NOOP` — duplicado exacto o casi exacto; se devuelve la memoria existente
 
 Para operaciones `UPDATE`, `merged_with_id` contiene el ID de la memoria que fue actualizada.
+
+**Extracción multi-candidato:** cuando `pipeline.extraction_enabled` es `true`
+(predeterminado `false`) y el contenido tiene al menos `pipeline.extraction_min_chars`
+de longitud, `remember` puede dividir contenido con múltiples hechos en varias
+memorias candidatas atómicas mediante una llamada LLM, cada una deduplicada/clasificada
+de forma independiente. En ese caso la herramienta devuelve un **array JSON** con los
+mismos objetos por candidato mostrados arriba — una entrada por candidato — en lugar
+de un solo objeto:
+
+```json
+[
+  {
+    "id": "3f4a1b2c-...",
+    "summary": "Alice owns the infra repo",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  },
+  {
+    "id": "9c7d2e5f-...",
+    "summary": "Deploys go through GitHub Actions",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  }
+]
+```
+
+Cualquier fallo de extracción (error de red, timeout, respuesta malformada/vacía)
+recurre de forma transparente a la respuesta de objeto único actual — la extracción
+nunca bloquea ni hace fallar una llamada a `remember`. Cualquier llamador que asuma
+que `remember` siempre devuelve un solo objeto debe actualizarse para distinguir entre
+array y objeto antes de habilitar `extraction_enabled`.
 
 **Ejemplos:**
 

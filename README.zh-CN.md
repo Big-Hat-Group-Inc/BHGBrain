@@ -435,12 +435,21 @@ BHGBrain 从以下位置加载配置文件：
 
   // 数据摄入管道设置
   "pipeline": {
-    // 启用提取阶段（当前运行确定性单候选提取）
-    "extraction_enabled": true,
-    // 用于基于 LLM 提取的模型（计划用于未来功能）
+    // 启用基于 LLM 的多候选提取：在去重/写入之前，将包含多个事实的 `remember`
+    // 内容拆分为原子候选记忆。默认值为 false——需要主动启用，因为启用后每次
+    // 足够长的 `remember` 都会消耗一次 LLM 调用（成本 + 延迟）。为 false 时，
+    // 或未能解析出 API key 时，提取始终只生成一个候选（当前行为）。
+    "extraction_enabled": false,
+    // 用于提取的 chat-completions 模型
     "extraction_model": "gpt-4o-mini",
-    // 提取模型 API key 的环境变量名称
+    // 提取模型 API key 的环境变量名称；回退到 OPENAI_API_KEY
     "extraction_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
+    // 短于此长度（字符数）的内容会跳过 LLM 调用，直接进入单候选提取
+    "extraction_min_chars": 120,
+    // 超过此上限的候选会被丢弃（而非合并），并记录日志和计数
+    "extraction_max_candidates": 6,
+    // 提取请求超时（毫秒），通过 AbortController 强制执行
+    "extraction_timeout_ms": 4000,
     // 为 true 时，若嵌入不可用则回退到校验和 + 全文相似度去重
     "fallback_to_threshold_dedup": true
   },
@@ -460,7 +469,7 @@ BHGBrain 从以下位置加载配置文件：
 | `BHGBRAIN_TOKEN` | 非回环 HTTP 时必需 | — | HTTP 认证的 Bearer token。若主机地址为非回环且此变量未设置，服务器**拒绝启动**（除非 `allow_unauthenticated_http: true`）。 |
 | `QDRANT_API_KEY` | Qdrant Cloud 时必需 | — | 在配置中将 `qdrant.api_key_env` 设置为此变量名称。默认配置字段名为 `QDRANT_API_KEY`。 |
 | `BHGBRAIN_DEVICE_ID` | 否 | 从主机名自动生成 | 覆盖多设备设置的设备标识符。参见[设备身份解析](#设备身份解析)。 |
-| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key（用于未来功能）。 |
+| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key，在 `pipeline.extraction_enabled` 为 `true` 时使用。 |
 
 生成安全的 Bearer token：
 
@@ -2251,6 +2260,34 @@ BHGBrain 暴露 11 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 - `NOOP`——精确或近似重复；返回现有记忆的 ID
 
 对于 `UPDATE` 操作，`merged_with_id` 包含被更新记忆的 ID。
+
+**多候选提取：** 当 `pipeline.extraction_enabled` 为 `true`（默认 `false`）且内容长度
+达到 `pipeline.extraction_min_chars` 时，`remember` 可能通过一次 LLM 调用将包含多个
+事实的内容拆分为若干条原子候选记忆，每条候选都会独立去重/分类。此时该工具返回一个
+**JSON 数组**，包含与上文相同的逐候选对象——每个候选一条——而不是单个对象：
+
+```json
+[
+  {
+    "id": "3f4a1b2c-...",
+    "summary": "Alice owns the infra repo",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  },
+  {
+    "id": "9c7d2e5f-...",
+    "summary": "Deploys go through GitHub Actions",
+    "type": "semantic",
+    "operation": "ADD",
+    "created_at": "2026-03-15T12:00:00Z"
+  }
+]
+```
+
+任何类型的提取失败（网络错误、超时、格式错误/空响应）都会透明地回退到当前的单对象
+响应——提取永远不会阻塞或导致 `remember` 调用失败。任何假设 `remember` 始终返回单个
+对象的调用方，都需要在启用 `extraction_enabled` 之前更新为区分数组与对象。
 
 **示例：**
 

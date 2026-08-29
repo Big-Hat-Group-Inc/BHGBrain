@@ -796,3 +796,50 @@ describe('handleRecall filter pushdown and score semantics (push-down-recall-fil
     expect(ctx.metrics.incCounter).not.toHaveBeenCalledWith('recall_zero_after_filter');
   });
 });
+
+// add-multi-candidate-extraction task 5.5: `handleRemember` already collapses
+// a length-1 result array but returns the array unchanged otherwise
+// (src/tools/index.ts:153) — exercised here with a live multi-candidate
+// `pipeline.process` result instead of a single-candidate mock.
+describe('remember tool multi-candidate response shape', () => {
+  function makeCtx(process: ReturnType<typeof vi.fn>): ToolContext {
+    return {
+      config: { device: { id: 'local-device' } } as unknown as ToolContext['config'],
+      storage: { sqlite: { countMemories: vi.fn(() => 3) } } as unknown as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: { process } as unknown as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('returns an array (not collapsed) when pipeline.process resolves with more than one WriteResult', async () => {
+    const process = vi.fn(async () => [
+      { id: 'a', summary: 's1', type: 'semantic', operation: 'ADD', created_at: 'now' },
+      { id: 'b', summary: 's2', type: 'semantic', operation: 'ADD', created_at: 'now' },
+      { id: 'c', summary: 's3', type: 'semantic', operation: 'ADD', created_at: 'now' },
+    ]);
+    const ctx = makeCtx(process);
+
+    const result = await handleTool(ctx, 'remember', { content: 'multi-fact content long enough to split' }, 'c1');
+
+    expect(process).toHaveBeenCalledTimes(1);
+    expect(Array.isArray(result)).toBe(true);
+    expect(result as unknown[]).toHaveLength(3);
+  });
+
+  it('collapses to a single object when pipeline.process resolves with exactly one WriteResult', async () => {
+    const process = vi.fn(async () => [
+      { id: 'a', summary: 's1', type: 'semantic', operation: 'ADD', created_at: 'now' },
+    ]);
+    const ctx = makeCtx(process);
+
+    const result = await handleTool(ctx, 'remember', { content: 'single fact content' }, 'c1') as { id: string };
+
+    expect(Array.isArray(result)).toBe(false);
+    expect(result.id).toBe('a');
+  });
+});

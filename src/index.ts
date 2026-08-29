@@ -8,6 +8,7 @@ import { QdrantStore } from './storage/qdrant.js';
 import { StorageManager } from './storage/index.js';
 import { createEmbeddingProvider, getEmbeddingBreakerKey, warnIfEmbeddingDegraded } from './embedding/index.js';
 import { WritePipeline } from './pipeline/index.js';
+import { createExtractionProvider, warnIfExtractionDegraded } from './pipeline/extraction.js';
 import { SearchService } from './search/index.js';
 import { BackupService } from './backup/index.js';
 import { RetentionService } from './backup/retention.js';
@@ -54,10 +55,18 @@ async function main() {
   const embeddingBreakerKey = getEmbeddingBreakerKey(config.embedding.provider);
   const embeddingBreaker = new CircuitBreaker({ ...breakerOptions, key: embeddingBreakerKey, logger });
   const qdrantBreaker = new CircuitBreaker({ ...breakerOptions, key: 'qdrant', logger });
+  // Not included in HealthService's `breakers` record below (see
+  // add-multi-candidate-extraction design.md): extraction is a best-effort
+  // enhancement with a fully-functional fallback, so an open extraction
+  // breaker should not degrade the server's aggregate health status. It
+  // still gets `logger` so state transitions are visible in structured logs.
+  const extractionBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
   const metrics = new MetricsCollector(config);
   const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
   warnIfEmbeddingDegraded(embedding, config, logger);
+  const extraction = createExtractionProvider(config, { breaker: extractionBreaker, metrics, logger });
+  warnIfExtractionDegraded(extraction, config, logger);
   const storage = new StorageManager(sqlite, qdrant, embedding, metrics, config);
 
   // Bootstrap: hydrate SQLite from Qdrant if this is a new device
@@ -91,7 +100,7 @@ async function main() {
   }
 
   // Initialize services
-  const pipeline = new WritePipeline(config, storage, embedding, logger);
+  const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics);
   const searchService = new SearchService(config, storage, embedding, metrics, logger);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {

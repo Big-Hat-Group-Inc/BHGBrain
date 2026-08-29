@@ -9,6 +9,7 @@ import { QdrantStore } from '../storage/qdrant.js';
 import { StorageManager } from '../storage/index.js';
 import { createEmbeddingProvider, getEmbeddingBreakerKey } from '../embedding/index.js';
 import { WritePipeline } from '../pipeline/index.js';
+import { createExtractionProvider } from '../pipeline/extraction.js';
 import { SearchService } from '../search/index.js';
 import { BackupService } from '../backup/index.js';
 import { HealthService } from '../health/index.js';
@@ -33,12 +34,14 @@ async function createContext(): Promise<ToolContext> {
   };
   const embeddingBreaker = new CircuitBreaker(breakerOptions);
   const qdrantBreaker = new CircuitBreaker(breakerOptions);
+  const extractionBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
   const metrics = new MetricsCollector(config);
   const qdrant = new QdrantStore(config, qdrantBreaker, logger);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
+  const extraction = createExtractionProvider(config, { breaker: extractionBreaker, metrics, logger });
   const storage = new StorageManager(sqlite, qdrant, embedding, undefined, config);
 
-  const pipeline = new WritePipeline(config, storage, embedding);
+  const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics);
   const searchService = new SearchService(config, storage, embedding, metrics, logger);
   const backupService = new BackupService(config, storage, logger);
   const healthService = new HealthService(storage, embedding, config, {

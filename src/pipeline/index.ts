@@ -2,11 +2,13 @@ import { v4 as uuidv4 } from 'uuid';
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
+import type { MetricsCollector } from '../health/metrics.js';
 import type { MemoryType, MemorySource, WriteOperation, MemoryRecord, WriteResult, RetentionTier } from '../domain/types.js';
 import { normalizeContent, computeChecksum, generateSummary, containsSecret, detectsInvalidation } from '../domain/normalize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { invalidInput, internal } from '../errors/index.js';
 import { checkEntailment } from './entailment.js';
+import { NoopExtractionProvider, type ExtractionProvider } from './extraction.js';
 
 interface MemoryCandidate {
   content: string;
@@ -17,14 +19,18 @@ interface MemoryCandidate {
 
 export class WritePipeline {
   private lifecycle: MemoryLifecycleService;
+  private extraction: ExtractionProvider;
 
   constructor(
     private config: BrainConfig,
     private storage: StorageManager,
     private embedding: EmbeddingProvider,
     private logger?: { warn: (obj: Record<string, unknown>) => void },
+    extraction?: ExtractionProvider,
+    private metrics?: MetricsCollector,
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
+    this.extraction = extraction ?? new NoopExtractionProvider();
   }
 
   async process(input: {
@@ -47,37 +53,76 @@ export class WritePipeline {
     }
 
     // Phase A: Extraction
-    const candidates = this.extract(normalized, input);
+    const candidates = await this.extract(normalized, input);
 
-    // Phase B: Decision per candidate
+    // Phase B: Decision per candidate. A candidate that throws is logged and
+    // counted, then skipped — it must not lose already-persisted sibling
+    // writes to an unhandled rejection (see add-multi-candidate-extraction).
     const results: WriteResult[] = [];
-    for (const candidate of candidates) {
-      const result = await this.decide(candidate, input);
-      results.push(result);
+    let lastError: unknown;
+    let attempted = 0;
+    for (const [index, candidate] of candidates.entries()) {
+      attempted += 1;
+      try {
+        const result = await this.decide(candidate, input);
+        results.push(result);
+      } catch (err) {
+        lastError = err;
+        this.logger?.warn({
+          event: 'candidate_write_failed',
+          namespace: input.namespace,
+          collection: input.collection,
+          candidate_index: index,
+          error: (err as Error).message,
+        });
+        this.metrics?.incCounter('extraction_candidate_failed_total');
+      }
+    }
+
+    if (results.length === 0 && attempted > 0) {
+      throw lastError;
     }
 
     return results;
   }
 
-  private extract(
+  private async extract(
     normalized: string,
     input: { type?: MemoryType; tags: string[]; importance?: number },
-  ): MemoryCandidate[] {
-    // v1 extraction is deterministic and single-candidate only, regardless of
-    // `pipeline.extraction_enabled` — the config knob is reserved for a future
-    // model-backed extraction stage but has no effect on candidate count today.
-    // TODO(bootstrap-memory-core): implement LLM-backed multi-candidate
-    // extraction using `config.pipeline.extraction_model` to split multi-fact
-    // content into atomic candidates, or retire `extraction_enabled` /
-    // `extraction_model` if multi-candidate extraction stays out of scope.
-    // The multi-candidate scenario is de-scoped for v1 in
-    // `write-decision-pipeline/spec.md` until this lands.
-    return [{
+  ): Promise<MemoryCandidate[]> {
+    const singleCandidate: MemoryCandidate[] = [{
       content: normalized,
       type: input.type,
       tags: input.tags,
       importance: input.importance,
     }];
+
+    if (normalized.length < this.config.pipeline.extraction_min_chars) {
+      return singleCandidate;
+    }
+
+    try {
+      const raw = await this.extraction.extractCandidates(normalized);
+      if (!raw || raw.length === 0) {
+        return singleCandidate;
+      }
+
+      return raw.map(candidate => ({
+        content: candidate.content,
+        type: candidate.type ?? input.type,
+        tags: input.tags,
+        importance: candidate.importance ?? input.importance,
+      }));
+    } catch (err) {
+      // Extraction must never block or fail a `remember` call: any
+      // unexpected throw (not just a `null` return) falls back to the
+      // deterministic single-candidate path.
+      this.logger?.warn({
+        event: 'extraction_failed',
+        error: (err as Error).message,
+      });
+      return singleCandidate;
+    }
   }
 
   private async decide(
