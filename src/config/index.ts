@@ -37,7 +37,7 @@ const ConfigSchema = z.object({
   data_dir: z.string().optional(),
   device: z.object({
     id: z.string().regex(DEVICE_ID_RE).optional(),
-  }).default({}),
+  }).prefault({}),
   embedding: z.object({
     provider: z.enum(['openai', 'azure-foundry']).default('openai'),
     model: z.string().default('text-embedding-3-small'),
@@ -48,7 +48,7 @@ const ConfigSchema = z.object({
     retry: z.object({
       max_attempts: z.number().int().min(1).max(5).default(3),
       backoff_ms: z.number().int().positive().default(1000),
-    }).default({}),
+    }).prefault({}),
     azure: AzureEmbeddingSchema.optional(),
     // Guards against silently mixing embedding spaces: when the store's
     // persisted expected embedding identity (see embedding-provenance)
@@ -92,24 +92,24 @@ const ConfigSchema = z.object({
         path: ['dimensions'],
       });
     }
-  }).default({}),
+  }).prefault({}),
   qdrant: z.object({
     mode: z.enum(['embedded', 'external']).default('embedded'),
     embedded_path: z.string().default('./qdrant'),
     external_url: z.string().nullable().default(null),
     api_key_env: z.string().nullable().default(null),
-  }).default({}),
+  }).prefault({}),
   transport: z.object({
     http: z.object({
       enabled: z.boolean().default(true),
       host: z.string().default('127.0.0.1'),
       port: z.number().int().default(3721),
       bearer_token_env: z.string().default('BHGBRAIN_TOKEN'),
-    }).default({}),
+    }).prefault({}),
     stdio: z.object({
       enabled: z.boolean().default(true),
-    }).default({}),
-  }).default({}),
+    }).prefault({}),
+  }).prefault({}),
   defaults: z.object({
     namespace: z.string().default('global'),
     collection: z.string().default('general'),
@@ -121,7 +121,7 @@ const ConfigSchema = z.object({
     // pinning stays a small, deliberate set rather than a second unbounded
     // inject path. See add-inject-pinning.
     pin_limit_per_namespace: z.number().int().min(1).max(200).default(20),
-  }).default({}),
+  }).prefault({}),
   retention: z.object({
     decay_after_days: z.number().int().positive().default(180),
     max_db_size_gb: z.number().positive().default(2),
@@ -132,13 +132,13 @@ const ConfigSchema = z.object({
       T1: z.number().int().positive().default(365),
       T2: z.number().int().positive().default(90),
       T3: z.number().int().positive().default(30),
-    }).default({}),
+    }).prefault({}),
     tier_budgets: z.object({
       T0: z.null().default(null),
       T1: z.number().int().positive().default(100000),
       T2: z.number().int().positive().default(200000),
       T3: z.number().int().positive().default(200000),
-    }).default({}),
+    }).prefault({}),
     auto_promote_access_threshold: z.number().int().positive().default(5),
     sliding_window_enabled: z.boolean().default(true),
     archive_before_delete: z.boolean().default(true),
@@ -174,8 +174,8 @@ const ConfigSchema = z.object({
       // Upper bound on clusters distilled (i.e. LLM calls made) per
       // scheduled tick, bounding worst-case cost/latency per run.
       max_clusters_per_run: z.number().int().positive().default(10),
-    }).default({}),
-  }).default({}),
+    }).prefault({}),
+  }).prefault({}),
   deduplication: z.object({
     enabled: z.boolean().default(true),
     similarity_threshold: z.number().min(0).max(1).default(0.92),
@@ -194,7 +194,7 @@ const ConfigSchema = z.object({
     corroboration_enabled: z.boolean().default(true),
     corroboration_count: z.number().int().min(2).default(2),
     corroboration_margin: z.number().min(0).max(1).default(0.03),
-  }).default({}),
+  }).prefault({}),
   // Read-side near-duplicate discovery/merge for existing memories, distinct
   // from write-time `deduplication` above: `consolidate list` surfaces
   // clusters of already-stored memories whose pairwise similarity meets
@@ -212,19 +212,19 @@ const ConfigSchema = z.object({
     // Upper bound on memories scanned per `list` call, regardless of how
     // large the namespace/collection is — see design.md "Bounded scan cost".
     max_scan_per_call: z.number().int().positive().default(500),
-  }).default({}),
+  }).prefault({}),
   resilience: z.object({
     circuit_breaker: z.object({
       failure_threshold: z.number().int().min(1).default(5),
       open_window_ms: z.number().int().min(1000).default(30000),
       half_open_probe_count: z.number().int().min(1).default(1),
-    }).default({}),
-  }).default({}),
+    }).prefault({}),
+  }).prefault({}),
   search: z.object({
     hybrid_weights: z.object({
       semantic: z.number().min(0).max(1).default(0.7),
       fulltext: z.number().min(0).max(1).default(0.3),
-    }).default({}),
+    }).prefault({}),
     // Composite ranking prior applied at result-assembly time:
     // final = relevance × (w_base + w_importance·importance +
     //   w_access·log1p(access_count)/log1p(access_norm)) × exp(-decay_per_day[tier]·age_days)
@@ -239,8 +239,8 @@ const ConfigSchema = z.object({
         T1: z.number().nonnegative().default(0.002),
         T2: z.number().nonnegative().default(0.008),
         T3: z.number().nonnegative().default(0.02),
-      }).default({}),
-    }).default({}),
+      }).prefault({}),
+    }).prefault({}),
     // Opt-in LLM rerank stage: re-scores `recall`'s candidate pool by sending
     // the query and each candidate's text to a configured LLM, replacing
     // `score` (not `semantic_score`, so `min_score` filtering is unaffected)
@@ -256,7 +256,7 @@ const ConfigSchema = z.object({
       model: z.string().default('gpt-4o-mini'),
       model_env: z.string().default('BHGBRAIN_RERANK_API_KEY'),
       timeout_ms: z.number().int().positive().default(3000),
-    }).default({}),
+    }).prefault({}),
     // Maximal Marginal Relevance diversity reordering applied to `recall`/
     // `search`'s composite-ranked candidate pool (never a truncator — see
     // `add-mmr-diversity-reranking`). `enabled: false` restores
@@ -269,7 +269,7 @@ const ConfigSchema = z.object({
       lambda: z.number().min(0).max(1).default(0.7),
       candidate_pool_multiplier: z.number().positive().default(3),
       candidate_pool_cap: z.number().int().positive().default(50),
-    }).default({}),
+    }).prefault({}),
     // Multi-query expansion (add-multi-query-expansion): `semanticSearch` and
     // the semantic leg of `hybridSearch` embed/search more than one
     // representation of the query and merge candidates by id, keeping the
@@ -293,9 +293,9 @@ const ConfigSchema = z.object({
         // Enforced via AbortController on the chat-completions fetch,
         // mirroring `pipeline.extraction_timeout_ms`.
         timeout_ms: z.number().int().positive().default(3000),
-      }).default({}),
-    }).default({}),
-  }).default({}),
+      }).prefault({}),
+    }).prefault({}),
+  }).prefault({}),
   security: z.object({
     require_loopback_http: z.boolean().default(true),
     allow_unauthenticated_http: z.boolean().default(false),
@@ -306,7 +306,7 @@ const ConfigSchema = z.object({
     // means `req.ip` is the direct socket peer (loopback-accurate); enable only
     // behind a trusted reverse proxy that sets `X-Forwarded-For` correctly.
     trust_proxy: z.boolean().default(false),
-  }).default({}),
+  }).prefault({}),
   auto_inject: z.object({
     max_chars: z.number().int().positive().default(30000),
     max_tokens: z.number().int().positive().nullable().default(null),
@@ -327,12 +327,12 @@ const ConfigSchema = z.object({
     // if no memory were pinned. The pin cap is still enforced at write time
     // regardless of this switch.
     pinned_enabled: z.boolean().default(true),
-  }).default({}),
+  }).prefault({}),
   observability: z.object({
     metrics_enabled: z.boolean().default(false),
     structured_logging: z.boolean().default(true),
     log_level: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
-  }).default({}),
+  }).prefault({}),
   pipeline: z.object({
     // Default is `false`: this flag was previously live configuration that
     // had zero effect (extraction was always deterministic single-candidate).
@@ -366,7 +366,7 @@ const ConfigSchema = z.object({
     contradiction_detection: z.object({
       enabled: z.boolean().default(false),
       timeout_ms: z.number().int().positive().default(5000),
-    }).default({}),
+    }).prefault({}),
     // Optional LLM-backed summarization tier (improve-memory-summarization).
     // Default `false`: this is a new external call with cost/latency
     // implications, unlike `auto_summarize` (which gates the free extractive
@@ -401,8 +401,8 @@ const ConfigSchema = z.object({
       api: z.number().min(0).max(1).default(1.0),
       agent: z.number().min(0).max(1).default(0.7),
       import: z.number().min(0).max(1).default(0.5),
-    }).default({}),
-  }).default({}),
+    }).prefault({}),
+  }).prefault({}),
   // Controls whether summarization quality tiers (extractive, or LLM when
   // `pipeline.summarization_enabled`) apply. `true` (default): tiered
   // summarizer. `false`: literal first-line truncation (`generateSummary`),

@@ -125,7 +125,7 @@ graph TD
 
 | Requisito | Versión | Notas |
 |---|---|---|
-| Node.js | ≥ 20.0.0 | Se recomienda LTS |
+| Node.js | ≥ 22.0.0 | Se recomienda LTS |
 | Qdrant | ≥ 1.10 | Debe estar en ejecución antes de iniciar BHGBrain. El cliente incluido (`@qdrant/js-client-rest` `~1.19.0`) llama a la API `query` introducida en Qdrant 1.10; los servidores más antiguos fallarán en la búsqueda semántica. |
 | Clave API de OpenAI | — | Para embeddings (`text-embedding-3-small` por defecto). El servidor inicia en modo degradado si no está presente. |
 

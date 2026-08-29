@@ -5,7 +5,7 @@
 BHGBrain is a persistent, vector-backed memory system for MCP (Model Context Protocol) clients. It provides long-term memory across sessions, repositories, and MCP clients like Claude CLI, Codex, and Gemini.
 
 **Key Technologies:**
-- TypeScript with Node.js (>=20.0.0)
+- TypeScript with Node.js (>=22.0.0)
 - ES modules (`"type": "module"`)
 - SQLite for metadata storage (via `node:sqlite`'s `DatabaseSync`, Node's built-in
   native binding — requires Node >=22; WAL journaling, commit-level durability, bundled
@@ -36,6 +36,17 @@ npm run eval              # Golden-set retrieval eval (recall@k/MRR report again
 # Build & Type Checking
 npm run lint             # Type check (tsc --noEmit) + eslint src
 ```
+
+## Versioning
+
+Bump `package.json`'s `version` with `npm version <patch|minor>` (or `major`) —
+never hand-edit the field. `npm version` rewrites `package.json` **and**
+`package-lock.json`'s root `version` in the same atomic step, which is what keeps
+the lockfile from drifting off the manifest (a real drift the project hit: lock
+`1.6.0` vs manifest `1.12.0` across six releases, fixed by
+`refresh-dependency-and-node-baseline`). It also creates a `v<version>` git tag by
+default; pass `--no-git-tag-version` if a commit/tag pair isn't wanted yet. Run it
+from a clean working tree with the version-worthy changes already committed.
 
 ## Codebase Structure
 

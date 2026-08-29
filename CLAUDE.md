@@ -44,12 +44,14 @@ No Docker or live Qdrant here by default, which leaves proposal tasks like "veri
 against a live instance" or "docker compose up" stuck unchecked (hit repeatedly, e.g.
 `fix-qdrant-client-search-removal`, `fix-vector-store-health-fidelity`,
 `secure-container-default-binding`). Unblock by provisioning a disposable WSL2 Ubuntu
-sandbox: `wsl --install -d Ubuntu-24.04 --no-launch`, install Docker Engine + Node 20
-*and* 22 (nvm) inside it, `git clone` the **local working tree** (not GitHub) into the
+sandbox: `wsl --install -d Ubuntu-24.04 --no-launch`, install Docker Engine + Node 22
+(nvm) inside it, `git clone` the **local working tree** (not GitHub) into the
 WSL native filesystem so unpushed commits carry over and npm/tsc stay fast.
-- `@qdrant/js-client-rest@1.19.0` needs Node **>=22** (`EBADENGINE` on 20) though
-  `package.json` still declares `>=20.0.0` — use Node 22 for anything touching the
-  Qdrant client directly.
+- `@qdrant/js-client-rest@1.19.0` needs Node **>=22** (`EBADENGINE` on 20).
+  `package.json` `engines.node` now correctly declares `>=22.0.0` (raised by
+  `refresh-dependency-and-node-baseline`) — Node 22 is the only supported floor for
+  this repo, including anything touching the Qdrant client or `node:sqlite`
+  directly.
 - From PowerShell/git-bash, set `MSYS_NO_PATHCONV=1` before any `wsl -d ... --` call,
   and hardcode values instead of `$(...)` or exported variables inside nested
   `wsl -- bash -c '...'` scripts — both silently break across that boundary.
@@ -65,7 +67,10 @@ WSL native filesystem so unpushed commits carry over and npm/tsc stay fast.
   edits `README.md` must land in all five, or none.
 - `.env.example` — environment variables.
 - `AGENTS.md` — developer guide.
-- `package.json` `version` — bump on user-visible changes.
+- `package.json` `version` — bump on user-visible changes, via `npm version
+  <patch|minor>` (never hand-edit) so `package-lock.json`'s root `version` is
+  updated atomically and cannot drift from the manifest — see AGENTS.md's
+  "Versioning" section.
 
 ## OpenSpec workflow
 

@@ -125,7 +125,7 @@ graph TD
 
 | 要求 | 版本 | 说明 |
 |---|---|---|
-| Node.js | ≥ 20.0.0 | 推荐使用 LTS 版本 |
+| Node.js | ≥ 22.0.0 | 推荐使用 LTS 版本 |
 | Qdrant | ≥ 1.10 | 必须在启动 BHGBrain 之前运行。内置客户端（`@qdrant/js-client-rest` `~1.19.0`）调用 Qdrant 1.10 引入的 `query` API；较旧的服务器在语义搜索时会失败。 |
 | OpenAI API key | — | 用于嵌入（默认使用 `text-embedding-3-small`）。如果缺失，服务器将以降级模式启动。 |
 

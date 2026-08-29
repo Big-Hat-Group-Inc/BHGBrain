@@ -126,7 +126,7 @@ graph TD
 
 | Requirement | Version | Notes |
 |---|---|---|
-| Node.js | ≥ 20.0.0 | LTS recommended |
+| Node.js | ≥ 22.0.0 | LTS recommended |
 | Qdrant | ≥ 1.10 | Must be running before starting BHGBrain. The bundled client (`@qdrant/js-client-rest` `~1.19.0`) calls the `query` API introduced in Qdrant 1.10; older servers will fail semantic search. |
 | OpenAI API key | - | For embeddings (`text-embedding-3-small` by default). Server starts in degraded mode if missing. |
 
@@ -3880,7 +3880,7 @@ When a container starts with an empty `/data` volume and connects to a Qdrant in
 docker build -t bhgbrain .
 ```
 
-The image uses a multi-stage build on `node:20-slim` (~200MB final size). The healthcheck uses Node.js native `fetch()` — no `curl` required.
+The image uses a multi-stage build on `node:22-slim` (~200MB final size). The healthcheck uses Node.js native `fetch()` — no `curl` required.
 
 ---
 

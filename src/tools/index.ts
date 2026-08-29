@@ -59,7 +59,7 @@ function parseInput<T>(schema: { parse: (d: unknown) => T }, data: unknown): T {
     return schema.parse(data);
   } catch (err) {
     if (err instanceof ZodError) {
-      const messages = err.errors.map(e => `${e.path.join('.')}: ${e.message}`).join('; ');
+      const messages = err.issues.map(e => `${e.path.join('.')}: ${e.message}`).join('; ');
       throw invalidInput(messages);
     }
     throw err;
