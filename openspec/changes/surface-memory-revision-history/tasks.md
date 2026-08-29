@@ -1,6 +1,6 @@
 ## 1. Storage access
 
-- [ ] 1.1 Expose a typed `getRevisions(memoryId)` on the storage interface
+- [x] 1.1 Expose a typed `getRevisions(memoryId)` on the storage interface
   (`src/storage/sqlite.ts` already has the query at ~1069; surface it on the
   `SqliteStore` interface with `MemoryRevisionRecord[]` return).
   Premise no longer holds: `SqliteStore` already exposes this — typed
