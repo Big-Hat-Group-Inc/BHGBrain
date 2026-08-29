@@ -198,7 +198,12 @@ async function handleRecall(
   // `buildSearchResults` cannot starve the caller's limit even once the
   // store already narrows candidates down to matching memories. Capped so a
   // filtered recall never asks the store for an unbounded candidate pool.
-  const fetchLimit = Math.min(input.limit * 2, 40);
+  // When MMR is eligible (recall is semantic-only, so no mode check is
+  // needed), widen the pool further using the config-driven formula so there
+  // is genuine diversity headroom beyond `limit` (add-mmr-diversity-reranking).
+  const fetchLimit = ctx.config.search.mmr.enabled
+    ? Math.min(input.limit * ctx.config.search.mmr.candidate_pool_multiplier, ctx.config.search.mmr.candidate_pool_cap)
+    : Math.min(input.limit * 2, 40);
 
   const results = await ctx.search.search(
     input.query, input.namespace, input.collection, 'semantic', fetchLimit, undefined, filter,
@@ -269,8 +274,19 @@ async function handleSearch(
     ? { after: input.after, before: input.before }
     : undefined;
 
+  // When MMR is eligible (mode carries vectors, `search.mmr.enabled`), fetch a
+  // wider pool using the same formula as `handleRecall` so there is genuine
+  // diversity headroom beyond `limit`; otherwise fetch exactly `input.limit`
+  // as before (add-mmr-diversity-reranking). `search()` no longer returns an
+  // exactly-`limit`-sized array in the MMR-eligible case, so the explicit
+  // `.slice(0, input.limit)` below truncates after filtering, mirroring how
+  // `handleRecall` already truncates after its own filtering.
+  const searchFetchLimit = input.mode !== 'fulltext' && ctx.config.search.mmr.enabled
+    ? Math.min(input.limit * ctx.config.search.mmr.candidate_pool_multiplier, ctx.config.search.mmr.candidate_pool_cap)
+    : input.limit;
+
   const results = await ctx.search.search(
-    input.query, input.namespace, input.collection, input.mode, input.limit, signal,
+    input.query, input.namespace, input.collection, input.mode, searchFetchLimit, signal,
     filter, input.include_archived,
   );
 
@@ -292,7 +308,7 @@ async function handleSearch(
 
   // `degraded` is true when hybrid mode fell back to fulltext-only (embedding /
   // vector store unavailable), so callers can tell it from a healthy result.
-  return { results: filtered, degraded: signal.degraded ?? false };
+  return { results: filtered.slice(0, input.limit), degraded: signal.degraded ?? false };
 }
 
 async function handleTag(

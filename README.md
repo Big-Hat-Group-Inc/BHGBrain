@@ -449,6 +449,15 @@ The file is created automatically on first run with all defaults applied. Edit i
         "T2": 0.008,
         "T3": 0.02
       }
+    },
+    // Maximal Marginal Relevance diversity reordering, applied after composite
+    // ranking (see "MMR Diversity Reranking" below). Set enabled: false to
+    // restore composite-relevance-only ordering exactly.
+    "mmr": {
+      "enabled": true,
+      "lambda": 0.7,
+      "candidate_pool_multiplier": 3,
+      "candidate_pool_cap": 50
     }
   },
 
@@ -1718,6 +1727,34 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Per-tier exponential decay rate applied to `age_days`. `T2`'s default gives a half-life of roughly 87 days, aligned with its 90-day TTL. |
 
 **What composite ranking does *not* affect:** the raw `semantic_score` and `fulltext_score` fields on each result, and the field `recall`'s `min_score` threshold applies to (`semantic_score`) - see [Recall vs Search](#recall-vs-search---differences). Composite ranking changes result *ordering*, never which memories clear the `min_score` gate.
+
+---
+
+### MMR Diversity Reranking
+
+`recall` and `search` (in `semantic` and `hybrid` modes) apply a further reordering pass after composite ranking: **Maximal Marginal Relevance (MMR)**. Composite ranking alone can still return a top-K dominated by several near-duplicate memories - two facts at 0.85 cosine similarity, say, both survive write-time dedup (which only collapses ≥ 0.92) and both rank near the top together. MMR trades a configurable amount of top-ranked relevance for diversity so the returned page spends its slots on *distinct* facts instead.
+
+**Ranking pipeline order:** relevance (cosine / FTS rank / RRF) → composite prior (importance/access/decay) → **MMR diversity reorder** → downstream `min_score` / type / tags filtering and truncation to the caller's `limit`.
+
+**How it works:**
+1. `recall`/`search` fetch a wider candidate pool than `limit` (see Candidate pool sizing below) so there is genuine headroom to diversify among.
+2. Each candidate's composite score is min-max normalized across the fetched pool, so `lambda` means the same thing regardless of whether the pool's scores are cosine-scale (semantic mode) or RRF-scale (hybrid mode, typically two orders of magnitude smaller).
+3. Starting from the highest-scoring candidate, MMR greedily selects the next candidate maximizing `lambda * normalized_relevance - (1 - lambda) * max_similarity_to_already_selected`, where similarity is cosine similarity against every already-selected candidate that carries a vector.
+4. This is a **full-pool reorder, never a truncator** - every candidate fetched is still present afterward, only reordered. `min_score`, type/tags filtering, and truncation to `limit` all run downstream, unaffected in mechanism, so a `min_score` gate can never under-return results just because MMR ran first.
+5. Candidates missing a vector (a fulltext-only match in hybrid mode, for example) are never penalized and never able to penalize others - they contribute `0` similarity.
+
+**Fulltext mode is unaffected:** `mode: 'fulltext'` carries no vectors to diversify against, so MMR never runs regardless of `search.mmr.enabled`.
+
+**Configuration** (`search.mmr` in `config.json`, see [Configuration](#configuration)):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Set `false` to disable MMR entirely and restore composite-relevance-only ordering exactly. |
+| `lambda` | `0.7` | Relevance/diversity trade-off, `0`-`1`. Close to `1` approximates pure composite-relevance ordering; close to `0` favors dissimilarity among candidates over relevance. |
+| `candidate_pool_multiplier` | `3` | Widens the pool fetched from the store to `limit * candidate_pool_multiplier` when MMR is eligible, giving genuine diversity headroom beyond the caller's `limit`. |
+| `candidate_pool_cap` | `50` | Upper bound on the widened pool size, regardless of `limit * candidate_pool_multiplier`. |
+
+**Not the same as `memory://inject/{hint}`'s near-duplicate suppression:** that resource template (see [MCP Resources Reference](#mcp-resources-reference)) already has its own, separate near-duplicate mechanism - a hard threshold drop (reusing `deduplication.similarity_threshold`, default `0.92`) rather than MMR's continuous relevance/diversity trade-off. The two are intentionally independent: `search.mmr` configuration has no effect on `memory://inject/{hint}`, and vice versa.
 
 ---
 

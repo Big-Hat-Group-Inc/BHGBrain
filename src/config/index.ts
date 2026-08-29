@@ -190,6 +190,19 @@ const ConfigSchema = z.object({
         T3: z.number().nonnegative().default(0.02),
       }).default({}),
     }).default({}),
+    // Maximal Marginal Relevance diversity reordering applied to `recall`/
+    // `search`'s composite-ranked candidate pool (never a truncator — see
+    // `add-mmr-diversity-reranking`). `enabled: false` restores
+    // composite-relevance-only ordering exactly. `lambda` near 1 approximates
+    // pure relevance ordering; near 0 favors dissimilarity among candidates.
+    // `candidate_pool_multiplier`/`candidate_pool_cap` widen the pool fetched
+    // from the store so there is genuine diversity headroom beyond `limit`.
+    mmr: z.object({
+      enabled: z.boolean().default(true),
+      lambda: z.number().min(0).max(1).default(0.7),
+      candidate_pool_multiplier: z.number().positive().default(3),
+      candidate_pool_cap: z.number().int().positive().default(50),
+    }).default({}),
   }).default({}),
   security: z.object({
     require_loopback_http: z.boolean().default(true),

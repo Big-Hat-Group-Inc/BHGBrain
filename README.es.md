@@ -404,6 +404,16 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
         "T2": 0.008,
         "T3": 0.02
       }
+    },
+    // Reordenamiento por diversidad de Maximal Marginal Relevance, aplicado
+    // después del ranking compuesto (ver "Reordenamiento por Diversidad MMR"
+    // más abajo). enabled: false restaura exactamente el orden por
+    // relevancia compuesta pura.
+    "mmr": {
+      "enabled": true,
+      "lambda": 0.7,
+      "candidate_pool_multiplier": 3,
+      "candidate_pool_cap": 50
     }
   },
 
@@ -1673,6 +1683,34 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Tasa de decadencia exponencial por nivel aplicada a `age_days`. El predeterminado de `T2` da una vida media de aproximadamente 87 días, alineada con su TTL de 90 días. |
 
 **Lo que el ranking compuesto *no* afecta:** los campos crudos `semantic_score` y `fulltext_score` de cada resultado, y el campo al que se aplica el umbral `min_score` de `recall` (`semantic_score`) — ver [Recall vs Search](#recall-vs-search--diferencias). El ranking compuesto cambia el *orden* de los resultados, nunca qué memorias superan el filtro `min_score`.
+
+---
+
+### Reordenamiento por Diversidad MMR
+
+`recall` y `search` (en los modos `semantic` e `hybrid`) aplican un paso de reordenamiento adicional después del ranking compuesto: **Maximal Marginal Relevance (MMR)**. El ranking compuesto por sí solo aún puede devolver un top-K dominado por varias memorias casi duplicadas — dos hechos con una similitud coseno de 0.85, por ejemplo, ambos sobreviven a la deduplicación en tiempo de escritura (que solo colapsa ≥ 0.92) y ambos terminan cerca de la cima juntos. MMR intercambia una cantidad configurable de relevancia mejor clasificada por diversidad, de modo que la página devuelta gaste sus posiciones en hechos *distintos* en lugar de repetidos.
+
+**Orden del pipeline de ranking:** relevancia (coseno / rango FTS / RRF) → prior compuesto (importancia/acceso/decadencia) → **reordenamiento por diversidad MMR** → filtrado posterior por `min_score` / tipo / etiquetas y truncamiento al `limit` del llamador.
+
+**Cómo funciona:**
+1. `recall`/`search` obtienen un grupo de candidatos más amplio que `limit`, para que exista margen real de diversificación.
+2. El puntaje compuesto de cada candidato se normaliza min-max sobre el grupo obtenido, de modo que `lambda` significa lo mismo sin importar si los puntajes del grupo están a escala de coseno (modo semántico) o a escala RRF (modo híbrido, típicamente dos órdenes de magnitud menor).
+3. Comenzando desde el candidato mejor puntuado, MMR selecciona voraz mente el siguiente candidato que maximiza `lambda * relevancia_normalizada - (1 - lambda) * similitud_máxima_con_ya_seleccionados`, donde la similitud es la similitud coseno con cada candidato ya seleccionado que tenga un vector.
+4. Esto es un **reordenamiento del grupo completo, nunca un truncamiento** — todo candidato obtenido sigue presente después, solo reordenado. `min_score`, el filtrado por tipo/etiquetas y el truncamiento a `limit` se ejecutan todos después, sin cambios en su mecanismo, por lo que un umbral `min_score` nunca puede devolver menos resultados de los debidos solo porque MMR se ejecutó antes.
+5. Los candidatos sin vector (por ejemplo, una coincidencia solo de texto completo en modo híbrido) nunca son penalizados ni pueden penalizar a otros — aportan una similitud de `0`.
+
+**El modo de texto completo no se ve afectado:** `mode: 'fulltext'` no lleva vectores contra los cuales diversificar, así que MMR nunca se ejecuta, sin importar `search.mmr.enabled`.
+
+**Configuración** (`search.mmr` en `config.json`, ver [Configuración](#configuración)):
+
+| Campo | Predeterminado | Significado |
+|---|---|---|
+| `enabled` | `true` | Establecer `false` para deshabilitar MMR completamente y restaurar exactamente el orden por relevancia compuesta pura. |
+| `lambda` | `0.7` | Compromiso entre relevancia y diversidad, `0`–`1`. Cerca de `1` se aproxima al orden por relevancia compuesta pura; cerca de `0` favorece la disimilitud entre candidatos por encima de la relevancia. |
+| `candidate_pool_multiplier` | `3` | Amplía el grupo obtenido del almacén a `limit * candidate_pool_multiplier` cuando MMR es elegible, dando margen real de diversificación más allá del `limit` del llamador. |
+| `candidate_pool_cap` | `50` | Límite superior del tamaño del grupo ampliado, independientemente de `limit * candidate_pool_multiplier`. |
+
+**No es lo mismo que la supresión de casi-duplicados de `memory://inject/{hint}`:** esa plantilla de recurso (ver [Referencia de Recursos MCP](#recursos-mcp)) ya tiene su propio mecanismo de casi-duplicados, separado — un descarte por umbral duro (reutilizando `deduplication.similarity_threshold`, predeterminado `0.92`) en lugar del compromiso continuo relevancia/diversidad de MMR. Ambos son intencionalmente independientes: la configuración `search.mmr` no tiene efecto sobre `memory://inject/{hint}`, y viceversa.
 
 ---
 

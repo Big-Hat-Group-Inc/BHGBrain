@@ -14,6 +14,7 @@ describe('SearchService', () => {
     memories?: Map<string, StoredMemory>;
     slidingWindowEnabled?: boolean;
     ranking?: BrainConfig['search']['ranking'];
+    mmr?: BrainConfig['search']['mmr'];
   } = {}) {
     const memories = opts.memories ?? new Map([
       ['mem-1', {
@@ -62,6 +63,15 @@ describe('SearchService', () => {
           w_access: 0.2,
           access_norm: 50,
           decay_per_day: { T0: 0, T1: 0.002, T2: 0.008, T3: 0.02 },
+        },
+        // Defaults to disabled here so every pre-existing test (written
+        // before add-mmr-diversity-reranking) keeps exercising byte-identical
+        // store-call arguments; tests exercising MMR explicitly pass `mmr`.
+        mmr: opts.mmr ?? {
+          enabled: false,
+          lambda: 0.7,
+          candidate_pool_multiplier: 3,
+          candidate_pool_cap: 50,
         },
       },
       ...(opts.slidingWindowEnabled === undefined ? {} : {
@@ -628,6 +638,217 @@ describe('SearchService', () => {
       // either way.
       expect(enabledResults[0].semantic_score).toBe(0.7);
       expect(disabledResults[0].semantic_score).toBe(0.7);
+    });
+  });
+
+  describe('MMR diversity reranking (add-mmr-diversity-reranking)', () => {
+    const makeMem = (id: string, overrides: Partial<StoredMemory> = {}): StoredMemory => ({
+      id, namespace: 'global', collection: 'general', type: 'semantic',
+      content: `content-${id}`, summary: `summary-${id}`, tags: [], source: 'cli',
+      checksum: id,
+      importance: 0.5,
+      retention_tier: 'T0',
+      expires_at: '2026-12-31T00:00:00Z',
+      decay_eligible: true,
+      review_due: null,
+      access_count: 0,
+      last_operation: 'ADD',
+      merged_from: null,
+      archived: false,
+      vector_synced: true,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+      ...overrides,
+    });
+
+    // Same importance/access_count/retention_tier (T0, no decay) for every
+    // fixture memory below so the composite prior is a constant multiplier
+    // across the pool — it never perturbs relative order, isolating MMR's
+    // own reordering effect from add-composite-recall-ranking's.
+    const mmrConfig = (overrides: Partial<BrainConfig['search']['mmr']> = {}): BrainConfig['search']['mmr'] => ({
+      enabled: true,
+      lambda: 0.7,
+      candidate_pool_multiplier: 3,
+      candidate_pool_cap: 50,
+      ...overrides,
+    });
+
+    it('promotes a distinct memory into the top-K ahead of a near-duplicate when enabled, not when disabled', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['a', makeMem('a')],
+        ['b-near-dup', makeMem('b-near-dup')],
+        ['d-distinct', makeMem('d-distinct')],
+      ]);
+      const qdrantResults = [
+        { id: 'a', score: 0.95, payload: {}, vector: [1, 0] },
+        // Near-duplicate of 'a' (cosine similarity ~0.9998).
+        { id: 'b-near-dup', score: 0.94, payload: {}, vector: [0.9998, 0.02] },
+        // Orthogonal to 'a'/'b' — genuinely distinct, lower relevance.
+        { id: 'd-distinct', score: 0.80, payload: {}, vector: [0, 1] },
+      ];
+
+      const { service: enabledService, storage: enabledStorage } = createSearchService({
+        memories, mmr: mmrConfig({ lambda: 0.5 }),
+      });
+      enabledStorage.qdrant.search.mockResolvedValue(qdrantResults);
+      const enabledResults = await enabledService.search('hello', 'global', undefined, 'semantic', 3);
+      // Full-pool reorder: every candidate still present, just reordered.
+      expect(enabledResults.map(r => r.id).sort()).toEqual(['a', 'b-near-dup', 'd-distinct'].sort());
+      const enabledTop2 = enabledResults.slice(0, 2).map(r => r.id);
+      expect(enabledTop2).toContain('d-distinct');
+
+      const { service: disabledService, storage: disabledStorage } = createSearchService({
+        memories, mmr: mmrConfig({ enabled: false }),
+      });
+      disabledStorage.qdrant.search.mockResolvedValue(qdrantResults);
+      const disabledResults = await disabledService.search('hello', 'global', undefined, 'semantic', 3);
+      const disabledTop2 = disabledResults.slice(0, 2).map(r => r.id);
+      // Pure composite-relevance ordering: the distinct-but-lower-relevance
+      // memory stays outside the top 2, unlike the enabled case above.
+      expect(disabledTop2).toEqual(['a', 'b-near-dup']);
+      expect(disabledTop2).not.toContain('d-distinct');
+    });
+
+    it('lambda close to 1 reduces to (near) pure composite-relevance ordering', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['a', makeMem('a')],
+        ['b-near-dup', makeMem('b-near-dup')],
+        ['d-distinct', makeMem('d-distinct')],
+      ]);
+      const qdrantResults = [
+        { id: 'a', score: 0.95, payload: {}, vector: [1, 0] },
+        { id: 'b-near-dup', score: 0.90, payload: {}, vector: [0.9998, 0.02] },
+        { id: 'd-distinct', score: 0.70, payload: {}, vector: [0, 1] },
+      ];
+
+      const { service, storage } = createSearchService({ memories, mmr: mmrConfig({ lambda: 1 }) });
+      storage.qdrant.search.mockResolvedValue(qdrantResults);
+      const results = await service.search('hello', 'global', undefined, 'semantic', 3);
+
+      expect(results.map(r => r.id)).toEqual(['a', 'b-near-dup', 'd-distinct']);
+    });
+
+    it('a low lambda visibly favors a dissimilar candidate over a marginally-more-relevant near-duplicate', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['p1', makeMem('p1')],
+        ['p2-near-dup', makeMem('p2-near-dup')],
+        ['q-distinct', makeMem('q-distinct')],
+      ]);
+      const qdrantResults = [
+        { id: 'p1', score: 0.95, payload: {}, vector: [1, 0] },
+        { id: 'p2-near-dup', score: 0.93, payload: {}, vector: [0.999, 0.045] },
+        { id: 'q-distinct', score: 0.85, payload: {}, vector: [0, 1] },
+      ];
+
+      const { service, storage } = createSearchService({ memories, mmr: mmrConfig({ lambda: 0.1 }) });
+      storage.qdrant.search.mockResolvedValue(qdrantResults);
+      const results = await service.search('hello', 'global', undefined, 'semantic', 3);
+
+      // 'q-distinct' (well-separated, marginally lower relevance) is promoted
+      // ahead of 'p2-near-dup' (near-duplicate of the top result), unlike
+      // the pure-relevance order (p1, p2-near-dup, q-distinct).
+      expect(results.map(r => r.id)).toEqual(['p1', 'q-distinct', 'p2-near-dup']);
+    });
+
+    it('mode: fulltext is unaffected by search.mmr.enabled (no vectors to diversify against)', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['f1', makeMem('f1')],
+        ['f2', makeMem('f2')],
+      ]);
+      const fulltextResults = [{ id: 'f1', rank: -2 }, { id: 'f2', rank: -1 }];
+
+      const { service: enabledService, storage: enabledStorage } = createSearchService({
+        memories, fulltextResults, mmr: mmrConfig({ enabled: true }),
+      });
+      const enabledResults = await enabledService.search('hello', 'global', undefined, 'fulltext', 10);
+
+      const { service: disabledService } = createSearchService({
+        memories, fulltextResults, mmr: mmrConfig({ enabled: false }),
+      });
+      const disabledResults = await disabledService.search('hello', 'global', undefined, 'fulltext', 10);
+
+      expect(enabledResults.map(r => r.id)).toEqual(disabledResults.map(r => r.id));
+      // No vector ever requested for fulltext, enabled or not.
+      expect(enabledStorage.qdrant.search).not.toHaveBeenCalled();
+    });
+
+    it('diversifies consistently across cosine-scale (semantic) and RRF-scale (hybrid) score magnitudes (normalization regression)', async () => {
+      // Same relative shape in both modes: a top result, a near-duplicate of
+      // it with slightly lower relevance, and a well-separated, lower-relevance
+      // distinct memory. At a high lambda, the diversity term should not
+      // dominate in either mode purely because hybrid's RRF scores are ~100x
+      // smaller in magnitude than semantic's cosine-range scores.
+      const memories = new Map<string, StoredMemory>([
+        ['p1', makeMem('p1')],
+        ['p2-near-dup', makeMem('p2-near-dup')],
+        ['q-distinct', makeMem('q-distinct')],
+      ]);
+      const vectors: Record<string, number[]> = {
+        p1: [1, 0],
+        'p2-near-dup': [0.999, 0.045],
+        'q-distinct': [0, 1],
+      };
+
+      const { service: semanticService, storage: semanticStorage } = createSearchService({
+        memories, mmr: mmrConfig({ lambda: 0.9 }),
+      });
+      semanticStorage.qdrant.search.mockResolvedValue([
+        { id: 'p1', score: 0.95, payload: {}, vector: vectors.p1 },
+        { id: 'p2-near-dup', score: 0.90, payload: {}, vector: vectors['p2-near-dup'] },
+        { id: 'q-distinct', score: 0.70, payload: {}, vector: vectors['q-distinct'] },
+      ]);
+      const semanticResults = await semanticService.search('hello', 'global', undefined, 'semantic', 3);
+
+      // Hybrid mode: rank-derived RRF scores are tiny (~0.011, see RRF_K=60
+      // in src/search/index.ts) — far smaller in absolute magnitude than the
+      // ~[0,1] cosine similarities used for the diversity term.
+      const { service: hybridService, storage: hybridStorage } = createSearchService({
+        memories, mmr: mmrConfig({ lambda: 0.9 }), fulltextResults: [],
+      });
+      hybridStorage.qdrant.search.mockResolvedValue([
+        { id: 'p1', score: 0.95, payload: {}, vector: vectors.p1 },
+        { id: 'p2-near-dup', score: 0.90, payload: {}, vector: vectors['p2-near-dup'] },
+        { id: 'q-distinct', score: 0.70, payload: {}, vector: vectors['q-distinct'] },
+      ]);
+      const hybridResults = await hybridService.search('hello', 'global', undefined, 'hybrid', 3);
+
+      // Both modes preserve (near-)pure-relevance ordering at high lambda,
+      // despite wildly different raw score scales — proof the min-max
+      // normalization equalizes `lambda`'s meaning across modes.
+      expect(semanticResults.map(r => r.id)).toEqual(['p1', 'p2-near-dup', 'q-distinct']);
+      expect(hybridResults.map(r => r.id)).toEqual(['p1', 'p2-near-dup', 'q-distinct']);
+    });
+
+    it('never leaks the transient MMR-scratch vector into search() output, enabled or disabled', async () => {
+      const memories = new Map<string, StoredMemory>([
+        ['a', makeMem('a')],
+        ['b', makeMem('b')],
+      ]);
+      const qdrantResults = [
+        { id: 'a', score: 0.9, payload: {}, vector: [1, 0] },
+        { id: 'b', score: 0.8, payload: {}, vector: [0, 1] },
+      ];
+
+      const { service: enabledService, storage: enabledStorage } = createSearchService({
+        memories, mmr: mmrConfig({ enabled: true }),
+      });
+      enabledStorage.qdrant.search.mockResolvedValue(qdrantResults);
+      const enabledResults = await enabledService.search('hello', 'global', undefined, 'semantic', 5);
+      expect(enabledResults.every(r => r.vector === undefined)).toBe(true);
+      expect(JSON.stringify(enabledResults)).not.toContain('"vector"');
+
+      const { service: disabledService, storage: disabledStorage } = createSearchService({
+        memories, mmr: mmrConfig({ enabled: false }),
+      });
+      disabledStorage.qdrant.search.mockResolvedValue(qdrantResults);
+      const disabledResults = await disabledService.search('hello', 'global', undefined, 'semantic', 5);
+      expect(disabledResults.every(r => r.vector === undefined)).toBe(true);
+      expect(JSON.stringify(disabledResults)).not.toContain('"vector"');
+
+      // searchForInject's existing vector-carrying contract is unaffected.
+      const injectResults = await enabledService.searchForInject('hello', 'global', 5);
+      expect(injectResults.some(r => r.vector !== undefined)).toBe(true);
     });
   });
 });

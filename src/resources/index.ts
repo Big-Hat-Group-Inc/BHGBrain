@@ -5,6 +5,7 @@ import type { HealthService } from '../health/index.js';
 import type { InjectPayload, PaginatedResult, MemoryRecord, MemoryRevisionRecord, SearchResult } from '../domain/types.js';
 import type { CategoryHeader } from '../storage/sqlite.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
+import { cosineSimilarity } from '../search/similarity.js';
 
 export class ResourceHandler {
   private static readonly LIST_LIMIT_MIN = 1;
@@ -168,22 +169,6 @@ export class ResourceHandler {
     return trimmed ? trimmed.slice(0, ResourceHandler.HINT_MAX_LENGTH) : undefined;
   }
 
-  private cosineSimilarity(a: number[], b: number[]): number {
-    if (a.length !== b.length || a.length === 0) return 0;
-    let dot = 0;
-    let magA = 0;
-    let magB = 0;
-    for (let i = 0; i < a.length; i++) {
-      const va = a[i]!;
-      const vb = b[i]!;
-      dot += va * vb;
-      magA += va * va;
-      magB += vb * vb;
-    }
-    if (magA === 0 || magB === 0) return 0;
-    return dot / (Math.sqrt(magA) * Math.sqrt(magB));
-  }
-
   // Greedy near-duplicate suppression over relevance-ranked candidates: a
   // candidate is dropped once it exceeds the dedup threshold's similarity to
   // an already-selected memory. Candidates with no vector (fulltext-only
@@ -195,7 +180,7 @@ export class ResourceHandler {
     for (const candidate of candidates) {
       const vector = candidate.vector;
       const isDuplicate = vector !== undefined && selected.some(sel =>
-        sel.vector !== undefined && this.cosineSimilarity(vector, sel.vector) > threshold,
+        sel.vector !== undefined && cosineSimilarity(vector, sel.vector) > threshold,
       );
       if (!isDuplicate) selected.push(candidate);
     }

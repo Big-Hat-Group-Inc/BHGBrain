@@ -405,6 +405,16 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
         "T2": 0.008,
         "T3": 0.02
       }
+    },
+    // Réordonnancement par diversité Maximal Marginal Relevance, appliqué
+    // après le classement composite (voir « Réordonnancement par diversité
+    // MMR » ci-dessous). enabled: false rétablit exactement le tri par
+    // pertinence composite pure.
+    "mmr": {
+      "enabled": true,
+      "lambda": 0.7,
+      "candidate_pool_multiplier": 3,
+      "candidate_pool_cap": 50
     }
   },
 
@@ -1677,6 +1687,34 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Taux de décroissance exponentielle par niveau appliqué à `age_days`. La valeur par défaut de `T2` donne une demi-vie d'environ 87 jours, alignée sur son TTL de 90 jours. |
 
 **Ce que le classement composite n'affecte *pas* :** les champs bruts `semantic_score` et `fulltext_score` de chaque résultat, ainsi que le champ auquel s'applique le seuil `min_score` de `recall` (`semantic_score`) — voir [Recall vs Search](#recall-vs-search--différences). Le classement composite change l'*ordre* des résultats, jamais les souvenirs qui franchissent le seuil `min_score`.
+
+---
+
+### Réordonnancement par diversité MMR
+
+`recall` et `search` (dans les modes `semantic` et `hybrid`) appliquent un réordonnancement supplémentaire après le classement composite : la **Maximal Marginal Relevance (MMR)**. Le classement composite seul peut encore renvoyer un top-K dominé par plusieurs souvenirs quasi identiques — deux faits à une similarité cosinus de 0,85, par exemple, survivent tous deux à la déduplication à l'écriture (qui ne fusionne qu'à partir de ≥ 0,92) et se retrouvent tous deux près du sommet ensemble. MMR échange une quantité configurable de pertinence maximale contre de la diversité, afin que la page renvoyée consacre ses emplacements à des faits *distincts* plutôt que redondants.
+
+**Ordre du pipeline de classement :** pertinence (cosinus / rang FTS / RRF) → prior composite (importance/accès/décroissance) → **réordonnancement par diversité MMR** → filtrage en aval par `min_score` / type / étiquettes et troncature au `limit` de l'appelant.
+
+**Fonctionnement :**
+1. `recall`/`search` récupèrent un ensemble de candidats plus large que `limit`, afin qu'il existe une réelle marge de diversification.
+2. Le score composite de chaque candidat est normalisé min-max sur l'ensemble récupéré, de sorte que `lambda` conserve la même signification, que les scores de l'ensemble soient à l'échelle cosinus (mode sémantique) ou à l'échelle RRF (mode hybride, généralement inférieure de deux ordres de grandeur).
+3. En partant du candidat le mieux noté, MMR sélectionne de façon gloutonne le candidat suivant qui maximise `lambda * pertinence_normalisée - (1 - lambda) * similarité_maximale_avec_les_déjà_sélectionnés`, où la similarité est la similarité cosinus avec chaque candidat déjà sélectionné disposant d'un vecteur.
+4. Il s'agit d'un **réordonnancement de l'ensemble complet, jamais d'une troncature** — chaque candidat récupéré reste présent ensuite, seulement réordonné. Le `min_score`, le filtrage par type/étiquettes et la troncature au `limit` s'exécutent tous en aval, sans changement de mécanisme, de sorte qu'un seuil `min_score` ne peut jamais renvoyer trop peu de résultats simplement parce que MMR s'est exécuté avant.
+5. Les candidats sans vecteur (une correspondance uniquement en texte intégral en mode hybride, par exemple) ne sont jamais pénalisés et ne peuvent jamais pénaliser les autres — ils contribuent avec une similarité de `0`.
+
+**Le mode texte intégral n'est pas affecté :** `mode: 'fulltext'` ne comporte aucun vecteur contre lequel diversifier, donc MMR ne s'exécute jamais, quel que soit `search.mmr.enabled`.
+
+**Configuration** (`search.mmr` dans `config.json`, voir [Configuration](#configuration)) :
+
+| Champ | Défaut | Signification |
+|---|---|---|
+| `enabled` | `true` | Mettre à `false` pour désactiver complètement MMR et rétablir exactement le tri par pertinence composite pure. |
+| `lambda` | `0.7` | Compromis pertinence/diversité, `0`–`1`. Proche de `1`, se rapproche du tri par pertinence composite pure ; proche de `0`, favorise la dissimilarité entre candidats plutôt que la pertinence. |
+| `candidate_pool_multiplier` | `3` | Élargit l'ensemble récupéré depuis le store à `limit * candidate_pool_multiplier` lorsque MMR est éligible, offrant une réelle marge de diversification au-delà du `limit` de l'appelant. |
+| `candidate_pool_cap` | `50` | Borne supérieure de la taille de l'ensemble élargi, quel que soit `limit * candidate_pool_multiplier`. |
+
+**Ce n'est pas la même chose que la suppression des quasi-doublons de `memory://inject/{hint}` :** ce modèle de ressource (voir [Référence des ressources MCP](#ressources-mcp)) dispose déjà de son propre mécanisme de quasi-doublons, distinct — un rejet à seuil strict (réutilisant `deduplication.similarity_threshold`, par défaut `0.92`) plutôt que le compromis continu pertinence/diversité de MMR. Les deux sont intentionnellement indépendants : la configuration `search.mmr` n'a aucun effet sur `memory://inject/{hint}`, et réciproquement.
 
 ---
 

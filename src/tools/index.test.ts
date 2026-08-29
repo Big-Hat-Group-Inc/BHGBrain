@@ -194,7 +194,7 @@ describe('search tool include_archived wiring', () => {
   it('passes include_archived through to SearchService.search', async () => {
     const search = vi.fn(async () => []);
     const ctx: ToolContext = {
-      config: {} as ToolContext['config'],
+      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
       storage: {} as StorageManager,
       embedding: {} as EmbeddingProvider,
       pipeline: {} as WritePipeline,
@@ -215,7 +215,7 @@ describe('search tool include_archived wiring', () => {
   it('defaults include_archived to false', async () => {
     const search = vi.fn(async () => []);
     const ctx: ToolContext = {
-      config: {} as ToolContext['config'],
+      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
       storage: {} as StorageManager,
       embedding: {} as EmbeddingProvider,
       pipeline: {} as WritePipeline,
@@ -722,7 +722,7 @@ describe('handleRecall filter pushdown and score semantics (push-down-recall-fil
   beforeEach(() => {
     searchMock = vi.fn(async () => [] as SearchResult[]);
     ctx = {
-      config: {} as ToolContext['config'],
+      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
       storage: {} as StorageManager,
       embedding: {} as EmbeddingProvider,
       pipeline: {} as WritePipeline,
@@ -795,6 +795,42 @@ describe('handleRecall filter pushdown and score semantics (push-down-recall-fil
 
     expect(ctx.metrics.incCounter).not.toHaveBeenCalledWith('recall_zero_after_filter');
   });
+
+  // add-mmr-diversity-reranking task 6.5: min_score is applied to
+  // semantic_score *after* SearchService's MMR reorder has already run (the
+  // reorder happens inside the mocked `search()` call here, so this
+  // simulates its output — an interleaved, non-relevance-sorted pool).
+  // `handleRecall` must still filter correctly and return up to `limit`
+  // whenever enough pool candidates clear `min_score`, regardless of order.
+  it('min_score still filters correctly and returns up to limit given an MMR-reordered (interleaved) pool', async () => {
+    const mmrEnabledCtx: ToolContext = {
+      ...ctx,
+      config: { search: { mmr: {
+        enabled: true, lambda: 0.7, candidate_pool_multiplier: 3, candidate_pool_cap: 50,
+      } } } as unknown as ToolContext['config'],
+    };
+    // 6 qualifying (semantic_score >= 0.5) interleaved with 2 non-qualifying,
+    // in an order that does not follow relevance ranking (as MMR's reorder
+    // would produce) — the widened pool a config-driven fetchLimit fetches.
+    searchMock.mockResolvedValue([
+      makeResult({ id: 'good-1', score: 0.9, semantic_score: 0.9 }),
+      makeResult({ id: 'bad-1', score: 0.4, semantic_score: 0.3 }),
+      makeResult({ id: 'good-2', score: 0.6, semantic_score: 0.55 }),
+      makeResult({ id: 'good-3', score: 0.85, semantic_score: 0.8 }),
+      makeResult({ id: 'bad-2', score: 0.45, semantic_score: 0.2 }),
+      makeResult({ id: 'good-4', score: 0.7, semantic_score: 0.65 }),
+      makeResult({ id: 'good-5', score: 0.75, semantic_score: 0.7 }),
+      makeResult({ id: 'good-6', score: 0.65, semantic_score: 0.6 }),
+    ]);
+
+    const result = await handleTool(
+      mmrEnabledCtx, 'recall', { query: 'q', min_score: 0.5, limit: 5 }, 'c1',
+    ) as { results: SearchResult[] };
+
+    expect(result.results).toHaveLength(5);
+    expect(result.results.every(r => (r.semantic_score ?? r.score) >= 0.5)).toBe(true);
+    expect(result.results.some(r => r.id === 'bad-1' || r.id === 'bad-2')).toBe(false);
+  });
 });
 
 describe('handleRecall after/before pushdown (add-time-scoped-recall)', () => {
@@ -822,7 +858,7 @@ describe('handleRecall after/before pushdown (add-time-scoped-recall)', () => {
   beforeEach(() => {
     searchMock = vi.fn(async () => [] as SearchResult[]);
     ctx = {
-      config: {} as ToolContext['config'],
+      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
       storage: {} as StorageManager,
       embedding: {} as EmbeddingProvider,
       pipeline: {} as WritePipeline,
@@ -901,7 +937,7 @@ describe('handleSearch after/before pushdown (add-time-scoped-recall)', () => {
   beforeEach(() => {
     searchMock = vi.fn(async () => [] as SearchResult[]);
     ctx = {
-      config: {} as ToolContext['config'],
+      config: { search: { mmr: { enabled: false } } } as unknown as ToolContext['config'],
       storage: {} as StorageManager,
       embedding: {} as EmbeddingProvider,
       pipeline: {} as WritePipeline,

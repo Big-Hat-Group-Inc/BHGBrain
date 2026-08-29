@@ -403,6 +403,15 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
         "T2": 0.008,
         "T3": 0.02
       }
+    },
+    // Maximal Marginal Relevance-Diversitäts-Neuordnung, angewendet nach dem
+    // Composite Ranking (siehe "MMR-Diversitäts-Neuordnung" unten).
+    // enabled: false stellt exakt die reine Composite-Relevanz-Reihenfolge wieder her.
+    "mmr": {
+      "enabled": true,
+      "lambda": 0.7,
+      "candidate_pool_multiplier": 3,
+      "candidate_pool_cap": 50
     }
   },
 
@@ -1673,6 +1682,34 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | Pro-Stufe exponentieller Decay-Satz auf `age_days`. Der Standard für `T2` ergibt eine Halbwertszeit von etwa 87 Tagen, passend zur 90-Tage-TTL. |
 
 **Was Composite Ranking *nicht* beeinflusst:** die rohen Felder `semantic_score` und `fulltext_score` jedes Ergebnisses sowie das Feld, auf das der `min_score`-Schwellenwert von `recall` angewendet wird (`semantic_score`) – siehe [Recall vs. Search](#recall-vs-search--unterschiede). Composite Ranking ändert die *Reihenfolge* der Ergebnisse, niemals, welche Erinnerungen die `min_score`-Schwelle passieren.
+
+---
+
+### MMR-Diversitäts-Neuordnung
+
+`recall` und `search` (in den Modi `semantic` und `hybrid`) wenden nach dem Composite Ranking einen weiteren Neuordnungsschritt an: **Maximal Marginal Relevance (MMR)**. Composite Ranking allein kann weiterhin ein Top-K liefern, das von mehreren nahezu identischen Erinnerungen dominiert wird – zwei Fakten mit einer Kosinus-Ähnlichkeit von 0,85 etwa überstehen beide die Schreibzeit-Deduplizierung (die nur ≥ 0,92 zusammenführt) und landen beide gemeinsam nahe der Spitze. MMR tauscht einen konfigurierbaren Anteil der Top-Relevanz gegen Diversität, sodass die zurückgegebene Seite ihre Plätze auf *unterschiedliche* Fakten verteilt.
+
+**Reihenfolge der Ranking-Pipeline:** Relevanz (Kosinus / FTS-Rang / RRF) → Composite-Prior (Wichtigkeit/Zugriff/Decay) → **MMR-Diversitäts-Neuordnung** → nachgelagerte `min_score`-/Typ-/Tag-Filterung und Kürzung auf das `limit` des Aufrufers.
+
+**Funktionsweise:**
+1. `recall`/`search` holen einen größeren Kandidatenpool als `limit`, damit tatsächlich Spielraum zur Diversifizierung besteht.
+2. Der Composite-Score jedes Kandidaten wird über den abgerufenen Pool min-max-normalisiert, sodass `lambda` unabhängig davon dasselbe bedeutet, ob die Pool-Scores kosinus-skaliert (semantischer Modus) oder RRF-skaliert sind (hybrider Modus, typischerweise um zwei Größenordnungen kleiner).
+3. Ausgehend vom höchstbewerteten Kandidaten wählt MMR gierig den nächsten Kandidaten, der `lambda * normalisierte_relevanz - (1 - lambda) * max_ähnlichkeit_zu_bereits_ausgewählten` maximiert, wobei Ähnlichkeit die Kosinus-Ähnlichkeit zu jedem bereits ausgewählten Kandidaten mit Vektor ist.
+4. Dies ist eine **Neuordnung des gesamten Pools, niemals eine Kürzung** – jeder abgerufene Kandidat ist danach noch vorhanden, nur neu angeordnet. `min_score`, Typ-/Tag-Filterung und die Kürzung auf `limit` laufen alle nachgelagert ab, mechanisch unverändert, sodass eine `min_score`-Schwelle niemals zu wenige Ergebnisse liefern kann, nur weil MMR zuvor gelaufen ist.
+5. Kandidaten ohne Vektor (z. B. ein reiner Volltext-Treffer im hybriden Modus) werden nie bestraft und können andere nie bestrafen – sie tragen mit Ähnlichkeit `0` bei.
+
+**Der Volltextmodus ist nicht betroffen:** `mode: 'fulltext'` führt keine Vektoren, gegen die diversifiziert werden könnte, daher läuft MMR nie, unabhängig von `search.mmr.enabled`.
+
+**Konfiguration** (`search.mmr` in `config.json`, siehe [Konfiguration](#konfiguration)):
+
+| Feld | Standard | Bedeutung |
+|---|---|---|
+| `enabled` | `true` | Auf `false` setzen, um MMR vollständig zu deaktivieren und exakt die reine Composite-Relevanz-Reihenfolge wiederherzustellen. |
+| `lambda` | `0.7` | Abwägung zwischen Relevanz und Diversität, `0`–`1`. Nahe `1` nähert sich der reinen Composite-Relevanz-Reihenfolge an; nahe `0` bevorzugt Unähnlichkeit zwischen Kandidaten gegenüber Relevanz. |
+| `candidate_pool_multiplier` | `3` | Erweitert den aus dem Store abgerufenen Pool auf `limit * candidate_pool_multiplier`, wenn MMR anwendbar ist, und schafft so echten Diversifizierungsspielraum über das `limit` des Aufrufers hinaus. |
+| `candidate_pool_cap` | `50` | Obergrenze für die Größe des erweiterten Pools, unabhängig von `limit * candidate_pool_multiplier`. |
+
+**Nicht dasselbe wie die Nahdublikat-Unterdrückung von `memory://inject/{hint}`:** Diese Resource-Vorlage (siehe [MCP-Ressourcen](#mcp-ressourcen)) verfügt bereits über einen eigenen, separaten Nahdublikat-Mechanismus – eine harte Schwellenwert-Verwerfung (die `deduplication.similarity_threshold`, Standard `0.92`, wiederverwendet) statt des kontinuierlichen Relevanz-/Diversitäts-Kompromisses von MMR. Beide sind absichtlich unabhängig: Die `search.mmr`-Konfiguration hat keine Auswirkung auf `memory://inject/{hint}` und umgekehrt.
 
 ---
 

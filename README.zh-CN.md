@@ -397,6 +397,15 @@ BHGBrain 从以下位置加载配置文件：
         "T2": 0.008,
         "T3": 0.02
       }
+    },
+    // 最大边际相关性（MMR）多样性重排序，在复合排名之后应用
+    // （详见下方"MMR 多样性重排序"）。enabled 设为 false 可精确恢复
+    // 纯复合相关性排序。
+    "mmr": {
+      "enabled": true,
+      "lambda": 0.7,
+      "candidate_pool_multiplier": 3,
+      "candidate_pool_cap": 50
     }
   },
 
@@ -1634,6 +1643,34 @@ final_score = relevance x (w_base + w_importance x importance + w_access x log1p
 | `decay_per_day.T0` / `T1` / `T2` / `T3` | `0` / `0.002` / `0.008` / `0.02` | 应用于 `age_days` 的各层级指数衰减率。`T2` 的默认值给出约 87 天的半衰期，与其 90 天 TTL 相吻合。 |
 
 **复合排名*不*影响的内容：** 每条结果上原始的 `semantic_score` 和 `fulltext_score` 字段，以及 `recall` 的 `min_score` 阈值所作用的字段（`semantic_score`）——参见 [Recall 与 Search 的区别](#recall-与-search-的区别)。复合排名改变的是结果的*排序*，绝不会改变哪些记忆能通过 `min_score` 关卡。
+
+---
+
+### MMR 多样性重排序
+
+`recall` 和 `search`（在 `semantic` 和 `hybrid` 模式下）在复合排名之后应用了进一步的重排序步骤：**最大边际相关性（Maximal Marginal Relevance，MMR）**。仅靠复合排名，返回的 top-K 结果仍可能被多条近似重复的记忆占据——例如两条余弦相似度为 0.85 的事实，都能挺过写入时的去重（该机制仅合并 ≥ 0.92 的相似项），并双双排在前列。MMR 用可配置比例的最高相关性换取多样性，使返回的结果页面把名额留给*不同*的事实，而不是重复的事实。
+
+**排名流水线顺序：** 相关性（余弦相似度 / FTS 排名 / RRF）→ 复合先验（重要性/访问/衰减）→ **MMR 多样性重排序** → 下游的 `min_score` / 类型 / 标签过滤以及截断到调用方的 `limit`。
+
+**工作原理：**
+1. `recall`/`search` 会获取一个比 `limit` 更大的候选池，以确保有真正的多样化空间。
+2. 每个候选项的复合得分会在获取到的候选池内进行 min-max 归一化，这样无论池中的分数是余弦尺度（语义模式）还是 RRF 尺度（混合模式，通常比余弦尺度小两个数量级），`lambda` 的含义都保持一致。
+3. 从得分最高的候选项开始，MMR 贪婪地选择使 `lambda * 归一化相关性 - (1 - lambda) * 与已选项的最大相似度` 最大化的下一个候选项，其中相似度是指与每个已选且携带向量的候选项之间的余弦相似度。
+4. 这是对**整个候选池的重排序，而不是截断**——重排序前获取到的每个候选项之后依然存在，只是顺序被调整。`min_score`、类型/标签过滤以及截断到 `limit` 都在下游执行，机制不受影响，因此 `min_score` 阈值绝不会因为 MMR 先运行过而导致返回结果不足。
+5. 没有向量的候选项（例如混合模式下仅通过全文匹配命中的结果）永远不会被惩罚，也不会惩罚其他候选项——它们贡献的相似度为 `0`。
+
+**全文模式不受影响：** `mode: 'fulltext'` 没有可供多样化比较的向量，因此无论 `search.mmr.enabled` 为何值，MMR 都不会运行。
+
+**配置**（`config.json` 中的 `search.mmr`，参见[配置](#配置)）：
+
+| 字段 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `true` | 设为 `false` 可完全禁用 MMR，精确恢复纯复合相关性排序。 |
+| `lambda` | `0.7` | 相关性与多样性之间的权衡，取值 `0`–`1`。接近 `1` 时近似纯复合相关性排序；接近 `0` 时更倾向于候选项之间的差异性而非相关性。 |
+| `candidate_pool_multiplier` | `3` | 当 MMR 可用时，将从存储中获取的候选池扩大到 `limit * candidate_pool_multiplier`，从而在调用方的 `limit` 之外提供真正的多样化空间。 |
+| `candidate_pool_cap` | `50` | 无论 `limit * candidate_pool_multiplier` 结果如何，扩大后的候选池大小的上限。 |
+
+**与 `memory://inject/{hint}` 的近似重复抑制并不相同：** 该资源模板（参见 [MCP 资源参考](#mcp-资源)）已经拥有自己独立的近似重复机制——一种硬阈值丢弃规则（复用 `deduplication.similarity_threshold`，默认值 `0.92`），而不是 MMR 那种连续的相关性/多样性权衡。二者刻意保持独立：`search.mmr` 配置对 `memory://inject/{hint}` 没有任何影响，反之亦然。
 
 ---
 

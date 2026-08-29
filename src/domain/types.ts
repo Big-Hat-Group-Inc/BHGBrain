@@ -102,10 +102,14 @@ export interface SearchResult {
   device_id?: string | null;
   created_at: string;
   last_accessed: string;
-  // Populated only by `SearchService.searchForInject` (the semantic leg's raw
+  // Populated by `SearchService.searchForInject` (the semantic leg's raw
   // vector, when available) so relevance-conditioned inject can suppress
-  // near-duplicate memories. Never populated by the public `search`/`recall`
-  // tools, so it never appears in their JSON responses.
+  // near-duplicate memories — those callers see it populated. Also used as
+  // transient MMR scratch space inside the public `search()` method
+  // (add-mmr-diversity-reranking: candidate vectors requested when
+  // `search.mmr.enabled`, consumed by the diversity reorder) but always
+  // cleared to `undefined` before `search()` returns, so it never appears in
+  // the public `search`/`recall` tools' JSON responses.
   vector?: number[];
   // Set only on archived matches surfaced via `search`'s `include_archived`
   // (add-review-and-archive-recall). Absent (not `false`) on every active

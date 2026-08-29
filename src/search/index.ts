@@ -6,6 +6,7 @@ import type { AccessUpdate } from '../storage/sqlite.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { embeddingUnavailable, internal } from '../errors/index.js';
+import { cosineSimilarity } from './similarity.js';
 
 const RRF_K = 60;
 
@@ -104,16 +105,23 @@ export class SearchService {
   ): Promise<SearchResult[]> {
     const start = Date.now();
     try {
+      // Whether this call is eligible for MMR diversity reordering
+      // (add-mmr-diversity-reranking): only when the feature is on and the
+      // mode actually carries vectors to diversify against (fulltext never
+      // does). Computed once so every mode branch requests vectors
+      // consistently instead of each caller threading its own boolean.
+      const wantVectors = this.config.search.mmr.enabled && mode !== 'fulltext';
+
       let results: SearchResult[];
       switch (mode) {
         case 'semantic':
-          results = await this.semanticSearch(query, namespace, collection, limit, filter);
+          results = await this.semanticSearch(query, namespace, collection, limit, filter, wantVectors);
           break;
         case 'fulltext':
           results = this.fulltextSearch(query, namespace, collection, limit, filter);
           break;
         case 'hybrid':
-          results = await this.hybridSearch(query, namespace, collection, limit, signal, filter);
+          results = await this.hybridSearch(query, namespace, collection, limit, signal, filter, wantVectors);
           break;
         default: {
           const unsupportedMode: never = mode;
@@ -121,11 +129,29 @@ export class SearchService {
         }
       }
 
+      // Full-pool reorder, never a truncator: every candidate present before
+      // this runs is still present afterward, only reordered. Downstream
+      // truncation/min_score/type-tags filtering in tools/index.ts is
+      // unaffected in mechanism (add-mmr-diversity-reranking).
+      results = wantVectors && results.length > 1
+        ? this.mmrRerank(results, this.config.search.mmr.lambda)
+        : results;
+
       if (includeArchived) {
         const archivedMatches = this.storage.sqlite
           .searchArchived(namespace, query, limit)
           .map(archiveRecordToSearchResult);
         results = [...results, ...archivedMatches];
+      }
+
+      // Strip the transient MMR scratch vector before returning so the
+      // "never populated in public tool responses" contract on
+      // `SearchResult.vector` continues to hold; `undefined` is dropped by
+      // `JSON.stringify`. `searchForInject` bypasses this method's return
+      // path entirely (calls `hybridSearch` directly), so its callers still
+      // see `vector` populated.
+      for (const r of results) {
+        r.vector = undefined;
       }
 
       return results;
@@ -140,6 +166,10 @@ export class SearchService {
     collection: string | undefined,
     limit: number,
     filter?: RecallFilter,
+    // Mirrors `hybridSearch`'s `withVectors` flag (add-mmr-diversity-reranking):
+    // when true, requests raw vectors from Qdrant so `search()` can MMR-rerank
+    // the pool. Default false so every pre-existing caller is unaffected.
+    withVectors = false,
   ): Promise<SearchResult[]> {
     let vector: number[];
     try {
@@ -148,10 +178,13 @@ export class SearchService {
       throw embeddingUnavailable('Cannot perform semantic search: embedding provider unavailable');
     }
 
-    let results: Array<{ id: string; score: number; payload: Record<string, unknown> }>;
+    let results: Array<{ id: string; score: number; payload: Record<string, unknown>; vector?: number[] }>;
     try {
-      results = filter
-        ? await this.storage.qdrant.search(namespace, collection, vector, limit, filter)
+      const qdrantFilter: (RecallFilter & { withVector?: boolean }) | undefined = withVectors
+        ? { ...(filter ?? {}), withVector: true }
+        : filter;
+      results = qdrantFilter
+        ? await this.storage.qdrant.search(namespace, collection, vector, limit, qdrantFilter)
         : await this.storage.qdrant.search(namespace, collection, vector, limit);
     } catch (err) {
       throw internal(`Semantic search failed: vector store unavailable — ${(err as Error).message}`);
@@ -163,6 +196,7 @@ export class SearchService {
         score: r.score,
         semantic_score: r.score,
         qdrantPayload: r.payload,
+        vector: r.vector,
       })),
     );
   }
@@ -327,6 +361,57 @@ export class SearchService {
     const decay = Math.exp(-lambda * ageDays);
 
     return relevance * prior * decay;
+  }
+
+  // Maximal Marginal Relevance: greedily reorders `results` trading relevance
+  // for diversity among already-selected candidates (add-mmr-diversity-
+  // reranking). Full-pool reorder, never a truncator — every input result is
+  // returned, same length, only reordered. No-op for pools too small to
+  // diversify. `.score` is min-max normalized across the pool first so
+  // `lambda` means the same thing regardless of whether it came from
+  // cosine-scale semantic ranking or RRF-scale hybrid ranking; a pool with no
+  // score spread normalizes to `1` for every candidate, so only diversity
+  // differentiates ties. Candidates/comparisons missing a vector contribute
+  // `0` similarity — never penalized, never able to penalize others.
+  private mmrRerank(results: SearchResult[], lambda: number): SearchResult[] {
+    if (results.length <= 1) return results;
+
+    const scores = results.map(r => r.score);
+    const min = Math.min(...scores);
+    const max = Math.max(...scores);
+    const spread = max - min;
+    const normScore = new Map<SearchResult, number>(
+      results.map(r => [r, spread === 0 ? 1 : (r.score - min) / spread]),
+    );
+
+    const remaining = [...results];
+    const selected: SearchResult[] = [];
+
+    while (remaining.length > 0) {
+      let bestIdx = 0;
+      let bestValue = -Infinity;
+      for (let i = 0; i < remaining.length; i++) {
+        const candidate = remaining[i]!;
+        const relevance = normScore.get(candidate)!;
+        let maxSim = 0;
+        if (candidate.vector) {
+          for (const sel of selected) {
+            if (!sel.vector) continue;
+            const sim = cosineSimilarity(candidate.vector, sel.vector);
+            if (sim > maxSim) maxSim = sim;
+          }
+        }
+        const value = lambda * relevance - (1 - lambda) * maxSim;
+        if (value > bestValue) {
+          bestValue = value;
+          bestIdx = i;
+        }
+      }
+      const [chosen] = remaining.splice(bestIdx, 1);
+      selected.push(chosen!);
+    }
+
+    return selected;
   }
 
   private buildSearchResults(
