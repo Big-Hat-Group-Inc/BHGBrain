@@ -1102,3 +1102,157 @@ describe('WritePipeline summarization', () => {
     expect(result!.summary).toBe('LLM-produced summary');
   });
 });
+
+describe('WritePipeline auto-tagging (add-auto-tagging)', () => {
+  const config = {
+    deduplication: { similarity_threshold: 0.92 },
+    pipeline: {
+      extraction_enabled: false,
+      fallback_to_threshold_dedup: true,
+      contradiction_detection: { enabled: false, timeout_ms: 5000 },
+      auto_tag_enabled: true,
+      auto_tag_max_per_memory: 6,
+    },
+  } as unknown as BrainConfig;
+
+  let embedding: EmbeddingProvider;
+  let storage: StorageManager;
+
+  beforeEach(() => {
+    embedding = {
+      model: 'test-model',
+      dimensions: 2,
+      embed: vi.fn(async () => [0.1, 0.2]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
+      healthCheck: vi.fn(async () => true),
+    };
+    storage = {
+      sqlite: {
+        getMemoryByChecksum: vi.fn(() => null),
+        getMemoryById: vi.fn(() => null),
+        insertMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+        fullTextSearch: vi.fn(() => []),
+      },
+      qdrant: {
+        searchSimilar: vi.fn(async () => []),
+      },
+      updateMemory: vi.fn(),
+      writeMemory: vi.fn(),
+      writeMemoryWithoutVector: vi.fn(),
+      deleteMemory: vi.fn(async () => true),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+  });
+
+  it('ADD with no caller tags gains auto-derived tags from content', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'See src/pipeline/index.ts for the extractionEnabled flag.',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('ADD');
+    expect(storage.writeMemory).toHaveBeenCalledTimes(1);
+    const [writtenMemory] = vi.mocked(storage.writeMemory).mock.calls[0]!;
+    expect(writtenMemory.tags.length).toBeGreaterThan(0);
+    expect(writtenMemory.tags).toEqual(expect.arrayContaining(['extractionenabled', 'src-pipeline-index-ts']));
+  });
+
+  it('ADD with caller tags gets caller tags union auto-derived tags, caller tags first', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'See src/pipeline/index.ts for the extractionEnabled flag.',
+      namespace: 'global',
+      collection: 'general',
+      tags: ['manual-tag'],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('ADD');
+    const [writtenMemory] = vi.mocked(storage.writeMemory).mock.calls[0]!;
+    expect(writtenMemory.tags[0]).toBe('manual-tag');
+    expect(writtenMemory.tags).toEqual(
+      expect.arrayContaining(['manual-tag', 'extractionenabled', 'src-pipeline-index-ts']),
+    );
+  });
+
+  it('UPDATE unions auto-derived tags into mergedTags like any candidate tag', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'existing-id', score: 0.95 }]);
+    storage.sqlite.getMemoryById = vi.fn(() => ({
+      id: 'existing-id',
+      summary: 'existing summary',
+      type: 'semantic',
+      content: 'existing content',
+      created_at: '2026-01-01T00:00:00.000Z',
+      importance: 0.5,
+      tags: ['existing-tag'],
+    }));
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'a refinement mentioning bhgbrain/core',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('UPDATE');
+    expect(storage.updateMemory).toHaveBeenCalledTimes(1);
+    const [, patch] = vi.mocked(storage.updateMemory).mock.calls[0]!;
+    expect(patch.tags).toEqual(expect.arrayContaining(['existing-tag', 'bhgbrain-core']));
+  });
+
+  it('never exceeds the 20-tag cap and never evicts caller-supplied tags when trimming', async () => {
+    const callerTags = Array.from({ length: 18 }, (_, i) => `caller-tag-${i}`);
+    // Shaped to produce more auto-tag candidates than
+    // `auto_tag_max_per_memory` (6), so the union with 18 caller tags
+    // exceeds the 20-tag cap and must trim auto-derived tags, not caller
+    // tags.
+    const content = [
+      'src/pipeline/index.ts', 'src/domain/auto-tag.ts', 'src/config/index.ts',
+      'bhgbrain/core', 'qdrant/qdrant', '@jsmith', '@asmith',
+      'extractionEnabled', 'autoTagEnabled',
+    ].join(' and ');
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await pipeline.process({
+      content,
+      namespace: 'global',
+      collection: 'general',
+      tags: callerTags,
+      source: 'cli',
+    });
+
+    const [writtenMemory] = vi.mocked(storage.writeMemory).mock.calls[0]!;
+    expect(writtenMemory.tags).toHaveLength(20);
+    for (const tag of callerTags) {
+      expect(writtenMemory.tags).toContain(tag);
+    }
+  });
+
+  it('auto_tag_enabled: false reproduces exact pass-through behavior (candidate tags identical to input.tags)', async () => {
+    const disabledConfig = {
+      ...config,
+      pipeline: { ...config.pipeline, auto_tag_enabled: false },
+    } as unknown as BrainConfig;
+    const pipeline = new WritePipeline(disabledConfig, storage, embedding);
+
+    await pipeline.process({
+      content: 'See src/pipeline/index.ts for the extractionEnabled flag.',
+      namespace: 'global',
+      collection: 'general',
+      tags: ['manual-tag'],
+      source: 'cli',
+    });
+
+    const [writtenMemory] = vi.mocked(storage.writeMemory).mock.calls[0]!;
+    expect(writtenMemory.tags).toEqual(['manual-tag']);
+  });
+});

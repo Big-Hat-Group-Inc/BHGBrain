@@ -5,6 +5,7 @@ import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { MemoryType, MemorySource, WriteOperation, MemoryRecord, WriteResult, RetentionTier } from '../domain/types.js';
 import { normalizeContent, computeChecksum, generateSummary, containsSecret, detectsInvalidation } from '../domain/normalize.js';
+import { extractAutoTags } from '../domain/auto-tag.js';
 import { summarizeContent } from '../domain/summarize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { invalidInput, internal } from '../errors/index.js';
@@ -99,7 +100,7 @@ export class WritePipeline {
     const singleCandidate: MemoryCandidate[] = [{
       content: normalized,
       type: input.type,
-      tags: input.tags,
+      tags: this.deriveTags(normalized, input.tags),
       importance: input.importance,
     }];
 
@@ -116,7 +117,7 @@ export class WritePipeline {
       return raw.map(candidate => ({
         content: candidate.content,
         type: candidate.type ?? input.type,
-        tags: input.tags,
+        tags: this.deriveTags(candidate.content, input.tags),
         importance: candidate.importance ?? input.importance,
       }));
     } catch (err) {
@@ -129,6 +130,22 @@ export class WritePipeline {
       });
       return singleCandidate;
     }
+  }
+
+  /**
+   * Unions caller-supplied tags with deterministic, content-derived tags
+   * (see `src/domain/auto-tag.ts`, add-auto-tagging). Caller tags are listed
+   * first so a subsequent trim to `TagsSchema`'s 20-tag cap
+   * (`src/domain/schemas.ts:15`) never evicts a caller-supplied tag in favor
+   * of an auto-derived one. `auto_tag_enabled: false` returns `callerTags`
+   * unchanged — byte-identical to pre-feature behavior.
+   */
+  private deriveTags(content: string, callerTags: string[]): string[] {
+    if (!this.config.pipeline.auto_tag_enabled) {
+      return callerTags;
+    }
+    const autoTags = extractAutoTags(content, this.config.pipeline.auto_tag_max_per_memory);
+    return [...new Set([...callerTags, ...autoTags])].slice(0, 20);
   }
 
   private async decide(

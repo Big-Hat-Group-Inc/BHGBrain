@@ -161,3 +161,78 @@ Jane Doe, CTO at Acme Corp.`;
     expect(firstCall.namespace).toBe('custom-ns');
   });
 });
+
+// add-auto-tagging (3.3): `handleImport` routes every memory through
+// `ctx.pipeline.process()`, so a real `WritePipeline` (not the stubbed
+// `pipelineProcess` above) must pick up auto-tagging with no separate
+// wiring in `import.ts` itself.
+describe('import tool auto-tagging (add-auto-tagging)', () => {
+  it('routes imported freeform content through WritePipeline.extract(), gaining auto-derived tags', async () => {
+    const { WritePipeline } = await import('../pipeline/index.js');
+
+    const config = {
+      deduplication: { similarity_threshold: 0.92 },
+      pipeline: {
+        extraction_enabled: false,
+        fallback_to_threshold_dedup: true,
+        contradiction_detection: { enabled: false, timeout_ms: 5000 },
+        auto_tag_enabled: true,
+        auto_tag_max_per_memory: 6,
+      },
+      device: { id: 'dev-1' },
+    } as unknown as ToolContext['config'];
+
+    const embedding = {
+      model: 'test-model',
+      dimensions: 2,
+      embed: vi.fn(async () => [0.1, 0.2]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
+      healthCheck: vi.fn(async () => true),
+    } as unknown as EmbeddingProvider;
+
+    const writeMemory = vi.fn();
+    const storage = {
+      sqlite: {
+        getMemoryByChecksum: vi.fn(() => null),
+        getMemoryById: vi.fn(() => null),
+        insertMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+        fullTextSearch: vi.fn(() => []),
+        countMemories: vi.fn(() => 1),
+      },
+      qdrant: {
+        searchSimilar: vi.fn(async () => []),
+      },
+      updateMemory: vi.fn(),
+      writeMemory,
+      writeMemoryWithoutVector: vi.fn(),
+      deleteMemory: vi.fn(async () => true),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+
+    const realPipeline = new WritePipeline(config, storage, embedding);
+    const importCtx: ToolContext = {
+      config,
+      storage,
+      embedding,
+      pipeline: realPipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+
+    const content = 'See src/pipeline/index.ts for the extractionEnabled flag.';
+    const result = await handleTool(importCtx, 'import', { format: 'freeform', content }) as Record<string, unknown>;
+
+    expect(result.memories_created).toBe(1);
+    expect(writeMemory).toHaveBeenCalledTimes(1);
+    const [writtenMemory] = writeMemory.mock.calls[0]!;
+    // The freeform parser's own caller-supplied tag is preserved...
+    expect(writtenMemory.tags).toContain('imported');
+    // ...and content-derived tags are unioned in for free.
+    expect(writtenMemory.tags).toContain('src-pipeline-index-ts');
+    expect(writtenMemory.tags).toContain('extractionenabled');
+  });
+});

@@ -29,6 +29,7 @@ BHGBrain speichert Erinnerungen in SQLite (Metadaten + Volltextsuche) und Qdrant
     - [Aufbewahrungsstufen](#aufbewahrungsstufen)
     - [Stufenlebenszyklus – Zuweisung, Beförderung, Gleitendes Fenster](#stufenlebenszyklus--zuweisung-beförderung-gleitendes-fenster)
     - [Deduplizierung](#deduplizierung)
+    - [Automatisches Taggen](#automatisches-taggen)
     - [Inhaltsnormalisierung](#inhaltsnormalisierung)
     - [Wichtigkeitsbewertung](#wichtigkeitsbewertung)
     - [Kategorien – Persistente Richtlinien-Slots](#kategorien--persistente-richtlinien-slots)
@@ -564,7 +565,18 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Bedarf auf eine andere Variable für einen separaten Schlüssel verweisen.
     "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
     // Timeout für die Zusammenfassungsanfrage in Millisekunden, per AbortController erzwungen
-    "summarization_timeout_ms": 3000
+    "summarization_timeout_ms": 3000,
+    // Deterministisches, abhängigkeitsfreies Inhalts-Tagging: leitet zusätzliche
+    // Tags aus code-artigen Tokens, Dateipfaden, Repo-Kurzformen (owner/repo) und
+    // @Erwähnungen im normalisierten Inhalt ab und vereinigt sie mit
+    // aufruferseitigen Tags. Kein LLM-Aufruf, kein Netzwerkzugriff. `false`
+    // stellt exakt das Verhalten vor dieser Funktion wieder her. Siehe
+    // "Automatisches Taggen" unten.
+    "auto_tag_enabled": true,
+    // Obergrenze für automatisch abgeleitete Tags pro Erinnerung, angewendet vor
+    // der Zusammenführung mit aufruferseitigen Tags und dem Kürzen auf die
+    // Obergrenze von 20 Tags (beim Kürzen haben aufruferseitige Tags immer Vorrang).
+    "auto_tag_max_per_memory": 6
   },
 
   // Steuert die Qualitätsstufe zur Erzeugung des `summary`-Felds jeder Erinnerung.
@@ -1024,7 +1036,7 @@ Jede in BHGBrain gespeicherte Erinnerung ist ein `MemoryRecord` mit folgenden Fe
 | `category` | `string \| null` | Kategoriename, wenn diese Erinnerung an eine persistente Richtlinienkategorie gebunden ist |
 | `content` | `string` | Der vollständige Speicherinhalt (bis zu 100.000 Zeichen) |
 | `summary` | `string` | Automatisch generierte Zusammenfassung der ersten Zeile (bis zu 120 Zeichen) |
-| `tags` | `string[]` | Freie Tags (alphanumerisch + Bindestriche, max. 20 Tags, max. 100 Zeichen je Tag) |
+| `tags` | `string[]` | Freie Tags (alphanumerisch + Bindestriche, max. 20 Tags, max. 100 Zeichen je Tag). Enthält sowohl aufruferseitige als auch automatisch abgeleitete Tags — siehe [Automatisches Taggen](#automatisches-taggen). |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | Wie die Erinnerung erstellt wurde |
 | `checksum` | `string` | SHA-256-Hash des normalisierten Inhalts (wird für exakte Deduplizierung verwendet) |
 | `embedding` | `number[]` | Vektoreinbettung (nicht in SQLite gespeichert; liegt in Qdrant) |
@@ -1382,6 +1394,73 @@ Die Qdrant-Ähnlichkeitssuche ruft bereits die obersten 10 Kandidaten ab, aber s
 
 **Fallback-Verhalten:**
 Wenn der Einbettungsanbieter nicht verfügbar ist und `pipeline.fallback_to_threshold_dedup: true`, wechselt die Pipeline auf einen vektorlosen Dedup-Pfad, statt den Schreibvorgang fehlschlagen zu lassen. Exakte Prüfsummen-Treffer führen weiterhin sofort zu `NOOP` wie in Phase 1. Für alles andere nutzt die Pipeline die SQLite-Volltextsuche über denselben Namensraum/dieselbe Sammlung, um die ähnlichste vorhandene Erinnerung zu finden, und bewertet sie mit einer deterministischen Wortüberlappungs-Ähnlichkeit (nicht dem Vektor-Kosinuswert); bei Erreichen oder Überschreiten des `UPDATE`-Schwellenwerts wird der Inhalt in diese Erinnerung zusammengeführt (`UPDATE`, mit `vector_synced: false`), andernfalls wird er als neue Erinnerung nur in SQLite geschrieben (`ADD`, `vector_synced: false`). In beiden Fällen ist die Erinnerung für die Volltextsuche verfügbar, aber nicht für die semantische Suche, bis die Qdrant-Synchronisation wiederhergestellt ist, und das Erreichen dieses Pfads protokolliert eine strukturierte `degraded_write`-Warnung.
+
+---
+
+### Automatisches Taggen
+
+Die meisten Schreibvorgänge tragen keine aufruferseitigen Tags, wodurch der
+`tags`-Filter bei `recall`/`search` und die 2×-Gewichtung von Tag-Treffern bei der
+Volltextsuche ins Leere laufen. Wenn `pipeline.auto_tag_enabled` `true` ist
+(Standard), führt die Schreibpipeline einen deterministischen, abhängigkeitsfreien
+Extraktor über den normalisierten Inhalt jedes Kandidaten aus — kein LLM-Aufruf, kein
+Netzwerkzugriff — und vereinigt die Ergebnisse mit etwaigen aufruferseitigen Tags.
+Die Extraktion erfolgt vor der Dedup-Klassifizierung und ändert daher nie, ob ein
+Schreibvorgang als `ADD`/`UPDATE`/`DELETE`/`NOOP` eingestuft wird.
+
+**Extraktionskategorien** (in Prioritätsreihenfolge — höher priorisierte Kategorien
+bleiben erhalten, falls die kombinierte Tag-Menge gekürzt werden muss):
+
+1. **Code-artige Tokens** — Markdown-Inline-Code-Spans (`` `useEffect` ``) sowie
+   camelCase-/PascalCase-/`snake_case`-/gepunktete Bezeichner (`extractionEnabled`,
+   `search.ranking.enabled`), mit einer Mindestlänge von 5 Zeichen, um kurze
+   zufällige Treffer auszuschließen.
+2. **Dateipfade** — durch Schrägstriche getrennte Pfade mit erkannter Endung
+   (`src/pipeline/index.ts`) sowie eine feste Menge bekannter Dateinamen
+   (`package.json`, `README.md`, `Dockerfile`, ...), die auch ohne Verzeichnisangabe
+   erkannt werden.
+3. **Repo-Kurzformen** — zweiteilige `owner/repo`-artige Tokens, deren letztes
+   Segment keine erkannte Dateiendung trägt (`bhgbrain/core`); trägt das letzte
+   Segment eine Endung, wird der Token stattdessen als Dateipfad eingestuft.
+4. **@-Erwähnungen** — `@handle`-artige Tokens, denen kein Wortzeichen unmittelbar
+   vorausgeht, unter Ausschluss von E-Mail-Adressen (`jsmith@example.com` erzeugt
+   keinen Erwähnungs-Tag).
+
+**Slugifizierung:** Jeder erkannte Token wird so normalisiert, dass er unverändert
+dem `TagSchema` (`^[a-zA-Z0-9-]+$`, max. 100 Zeichen) genügt — kleingeschrieben, ein
+führendes `@` wird auf das Präfix `at-` abgebildet (sodass `@jsmith` zu `at-jsmith`
+wird, statt mit einem einfachen Wort-Tag zu kollidieren), jede Folge anderer Zeichen
+wird zu einem einzelnen `-` zusammengefasst, führende/nachgestellte `-` werden
+entfernt und auf 100 Zeichen gekürzt. Kandidaten, die nach der Slugifizierung kürzer
+als 2 Zeichen sind, werden verworfen. Beispiele: `src/pipeline/index.ts` →
+`src-pipeline-index-ts`, `bhgbrain/core` → `bhgbrain-core`, `` `useEffect` `` →
+`useeffect`.
+
+**Zusammenführung und Obergrenzen:** Automatisch abgeleitete Tags werden dedupliziert
+und mit aufruferseitigen Tags vereinigt (`aufruferseitige Tags ∪ automatische Tags`,
+aufruferseitige Tags stehen immer zuerst), dann auf die bestehende Obergrenze von 20
+Tags pro Erinnerung gekürzt — beim Kürzen werden immer zuerst automatisch abgeleitete
+Tags entfernt, nie ein aufruferseitiger. Bei `UPDATE` fließen automatisch abgeleitete
+Tags genau wie jeder andere Kandidaten-Tag in die bestehende Tag-Zusammenführung ein.
+
+| Konfigurationsfeld | Standard | Bedeutung |
+|---|---|---|
+| `pipeline.auto_tag_enabled` | `true` | Abschalter. `false` stellt exakt das Verhalten vor dieser Funktion wieder her: Die Kandidaten-Tags entsprechen genau der aufruferseitigen `tags`-Eingabe. |
+| `pipeline.auto_tag_max_per_memory` | `6` | Obergrenze für automatisch abgeleitete Tags pro Erinnerung, angewendet vor der Zusammenführung mit aufruferseitigen Tags. |
+
+Keine Schema- oder Speicheränderungen: Automatisch abgeleitete Tags werden als
+gewöhnliche Einträge im `tags`-Array gespeichert — dieselbe Spalte, dieselbe
+2×-Volltextgewichtung, derselbe `tags`-Filter-Pushdown bei `recall`/`search`.
+`import` und `remember` laufen beide über dieselbe Schreibpipeline und profitieren
+daher ohne separate Verdrahtung.
+
+**Bekannte Ungenauigkeit:** Die musterbasierte Extraktion taggt gelegentlich
+gewöhnlichen großgeschriebenen Fließtext oder Markennamen, die zufällig
+camelCase-/PascalCase-artig geformt sind (z. B. `GitHub` → `github`) — dies wird als
+inhärente Eigenschaft eines deterministischen v1-Extraktors akzeptiert, nicht als
+semantisches Verständnis; nutzen Sie die `remove`-Aktion des `tag`-Tools, um
+Ausreißer zu korrigieren, oder setzen Sie `pipeline.auto_tag_enabled: false`, um die
+Extraktion vollständig zu deaktivieren.
 
 ---
 
@@ -2631,7 +2710,7 @@ Inhalt in BHGBrain mit automatischer Deduplizierung, Normalisierung, Einbettung 
 | `namespace` | `string` | Nein | `"global"` | Namensraum-Scope. Muster: `^[a-zA-Z0-9/-]{1,200}$` |
 | `collection` | `string` | Nein | `"general"` | Sammlung innerhalb des Namensraums. Max. 100 Zeichen. |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | Nein | `"semantic"` | Speichertyp. Beeinflusst die Standard-Stufenzuweisung. |
-| `tags` | `string[]` | Nein | `[]` | Tags für Filterung und Klassifizierung. Max. 20 Tags, jeder max. 100 Zeichen. Muster: `^[a-zA-Z0-9-]+$` |
+| `tags` | `string[]` | Nein | `[]` | Tags für Filterung und Klassifizierung. Max. 20 Tags, jeder max. 100 Zeichen. Muster: `^[a-zA-Z0-9-]+$`. Die gespeicherte Erinnerung kann zusätzliche automatisch abgeleitete Tags enthalten — siehe [Automatisches Taggen](#automatisches-taggen). |
 | `category` | `string` | Nein | — | An einen Kategorie-Slot binden (impliziert T0-Stufe). Max. 100 Zeichen. |
 | `importance` | `number (0–1)` | Nein | `0.5` | Wichtigkeitsbewertung. Höhere Werte werden bei der Stale-Bereinigung priorisiert. |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | Nein | `"cli"` | Quelle der Erinnerung. Beeinflusst die Standard-Stufe (z. B. agent+procedural → T1). |
@@ -2747,7 +2826,7 @@ Die relevantesten Erinnerungen für eine Abfrage mithilfe semantischer (Vektor-)
 | `namespace` | `string` | Nein | `"global"` | Zu durchsuchender Namensraum. |
 | `collection` | `string` | Nein | — | Auf eine bestimmte Sammlung beschränken. Weglassen, um die Standard-Sammlung zu durchsuchen. |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | Nein | — | Ergebnisse auf einen bestimmten Speichertyp filtern. In den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
-| `tags` | `string[]` | Nein | — | Auf Erinnerungen mit mindestens einem übereinstimmenden Tag filtern (beliebige Übereinstimmung). In den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |
+| `tags` | `string[]` | Nein | — | Auf Erinnerungen mit mindestens einem übereinstimmenden Tag filtern (beliebige Übereinstimmung). In den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. Trifft gleichermaßen auf aufruferseitige und automatisch abgeleitete Tags zu — siehe [Automatisches Taggen](#automatisches-taggen). |
 | `limit` | `integer (1–20)` | Nein | `5` | Maximale Anzahl der Ergebnisse. |
 | `min_score` | `number (0–1)` | Nein | `0.6` | Mindestkosinus-Ähnlichkeitsscore, angewendet auf `semantic_score` (nicht auf den fusionierten/angepassten `score`). Ergebnisse unter diesem Schwellenwert werden ausgeschlossen. |
 | `after` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at >= after` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Speicher hinuntergereicht, sodass `limit` passende Erinnerungen zählt. |

@@ -684,6 +684,28 @@ describe('SqliteStore', () => {
     expect(filtered.map(r => r.id)).toEqual(['00000000-0000-0000-0000-0000000000e1']);
   });
 
+  it('fullTextSearch tags filter matches an auto-derived tag with no code changes (add-auto-tagging 4.1)', async () => {
+    // Auto-derived tags are stored as ordinary `tags` array entries — this
+    // exercises the same tags-filter push-down as any caller-supplied tag,
+    // confirming no change is needed downstream (design.md, Context).
+    const { extractAutoTags } = await import('../domain/auto-tag.js');
+    const content = 'See src/pipeline/index.ts for the extractionEnabled flag.';
+    const autoTags = extractAutoTags(content, 6);
+    expect(autoTags).toContain('src-pipeline-index-ts');
+
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000e3', checksum: 'auto-tag-match',
+      content, summary: 'pipeline note', tags: autoTags,
+    });
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000e4', checksum: 'auto-tag-no-match',
+      content: 'an unrelated memory about pipeline scheduling', summary: 'unrelated', tags: [],
+    });
+
+    const filtered = store.fullTextSearch('global', 'pipeline', 10, undefined, { tags: ['src-pipeline-index-ts'] });
+    expect(filtered.map(r => r.id)).toEqual(['00000000-0000-0000-0000-0000000000e3']);
+  });
+
   it('fullTextSearch after/before filter excludes memories outside the window and includes ones inside it', () => {
     // add-time-scoped-recall: created_at >= after / created_at <= before pushed
     // down into the query, including boundary (exactly-equal) cases.

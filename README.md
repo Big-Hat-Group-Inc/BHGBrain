@@ -29,6 +29,7 @@ BHGBrain stores memories in SQLite (metadata + fulltext search) and Qdrant (sema
    - [Retention Tiers](#retention-tiers)
    - [Tier Lifecycle - Assignment, Promotion, Sliding Window](#tier-lifecycle--assignment-promotion-sliding-window)
    - [Deduplication](#deduplication)
+   - [Auto-Tagging](#auto-tagging)
    - [Content Normalization](#content-normalization)
    - [Importance Scoring](#importance-scoring)
    - [Categories - Persistent Policy Slots](#categories--persistent-policy-slots)
@@ -600,7 +601,18 @@ The file is created automatically on first run with all defaults applied. Edit i
     // against the same OpenAI account) — point it elsewhere for a separate key.
     "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
     // Summarization request timeout in milliseconds, enforced via AbortController
-    "summarization_timeout_ms": 3000
+    "summarization_timeout_ms": 3000,
+    // Deterministic, dependency-free content tagging: derives additional tags
+    // from code-shaped tokens, file paths, repo shorthand (owner/repo), and
+    // @mentions found in the normalized content, and unions them with any
+    // caller-supplied tags. No LLM call, no network. false restores exact
+    // pre-feature behavior (candidate tags are exactly the caller-supplied
+    // tags). See "Auto-Tagging" below.
+    "auto_tag_enabled": true,
+    // Upper bound on auto-derived tags added per memory, before merging with
+    // caller-supplied tags and trimming to the 20-tag-per-memory cap
+    // (trimming always prefers caller-supplied tags).
+    "auto_tag_max_per_memory": 6
   },
 
   // Controls the quality tier used to generate each memory's `summary` field.
@@ -1051,7 +1063,7 @@ Every memory stored in BHGBrain is a `MemoryRecord` with the following fields:
 | `category` | `string \| null` | Category name if this memory is attached to a persistent policy category |
 | `content` | `string` | The full memory content (up to 100,000 characters) |
 | `summary` | `string` | Auto-generated first-line summary (up to 120 characters) |
-| `tags` | `string[]` | Free-form tags (alphanumeric + hyphens, max 20 tags, max 100 chars each) |
+| `tags` | `string[]` | Free-form tags (alphanumeric + hyphens, max 20 tags, max 100 chars each). Includes both caller-supplied tags and any content-derived tags auto-tagging adds — see [Auto-Tagging](#auto-tagging). |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | How the memory was created |
 | `checksum` | `string` | SHA-256 hash of normalized content (used for exact deduplication) |
 | `embedding` | `number[]` | Vector embedding (not stored in SQLite; lives in Qdrant) |
@@ -1409,6 +1421,66 @@ The Qdrant similarity search already fetches the top 10 candidates, but by defau
 
 **Fallback behavior:**
 If the embedding provider is unavailable and `pipeline.fallback_to_threshold_dedup: true`, the pipeline degrades to a vectorless dedup path instead of failing the write. Exact-checksum matches still short-circuit to `NOOP` as in Phase 1. For everything else, the pipeline uses SQLite full-text search over the same namespace/collection to find the closest existing memory and scores it with a deterministic word-overlap similarity (not the vector cosine score); at or above the `update` threshold the content is merged into that memory (`UPDATE`, with `vector_synced: false`), otherwise it is written as a new memory in SQLite only (`ADD`, `vector_synced: false`). Either way the memory is available for fulltext search but not semantic search until Qdrant sync is restored, and entering this path logs a structured `degraded_write` warning.
+
+---
+
+### Auto-Tagging
+
+Most writes carry no caller-supplied tags, which leaves the `tags` filter on
+`recall`/`search` and fulltext search's 2× tag-match weight with nothing to act on.
+When `pipeline.auto_tag_enabled` is `true` (default), the write pipeline runs a
+deterministic, dependency-free extractor over the normalized content of every
+candidate — no LLM call, no network — and unions the results with any
+caller-supplied tags. Extraction happens before dedup classification, so it never
+changes whether a write is `ADD`/`UPDATE`/`DELETE`/`NOOP`.
+
+**Extraction categories** (in priority order — higher-priority categories are kept
+first if the combined tag set must be trimmed):
+
+1. **Code-shaped tokens** — markdown inline-code spans (`` `useEffect` ``) and
+   camelCase/PascalCase/`snake_case`/dotted identifiers (`extractionEnabled`,
+   `search.ranking.enabled`), with a 5-character floor to cut noise from short
+   accidental matches.
+2. **File paths** — slash-separated paths ending in a recognized extension
+   (`src/pipeline/index.ts`), plus a closed set of bare dotted filenames
+   (`package.json`, `README.md`, `Dockerfile`, ...) matched without a directory.
+3. **Repo shorthand** — two-segment `owner/repo`-shaped slash tokens whose trailing
+   segment has no recognized extension (`bhgbrain/core`); a token whose trailing
+   segment does have one is classified as a file path instead.
+4. **@-mentions** — `@handle`-shaped tokens not immediately preceded by a word
+   character, excluding email addresses (`jsmith@example.com` produces no mention
+   tag).
+
+**Slugification:** every matched token is normalized to satisfy `TagSchema`
+(`^[a-zA-Z0-9-]+$`, max 100 chars) unchanged — lowercased, a leading `@` mapped to an
+`at-` prefix (so `@jsmith` → `at-jsmith` instead of colliding with a plain word tag),
+every run of other characters collapsed to a single `-`, leading/trailing `-`
+trimmed, and truncated to 100 characters. Candidates that slugify to fewer than 2
+characters are dropped. Examples: `src/pipeline/index.ts` → `src-pipeline-index-ts`,
+`bhgbrain/core` → `bhgbrain-core`, `` `useEffect` `` → `useeffect`.
+
+**Merging and caps:** auto-derived tags are deduplicated and unioned with
+caller-supplied tags (`caller tags ∪ auto tags`, caller tags always listed first),
+then trimmed to the existing 20-tag-per-memory cap — trimming always drops
+auto-derived tags first, never a caller-supplied one. On `UPDATE`, auto-derived tags
+flow into the existing tag-merge union exactly like any other candidate tag.
+
+| Config field | Default | Meaning |
+|---|---|---|
+| `pipeline.auto_tag_enabled` | `true` | Kill switch. `false` restores exact pre-feature behavior: candidate tags are exactly the caller-supplied `tags` input. |
+| `pipeline.auto_tag_max_per_memory` | `6` | Upper bound on auto-derived tags added per memory, applied before merging with caller-supplied tags. |
+
+No schema or storage changes: auto-derived tags are stored as ordinary `tags` array
+entries — same column, same fulltext 2× weighting, same `tags` filter push-down on
+`recall`/`search`. `import` and `remember` both route through the same write
+pipeline, so both benefit without separate wiring.
+
+**Known imprecision:** pattern-based extraction occasionally tags ordinary
+capitalized prose or brand names that happen to be camelCase/PascalCase-shaped
+(e.g. `GitHub` → `github`) — this is accepted as inherent to a deterministic v1
+extractor rather than semantic understanding; use the `tag` tool's `remove` action to
+correct outliers, or set `pipeline.auto_tag_enabled: false` to disable extraction
+entirely.
 
 ---
 
@@ -2681,7 +2753,7 @@ Store content in BHGBrain with automatic deduplication, normalization, embedding
 | `namespace` | `string` | No | `"global"` | Namespace scope. Pattern: `^[a-zA-Z0-9/-]{1,200}$` |
 | `collection` | `string` | No | `"general"` | Collection within the namespace. Max 100 chars. |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | No | `"semantic"` | Memory type. Influences default tier assignment. |
-| `tags` | `string[]` | No | `[]` | Tags for filtering and classification. Max 20 tags, each max 100 chars. Pattern: `^[a-zA-Z0-9-]+$` |
+| `tags` | `string[]` | No | `[]` | Tags for filtering and classification. Max 20 tags, each max 100 chars. Pattern: `^[a-zA-Z0-9-]+$`. The stored memory's `tags` may include additional content-derived entries auto-tagging adds on top of these — see [Auto-Tagging](#auto-tagging). |
 | `category` | `string` | No | - | Attach to a category slot (implies T0 tier). Max 100 chars. |
 | `importance` | `number (0-1)` | No | `0.5` | Importance score. Higher values are prioritized in stale cleanup. |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | No | `"cli"` | Source of the memory. Affects default tier (e.g., agent+procedural → T1). |
@@ -2803,7 +2875,7 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
 | `namespace` | `string` | No | `"global"` | Namespace to search. |
 | `collection` | `string` | No | - | Filter to a specific collection. Omit to search the default collection. |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | No | - | Filter results to a specific memory type. Pushed down into the store so `limit` counts matching memories. |
-| `tags` | `string[]` | No | - | Filter to memories with at least one matching tag (match-any). Pushed down into the store so `limit` counts matching memories. |
+| `tags` | `string[]` | No | - | Filter to memories with at least one matching tag (match-any). Pushed down into the store so `limit` counts matching memories. Matches both caller-supplied and auto-derived tags equally — see [Auto-Tagging](#auto-tagging). |
 | `limit` | `integer (1-20)` | No | `5` | Maximum number of results. |
 | `min_score` | `number (0-1)` | No | `0.6` | Minimum cosine-similarity score, applied to `semantic_score` (not the fused/adjusted `score`). Results below this threshold are excluded. |
 | `after` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at >= after` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the store so `limit` counts matching memories. |

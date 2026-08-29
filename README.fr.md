@@ -29,6 +29,7 @@ BHGBrain stocke les souvenirs dans SQLite (métadonnées + recherche plein texte
     - [Niveaux de rétention](#niveaux-de-rétention)
     - [Cycle de vie des niveaux — Attribution, Promotion, Fenêtre glissante](#cycle-de-vie-des-niveaux--attribution-promotion-fenêtre-glissante)
     - [Déduplication](#déduplication)
+    - [Étiquetage automatique](#étiquetage-automatique)
     - [Normalisation du contenu](#normalisation-du-contenu)
     - [Score d'importance](#score-dimportance)
     - [Catégories — Emplacements de politique persistants](#catégories--emplacements-de-politique-persistants)
@@ -568,7 +569,20 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     // OpenAI) — pointez-la ailleurs pour une clé séparée.
     "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
     // Délai d'expiration de la requête de résumé en millisecondes, appliqué via AbortController
-    "summarization_timeout_ms": 3000
+    "summarization_timeout_ms": 3000,
+    // Étiquetage de contenu déterministe et sans dépendance : dérive des tags
+    // supplémentaires à partir de tokens en forme de code, de chemins de
+    // fichiers, d'abréviations de dépôt (owner/repo) et de @mentions présents
+    // dans le contenu normalisé, puis les unit avec les tags fournis par
+    // l'appelant. Aucun appel LLM, aucun réseau. `false` restaure exactement le
+    // comportement antérieur à cette fonctionnalité. Voir « Étiquetage
+    // automatique » ci-dessous.
+    "auto_tag_enabled": true,
+    // Borne supérieure de tags auto-dérivés ajoutés par souvenir, appliquée
+    // avant la fusion avec les tags fournis par l'appelant et le troncage à la
+    // limite de 20 tags par souvenir (le troncage privilégie toujours les tags
+    // fournis par l'appelant).
+    "auto_tag_max_per_memory": 6
   },
 
   // Contrôle le niveau de qualité utilisé pour générer le champ `summary` de
@@ -1030,7 +1044,7 @@ Chaque souvenir stocké dans BHGBrain est un `MemoryRecord` avec les champs suiv
 | `category` | `string \| null` | Nom de catégorie si ce souvenir est rattaché à une catégorie de politique persistante |
 | `content` | `string` | Contenu complet du souvenir (jusqu'à 100 000 caractères) |
 | `summary` | `string` | Résumé auto-généré de la première ligne (jusqu'à 120 caractères) |
-| `tags` | `string[]` | Tags libres (alphanumériques + tirets, max 20 tags, max 100 caractères chacun) |
+| `tags` | `string[]` | Tags libres (alphanumériques + tirets, max 20 tags, max 100 caractères chacun). Inclut les tags fournis par l'appelant et les tags auto-dérivés du contenu — voir [Étiquetage automatique](#étiquetage-automatique). |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | Comment le souvenir a été créé |
 | `checksum` | `string` | Hachage SHA-256 du contenu normalisé (utilisé pour la déduplication exacte) |
 | `embedding` | `number[]` | Embedding vectoriel (non stocké dans SQLite ; réside dans Qdrant) |
@@ -1388,6 +1402,75 @@ La recherche de similarité Qdrant récupère déjà les 10 meilleurs candidats,
 
 **Comportement de repli :**
 Si le fournisseur d'embedding est indisponible et que `pipeline.fallback_to_threshold_dedup: true`, le pipeline passe sur un chemin de déduplication sans vecteur au lieu de faire échouer l'écriture. Les correspondances exactes de somme de contrôle continuent de court-circuiter vers `NOOP` comme en phase 1. Pour le reste, le pipeline utilise la recherche plein texte SQLite sur le même namespace/collection pour trouver le souvenir existant le plus proche et le note avec une similarité déterministe de chevauchement de mots (et non le score cosinus vectoriel) ; au seuil `update` ou au-delà, le contenu est fusionné dans ce souvenir (`UPDATE`, avec `vector_synced: false`), sinon il est écrit comme nouveau souvenir dans SQLite uniquement (`ADD`, `vector_synced: false`). Dans tous les cas, le souvenir est disponible pour la recherche plein texte mais pas pour la recherche sémantique jusqu'à ce que la synchronisation Qdrant soit rétablie, et l'entrée dans ce chemin journalise un avertissement structuré `degraded_write`.
+
+---
+
+### Étiquetage automatique
+
+La plupart des écritures n'ont aucun tag fourni par l'appelant, ce qui laisse le
+filtre `tags` de `recall`/`search` et la pondération 2× des correspondances de tags
+en recherche plein texte sans rien sur quoi agir. Lorsque `pipeline.auto_tag_enabled`
+vaut `true` (par défaut), le pipeline d'écriture exécute un extracteur déterministe
+et sans dépendance sur le contenu normalisé de chaque candidat — aucun appel LLM,
+aucun réseau — et unit les résultats avec les tags fournis par l'appelant, le cas
+échéant. L'extraction a lieu avant la classification de déduplication, donc elle ne
+change jamais la classification `ADD`/`UPDATE`/`DELETE`/`NOOP` d'une écriture.
+
+**Catégories d'extraction** (par ordre de priorité — les catégories les plus
+prioritaires sont conservées en premier si l'ensemble de tags combiné doit être
+tronqué) :
+
+1. **Tokens en forme de code** — spans de code en ligne markdown
+   (`` `useEffect` ``) et identifiants camelCase/PascalCase/`snake_case`/à points
+   (`extractionEnabled`, `search.ranking.enabled`), avec un plancher de 5 caractères
+   pour réduire le bruit des correspondances courtes accidentelles.
+2. **Chemins de fichiers** — chemins séparés par des barres obliques se terminant
+   par une extension reconnue (`src/pipeline/index.ts`), plus un ensemble fermé de
+   noms de fichiers à points (`package.json`, `README.md`, `Dockerfile`, ...)
+   reconnus sans nécessiter de répertoire.
+3. **Abréviations de dépôt** — tokens à deux segments en forme `owner/repo` dont le
+   segment final ne porte aucune extension reconnue (`bhgbrain/core`) ; un token dont
+   le segment final porte une extension est classé comme chemin de fichier à la
+   place.
+4. **@Mentions** — tokens en forme `@handle` non immédiatement précédés d'un
+   caractère de mot, à l'exclusion des adresses e-mail (`jsmith@example.com` ne
+   produit aucun tag de mention).
+
+**Slugification :** chaque token trouvé est normalisé pour satisfaire le
+`TagSchema` (`^[a-zA-Z0-9-]+$`, max 100 caractères) sans modification — mis en
+minuscules, un `@` initial mappé sur un préfixe `at-` (afin que `@jsmith` devienne
+`at-jsmith` au lieu d'entrer en collision avec un tag de mot simple), chaque suite
+d'autres caractères réduite à un unique `-`, les `-` de début/fin supprimés, et
+tronqué à 100 caractères. Les candidats se réduisant à moins de 2 caractères après
+slugification sont écartés. Exemples : `src/pipeline/index.ts` →
+`src-pipeline-index-ts`, `bhgbrain/core` → `bhgbrain-core`, `` `useEffect` `` →
+`useeffect`.
+
+**Fusion et plafonds :** les tags auto-dérivés sont dédupliqués et unis aux tags
+fournis par l'appelant (`tags de l'appelant ∪ tags automatiques`, ceux de
+l'appelant toujours listés en premier), puis tronqués à la limite existante de 20
+tags par souvenir — le troncage supprime toujours d'abord les tags auto-dérivés,
+jamais un tag fourni par l'appelant. Lors d'un `UPDATE`, les tags auto-dérivés
+entrent dans la fusion de tags existante exactement comme n'importe quel autre tag
+candidat.
+
+| Champ de configuration | Défaut | Signification |
+|---|---|---|
+| `pipeline.auto_tag_enabled` | `true` | Interrupteur d'arrêt. `false` restaure exactement le comportement antérieur à cette fonctionnalité : les tags candidats sont exactement l'entrée `tags` fournie par l'appelant. |
+| `pipeline.auto_tag_max_per_memory` | `6` | Borne supérieure de tags auto-dérivés ajoutés par souvenir, appliquée avant la fusion avec les tags fournis par l'appelant. |
+
+Aucun changement de schéma ou de stockage : les tags auto-dérivés sont stockés comme
+des entrées ordinaires du tableau `tags` — même colonne, même pondération 2× en
+recherche plein texte, même propagation du filtre `tags` dans `recall`/`search`.
+`import` et `remember` passent tous deux par le même pipeline d'écriture, donc les
+deux en bénéficient sans câblage séparé.
+
+**Imprécision connue :** l'extraction basée sur des motifs étiquette parfois de la
+prose capitalisée ordinaire ou des noms de marque qui se trouvent avoir une forme
+camelCase/PascalCase (par ex. `GitHub` → `github`) — ceci est accepté comme inhérent
+à un extracteur déterministe v1, et non comme une compréhension sémantique ; utilisez
+l'action `remove` de l'outil `tag` pour corriger les cas atypiques, ou définissez
+`pipeline.auto_tag_enabled: false` pour désactiver entièrement l'extraction.
 
 ---
 
@@ -2633,7 +2716,7 @@ Stocke du contenu dans BHGBrain avec déduplication automatique, normalisation, 
 | `namespace` | `string` | Non | `"global"` | Portée de l'espace de noms. Modèle : `^[a-zA-Z0-9/-]{1,200}$` |
 | `collection` | `string` | Non | `"general"` | Collection au sein de l'espace de noms. Max 100 caractères. |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | Non | `"semantic"` | Type de mémoire. Influence l'attribution du niveau par défaut. |
-| `tags` | `string[]` | Non | `[]` | Tags pour le filtrage et la classification. Max 20 tags, chacun max 100 caractères. Modèle : `^[a-zA-Z0-9-]+$` |
+| `tags` | `string[]` | Non | `[]` | Tags pour le filtrage et la classification. Max 20 tags, chacun max 100 caractères. Modèle : `^[a-zA-Z0-9-]+$`. Le souvenir stocké peut inclure des tags supplémentaires auto-dérivés du contenu — voir [Étiquetage automatique](#étiquetage-automatique). |
 | `category` | `string` | Non | — | Rattacher à un emplacement de catégorie (implique le niveau T0). Max 100 caractères. |
 | `importance` | `number (0–1)` | Non | `0,5` | Score d'importance. Les valeurs plus élevées sont prioritaires lors du nettoyage des périmés. |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | Non | `"cli"` | Source du souvenir. Affecte le niveau par défaut (ex. agent+procedural → T1). |
@@ -2748,7 +2831,7 @@ Récupère les souvenirs les plus pertinents pour une requête en utilisant la r
 | `namespace` | `string` | Non | `"global"` | Espace de noms à rechercher. |
 | `collection` | `string` | Non | — | Filtrer sur une collection spécifique. Omettre pour rechercher dans la collection par défaut. |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | Non | — | Filtrer les résultats sur un type de mémoire spécifique. Propagé jusque dans le magasin, afin que `limit` compte les mémoires correspondantes. |
-| `tags` | `string[]` | Non | — | Filtrer sur les souvenirs ayant au moins un tag correspondant (correspondance sur l'un quelconque). Propagé jusque dans le magasin, afin que `limit` compte les mémoires correspondantes. |
+| `tags` | `string[]` | Non | — | Filtrer sur les souvenirs ayant au moins un tag correspondant (correspondance sur l'un quelconque). Propagé jusque dans le magasin, afin que `limit` compte les mémoires correspondantes. Correspond aussi bien aux tags fournis par l'appelant qu'aux tags auto-dérivés — voir [Étiquetage automatique](#étiquetage-automatique). |
 | `limit` | `integer (1–20)` | Non | `5` | Nombre maximum de résultats. |
 | `min_score` | `number (0–1)` | Non | `0,6` | Score de similarité cosinus minimal, appliqué à `semantic_score` (et non au `score` fusionné/ajusté). Les résultats en dessous de ce seuil sont exclus. |
 | `after` | `string (date-heure ISO 8601)` | Non | - | N'inclut que les souvenirs avec `created_at >= after` (inclusif). Filtre sur la date de création, pas `updated_at`. Propagé jusque dans le magasin afin que `limit` compte les souvenirs correspondants. |

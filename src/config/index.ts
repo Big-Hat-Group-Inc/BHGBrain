@@ -349,6 +349,16 @@ const ConfigSchema = z.object({
     summarization_model_env: z.string().default('BHGBRAIN_EXTRACTION_API_KEY'),
     // Enforced via AbortController on the chat-completions fetch.
     summarization_timeout_ms: z.number().positive().default(3000),
+    // Deterministic, dependency-free content tagging (add-auto-tagging):
+    // `WritePipeline.extract()` derives additional tags from code-shaped
+    // tokens, file paths, repo shorthand, and @-mentions in the normalized
+    // content, unioned with any caller-supplied tags. `false` restores
+    // today's pass-through behavior exactly (candidate tags identical to
+    // `input.tags`).
+    auto_tag_enabled: z.boolean().default(true),
+    // Cap on auto-derived tags added per memory (before merging with
+    // caller-supplied tags and trimming to the 20-tag `TagsSchema` cap).
+    auto_tag_max_per_memory: z.number().int().min(0).max(20).default(6),
   }).default({}),
   // Controls whether summarization quality tiers (extractive, or LLM when
   // `pipeline.summarization_enabled`) apply. `true` (default): tiered

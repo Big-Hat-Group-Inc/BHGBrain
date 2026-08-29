@@ -29,6 +29,7 @@ BHGBrain 将记忆存储在 SQLite（元数据 + 全文搜索）和 Qdrant（语
     - [保留层级](#保留层级)
     - [层级生命周期——分配、晋升与滑动窗口](#层级生命周期分配晋升与滑动窗口)
     - [去重](#去重)
+    - [自动标记](#自动标记)
     - [内容规范化](#内容规范化)
     - [重要性评分](#重要性评分)
     - [类别——持久化策略槽](#类别持久化策略槽)
@@ -534,7 +535,14 @@ BHGBrain 从以下位置加载配置文件：
     // 独立的 key，可指向另一个变量。
     "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
     // 摘要请求超时（毫秒），通过 AbortController 强制执行
-    "summarization_timeout_ms": 3000
+    "summarization_timeout_ms": 3000,
+    // 确定性、无依赖的内容标记：从规范化内容中的代码形态标记、文件路径、仓库简写
+    // （owner/repo）和 @提及 中派生额外标签，并与调用方提供的标签合并。不调用
+    // LLM，不访问网络。`false` 会精确恢复此功能之前的行为。详见下方"自动标记"。
+    "auto_tag_enabled": true,
+    // 每条记忆自动派生标签数量的上限，在与调用方提供的标签合并、并裁剪到每条
+    // 记忆 20 个标签的上限之前应用（裁剪时始终优先保留调用方提供的标签）。
+    "auto_tag_max_per_memory": 6
   },
 
   // 控制用于生成每条记忆 `summary` 字段的质量层级。true（默认）：一个无依赖
@@ -969,7 +977,7 @@ BHGBrain 中存储的每条记忆都是一个 `MemoryRecord`，包含以下字�
 | `category` | `string \| null` | 若该记忆附加到持久化策略类别，则为类别名称 |
 | `content` | `string` | 记忆的完整内容（最多 100,000 字符） |
 | `summary` | `string` | 自动生成的首行摘要（最多 120 字符） |
-| `tags` | `string[]` | 自由格式标签（字母数字 + 连字符，最多 20 个，每个最多 100 字符） |
+| `tags` | `string[]` | 自由格式标签（字母数字 + 连字符，最多 20 个，每个最多 100 字符）。既包含调用方提供的标签，也可能包含内容自动派生的标签——详见[自动标记](#自动标记)。 |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | 记忆的创建方式 |
 | `checksum` | `string` | 规范化内容的 SHA-256 哈希（用于精确去重） |
 | `embedding` | `number[]` | 向量嵌入（不存储在 SQLite 中，存在 Qdrant 里） |
@@ -1327,6 +1335,56 @@ Qdrant 相似度搜索已经获取了前 10 个候选，但分类器默认只检
 
 **回退行为：**
 如果嵌入提供商不可用且 `pipeline.fallback_to_threshold_dedup: true`，管道会降级到无向量的去重路径，而不是让写入失败。精确校验和匹配仍会像第一阶段一样直接短路为 `NOOP`。对于其他情况，管道使用 SQLite 全文搜索在同一命名空间/集合内查找最接近的现有记忆，并用确定性的词汇重叠相似度（而非向量余弦得分）为其打分；达到或超过 `update` 阈值时，内容会合并到该记忆中（`UPDATE`，`vector_synced: false`），否则会作为新记忆仅写入 SQLite（`ADD`，`vector_synced: false`）。无论哪种情况，该记忆在 Qdrant 同步恢复之前都可用于全文搜索，但不可用于语义搜索，并且进入此路径会记录一条结构化的 `degraded_write` 警告。
+
+---
+
+### 自动标记
+
+大多数写入操作都没有调用方提供的标签，这使得 `recall`/`search` 的 `tags` 过滤器和
+全文搜索中标签匹配的 2× 权重无从发挥作用。当 `pipeline.auto_tag_enabled` 为 `true`
+（默认值）时，写入管道会对每个候选项的规范化内容运行一个确定性、无依赖的提取器——
+不调用 LLM，不访问网络——并将结果与任何调用方提供的标签合并。提取发生在去重分类
+之前，因此永远不会改变写入被分类为 `ADD`/`UPDATE`/`DELETE`/`NOOP` 的结果。
+
+**提取类别**（按优先级顺序排列——如果合并后的标签集合必须被裁剪，优先级更高的类别
+会被优先保留）：
+
+1. **代码形态标记** —— Markdown 行内代码片段（`` `useEffect` ``）以及
+   camelCase/PascalCase/`snake_case`/点号标识符（`extractionEnabled`、
+   `search.ranking.enabled`），设有 5 字符下限以减少偶然短匹配带来的噪音。
+2. **文件路径** —— 以斜杠分隔、以已识别扩展名结尾的路径
+   （`src/pipeline/index.ts`），加上一组封闭的裸文件名（`package.json`、
+   `README.md`、`Dockerfile` 等），即使不带目录也能识别。
+3. **仓库简写** —— 两段式 `owner/repo` 形态的斜杠标记，其末段不带已识别的扩展名
+   （`bhgbrain/core`）；末段带有扩展名的标记会被归类为文件路径。
+4. **@提及** —— `@handle` 形态的标记，前面不能紧跟单词字符，且排除电子邮件地址
+   （`jsmith@example.com` 不会产生提及标签）。
+
+**Slug 化：** 每个匹配到的标记都会被规范化，以便不加修改地满足 `TagSchema`
+（`^[a-zA-Z0-9-]+$`，最多 100 字符）——转为小写，开头的 `@` 映射为 `at-` 前缀
+（这样 `@jsmith` 会变为 `at-jsmith`，而不是与普通单词标签冲突），其余字符的连续序列
+折叠为单个 `-`，去除首尾的 `-`，并截断至 100 字符。Slug 化后短于 2 字符的候选项会
+被丢弃。示例：`src/pipeline/index.ts` → `src-pipeline-index-ts`、`bhgbrain/core` →
+`bhgbrain-core`、`` `useEffect` `` → `useeffect`。
+
+**合并与上限：** 自动派生的标签会去重，并与调用方提供的标签合并（"调用方标签 ∪
+自动标签"，调用方标签始终排在前面），然后裁剪到现有的每条记忆 20 个标签的上限——
+裁剪时始终先移除自动派生的标签，绝不会移除调用方提供的标签。在 `UPDATE` 时，自动
+派生的标签会像其他任何候选标签一样并入现有的标签合并逻辑。
+
+| 配置字段 | 默认值 | 含义 |
+|---|---|---|
+| `pipeline.auto_tag_enabled` | `true` | 总开关。`false` 会精确恢复此功能之前的行为：候选标签就是调用方提供的 `tags` 输入本身。 |
+| `pipeline.auto_tag_max_per_memory` | `6` | 每条记忆自动派生标签数量的上限，在与调用方提供的标签合并之前应用。 |
+
+无需模式或存储变更：自动派生的标签作为普通条目存储在 `tags` 数组中——相同的列、
+相同的全文 2× 权重、相同的 `recall`/`search` `tags` 过滤器下推。`import` 和
+`remember` 都通过同一条写入管道，因此两者都无需额外接线即可受益。
+
+**已知的不精确性：** 基于模式的提取偶尔会将普通的大写散文或恰好呈
+camelCase/PascalCase 形态的品牌名称标记为标签（例如 `GitHub` → `github`）——这被
+视为确定性 v1 提取器固有的特性，而非语义理解；可使用 `tag` 工具的 `remove`
+操作修正异常项，或设置 `pipeline.auto_tag_enabled: false` 以完全禁用提取。
 
 ---
 
@@ -2536,7 +2594,7 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `namespace` | `string` | 否 | `"global"` | 命名空间作用域。格式：`^[a-zA-Z0-9/-]{1,200}$` |
 | `collection` | `string` | 否 | `"general"` | 命名空间内的集合。最多 100 字符。 |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | 否 | `"semantic"` | 记忆类型。影响默认层级分配。 |
-| `tags` | `string[]` | 否 | `[]` | 用于过滤和分类的标签。最多 20 个标签，每个最多 100 字符。格式：`^[a-zA-Z0-9-]+$` |
+| `tags` | `string[]` | 否 | `[]` | 用于过滤和分类的标签。最多 20 个标签，每个最多 100 字符。格式：`^[a-zA-Z0-9-]+$`。存储的记忆可能包含内容自动派生的额外标签——详见[自动标记](#自动标记)。 |
 | `category` | `string` | 否 | — | 附加到类别槽（意味着 T0 层级）。最多 100 字符。 |
 | `importance` | `number (0–1)` | 否 | `0.5` | 重要性评分。较高值在过期清理中优先保留。 |
 | `source` | `"cli" \| "api" \| "agent" \| "import"` | 否 | `"cli"` | 记忆来源。影响默认层级（例如 agent+procedural → T1）。 |
@@ -2646,7 +2704,7 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `namespace` | `string` | 否 | `"global"` | 要搜索的命名空间。 |
 | `collection` | `string` | 否 | — | 过滤到特定集合。省略则搜索默认集合。 |
 | `type` | `"episodic" \| "semantic" \| "procedural"` | 否 | — | 将结果过滤到特定记忆类型。下推到存储层，因此 `limit` 计算的是匹配的记忆数量。 |
-| `tags` | `string[]` | 否 | — | 过滤到具有至少一个匹配标签的记忆（任意匹配）。下推到存储层，因此 `limit` 计算的是匹配的记忆数量。 |
+| `tags` | `string[]` | 否 | — | 过滤到具有至少一个匹配标签的记忆（任意匹配）。下推到存储层，因此 `limit` 计算的是匹配的记忆数量。对调用方提供的标签和自动派生的标签一视同仁——详见[自动标记](#自动标记)。 |
 | `limit` | `integer (1–20)` | 否 | `5` | 最大结果数量。 |
 | `min_score` | `number (0–1)` | 否 | `0.6` | 最低余弦相似度得分，作用于 `semantic_score`（而非融合/调整后的 `score`）。低于此阈值的结果被排除。 |
 | `after` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at >= after`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到存储层，使 `limit` 计算匹配的记忆数量。 |
