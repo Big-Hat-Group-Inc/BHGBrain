@@ -362,7 +362,20 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "enabled": true,
     // Cosinus-Ähnlichkeitsschwelle, ab der neuer Inhalt als UPDATE eines vorhandenen Inhalts gilt.
     // Stufenspezifische Anpassungen werden zusätzlich angewendet (siehe Abschnitt Deduplizierung unten).
-    "similarity_threshold": 0.92
+    "similarity_threshold": 0.92,
+    // Wie viele der 10 abgerufenen Ähnlichkeitskandidaten der Klassifikator für die
+    // Korroboration prüft (1-10; NOOP/DELETE/direktes UPDATE verwenden immer nur den nächsten).
+    "candidate_window": 5,
+    // Unabhängiger Ausschalter für den unten beschriebenen Korroborationspfad; false stellt
+    // die Klassifikation vor der Erweiterung (nur einzelner Kandidat) wieder her,
+    // unabhängig von den anderen drei Einstellungen hier.
+    "corroboration_enabled": true,
+    // Mindestanzahl der Fensterkandidaten (einschließlich des nächsten), die innerhalb von
+    // corroboration_margin des Update-Schwellenwerts liegen müssen, um ADD zu UPDATE zu eskalieren.
+    "corroboration_count": 2,
+    // Wie weit ein Kandidat unter dem Update-Schwellenwert liegen darf und trotzdem
+    // zur Korroboration zählt.
+    "corroboration_margin": 0.03
   },
 
   // Suchkonfiguration
@@ -821,8 +834,8 @@ Grund dafür: Das Mischen von Einbettungsräumen ist eine stille Korruption. Wen
 Dimensionalität ändern (z. B. Wechsel zu einer Azure-Deployment derselben Modellfamilie),
 erkennt dies auf Qdrant-Ebene nichts — neue Vektoren landen in derselben Sammlung wie
 alte, Kosinus-Ähnlichkeit zwischen den beiden Räumen ist bedeutungslos, und sowohl die
-Recall-Relevanz als auch die Deduplizierung (`similar[0]`-Scores, die in die
-0.92/0.98-Schwellenwerte einfließen) verschlechtern sich still. Eine Dimensionsänderung
+Recall-Relevanz als auch die Deduplizierung (die Scores des nächsten Kandidaten und
+des Kandidatenfensters, die in die 0.92/0.98-Schwellenwerte einfließen) verschlechtern sich still. Eine Dimensionsänderung
 schlägt stattdessen laut mit einem kryptischen Qdrant-Fehler fehl; die Herkunfts-Stempel
 machen beide Fälle laut und handlungsfähig.
 
@@ -1191,9 +1204,12 @@ flowchart TD
     G --> H{"Highest Cosine<br/>Similarity Score"}
     H -->|"score ≥ noop threshold"| NOOP2["🔄 NOOP<br/>Near-duplicate found"]
     H -->|"score ≥ update threshold"| UPD["✏️ UPDATE Path"]
-    H -->|"score < update threshold"| ADD["➕ ADD Path"]
+    H -->|"score < update threshold"| WIN{"candidate_window:<br/>N corroborators ≥<br/>(update − margin)?"}
+    WIN -->|"Yes (≥ corroboration_count)"| CORR["✏️ UPDATE Path<br/>(corroborated)"]
+    WIN -->|"No"| ADD["➕ ADD Path"]
 
     UPD --> U1["Merge tags (union)"]
+    CORR --> U1
     U1 --> U2["Replace content"]
     U2 --> U3["importance = max(old, new)"]
     U3 --> U4["SQLite UPDATE"]
@@ -1211,9 +1227,9 @@ flowchart TD
 
     class REJECT reject
     class NOOP1,NOOP2 noop
-    class UPD,U1,U2,U3,U4,U5 update
+    class UPD,CORR,U1,U2,U3,U4,U5 update
     class ADD,A1,A2,A3 add
-    class A,B,C,D,E,F,G,H process
+    class A,B,C,D,E,F,G,H,WIN process
 ```
 
 #### Phase 1: Exakte Deduplizierung (Prüfsumme)
@@ -1230,13 +1246,14 @@ Wenn keine exakte Übereinstimmung gefunden wird, wird der Inhalt eingebettet un
 
 | Entscheidung | Bedingung | Auswirkung |
 |---|---|---|
-| `NOOP` | Score ≥ NOOP-Schwellenwert | Inhalt gilt als Duplikat; ID der vorhandenen Erinnerung wird ohne Schreibvorgang zurückgegeben |
-| `DELETE` | Score ≥ UPDATE-Schwellenwert **und** der Inhalt macht die Übereinstimmung explizit ungültig (z. B. "nicht mehr wahr", "Korrektur:", "vergiss das") | Die vorhandene Erinnerung wird gelöscht und der Kandidat wird als neue Erinnerung gespeichert, die über `merged_from` darauf verweist |
-| `DELETE` (opt-in) | Score liegt im UPDATE-Band, die Phrasen-Heuristik oben hat **nicht** angeschlagen, `pipeline.contradiction_detection.enabled` ist `true`, und eine LLM-Entailment-Prüfung klassifiziert den Kandidaten relativ zur vorhandenen Erinnerung als `contradict` | Gleiche Wirkung wie das phrasenbasierte `DELETE` oben — die vorhandene Erinnerung wird gelöscht und der Kandidat wird als neue Erinnerung gespeichert, die über `merged_from` darauf verweist |
-| `UPDATE` | Score ≥ UPDATE-Schwellenwert | Inhalt ist eine Aktualisierung einer vorhandenen; Tags zusammenführen, Inhalt und Prüfsumme aktualisieren, ID beibehalten |
-| `ADD` | Score < UPDATE-Schwellenwert | Wirklich neue Erinnerung; mit neuer UUID erstellen |
+| `NOOP` | Score des nächsten Kandidaten ≥ NOOP-Schwellenwert | Inhalt gilt als Duplikat; ID der vorhandenen Erinnerung wird ohne Schreibvorgang zurückgegeben |
+| `DELETE` | Score des nächsten Kandidaten ≥ UPDATE-Schwellenwert **und** der Inhalt macht die Übereinstimmung explizit ungültig (z. B. "nicht mehr wahr", "Korrektur:", "vergiss das") | Die vorhandene Erinnerung wird gelöscht und der Kandidat wird als neue Erinnerung gespeichert, die über `merged_from` darauf verweist |
+| `DELETE` (opt-in) | Score des nächsten Kandidaten liegt im UPDATE-Band, die Phrasen-Heuristik oben hat **nicht** angeschlagen, `pipeline.contradiction_detection.enabled` ist `true`, und eine LLM-Entailment-Prüfung klassifiziert den Kandidaten relativ zur vorhandenen Erinnerung als `contradict` | Gleiche Wirkung wie das phrasenbasierte `DELETE` oben — die vorhandene Erinnerung wird gelöscht und der Kandidat wird als neue Erinnerung gespeichert, die über `merged_from` darauf verweist |
+| `UPDATE` | Score des nächsten Kandidaten ≥ UPDATE-Schwellenwert | Inhalt ist eine Aktualisierung einer vorhandenen; Tags zusammenführen, Inhalt und Prüfsumme aktualisieren, ID beibehalten |
+| `UPDATE` (korroboriert) | Score des nächsten Kandidaten < UPDATE-Schwellenwert, **aber** mindestens `deduplication.corroboration_count` Kandidaten innerhalb des Fensters der obersten `deduplication.candidate_window` (einschließlich des nächsten) erreichen ≥ `UPDATE-Schwellenwert − deduplication.corroboration_margin` | Mehrere nahezu identische Erinnerungen bilden unabhängig einen Cluster nahe dem Schwellenwert; Zusammenführung mit dem höchstbewerteten Kandidaten, genau wie bei einem direkten `UPDATE` |
+| `ADD` | Score des nächsten Kandidaten < UPDATE-Schwellenwert und kein korroborierter Cluster gefunden | Wirklich neue Erinnerung; mit neuer UUID erstellen |
 
-Das obige Diagramm zeigt die Pfade NOOP/UPDATE/ADD; DELETE ist eine Variante des UPDATE-Pfads, die ausgelöst wird, wenn entweder die phrasenbasierte Ungültigkeits-Heuristik anschlägt, oder (opt-in, siehe unten) eine LLM-Entailment-Prüfung einen Kandidaten im UPDATE-Band als Widerspruch zur vorhandenen Erinnerung klassifiziert.
+Das obige Diagramm zeigt die Pfade NOOP/UPDATE/ADD; DELETE ist eine Variante des UPDATE-Pfads, die ausgelöst wird, wenn entweder die phrasenbasierte Ungültigkeits-Heuristik anschlägt, oder (opt-in, siehe unten) eine LLM-Entailment-Prüfung einen Kandidaten im UPDATE-Band als Widerspruch zur vorhandenen Erinnerung klassifiziert. NOOP und DELETE werden immer ausschließlich anhand des nächsten Kandidaten entschieden — Korroboration gilt für sie nie (siehe "Kandidatenfenster und Korroboration" unten).
 
 **Widerspruchserkennung (opt-in, standardmäßig aus):** Die obige Phrasen-Heuristik erkennt nur Kandidaten, die explizit sagen, dass sie eine Korrektur sind ("nicht mehr wahr", "Korrektur:", ...). Ein Kandidat zum gleichen Thema, der ohne eine dieser Phrasen widerspricht — z. B. "Wir sind zu Postgres migriert", wenn der Speicher bereits "wir verwenden MySQL" enthält — fällt stillschweigend durch zu `UPDATE`, und beide Fakten koexistieren. Wird `pipeline.contradiction_detection.enabled: true` gesetzt, schließt das diese Lücke: Für Kandidaten, die im UPDATE-Band landen *und* die Phrasen-Heuristik nicht bereits ausgelöst haben, macht die Pipeline einen einzigen LLM-Aufruf (unter Wiederverwendung der `pipeline.extraction_model` / `pipeline.extraction_model_env`-Zugangsdaten — keine separate Modell- oder API-Schlüssel-Konfiguration), der den Kandidaten relativ zur vorhandenen Erinnerung als `agree`, `refine` oder `contradict` klassifiziert. Nur `contradict` ändert das Verhalten und führt zum gleichen Lösch-und-Ersetzen-Pfad wie die Phrasen-Heuristik; `agree`/`refine` fallen beide durch zum bestehenden `UPDATE`-Merge, identisch zum heutigen Verhalten. Die Phrasen-Heuristik wird immer zuerst geprüft und bricht ohne LLM-Aufruf ab, sobald sie zutrifft, sodass explizite Korrekturen weiterhin kostenlos und sofort bleiben.
 
@@ -1257,6 +1274,10 @@ Der Basis-`similarity_threshold` (Standard 0.92) wird pro Stufe angepasst, da T0
 | `T1` | 0.98 | max(Basis, 0.95) |
 | `T2` | 0.98 | Basis (0.92) |
 | `T3` | 0.95 | max(Basis, 0.90) |
+
+**Kandidatenfenster und Korroboration:**
+
+Die Qdrant-Ähnlichkeitssuche ruft bereits die obersten 10 Kandidaten ab, aber standardmäßig prüft der Klassifikator für NOOP/DELETE/direktes UPDATE nur den einzigen nächsten. Wenn dieser nächste Kandidat *unter* dem UPDATE-Schwellenwert liegt, prüft die Pipeline zusätzlich, ob mehrere andere Kandidaten unabhängig voneinander nahe demselben Schwellenwert clustern — mehrere Beinahe-Wiederholungen derselben Tatsache sollten zu einer Erinnerung zusammengeführt werden, statt jeweils eine neue Variante per ADD anzulegen. Konkret: Liegen innerhalb der obersten `deduplication.candidate_window` Kandidaten (Standard 5, gedeckelt bei 10 — der bereits abgerufenen Obergrenze) mindestens `deduplication.corroboration_count` (Standard 2) mit einem Score ≥ `UPDATE-Schwellenwert − deduplication.corroboration_margin` (Standard 0.03), klassifiziert der Schreibvorgang `UPDATE` gegen den höchstbewerteten dieser Kandidaten statt `ADD`. Dies ist ausschließlich eine Einwegeskalation: Sie kann ein `ADD` in ein `UPDATE` verwandeln, ändert aber nie eine `NOOP`- oder `DELETE`-Entscheidung, und zielt immer auf den höchstbewerteten Kandidaten (keine neue Logik zur Konfliktlösung nötig). Mit `deduplication.corroboration_enabled: false` wird dieser Pfad vollständig deaktiviert und die Klassifikation vor der Erweiterung (nur einzelner Kandidat) wiederhergestellt; dies ist unabhängig von `deduplication.enabled`, das die semantische Deduplizierung insgesamt abschaltet. Wenn der Korroborationspfad greift, wird eine strukturierte `corroborated_dedup`-Warnung protokolliert (`targetId`, `topScore`, `corroborators`), damit Betreiber überwachen können, wie oft er auslöst, und Marge/Anzahl anpassen können.
 
 **UPDATE-Zusammenführungsverhalten:**
 - Tags werden vereinigt (vorhandene Tags ∪ neue Tags)

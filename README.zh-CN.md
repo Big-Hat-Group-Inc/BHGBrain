@@ -359,7 +359,18 @@ BHGBrain 从以下位置加载配置文件：
     "enabled": true,
     // 余弦相似度阈值，超过此值时新内容被认为是对现有内容的更新。
     // 各层级有额外调整（详见下方去重章节）。
-    "similarity_threshold": 0.92
+    "similarity_threshold": 0.92,
+    // 分类器为佐证判断评估已获取的 10 个相似度候选中的多少个
+    // （1-10；NOOP/DELETE/直接 UPDATE 始终只使用最接近的一个）。
+    "candidate_window": 5,
+    // 下方佐证路径的独立开关；设为 false 会恢复到扩展前
+    // 仅单候选的分类方式，与此处其他三项设置无关。
+    "corroboration_enabled": true,
+    // 窗口内候选（包括最接近的那个）中，分数需落在更新阈值的
+    // corroboration_margin 范围内的最少数量，才能将 ADD 升级为 UPDATE。
+    "corroboration_count": 2,
+    // 候选分数可以低于更新阈值多少，仍计入佐证。
+    "corroboration_margin": 0.03
   },
 
   // 搜索配置
@@ -794,8 +805,8 @@ repair 工具：
 之所以这样做，是因为混用嵌入空间是一种静默的数据损坏：如果在维度不变的情况下更改
 `config.json` 中的 `embedding.provider` 或 `embedding.model`（例如切换到同一模型
 系列的 Azure 部署），Qdrant 层面不会检测到任何异常——新向量会混入与旧向量相同的
-集合，两个空间之间的余弦相似度毫无意义，召回相关性和去重（`similar[0]` 分数会
-输入到 0.92/0.98 阈值中）都会悄悄劣化。维度变化则会在 Qdrant 层直接报出一个含糊
+集合，两个空间之间的余弦相似度毫无意义，召回相关性和去重（最接近候选与候选窗口的
+分数会输入到 0.92/0.98 阈值中）都会悄悄劣化。维度变化则会在 Qdrant 层直接报出一个含糊
 的错误而失败；来源标记让这两类问题都变得显而易见且可操作。
 
 **模型更改后会发生什么：**
@@ -1154,9 +1165,12 @@ flowchart TD
     G --> H{"Highest Cosine<br/>Similarity Score"}
     H -->|"score ≥ noop threshold"| NOOP2["🔄 NOOP<br/>Near-duplicate found"]
     H -->|"score ≥ update threshold"| UPD["✏️ UPDATE Path"]
-    H -->|"score < update threshold"| ADD["➕ ADD Path"]
+    H -->|"score < update threshold"| WIN{"candidate_window:<br/>N corroborators ≥<br/>(update − margin)?"}
+    WIN -->|"Yes (≥ corroboration_count)"| CORR["✏️ UPDATE Path<br/>(corroborated)"]
+    WIN -->|"No"| ADD["➕ ADD Path"]
 
     UPD --> U1["Merge tags (union)"]
+    CORR --> U1
     U1 --> U2["Replace content"]
     U2 --> U3["importance = max(old, new)"]
     U3 --> U4["SQLite UPDATE"]
@@ -1174,9 +1188,9 @@ flowchart TD
 
     class REJECT reject
     class NOOP1,NOOP2 noop
-    class UPD,U1,U2,U3,U4,U5 update
+    class UPD,CORR,U1,U2,U3,U4,U5 update
     class ADD,A1,A2,A3 add
-    class A,B,C,D,E,F,G,H process
+    class A,B,C,D,E,F,G,H,WIN process
 ```
 
 #### 第一阶段：精确去重（校验和）
@@ -1193,13 +1207,14 @@ checksum = SHA-256(normalizeContent(content))
 
 | 决策 | 条件 | 效果 |
 |---|---|---|
-| `NOOP` | 得分 ≥ noop 阈值 | 内容被视为重复；返回现有记忆的 ID 而不写入 |
-| `DELETE` | 得分 ≥ update 阈值**且**内容明确使匹配项失效（例如"不再正确"、"更正："、"忘记那个"） | 删除现有记忆，候选内容作为新记忆存储，并通过 `merged_from` 引用被删除的记忆 |
-| `DELETE`（可选启用） | 得分处于 update 区间内，上述短语启发式规则**未**触发，`pipeline.contradiction_detection.enabled` 为 `true`，且 LLM 蕴含检查将候选内容相对于匹配记忆分类为 `contradict` | 与上方短语触发的 `DELETE` 效果相同——删除现有记忆，候选内容作为新记忆存储，并通过 `merged_from` 引用被删除的记忆 |
-| `UPDATE` | 得分 ≥ update 阈值 | 内容是对现有内容的更新；合并标签、更新内容和校验和，保留 ID |
-| `ADD` | 得分 < update 阈值 | 全新记忆；使用新 UUID 创建 |
+| `NOOP` | 最接近候选的得分 ≥ noop 阈值 | 内容被视为重复；返回现有记忆的 ID 而不写入 |
+| `DELETE` | 最接近候选的得分 ≥ update 阈值**且**内容明确使匹配项失效（例如"不再正确"、"更正："、"忘记那个"） | 删除现有记忆，候选内容作为新记忆存储，并通过 `merged_from` 引用被删除的记忆 |
+| `DELETE`（可选启用） | 最接近候选的得分处于 update 区间内，上述短语启发式规则**未**触发，`pipeline.contradiction_detection.enabled` 为 `true`，且 LLM 蕴含检查将候选内容相对于匹配记忆分类为 `contradict` | 与上方短语触发的 `DELETE` 效果相同——删除现有记忆，候选内容作为新记忆存储，并通过 `merged_from` 引用被删除的记忆 |
+| `UPDATE` | 最接近候选的得分 ≥ update 阈值 | 内容是对现有内容的更新；合并标签、更新内容和校验和，保留 ID |
+| `UPDATE`（经佐证） | 最接近候选的得分 < update 阈值，**但**在最靠前的 `deduplication.candidate_window` 个候选窗口内（含最接近的那个），至少有 `deduplication.corroboration_count` 个候选的得分 ≥ `update 阈值 − deduplication.corroboration_margin` | 多条几乎相同的记忆各自独立地聚集在阈值附近；合并到得分最高的候选中，效果与直接 `UPDATE` 相同 |
+| `ADD` | 最接近候选的得分 < update 阈值，且未发现可佐证的聚集 | 全新记忆；使用新 UUID 创建 |
 
-上图展示的是 NOOP/UPDATE/ADD 路径；DELETE 是 UPDATE 路径的一个变体，当基于短语的失效启发式规则触发时，或者（可选启用，见下文）当 LLM 蕴含检查将 update 区间内的候选内容分类为与现有记忆矛盾时，都会走这条路径。
+上图展示的是 NOOP/UPDATE/ADD 路径；DELETE 是 UPDATE 路径的一个变体，当基于短语的失效启发式规则触发时，或者（可选启用，见下文）当 LLM 蕴含检查将 update 区间内的候选内容分类为与现有记忆矛盾时，都会走这条路径。NOOP 和 DELETE 始终只依据最接近的候选来判定——佐证机制永远不适用于它们（见下方"候选窗口与佐证"）。
 
 **矛盾检测（可选启用，默认关闭）：** 上述短语启发式规则仅能识别明确表明自己是更正的候选内容（"不再正确"、"更正："等）。如果同一话题的候选内容在不使用这些短语的情况下产生冲突——例如存储中已有"我们使用 MySQL"，此时到达"我们已迁移到 Postgres"——就会悄悄落入 `UPDATE`，两条事实并存。将 `pipeline.contradiction_detection.enabled` 设为 `true` 可以弥补这一缺口：对于落在 update 区间内、且尚未触发短语启发式规则的候选内容，管道会发起一次 LLM 调用（复用 `pipeline.extraction_model` / `pipeline.extraction_model_env` 的凭据——无需单独配置模型或 API 密钥），将候选内容相对于匹配记忆分类为 `agree`、`refine` 或 `contradict`。只有 `contradict` 会改变行为，走向与短语启发式规则相同的删除并替换路径；`agree`/`refine` 都会落入现有的 `UPDATE` 合并逻辑，与当前行为完全一致。短语启发式规则始终优先检查，一旦匹配就会短路，不发起 LLM 调用，因此明确的更正仍然是免费且即时的。
 
@@ -1220,6 +1235,10 @@ checksum = SHA-256(normalizeContent(content))
 | `T1` | 0.98 | max(base, 0.95) |
 | `T2` | 0.98 | base (0.92) |
 | `T3` | 0.95 | max(base, 0.90) |
+
+**候选窗口与佐证：**
+
+Qdrant 相似度搜索已经获取了前 10 个候选，但分类器默认只检查最接近的那一个来做出 NOOP/DELETE/直接 UPDATE 决策。当最接近的候选低于 update 阈值时，管道会额外检查是否有其他多个候选各自独立地聚集在同一阈值附近——同一事实的多条近似复述应当合并为一条记忆，而不是每条都通过 ADD 产生一个新变体。具体来说：在最靠前的 `deduplication.candidate_window` 个候选中（默认 5，上限为 10——即已获取的上限），如果至少有 `deduplication.corroboration_count`（默认 2）个候选的得分 ≥ `update 阈值 − deduplication.corroboration_margin`（默认 0.03），则该次写入会对这些候选中得分最高的那个分类为 `UPDATE`，而不是 `ADD`。这只是单向升级：它可以把 `ADD` 变成 `UPDATE`，但永远不会改变 `NOOP` 或 `DELETE` 的判定，并且总是以得分最高的候选为目标（无需新的排序逻辑）。将 `deduplication.corroboration_enabled` 设为 `false` 可完全禁用此路径，恢复到扩展前仅单候选的分类方式；这与 `deduplication.enabled`（完全关闭语义去重）相互独立。当佐证路径被触发时，会记录一条结构化的 `corroborated_dedup` 警告日志（`targetId`、`topScore`、`corroborators`），便于运维人员监控其触发频率并调整边界值/数量阈值。
 
 **UPDATE 合并行为：**
 - 标签取并集（现有标签 ∪ 新标签）

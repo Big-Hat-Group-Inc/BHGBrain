@@ -146,6 +146,21 @@ const ConfigSchema = z.object({
   deduplication: z.object({
     enabled: z.boolean().default(true),
     similarity_threshold: z.number().min(0).max(1).default(0.92),
+    // How many of the fetched top-10 similarity candidates classifyOperation
+    // evaluates for corroboration (capped at 10 because searchSimilar is called
+    // with a hardcoded topK=10). NOOP/DELETE/direct-UPDATE still key off
+    // window[0] (== similar[0]) alone; only the new corroboration path (below)
+    // looks past the closest candidate. corroboration_enabled is an independent
+    // kill switch: when false, classification is single-candidate-only exactly
+    // as it was pre-widening, regardless of the other three values here.
+    // corroboration_count candidates (out of the window) scoring within
+    // corroboration_margin of the tier's UPDATE threshold escalate an otherwise
+    // ADD decision to UPDATE against the highest-scoring corroborator. See
+    // widen-dedup-candidate-window.
+    candidate_window: z.number().int().min(1).max(10).default(5),
+    corroboration_enabled: z.boolean().default(true),
+    corroboration_count: z.number().int().min(2).default(2),
+    corroboration_margin: z.number().min(0).max(1).default(0.03),
   }).default({}),
   resilience: z.object({
     circuit_breaker: z.object({

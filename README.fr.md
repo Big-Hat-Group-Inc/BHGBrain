@@ -364,7 +364,20 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     "enabled": true,
     // Seuil de similarité cosinus au-delà duquel le nouveau contenu est considéré comme une MISE À JOUR du contenu existant.
     // Des ajustements spécifiques au niveau sont appliqués en supplément (voir section Déduplication ci-dessous).
-    "similarity_threshold": 0.92
+    "similarity_threshold": 0.92,
+    // Combien des 10 candidats de similarité récupérés le classificateur évalue
+    // pour la corroboration (1-10 ; NOOP/DELETE/UPDATE direct n'utilisent toujours que le plus proche).
+    "candidate_window": 5,
+    // Interrupteur indépendant pour le chemin de corroboration décrit ci-dessous ; false
+    // restaure la classification d'avant l'élargissement (candidat unique uniquement),
+    // quels que soient les trois autres réglages ci-dessous.
+    "corroboration_enabled": true,
+    // Nombre minimal de candidats de la fenêtre (y compris le plus proche) devant
+    // se situer dans corroboration_margin du seuil de mise à jour pour faire passer ADD à UPDATE.
+    "corroboration_count": 2,
+    // De combien un candidat peut se situer sous le seuil de mise à jour tout en
+    // comptant encore pour la corroboration.
+    "corroboration_margin": 0.03
   },
 
   // Configuration de la recherche
@@ -824,8 +837,8 @@ silencieuse : si vous changez `embedding.provider` ou `embedding.model` dans
 Azure de la même famille de modèles), rien au niveau de Qdrant ne le détecte — les
 nouveaux vecteurs se retrouvent dans la même collection que les anciens, la
 similarité cosinus entre les deux espaces n'a plus de sens, et la pertinence du
-recall comme la déduplication (les scores `similar[0]` alimentant les seuils
-0.92/0.98) se dégradent silencieusement. Un changement de dimensions échoue
+recall comme la déduplication (les scores du candidat le plus proche et de la
+fenêtre de candidats alimentant les seuils 0.92/0.98) se dégradent silencieusement. Un changement de dimensions échoue
 bruyamment avec une erreur Qdrant opaque à la place ; l'estampillage de provenance
 rend les deux cas bruyants et actionnables.
 
@@ -1195,9 +1208,12 @@ flowchart TD
     G --> H{"Highest Cosine<br/>Similarity Score"}
     H -->|"score ≥ noop threshold"| NOOP2["🔄 NOOP<br/>Near-duplicate found"]
     H -->|"score ≥ update threshold"| UPD["✏️ UPDATE Path"]
-    H -->|"score < update threshold"| ADD["➕ ADD Path"]
+    H -->|"score < update threshold"| WIN{"candidate_window:<br/>N corroborators ≥<br/>(update − margin)?"}
+    WIN -->|"Yes (≥ corroboration_count)"| CORR["✏️ UPDATE Path<br/>(corroborated)"]
+    WIN -->|"No"| ADD["➕ ADD Path"]
 
     UPD --> U1["Merge tags (union)"]
+    CORR --> U1
     U1 --> U2["Replace content"]
     U2 --> U3["importance = max(old, new)"]
     U3 --> U4["SQLite UPDATE"]
@@ -1215,9 +1231,9 @@ flowchart TD
 
     class REJECT reject
     class NOOP1,NOOP2 noop
-    class UPD,U1,U2,U3,U4,U5 update
+    class UPD,CORR,U1,U2,U3,U4,U5 update
     class ADD,A1,A2,A3 add
-    class A,B,C,D,E,F,G,H process
+    class A,B,C,D,E,F,G,H,WIN process
 ```
 
 #### Phase 1 : Déduplication exacte (somme de contrôle)
@@ -1234,13 +1250,14 @@ Si aucune correspondance exacte n'est trouvée, le contenu est intégré et les 
 
 | Décision | Condition | Effet |
 |---|---|---|
-| `NOOP` | Score ≥ seuil noop | Le contenu est considéré comme un doublon ; renvoyer l'ID du souvenir existant sans écriture |
-| `DELETE` | Score ≥ seuil update **et** le contenu invalide explicitement la correspondance (p. ex. « n'est plus vrai », « correction : », « oublie ça ») | Le souvenir existant est supprimé et le candidat est stocké comme nouveau souvenir y faisant référence via `merged_from` |
-| `DELETE` (optionnel) | Le score est dans la bande update, l'heuristique de phrases ci-dessus ne s'est **pas** déclenchée, `pipeline.contradiction_detection.enabled` vaut `true`, et une vérification d'entailment par LLM classe le candidat comme `contradict` par rapport au souvenir correspondant | Même effet que le `DELETE` déclenché par phrase ci-dessus — le souvenir existant est supprimé et le candidat est stocké comme nouveau souvenir y faisant référence via `merged_from` |
-| `UPDATE` | Score ≥ seuil update | Le contenu est une mise à jour de l'existant ; fusionner les tags, mettre à jour le contenu et la somme de contrôle, conserver l'ID |
-| `ADD` | Score < seuil update | Souvenir véritablement nouveau ; créer avec un nouvel UUID |
+| `NOOP` | Score du candidat le plus proche ≥ seuil noop | Le contenu est considéré comme un doublon ; renvoyer l'ID du souvenir existant sans écriture |
+| `DELETE` | Score du candidat le plus proche ≥ seuil update **et** le contenu invalide explicitement la correspondance (p. ex. « n'est plus vrai », « correction : », « oublie ça ») | Le souvenir existant est supprimé et le candidat est stocké comme nouveau souvenir y faisant référence via `merged_from` |
+| `DELETE` (optionnel) | Le score du candidat le plus proche est dans la bande update, l'heuristique de phrases ci-dessus ne s'est **pas** déclenchée, `pipeline.contradiction_detection.enabled` vaut `true`, et une vérification d'entailment par LLM classe le candidat comme `contradict` par rapport au souvenir correspondant | Même effet que le `DELETE` déclenché par phrase ci-dessus — le souvenir existant est supprimé et le candidat est stocké comme nouveau souvenir y faisant référence via `merged_from` |
+| `UPDATE` | Score du candidat le plus proche ≥ seuil update | Le contenu est une mise à jour de l'existant ; fusionner les tags, mettre à jour le contenu et la somme de contrôle, conserver l'ID |
+| `UPDATE` (corroboré) | Score du candidat le plus proche < seuil update, **mais** au moins `deduplication.corroboration_count` candidats dans la fenêtre des `deduplication.candidate_window` meilleurs (y compris le plus proche) obtiennent ≥ `seuil update − deduplication.corroboration_margin` | Plusieurs souvenirs quasi identiques forment indépendamment un groupe proche du seuil ; fusion avec le candidat au score le plus élevé, exactement comme un `UPDATE` direct |
+| `ADD` | Score du candidat le plus proche < seuil update et aucun groupe corroboré trouvé | Souvenir véritablement nouveau ; créer avec un nouvel UUID |
 
-Le diagramme ci-dessus montre les chemins NOOP/UPDATE/ADD ; DELETE est une variante du chemin UPDATE déclenchée soit par l'heuristique d'invalidation basée sur les phrases, soit (optionnel, voir ci-dessous) lorsqu'une vérification d'entailment par LLM classe un candidat de la bande update comme contredisant le souvenir existant.
+Le diagramme ci-dessus montre les chemins NOOP/UPDATE/ADD ; DELETE est une variante du chemin UPDATE déclenchée soit par l'heuristique d'invalidation basée sur les phrases, soit (optionnel, voir ci-dessous) lorsqu'une vérification d'entailment par LLM classe un candidat de la bande update comme contredisant le souvenir existant. NOOP et DELETE sont toujours décidés uniquement en fonction du candidat le plus proche — la corroboration ne s'y applique jamais (voir « Fenêtre de candidats et corroboration » ci-dessous).
 
 **Détection de contradiction (optionnelle, désactivée par défaut) :** l'heuristique de phrases ci-dessus ne détecte que les candidats qui indiquent explicitement qu'ils sont une correction (« n'est plus vrai », « correction : », ...). Un candidat sur le même sujet qui entre en conflit sans utiliser l'une de ces phrases — p. ex. « Nous sommes passés à Postgres » arrivant alors que le stockage contient déjà « nous utilisons MySQL » — passe silencieusement en `UPDATE` et les deux faits coexistent. Définir `pipeline.contradiction_detection.enabled: true` comble cette lacune : pour les candidats qui atterrissent dans la bande update *et* qui n'ont pas déjà déclenché l'heuristique de phrases, le pipeline effectue un appel LLM (en réutilisant les identifiants `pipeline.extraction_model` / `pipeline.extraction_model_env` — pas de configuration de modèle ou de clé API séparée) qui classe le candidat par rapport au souvenir correspondant comme `agree`, `refine`, ou `contradict`. Seul `contradict` change le comportement, en dirigeant vers le même chemin de suppression-remplacement que l'heuristique de phrases ; `agree`/`refine` retombent tous deux dans la fusion `UPDATE` existante, identique au comportement actuel. L'heuristique de phrases est toujours vérifiée en premier et court-circuite sans appel LLM dès qu'elle correspond, donc les corrections explicites restent gratuites et instantanées.
 
@@ -1261,6 +1278,10 @@ Le `similarity_threshold` de base (par défaut 0,92) est ajusté par niveau car 
 | `T1` | 0,98 | max(base, 0,95) |
 | `T2` | 0,98 | base (0,92) |
 | `T3` | 0,95 | max(base, 0,90) |
+
+**Fenêtre de candidats et corroboration :**
+
+La recherche de similarité Qdrant récupère déjà les 10 meilleurs candidats, mais par défaut le classificateur n'inspecte que le seul plus proche pour les décisions NOOP/DELETE/UPDATE direct. Lorsque ce candidat le plus proche se situe *en dessous* du seuil update, le pipeline vérifie en plus si plusieurs autres candidats forment indépendamment un groupe proche du même seuil — plusieurs quasi-répétitions d'un même fait devraient fusionner en un seul souvenir plutôt que chacune ajoutant une nouvelle variante via ADD. Concrètement : au sein des `deduplication.candidate_window` candidats les plus proches (par défaut 5, plafonné à 10 — la limite déjà récupérée), si au moins `deduplication.corroboration_count` (par défaut 2) d'entre eux obtiennent un score ≥ `seuil update − deduplication.corroboration_margin` (par défaut 0,03), l'écriture classe `UPDATE` contre le candidat au score le plus élevé parmi eux plutôt que `ADD`. Il s'agit d'une escalade à sens unique uniquement : elle peut transformer un `ADD` en `UPDATE`, mais ne change jamais une décision `NOOP` ou `DELETE`, et vise toujours le candidat au score le plus élevé (aucune nouvelle logique de départage nécessaire). Définissez `deduplication.corroboration_enabled: false` pour désactiver entièrement ce chemin et restaurer la classification d'avant l'élargissement (candidat unique uniquement) ; ceci est indépendant de `deduplication.enabled`, qui désactive entièrement la déduplication sémantique. Lorsque le chemin de corroboration se déclenche, il émet un avertissement structuré `corroborated_dedup` (`targetId`, `topScore`, `corroborators`) afin que les opérateurs puissent surveiller sa fréquence de déclenchement et ajuster la marge/le nombre.
 
 **Comportement de fusion UPDATE :**
 - Les tags sont réunis (tags existants ∪ nouveaux tags)

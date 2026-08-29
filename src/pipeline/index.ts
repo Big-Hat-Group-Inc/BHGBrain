@@ -343,7 +343,8 @@ export class WritePipeline {
   ): Promise<{ op: WriteOperation; targetId?: string }> {
     if (similar.length === 0) return { op: 'ADD' };
 
-    const top = similar[0]!;
+    const window = similar.slice(0, this.config.deduplication.candidate_window);
+    const top = window[0]!;
     const thresholds = this.lifecycle.dedupThresholdFor(tier, this.config.deduplication.similarity_threshold);
 
     // An explicit invalidation ("no longer true", "correction:", ...) tied to
@@ -367,6 +368,27 @@ export class WritePipeline {
       }
       return { op: 'UPDATE', targetId: top.id };
     }
+
+    // Corroboration: the single closest candidate didn't independently clear
+    // the UPDATE threshold, but several members of the window cluster near it.
+    // This only ever escalates ADD -> UPDATE; it never invents a NOOP or DELETE,
+    // and always targets the highest-scoring (first) window member. See
+    // widen-dedup-candidate-window.
+    if (this.config.deduplication.corroboration_enabled) {
+      const corroborators = window.filter(
+        candidate => candidate.score >= thresholds.update - this.config.deduplication.corroboration_margin,
+      );
+      if (corroborators.length >= this.config.deduplication.corroboration_count) {
+        this.logger?.warn({
+          event: 'corroborated_dedup',
+          targetId: top.id,
+          topScore: top.score,
+          corroborators: corroborators.length,
+        });
+        return { op: 'UPDATE', targetId: top.id };
+      }
+    }
+
     return { op: 'ADD' };
   }
 

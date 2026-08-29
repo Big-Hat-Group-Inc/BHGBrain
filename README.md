@@ -396,7 +396,20 @@ The file is created automatically on first run with all defaults applied. Edit i
     "enabled": true,
     // Cosine similarity threshold above which new content is considered an UPDATE of existing content.
     // Tier-specific adjustments are applied on top (see Deduplication section below).
-    "similarity_threshold": 0.92
+    "similarity_threshold": 0.92,
+    // How many of the top-10 fetched similarity candidates the classifier evaluates
+    // for corroboration (1-10; NOOP/DELETE/direct-UPDATE always use only the closest).
+    "candidate_window": 5,
+    // Independent kill switch for the corroboration path below; false restores
+    // pre-widening single-candidate-only classification regardless of the other
+    // three settings here.
+    "corroboration_enabled": true,
+    // Minimum number of window candidates (including the closest) that must score
+    // within corroboration_margin of the update threshold to escalate ADD to UPDATE.
+    "corroboration_count": 2,
+    // How far below the update threshold a candidate can score and still count
+    // toward corroboration.
+    "corroboration_margin": 0.03
   },
 
   // Resilience settings (circuit breakers for external dependencies)
@@ -863,7 +876,7 @@ This exists because mixing embedding spaces is silent corruption: if you change
 same (e.g. switching to an Azure deployment of the same model family), nothing at the
 Qdrant layer detects it — new vectors land in the same collection as old ones, cosine
 similarity across the two spaces is meaningless, and both recall relevance and
-deduplication (`similar[0]` scores feeding the 0.92/0.98 thresholds) silently corrode.
+deduplication (the closest-candidate and candidate-window scores feeding the 0.92/0.98 thresholds) silently corrode.
 A dimension change fails loudly with an opaque Qdrant error instead; provenance
 stamping makes the same class of problem loud and actionable in both cases.
 
@@ -1226,9 +1239,12 @@ flowchart TD
     G --> H{"Highest Cosine<br/>Similarity Score"}
     H -->|"score ≥ noop threshold"| NOOP2["🔄 NOOP<br/>Near-duplicate found"]
     H -->|"score ≥ update threshold"| UPD["✏️ UPDATE Path"]
-    H -->|"score < update threshold"| ADD["➕ ADD Path"]
+    H -->|"score < update threshold"| WIN{"candidate_window:<br/>N corroborators ≥<br/>(update − margin)?"}
+    WIN -->|"Yes (≥ corroboration_count)"| CORR["✏️ UPDATE Path<br/>(corroborated)"]
+    WIN -->|"No"| ADD["➕ ADD Path"]
 
     UPD --> U1["Merge tags (union)"]
+    CORR --> U1
     U1 --> U2["Replace content"]
     U2 --> U3["importance = max(old, new)"]
     U3 --> U4["SQLite UPDATE"]
@@ -1246,9 +1262,9 @@ flowchart TD
 
     class REJECT reject
     class NOOP1,NOOP2 noop
-    class UPD,U1,U2,U3,U4,U5 update
+    class UPD,CORR,U1,U2,U3,U4,U5 update
     class ADD,A1,A2,A3 add
-    class A,B,C,D,E,F,G,H process
+    class A,B,C,D,E,F,G,H,WIN process
 ```
 
 #### Phase 1: Exact Deduplication (Checksum)
@@ -1265,13 +1281,14 @@ If no exact match is found, the content is embedded and the top 10 most similar 
 
 | Decision | Condition | Effect |
 |---|---|---|
-| `NOOP` | Score ≥ noop threshold | Content is considered a duplicate; return the existing memory's ID without writing |
-| `DELETE` | Score ≥ update threshold **and** the content explicitly invalidates the match (e.g. "no longer true", "correction:", "forget that") | The existing memory is deleted and the candidate is stored as a new memory referencing it via `merged_from` |
-| `DELETE` (opt-in) | Score is in the update band, the phrase heuristic above did **not** fire, `pipeline.contradiction_detection.enabled` is `true`, and an LLM entailment check classifies the candidate as `contradict` relative to the matched memory | Same effect as the phrase-triggered `DELETE` above — the existing memory is deleted and the candidate is stored as a new memory referencing it via `merged_from` |
-| `UPDATE` | Score ≥ update threshold | Content is an update of existing; merge tags, update content and checksum, preserve ID |
-| `ADD` | Score < update threshold | Genuinely new memory; create with a new UUID |
+| `NOOP` | Closest candidate's score ≥ noop threshold | Content is considered a duplicate; return the existing memory's ID without writing |
+| `DELETE` | Closest candidate's score ≥ update threshold **and** the content explicitly invalidates the match (e.g. "no longer true", "correction:", "forget that") | The existing memory is deleted and the candidate is stored as a new memory referencing it via `merged_from` |
+| `DELETE` (opt-in) | Closest candidate's score is in the update band, the phrase heuristic above did **not** fire, `pipeline.contradiction_detection.enabled` is `true`, and an LLM entailment check classifies the candidate as `contradict` relative to the matched memory | Same effect as the phrase-triggered `DELETE` above — the existing memory is deleted and the candidate is stored as a new memory referencing it via `merged_from` |
+| `UPDATE` | Closest candidate's score ≥ update threshold | Content is an update of existing; merge tags, update content and checksum, preserve ID |
+| `UPDATE` (corroborated) | Closest candidate's score < update threshold, **but** at least `deduplication.corroboration_count` candidates within the top `deduplication.candidate_window` (including the closest) score ≥ `update threshold − deduplication.corroboration_margin` | Several near-identical memories independently cluster near the threshold; merge into the highest-scoring candidate exactly as a direct `UPDATE` would |
+| `ADD` | Closest candidate's score < update threshold and no corroborated cluster is found | Genuinely new memory; create with a new UUID |
 
-The diagram above shows the NOOP/UPDATE/ADD paths; DELETE is a variant of the UPDATE path taken when either the phrase-based invalidation heuristic fires, or (opt-in, see below) an LLM entailment check classifies an update-band candidate as contradicting the existing memory.
+The diagram above shows the NOOP/UPDATE/ADD paths; DELETE is a variant of the UPDATE path taken when either the phrase-based invalidation heuristic fires, or (opt-in, see below) an LLM entailment check classifies an update-band candidate as contradicting the existing memory. NOOP and DELETE are always decided against the single closest candidate only — corroboration never applies to them (see "Candidate window and corroboration" below).
 
 **Contradiction detection (opt-in, default off):** the phrase heuristic above only catches candidates that explicitly say they're a correction ("no longer true", "correction:", ...). A same-topic candidate that conflicts without using one of those phrases — e.g. "We migrated to Postgres" arriving when the store already has "we use MySQL" — silently falls through to `UPDATE` and both facts coexist. Setting `pipeline.contradiction_detection.enabled: true` closes that gap: for candidates that land in the update band *and* don't already trip the phrase heuristic, the pipeline makes one LLM call (reusing the `pipeline.extraction_model` / `pipeline.extraction_model_env` credentials — no separate model or API key configuration) that classifies the candidate against the matched memory as `agree`, `refine`, or `contradict`. Only `contradict` changes behavior, routing to the same delete-and-replace path as the phrase heuristic; `agree`/`refine` fall through to the existing `UPDATE` merge, identical to today's behavior. The phrase heuristic is always checked first and short-circuits without an LLM call whenever it matches, so explicit corrections stay free and instant.
 
@@ -1292,6 +1309,10 @@ The base `similarity_threshold` (default 0.92) is adjusted per tier because T0/T
 | `T1` | 0.98 | max(base, 0.95) |
 | `T2` | 0.98 | base (0.92) |
 | `T3` | 0.95 | max(base, 0.90) |
+
+**Candidate window and corroboration:**
+
+The Qdrant similarity search already fetches the top 10 candidates, but by default the classifier only inspects the single closest one for NOOP/DELETE/direct-UPDATE decisions. When that closest candidate falls *below* the update threshold, the pipeline additionally checks whether several other candidates independently cluster near the same threshold — several near-restatements of the same fact should merge into one memory rather than each ADD-ing a fresh variant. Concretely: within the top `deduplication.candidate_window` candidates (default 5, capped at 10 — the ceiling already fetched), if at least `deduplication.corroboration_count` (default 2) of them score at or above `update threshold − deduplication.corroboration_margin` (default 0.03), the write classifies `UPDATE` against the highest-scoring of those candidates instead of `ADD`. This is a one-way escalation only: it can turn an `ADD` into an `UPDATE`, but never changes a `NOOP` or `DELETE` decision, and it always targets the highest-scoring candidate (no new tie-breaking logic). Set `deduplication.corroboration_enabled: false` to disable this path entirely and restore pre-widening single-candidate-only classification; this is independent of `deduplication.enabled`, which turns off semantic dedup altogether. When the corroboration path fires it emits a structured `corroborated_dedup` warning log (`targetId`, `topScore`, `corroborators`) so operators can monitor how often it triggers and tune the margin/count.
 
 **UPDATE merge behavior:**
 - Tags are unioned (existing tags ∪ new tags)

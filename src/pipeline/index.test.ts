@@ -318,6 +318,204 @@ describe('WritePipeline NOOP handling', () => {
   });
 });
 
+describe('WritePipeline dedup candidate window corroboration', () => {
+  // Tier T2 (source: 'cli') resolves thresholds to { noop: 0.98, update: 0.92 }
+  // via dedupThresholdFor with similarity_threshold: 0.92 (see
+  // src/domain/lifecycle.ts). corroboration_margin: 0.03 means candidates
+  // scoring >= 0.89 count toward corroboration.
+  const config = {
+    deduplication: {
+      similarity_threshold: 0.92,
+      candidate_window: 5,
+      corroboration_enabled: true,
+      corroboration_count: 2,
+      corroboration_margin: 0.03,
+    },
+    pipeline: {
+      extraction_enabled: true,
+      fallback_to_threshold_dedup: true,
+      extraction_model: 'gpt-4o-mini',
+      extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY',
+      contradiction_detection: { enabled: false, timeout_ms: 5000 },
+    },
+  } as unknown as BrainConfig;
+
+  let embedding: EmbeddingProvider;
+  let storage: StorageManager;
+
+  beforeEach(() => {
+    vi.mocked(checkEntailment).mockReset();
+    embedding = {
+      model: 'test-model',
+      dimensions: 2,
+      embed: vi.fn(async () => [0.1, 0.2]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
+      healthCheck: vi.fn(async () => true),
+    };
+    storage = {
+      sqlite: {
+        getMemoryByChecksum: vi.fn(() => null),
+        getMemoryById: vi.fn(() => ({
+          id: 'top-id',
+          summary: 'existing summary',
+          type: 'semantic',
+          content: 'existing content',
+          created_at: '2026-01-01T00:00:00.000Z',
+          importance: 0.5,
+          tags: [],
+        })),
+        insertMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+        fullTextSearch: vi.fn(() => []),
+      },
+      qdrant: {
+        // Below the 0.92 update threshold individually, but 3 candidates sit
+        // within the 0.03 corroboration margin (i.e. >= 0.89).
+        searchSimilar: vi.fn(async () => [
+          { id: 'top-id', score: 0.91 },
+          { id: 'second-id', score: 0.90 },
+          { id: 'third-id', score: 0.89 },
+        ]),
+      },
+      updateMemory: vi.fn(),
+      writeMemory: vi.fn(),
+      writeMemoryWithoutVector: vi.fn(),
+      deleteMemory: vi.fn(async () => true),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+  });
+
+  it('classifies UPDATE targeting the highest-scoring candidate when a corroborated cluster is found', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'a near-restatement of several existing memories',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('UPDATE');
+    expect(result[0]!.merged_with_id).toBe('top-id');
+    expect(storage.updateMemory).toHaveBeenCalledTimes(1);
+    expect(storage.writeMemory).not.toHaveBeenCalled();
+  });
+
+  it('falls back to ADD when fewer than corroboration_count candidates qualify', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [
+      { id: 'top-id', score: 0.91 },
+      { id: 'second-id', score: 0.50 },
+      { id: 'third-id', score: 0.40 },
+    ]);
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'content close to only one prior memory',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('ADD');
+    expect(storage.writeMemory).toHaveBeenCalledTimes(1);
+    expect(storage.updateMemory).not.toHaveBeenCalled();
+  });
+
+  it('restores pre-widening ADD behavior when corroboration_enabled is false', async () => {
+    const disabledConfig = {
+      ...config,
+      deduplication: { ...config.deduplication, corroboration_enabled: false },
+    } as unknown as BrainConfig;
+    const pipeline = new WritePipeline(disabledConfig, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'a near-restatement of several existing memories',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('ADD');
+    expect(storage.writeMemory).toHaveBeenCalledTimes(1);
+    expect(storage.updateMemory).not.toHaveBeenCalled();
+  });
+
+  it('restores pre-widening ADD behavior when candidate_window is 1', async () => {
+    const narrowConfig = {
+      ...config,
+      deduplication: { ...config.deduplication, candidate_window: 1 },
+    } as unknown as BrainConfig;
+    const pipeline = new WritePipeline(narrowConfig, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'a near-restatement of several existing memories',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(result[0]!.operation).toBe('ADD');
+    expect(storage.writeMemory).toHaveBeenCalledTimes(1);
+    expect(storage.updateMemory).not.toHaveBeenCalled();
+  });
+
+  it('emits a corroborated_dedup warning log only when the corroboration path fires', async () => {
+    const logger = { warn: vi.fn() };
+    const pipeline = new WritePipeline(config, storage, embedding, logger);
+
+    await pipeline.process({
+      content: 'a near-restatement of several existing memories',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'corroborated_dedup',
+      targetId: 'top-id',
+      topScore: 0.91,
+      corroborators: 3,
+    }));
+  });
+
+  it('does not emit a corroborated_dedup log for a plain single-candidate ADD', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'top-id', score: 0.1 }]);
+    const logger = { warn: vi.fn() };
+    const pipeline = new WritePipeline(config, storage, embedding, logger);
+
+    await pipeline.process({
+      content: 'completely unrelated new content',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'corroborated_dedup' }));
+  });
+
+  it('does not emit a corroborated_dedup log for a direct single-candidate UPDATE', async () => {
+    storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'top-id', score: 0.95 }]);
+    const logger = { warn: vi.fn() };
+    const pipeline = new WritePipeline(config, storage, embedding, logger);
+
+    await pipeline.process({
+      content: 'a refinement of the existing memory',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'cli',
+    });
+
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'corroborated_dedup' }));
+  });
+});
+
 describe('WritePipeline contradiction detection', () => {
   const enabledConfig = {
     deduplication: { similarity_threshold: 0.92 },
