@@ -298,6 +298,55 @@ export class QdrantStore {
     }
   }
 
+  /**
+   * Per-point ANN neighbor discovery for duplicate-cluster consolidation
+   * (`consolidate list`, see design.md "Neighbor discovery via Qdrant's own
+   * per-point ANN query"). Passes an existing point's id as the query
+   * instead of a raw vector — Qdrant's Query API resolves the point's stored
+   * vector server-side, so no vector is ever fetched or held client-side.
+   * Requests one extra result (`topK + 1`) because Qdrant returns the query
+   * point itself at score 1.0 when querying by id, then filters that self-hit
+   * out of the response. Bounded (`O(topK)` per call) rather than a full
+   * pairwise scan — see design.md Decisions.
+   */
+  async findNeighborsById(
+    namespace: string,
+    collection: string,
+    pointId: string,
+    topK: number,
+    minScore: number,
+  ): Promise<Array<{ id: string; score: number }>> {
+    const name = this.collectionName(namespace, collection);
+    try {
+      const response = await this.executeWithBreaker(() => this.client.query(name, {
+        query: pointId,
+        limit: topK + 1,
+        filter: {
+          must: [{ key: 'namespace', match: { value: namespace } }],
+        },
+        score_threshold: minScore,
+        with_payload: false,
+      }));
+      return response.points
+        .filter(r => r.id !== pointId)
+        .map(r => ({ id: r.id as string, score: r.score }));
+    } catch (err) {
+      // A collection that has never been written to yields no neighbors, not
+      // a thrown error — same convention as `searchSimilar`.
+      if (this.isNotFoundError(err)) {
+        return [];
+      }
+      this.logger?.warn({
+        event: 'neighbor_discovery_failed',
+        namespace,
+        collection,
+        point_id: pointId,
+        error: (err as Error).message,
+      });
+      throw err;
+    }
+  }
+
   async healthCheck(): Promise<boolean> {
     // Probe the retrieval path itself (the same `query` call `search`/
     // `searchSimilar` use), not just connectivity: a reachable server that

@@ -144,6 +144,25 @@ export const RepairInputSchema = z.object({
   { message: 'device_id and all_devices are mutually exclusive', path: ['all_devices'] },
 );
 
+export const ConsolidateInputSchema = z.object({
+  action: z.enum(['list', 'merge']),
+  namespace: NamespaceSchema.default('global'),
+  collection: NameSchema.default('general'),
+  // list only: cursor from a prior list call, and the minimum cluster size
+  // (edges within the scanned page) below which a cluster is dropped.
+  cursor: z.string().optional(),
+  min_cluster_size: z.number().int().min(2).default(2),
+  // merge only: the human-chosen canonical memory and the ids merged into it.
+  target_id: z.string().uuid().optional(),
+  source_ids: z.array(z.string().uuid()).min(1).optional(),
+}).strict().refine(
+  data => data.action !== 'merge' || (data.target_id !== undefined && data.source_ids !== undefined),
+  { message: 'target_id and source_ids are required for merge', path: ['target_id'] },
+).refine(
+  data => data.action !== 'merge' || !data.source_ids?.includes(data.target_id!),
+  { message: 'target_id must not appear in source_ids', path: ['source_ids'] },
+);
+
 export type RememberInput = z.infer<typeof RememberInputSchema>;
 export type RecallInput = z.infer<typeof RecallInputSchema>;
 export type ForgetInput = z.infer<typeof ForgetInputSchema>;
@@ -155,3 +174,4 @@ export type BackupInput = z.infer<typeof BackupInputSchema>;
 export type RepairInput = z.infer<typeof RepairInputSchema>;
 export type RevisionsInput = z.infer<typeof RevisionsInputSchema>;
 export type ReviewInput = z.infer<typeof ReviewInputSchema>;
+export type ConsolidateInput = z.infer<typeof ConsolidateInputSchema>;

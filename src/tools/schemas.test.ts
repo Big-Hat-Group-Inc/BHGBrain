@@ -25,8 +25,8 @@ function bareCtx(): ToolContext {
 }
 
 describe('MCP_TOOL_DEFINITIONS (task 2.1)', () => {
-  it('has exactly 13 tools', () => {
-    expect(MCP_TOOL_DEFINITIONS).toHaveLength(13);
+  it('has exactly 14 tools', () => {
+    expect(MCP_TOOL_DEFINITIONS).toHaveLength(14);
   });
 
   it('every tool has a non-empty title and an annotations block', () => {

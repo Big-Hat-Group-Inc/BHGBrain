@@ -318,6 +318,79 @@ describe('QdrantStore.searchSimilar', () => {
   });
 });
 
+describe('QdrantStore.findNeighborsById', () => {
+  // add-duplicate-cluster-consolidation: per-point ANN neighbor discovery for
+  // the `consolidate list` action.
+  it('queries by point id and excludes the self-hit from the mapped results', async () => {
+    const query = vi.fn<QdrantClient['query']>(async () => ({
+      points: [
+        { id: 'p1', score: 1.0, version: 0 }, // self-hit at score 1.0
+        { id: 'dup-1', score: 0.95, version: 0 },
+        { id: 'dup-2', score: 0.91, version: 0 },
+      ],
+    }));
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query,
+    };
+    const store = createStore(client);
+
+    const results = await store.findNeighborsById('global', 'work', 'p1', 20, 0.9);
+
+    expect(results).toEqual([{ id: 'dup-1', score: 0.95 }, { id: 'dup-2', score: 0.91 }]);
+    const call = query.mock.calls[0]!;
+    expect(call[0]).toBe('bhgbrain_global_work');
+    expect(call[1]).toEqual(expect.objectContaining({
+      query: 'p1',
+      limit: 21,
+      score_threshold: 0.9,
+      with_payload: false,
+    }));
+  });
+
+  it('returns an empty array for a collection that has never been written to, not a thrown error', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => {
+        const err = new Error('Collection `bhgbrain_global_work` doesn\'t exist!') as Error & { status?: number };
+        err.status = 404;
+        throw err;
+      }),
+    };
+    const store = createStore(client);
+    const results = await store.findNeighborsById('global', 'work', 'p1', 20, 0.9);
+    expect(results).toEqual([]);
+  });
+
+  it('propagates a genuine transport failure instead of reporting no neighbors', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => {
+        throw new Error('transport failure');
+      }),
+    };
+    const store = createStore(client);
+    await expect(store.findNeighborsById('global', 'work', 'p1', 20, 0.9)).rejects.toThrow('transport failure');
+  });
+
+  it('routes calls through the circuit breaker', async () => {
+    const query = vi.fn<QdrantClient['query']>(async () => {
+      throw new Error('transport failure');
+    });
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query };
+    const breaker = new CircuitBreaker({ failureThreshold: 1, openWindowMs: 60_000, halfOpenProbeCount: 1 });
+    const store = createStore(client, { breaker });
+
+    await expect(store.findNeighborsById('global', 'work', 'p1', 20, 0.9)).rejects.toThrow('transport failure');
+    expect(breaker.getState()).toBe('open');
+
+    await expect(store.findNeighborsById('global', 'work', 'p1', 20, 0.9)).rejects.toThrow(
+      'Qdrant circuit breaker is open',
+    );
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('QdrantStore.ensureCollection device_id index migration', () => {
   // Regression guard: the index was originally created only inside the
   // collection-not-found branch, so a collection that already exists (the

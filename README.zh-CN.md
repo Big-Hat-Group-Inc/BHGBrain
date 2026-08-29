@@ -2888,6 +2888,65 @@ SQLite 数据库——用于多设备设置、数据丢失恢复或新设备接�
 
 ---
 
+### `consolidate`——发现并合并重复记忆簇
+
+发现并合并近似重复的**已存在**记忆——弥补写入时去重留下的读取侧缺口。去重（参见[去重](#去重)）只会将新写入的内容与已存储的内容比较；从不回头审视已经存在的记忆之间的关系。导入操作，以及降级窗口期的写入（嵌入服务提供方故障时回退到更宽松的校验和/Jaccard 启发式算法），都会在结构上留下写入时去重无法事后捕获的近似重复项。`action: "list"` 使用有界、分页的逐点相似度查询（绝不进行完整的两两全量扫描）在单个命名空间/集合内扫描近似重复记忆簇；`action: "merge"` 将一个由人工明确挑选的簇合并到一条目标记忆，逐条来源复用 `review` 工具归档动作所使用的同一归档转换逻辑。不存在自动或计划性的合并路径——`merge` 始终要求显式提供 `target_id` 和 `source_ids`。
+
+**输入：**
+
+| 参数 | 类型 | 是否必需 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `action` | `"list" \| "merge"` | **是** | - | 要执行的操作。 |
+| `namespace` | `string` | 否 | `"global"` | 命名空间范围。 |
+| `collection` | `string` | 否 | `"general"` | 集合范围。簇永远不会跨集合。 |
+| `cursor` | `string` | 否 | - | （仅 `list`）上一次 `list` 调用返回的分页游标。 |
+| `min_cluster_size` | `integer (>= 2)` | 否 | `2` | （仅 `list`）小于此值的簇会从结果中剔除。 |
+| `target_id` | `string (UUID)` | `merge` 必需 | - | 所有来源记忆将合并入的目标记忆。内容和嵌入向量保持不变。 |
+| `source_ids` | `array<string (UUID)>` | `merge` 必需 | - | 将被合并入 `target_id` 并归档的记忆 ID 列表。不得包含 `target_id`。 |
+
+**输出（`action: "list"`）：**
+
+```json
+{
+  "clusters": [
+    {
+      "members": [
+        {
+          "id": "3f4a1b2c-...",
+          "summary": "支付服务的部署手册",
+          "tags": ["deployment", "runbook"],
+          "importance": 0.7,
+          "access_count": 4,
+          "updated_at": "2026-02-01T00:00:00.000Z"
+        },
+        {
+          "id": "9c2e5f10-...",
+          "summary": "支付服务部署手册（v2）",
+          "tags": ["deployment"],
+          "importance": 0.5,
+          "access_count": 1,
+          "updated_at": "2026-01-15T00:00:00.000Z"
+        }
+      ],
+      "suggested_target": "3f4a1b2c-..."
+    }
+  ],
+  "cursor": null
+}
+```
+
+在被扫描的这一页内，只要两条记忆之间的相似度边达到或超过 `consolidation.similarity_threshold`（默认 `0.9`——刻意低于写入时去重的 UPDATE 阈值，因此 `list` 会呈现出那些去重机制本身不会自动合并的候选项），就会被归入同一个簇。`suggested_target` **仅是提示**：取 `importance` 最高的成员（若相同则比较 `access_count`，再相同则取 `updated_at` 最新的一个）。`merge` 从不据此自动推断 `target_id`——调用方必须显式指定。当被扫描的这一页小于 `consolidation.max_scan_per_call` 时，`cursor` 为 `null`；否则将其传回以便跨多次调用继续扫描。
+
+**输出（`action: "merge"`）：**
+
+```json
+{ "target_id": "3f4a1b2c-...", "merged": ["9c2e5f10-..."], "failed": [] }
+```
+
+成功后，目标记忆的 `tags` 会变为其自身标签与所有来源标签的并集，其 `importance` 会变为目标与所有来源中的最大值，其 `merged_from` 字段会记录每一个被合并的来源 ID（以逗号连接，并追加在此前已有的值之后——一条记忆在其生命周期内可以多次成为合并目标）。每个来源都会通过与 `review` 工具 `archive` 动作相同的转换流程归档：移除向量，行迁移至 `archived_memories`，并记录一条 `ARCHIVE` 审计事件，其中 `action: "consolidate"`，`merged_into` 指向目标记忆。如果 `target_id` 出现在 `source_ids` 中，或某个来源与目标不属于同一命名空间/集合，请求会以 `INVALID_INPUT` 被拒绝（此时不会归档任何内容）；如果某个来源 ID 从未存在过，则返回 `NOT_FOUND`。已归档的来源会被静默跳过而非拒绝，因此对部分成功的合并重试是安全的。若某个来源在归档过程中途失败，响应中的 `merged`/`failed` 数组会区分成功与失败的部分——失败的来源保持存活状态，不会出现既归档又未删除的情况。
+
+---
+
 ## 升级
 
 ### 1.2 → 1.3（多设备记忆与数据弹性）

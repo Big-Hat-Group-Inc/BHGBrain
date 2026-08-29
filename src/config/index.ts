@@ -162,6 +162,24 @@ const ConfigSchema = z.object({
     corroboration_count: z.number().int().min(2).default(2),
     corroboration_margin: z.number().min(0).max(1).default(0.03),
   }).default({}),
+  // Read-side near-duplicate discovery/merge for existing memories, distinct
+  // from write-time `deduplication` above: `consolidate list` surfaces
+  // clusters of already-stored memories whose pairwise similarity meets
+  // `similarity_threshold`; `consolidate merge` requires an explicit
+  // human-supplied target/source selection. See
+  // add-duplicate-cluster-consolidation.
+  consolidation: z.object({
+    enabled: z.boolean().default(true),
+    // Deliberately below deduplication's tier UPDATE thresholds (0.95/0.9) so
+    // consolidation surfaces candidates write-time dedup would not have
+    // auto-merged, not just ones it would have.
+    similarity_threshold: z.number().min(0).max(1).default(0.9),
+    // Per-point neighbor breadth passed to `findNeighborsById`'s topK.
+    neighbor_top_k: z.number().int().positive().default(20),
+    // Upper bound on memories scanned per `list` call, regardless of how
+    // large the namespace/collection is — see design.md "Bounded scan cost".
+    max_scan_per_call: z.number().int().positive().default(500),
+  }).default({}),
   resilience: z.object({
     circuit_breaker: z.object({
       failure_threshold: z.number().int().min(1).default(5),

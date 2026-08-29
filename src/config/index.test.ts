@@ -211,6 +211,58 @@ describe('pipeline.contradiction_detection config', () => {
   });
 });
 
+describe('consolidation config (add-duplicate-cluster-consolidation)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to enabled with threshold 0.9, neighbor_top_k 20, max_scan_per_call 500 when omitted', () => {
+    const configPath = writeConfig({});
+
+    const config = loadConfig(configPath);
+
+    expect(config.consolidation.enabled).toBe(true);
+    expect(config.consolidation.similarity_threshold).toBe(0.9);
+    expect(config.consolidation.neighbor_top_k).toBe(20);
+    expect(config.consolidation.max_scan_per_call).toBe(500);
+  });
+
+  it('honors explicit overrides', () => {
+    const configPath = writeConfig({
+      consolidation: {
+        enabled: false, similarity_threshold: 0.85, neighbor_top_k: 10, max_scan_per_call: 100,
+      },
+    });
+
+    const config = loadConfig(configPath);
+
+    expect(config.consolidation.enabled).toBe(false);
+    expect(config.consolidation.similarity_threshold).toBe(0.85);
+    expect(config.consolidation.neighbor_top_k).toBe(10);
+    expect(config.consolidation.max_scan_per_call).toBe(100);
+  });
+
+  it('rejects a similarity_threshold outside [0,1]', () => {
+    const configPath = writeConfig({ consolidation: { similarity_threshold: 1.5 } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
 describe('pipeline extraction config (add-multi-candidate-extraction)', () => {
   const tempDirs: string[] = [];
 

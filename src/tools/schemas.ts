@@ -308,6 +308,27 @@ export const MCP_TOOL_DEFINITIONS = [
     // Reconstructive; safe to repeat (re-scans and only recovers what's missing).
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
+  {
+    name: 'consolidate',
+    title: 'Consolidate Duplicates',
+    description: 'Discover and merge near-duplicate existing memories. action: "list" scans a namespace/collection for clusters of near-duplicate memories (bounded, paginated, no full pairwise scan) and returns each with a suggested merge target (a hint only). action: "merge" merges explicitly named source memories into an explicitly named target: unions tags, raises importance to the cluster max, and archives each source through the existing archive transition. Always requires an explicit target_id/source_ids — there is no automatic or scheduled merge.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: { type: 'string', enum: ['list', 'merge'], description: 'The action to perform' },
+        namespace: { type: 'string', description: 'Namespace scope (default: global)', pattern: '^[a-zA-Z0-9/-]{1,200}$' },
+        collection: { type: 'string', description: 'Collection name (default: general)', maxLength: 100 },
+        cursor: { type: 'string', description: '(list only) Pagination cursor from a prior list call' },
+        min_cluster_size: { type: 'number', minimum: 2, default: 2, description: '(list only) Minimum members for a cluster to be reported' },
+        target_id: { type: 'string', format: 'uuid', description: '(merge only) The memory id every source is merged into' },
+        source_ids: { type: 'array', items: { type: 'string', format: 'uuid' }, minItems: 1, description: '(merge only) Memory ids to merge into target_id and archive' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    // `merge` archives sources, but that transition is reversible via `review restore`.
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
 ];
 
 /** Task 2.4: single source of truth for "is this a known MCP tool name",

@@ -2962,6 +2962,65 @@ voir [Migration du modèle d'embedding](#migration-du-modèle-dembedding). Voir 
 
 ---
 
+### `consolidate` — Découverte et fusion de clusters de doublons
+
+Découvre et fusionne des souvenirs *existants* quasi doublons — comble la lacune côté lecture que la déduplication à l'écriture laisse ouverte. La déduplication (voir [Déduplication](#déduplication)) ne compare qu'une écriture entrante avec ce qui est déjà stocké ; rien ne regarde *en arrière* parmi les souvenirs déjà existants. Les imports et les écritures en fenêtre dégradée (une panne du fournisseur d'embeddings qui bascule vers une heuristique checksum/Jaccard plus laxiste) laissent régulièrement des quasi-doublons que la déduplication à l'écriture ne peut structurellement pas détecter après coup. `action: "list"` explore un namespace/une collection à la recherche de clusters de souvenirs quasi doublons via une requête de similarité par point bornée et paginée (jamais une comparaison exhaustive par paires) ; `action: "merge"` consolide un cluster explicitement choisi par un humain en un souvenir cible, en réutilisant la même transition d'archivage que l'action `archive` de l'outil `review`, source par source. Il n'existe aucune voie de fusion automatique ou planifiée — `merge` requiert toujours un `target_id` et des `source_ids` explicites.
+
+**Entrée :**
+
+| Paramètre | Type | Requis | Défaut | Description |
+|---|---|---|---|---|
+| `action` | `"list" \| "merge"` | **Oui** | - | L'opération à effectuer. |
+| `namespace` | `string` | Non | `"global"` | Portée du namespace. |
+| `collection` | `string` | Non | `"general"` | Portée de la collection. Un cluster ne s'étend jamais sur plusieurs collections. |
+| `cursor` | `string` | Non | - | (`list` uniquement) Curseur de pagination renvoyé par un appel `list` précédent. |
+| `min_cluster_size` | `integer (>= 2)` | Non | `2` | (`list` uniquement) Les clusters plus petits que cette valeur sont exclus du résultat. |
+| `target_id` | `string (UUID)` | Requis pour `merge` | - | Le souvenir dans lequel chaque source est fusionnée. Le contenu et l'embedding restent inchangés. |
+| `source_ids` | `array<string (UUID)>` | Requis pour `merge` | - | IDs de souvenirs à fusionner dans `target_id` puis à archiver. Ne doit pas inclure `target_id`. |
+
+**Sortie (`action: "list"`) :**
+
+```json
+{
+  "clusters": [
+    {
+      "members": [
+        {
+          "id": "3f4a1b2c-...",
+          "summary": "Runbook de déploiement du service de paiement",
+          "tags": ["deployment", "runbook"],
+          "importance": 0.7,
+          "access_count": 4,
+          "updated_at": "2026-02-01T00:00:00.000Z"
+        },
+        {
+          "id": "9c2e5f10-...",
+          "summary": "Runbook de déploiement du service de paiement (v2)",
+          "tags": ["deployment"],
+          "importance": 0.5,
+          "access_count": 1,
+          "updated_at": "2026-01-15T00:00:00.000Z"
+        }
+      ],
+      "suggested_target": "3f4a1b2c-..."
+    }
+  ],
+  "cursor": null
+}
+```
+
+Les souvenirs sont regroupés en un cluster lorsqu'ils sont reliés, au sein de la page explorée, par une arête de similarité au moins égale à `consolidation.similarity_threshold` (par défaut `0.9` — délibérément en dessous des seuils UPDATE de la déduplication à l'écriture, afin que `list` fasse apparaître des candidats que la déduplication elle-même n'aurait pas fusionnés automatiquement). `suggested_target` n'est **qu'une suggestion** : le membre avec la plus haute `importance` (les égalités sont départagées par `access_count`, puis par le `updated_at` le plus récent). `merge` n'en déduit jamais `target_id` — l'appelant doit le nommer explicitement. `cursor` est `null` dès que la page explorée est plus petite que `consolidation.max_scan_per_call` ; le renvoyer permet de poursuivre l'exploration sur plusieurs appels.
+
+**Sortie (`action: "merge"`) :**
+
+```json
+{ "target_id": "3f4a1b2c-...", "merged": ["9c2e5f10-..."], "failed": [] }
+```
+
+En cas de succès, les `tags` de la cible deviennent l'union de ses propres tags et de ceux de toutes les sources, son `importance` devient le maximum entre la cible et toutes les sources, et son champ `merged_from` enregistre chaque id source fusionné (séparés par des virgules, ajoutés à toute valeur précédente — un souvenir peut être la cible de plusieurs consolidations au cours de sa vie). Chaque source est archivée via la même transition que l'action `archive` de `review` : le vecteur est supprimé, la ligne déplacée vers `archived_memories`, et un événement d'audit `ARCHIVE` est enregistré avec `action: "consolidate"` et `merged_into` désignant la cible. La requête est rejetée avec `INVALID_INPUT` si `target_id` figure dans `source_ids` ou si une source appartient à un namespace/une collection différent de celui de la cible (rien n'est alors archivé), et avec `NOT_FOUND` si un id source n'a jamais existé. Une source déjà archivée est silencieusement ignorée plutôt que rejetée, de sorte qu'une nouvelle tentative de `merge` après un succès partiel est sûre. Si l'archivage d'une source échoue en cours de route, les tableaux `merged`/`failed` de la réponse distinguent ce qui a réussi de ce qui a échoué — la source en échec reste active, ni archivée ni supprimée.
+
+---
+
 ## Mise à jour
 
 ### 1.2 → 1.3 (Mémoire multi-appareils et résilience des données)

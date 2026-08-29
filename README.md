@@ -3133,6 +3133,97 @@ whose embedding stamp differs from the active `embedding.provider`/`embedding.mo
 
 ---
 
+### `consolidate` - Duplicate Cluster Discovery and Merge
+
+Discovers and merges near-duplicate *existing* memories — the read-side gap write-time
+dedup leaves open. Dedup (see [Deduplication](#deduplication)) only ever compares an
+incoming write against what's already stored; nothing looks
+*backward* across memories that already exist. Imports and degraded-window writes (an
+embedding-provider outage falling back to a looser checksum/Jaccard heuristic)
+routinely leave near-duplicates that write-time dedup structurally cannot catch after
+the fact. `action: "list"` scans one namespace/collection for clusters of near-duplicate
+memories using a bounded, paginated per-point similarity query (never a full pairwise
+scan); `action: "merge"` consolidates an explicit, human-chosen cluster into one target
+memory, reusing the `review` tool's archive transition per source. There is no
+automatic or scheduled merge path — `merge` always requires an explicit `target_id` and
+`source_ids`.
+
+**Input:**
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `action` | `"list" \| "merge"` | **Yes** | - | Which operation to perform. |
+| `namespace` | `string` | No | `"global"` | Namespace scope. |
+| `collection` | `string` | No | `"general"` | Collection scope. Clusters never span collections. |
+| `cursor` | `string` | No | - | (`list` only) Pagination cursor returned by a prior `list` call. |
+| `min_cluster_size` | `integer (>= 2)` | No | `2` | (`list` only) Clusters smaller than this are dropped from the result. |
+| `target_id` | `string (UUID)` | Required for `merge` | - | The memory every source is merged into. Content and embedding are left unchanged. |
+| `source_ids` | `array<string (UUID)>` | Required for `merge` | - | Memory IDs to merge into `target_id` and archive. Must not include `target_id`. |
+
+**Output (`action: "list"`):**
+
+```json
+{
+  "clusters": [
+    {
+      "members": [
+        {
+          "id": "3f4a1b2c-...",
+          "summary": "Deployment runbook for the payments service",
+          "tags": ["deployment", "runbook"],
+          "importance": 0.7,
+          "access_count": 4,
+          "updated_at": "2026-02-01T00:00:00.000Z"
+        },
+        {
+          "id": "9c2e5f10-...",
+          "summary": "Payments service deployment runbook (v2)",
+          "tags": ["deployment"],
+          "importance": 0.5,
+          "access_count": 1,
+          "updated_at": "2026-01-15T00:00:00.000Z"
+        }
+      ],
+      "suggested_target": "3f4a1b2c-..."
+    }
+  ],
+  "cursor": null
+}
+```
+
+Memories are grouped into a cluster when they're connected, within the scanned page, by
+a similarity edge at or above `consolidation.similarity_threshold` (default `0.9` —
+deliberately below the write-time dedup UPDATE thresholds, so `list` surfaces
+candidates dedup itself would not have auto-merged). `suggested_target` is a **hint
+only**: the member with the highest `importance` (ties broken by `access_count`, then
+most-recently `updated_at`). `merge` never infers `target_id` from it — a caller must
+name it explicitly. `cursor` is `null` once the scanned page is smaller than
+`consolidation.max_scan_per_call`; pass it back to continue scanning a larger
+namespace/collection across multiple calls.
+
+**Output (`action: "merge"`):**
+
+```json
+{ "target_id": "3f4a1b2c-...", "merged": ["9c2e5f10-..."], "failed": [] }
+```
+
+On success, the target's `tags` become the union of its own tags and every source's
+tags, its `importance` becomes the maximum across the target and all sources, and its
+`merged_from` field records every merged source id (comma-joined, appended to any prior
+value — a memory can be the target of more than one consolidation over its life). Each
+source is archived through the same transition `review`'s `archive` action uses:
+vector removed, row moved to `archived_memories`, and an `ARCHIVE` audit event recorded
+with `action: "consolidate"` and `merged_into` naming the target. Rejects with
+`INVALID_INPUT` if `target_id` appears in `source_ids` or if a source belongs to a
+different namespace/collection than the target (nothing is archived in that case), and
+`NOT_FOUND` if a source id has never existed. A source that is already archived is
+silently skipped rather than rejected, so retrying a `merge` call that partially
+succeeded is safe. If archiving a source fails partway through, the response's
+`merged`/`failed` arrays distinguish what succeeded from what didn't — the failed
+source is left live, not both archived and undeleted.
+
+---
+
 ## Docker
 
 BHGBrain provides official Docker support with two deployment modes: self-hosted Qdrant (sidecar container) and Qdrant Cloud (external).

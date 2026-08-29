@@ -2955,6 +2955,65 @@ Geräte. `mode: "re-embed"` migriert Erinnerungen, deren Embedding-Stempel von
 
 ---
 
+### `consolidate` — Auffinden und Zusammenführen von Duplikat-Clustern
+
+Findet und führt nahezu doppelte, bereits vorhandene Erinnerungen zusammen — schließt die Lücke auf der Lesenseite, die die schreibzeitige Duplikaterkennung offen lässt. Die Duplikaterkennung (siehe [Deduplizierung](#deduplizierung)) vergleicht einen eingehenden Schreibvorgang immer nur mit dem bereits Gespeicherten; nichts schaut *rückwärts* über bereits existierende Erinnerungen. Importe und Schreibvorgänge während eines Ausfalls (ein Embedding-Provider-Ausfall, der auf eine losere Checksum/Jaccard-Heuristik zurückfällt) hinterlassen regelmäßig Beinahe-Duplikate, die die schreibzeitige Duplikaterkennung im Nachhinein strukturell nicht erfassen kann. `action: "list"` durchsucht einen Namensraum/eine Collection nach Clustern von Beinahe-Duplikaten mittels einer begrenzten, paginierten Ähnlichkeitsabfrage pro Punkt (niemals ein vollständiger paarweiser Scan); `action: "merge"` führt ein explizit vom Menschen gewähltes Cluster in eine Ziel-Erinnerung zusammen und nutzt dabei denselben Archivierungsübergang wie das `review`-Werkzeug pro Quelle. Es gibt keinen automatischen oder geplanten Merge-Pfad — `merge` erfordert immer eine explizite `target_id` und `source_ids`.
+
+**Eingabe:**
+
+| Parameter | Typ | Erforderlich | Standard | Beschreibung |
+|---|---|---|---|---|
+| `action` | `"list" \| "merge"` | **Ja** | - | Welche Operation ausgeführt werden soll. |
+| `namespace` | `string` | Nein | `"global"` | Namensraum-Geltungsbereich. |
+| `collection` | `string` | Nein | `"general"` | Collection-Geltungsbereich. Cluster überspannen niemals mehrere Collections. |
+| `cursor` | `string` | Nein | - | (nur `list`) Paginierungs-Cursor aus einem vorherigen `list`-Aufruf. |
+| `min_cluster_size` | `integer (>= 2)` | Nein | `2` | (nur `list`) Cluster, die kleiner sind, werden aus dem Ergebnis entfernt. |
+| `target_id` | `string (UUID)` | Erforderlich für `merge` | - | Die Erinnerung, in die alle Quellen zusammengeführt werden. Inhalt und Embedding bleiben unverändert. |
+| `source_ids` | `array<string (UUID)>` | Erforderlich für `merge` | - | Erinnerungs-IDs, die in `target_id` zusammengeführt und archiviert werden. Darf `target_id` nicht enthalten. |
+
+**Ausgabe (`action: "list"`):**
+
+```json
+{
+  "clusters": [
+    {
+      "members": [
+        {
+          "id": "3f4a1b2c-...",
+          "summary": "Deployment-Runbook für den Payments-Service",
+          "tags": ["deployment", "runbook"],
+          "importance": 0.7,
+          "access_count": 4,
+          "updated_at": "2026-02-01T00:00:00.000Z"
+        },
+        {
+          "id": "9c2e5f10-...",
+          "summary": "Payments-Service Deployment-Runbook (v2)",
+          "tags": ["deployment"],
+          "importance": 0.5,
+          "access_count": 1,
+          "updated_at": "2026-01-15T00:00:00.000Z"
+        }
+      ],
+      "suggested_target": "3f4a1b2c-..."
+    }
+  ],
+  "cursor": null
+}
+```
+
+Erinnerungen werden zu einem Cluster gruppiert, wenn sie innerhalb der gescannten Seite durch eine Ähnlichkeitskante bei oder über `consolidation.similarity_threshold` (Standard `0.9` — bewusst unterhalb der schreibzeitigen UPDATE-Schwellenwerte der Duplikaterkennung, sodass `list` Kandidaten aufzeigt, die die Duplikaterkennung selbst nicht automatisch zusammengeführt hätte) verbunden sind. `suggested_target` ist **nur ein Hinweis**: das Mitglied mit der höchsten `importance` (bei Gleichstand entscheidet `access_count`, dann die zuletzt aktualisierte `updated_at`). `merge` leitet `target_id` niemals daraus ab — ein Aufrufer muss sie explizit benennen. `cursor` ist `null`, sobald die gescannte Seite kleiner als `consolidation.max_scan_per_call` ist; zum Fortsetzen des Scans über mehrere Aufrufe hinweg zurückgeben.
+
+**Ausgabe (`action: "merge"`):**
+
+```json
+{ "target_id": "3f4a1b2c-...", "merged": ["9c2e5f10-..."], "failed": [] }
+```
+
+Bei Erfolg werden die `tags` des Ziels zur Vereinigung seiner eigenen Tags und aller Quell-Tags, seine `importance` wird zum Maximum über Ziel und alle Quellen, und sein `merged_from`-Feld verzeichnet jede zusammengeführte Quell-ID (kommagetrennt, an einen etwaigen vorherigen Wert angehängt — eine Erinnerung kann im Laufe ihres Lebens Ziel mehrerer Konsolidierungen sein). Jede Quelle wird über denselben Übergang archiviert, den die `archive`-Aktion von `review` verwendet: Vektor entfernt, Zeile nach `archived_memories` verschoben, und ein `ARCHIVE`-Audit-Ereignis mit `action: "consolidate"` und `merged_into` (verweist auf das Ziel) wird aufgezeichnet. Lehnt mit `INVALID_INPUT` ab, wenn `target_id` in `source_ids` enthalten ist oder eine Quelle zu einem anderen Namensraum/einer anderen Collection als das Ziel gehört (in diesem Fall wird nichts archiviert), und mit `NOT_FOUND`, wenn eine Quell-ID nie existiert hat. Eine bereits archivierte Quelle wird stillschweigend übersprungen statt abgelehnt, sodass ein erneuter `merge`-Aufruf nach einem teilweise erfolgreichen Versuch sicher ist. Schlägt die Archivierung einer Quelle mittendrin fehl, unterscheiden die Arrays `merged`/`failed` in der Antwort, was erfolgreich war und was nicht — die fehlgeschlagene Quelle bleibt aktiv, nicht sowohl archiviert als auch nicht gelöscht.
+
+---
+
 ## Upgrade
 
 ### 1.2 → 1.3 (Multi-Device-Speicher & Datenresilienz)

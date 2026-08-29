@@ -409,6 +409,258 @@ describe('review tool', () => {
   });
 });
 
+describe('consolidate tool', () => {
+  const T = '550e8400-e29b-41d4-a716-446655440020';
+  const S1 = '550e8400-e29b-41d4-a716-446655440021';
+  const S2 = '550e8400-e29b-41d4-a716-446655440022';
+  const OTHER = '550e8400-e29b-41d4-a716-446655440023';
+
+  type ConsolidateStorage = StorageManager & {
+    deleteMemory: ReturnType<typeof vi.fn>;
+    updateMemory: ReturnType<typeof vi.fn>;
+    logAudit: ReturnType<typeof vi.fn>;
+    qdrant: { findNeighborsById: ReturnType<typeof vi.fn> };
+  };
+
+  function baseMemory(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+    return {
+      id: 'm', namespace: 'global', collection: 'general',
+      summary: 's', tags: [], importance: 0.5, access_count: 0,
+      created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z',
+      retention_tier: 'T2', merged_from: null,
+      ...overrides,
+    };
+  }
+
+  function createCtx(config: Record<string, unknown> = {}): { ctx: ToolContext; storage: ConsolidateStorage } {
+    const storage = {
+      sqlite: {
+        listMemoriesInCollection: vi.fn(() => []),
+        getMemoryById: vi.fn(() => null),
+        getArchiveByMemoryId: vi.fn(() => null),
+        archiveMemory: vi.fn(),
+        deleteArchive: vi.fn(),
+        flushIfDirty: vi.fn(),
+        countMemories: vi.fn(() => 0),
+      },
+      qdrant: { findNeighborsById: vi.fn(async () => []) },
+      deleteMemory: vi.fn(async () => true),
+      updateMemory: vi.fn(async () => {}),
+      logAudit: vi.fn(),
+    } as unknown as ConsolidateStorage;
+
+    const ctx: ToolContext = {
+      config: {
+        consolidation: {
+          enabled: true, similarity_threshold: 0.9, neighbor_top_k: 20, max_scan_per_call: 500,
+          ...config,
+        },
+      } as unknown as ToolContext['config'],
+      storage,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+    return { ctx, storage };
+  }
+
+  it('rejects any action when consolidation.enabled is false', async () => {
+    const { ctx } = createCtx({ enabled: false });
+    const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as BrainErrorEnvelope;
+    expect(result.error.code).toBe('INVALID_INPUT');
+  });
+
+  it('list clusters memories connected by a neighbor edge within the scanned page', async () => {
+    const { ctx, storage } = createCtx();
+    const m1 = baseMemory({ id: T, importance: 0.9 });
+    const m2 = baseMemory({ id: S1, importance: 0.4 });
+    const m3 = baseMemory({ id: OTHER, importance: 0.1 });
+    (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1, m2, m3]);
+    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockImplementation(async (_ns: string, _col: string, id: string) => {
+      if (id === T) return [{ id: S1, score: 0.95 }];
+      if (id === S1) return [{ id: T, score: 0.95 }];
+      return [];
+    });
+
+    const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as {
+      clusters: Array<{ members: Array<{ id: string }>; suggested_target: string }>; cursor: string | null;
+    };
+
+    expect(result.clusters).toHaveLength(1);
+    expect(result.clusters[0]!.members.map(m => m.id).sort()).toEqual([S1, T].sort());
+    // Higher importance wins the suggested_target tie-break.
+    expect(result.clusters[0]!.suggested_target).toBe(T);
+  });
+
+  it('list drops clusters below min_cluster_size', async () => {
+    const { ctx, storage } = createCtx();
+    const m1 = baseMemory({ id: T });
+    const m2 = baseMemory({ id: OTHER });
+    (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1, m2]);
+    // No edges at all -> both memories are singleton clusters.
+    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+
+    const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as { clusters: unknown[] };
+    expect(result.clusters).toEqual([]);
+  });
+
+  it('list suggested_target ties break on access_count then most-recent updated_at', async () => {
+    const { ctx, storage } = createCtx();
+    const m1 = baseMemory({ id: T, importance: 0.5, access_count: 1, updated_at: '2026-01-01T00:00:00.000Z' });
+    const m2 = baseMemory({ id: S1, importance: 0.5, access_count: 5, updated_at: '2026-01-02T00:00:00.000Z' });
+    (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1, m2]);
+    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockImplementation(async (_ns: string, _col: string, id: string) =>
+      id === T ? [{ id: S1, score: 0.95 }] : [{ id: T, score: 0.95 }]);
+
+    const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as {
+      clusters: Array<{ suggested_target: string }>;
+    };
+    expect(result.clusters[0]!.suggested_target).toBe(S1);
+  });
+
+  it('list returns a cursor only when the scanned page is full', async () => {
+    const { ctx, storage } = createCtx({ max_scan_per_call: 1 });
+    const m1 = baseMemory({ id: T, created_at: '2026-01-01T00:00:00.000Z' });
+    (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1]);
+
+    const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as { cursor: string | null };
+    expect(result.cursor).toBe('2026-01-01T00:00:00.000Z|' + T);
+  });
+
+  it('list returns a null cursor when the page is not full', async () => {
+    const { ctx, storage } = createCtx({ max_scan_per_call: 500 });
+    (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([baseMemory({ id: T })]);
+
+    const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as { cursor: string | null };
+    expect(result.cursor).toBeNull();
+  });
+
+  it('merge happy path: unions tags, maxes importance, sets merged_from, archives sources, and audits consolidate', async () => {
+    const { ctx, storage } = createCtx();
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      if (id === T) return baseMemory({ id: T, tags: ['a'], importance: 0.3, merged_from: null });
+      if (id === S1) return baseMemory({ id: S1, tags: ['b'], importance: 0.8 });
+      return null;
+    });
+
+    const result = await handleTool(ctx, 'consolidate', {
+      action: 'merge', target_id: T, source_ids: [S1],
+    }, 'c1') as { target_id: string; merged: string[]; failed: string[] };
+
+    expect(storage.updateMemory).toHaveBeenCalledWith(T, expect.objectContaining({
+      tags: expect.arrayContaining(['a', 'b']),
+      importance: 0.8,
+      merged_from: S1,
+    }));
+    expect(storage.sqlite.archiveMemory).toHaveBeenCalled();
+    expect(storage.deleteMemory).toHaveBeenCalledWith(S1);
+    expect(storage.logAudit).toHaveBeenCalledWith('ARCHIVE', S1, 'global', 'c1', expect.objectContaining({
+      details: expect.objectContaining({ action: 'consolidate', merged_into: T }),
+    }));
+    expect(result).toEqual({ target_id: T, merged: [S1], failed: [] });
+  });
+
+  it('merge appends to an existing merged_from rather than overwriting it', async () => {
+    const { ctx, storage } = createCtx();
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      if (id === T) return baseMemory({ id: T, merged_from: 'prior-id' });
+      if (id === S1) return baseMemory({ id: S1 });
+      return null;
+    });
+
+    await handleTool(ctx, 'consolidate', { action: 'merge', target_id: T, source_ids: [S1] }, 'c1');
+
+    expect(storage.updateMemory).toHaveBeenCalledWith(T, expect.objectContaining({
+      merged_from: `prior-id,${S1}`,
+    }));
+  });
+
+  it('merge rejects an unknown source id with NOT_FOUND and archives nothing', async () => {
+    const { ctx, storage } = createCtx();
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === T ? baseMemory({ id: T }) : null);
+    (storage.sqlite.getArchiveByMemoryId as ReturnType<typeof vi.fn>).mockReturnValue(null);
+
+    const result = await handleTool(ctx, 'consolidate', {
+      action: 'merge', target_id: T, source_ids: [S1],
+    }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('NOT_FOUND');
+    expect(storage.sqlite.archiveMemory).not.toHaveBeenCalled();
+  });
+
+  it('merge rejects a source from a different collection with INVALID_INPUT and archives nothing', async () => {
+    const { ctx, storage } = createCtx();
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      if (id === T) return baseMemory({ id: T, collection: 'general' });
+      if (id === S1) return baseMemory({ id: S1, collection: 'other' });
+      return null;
+    });
+
+    const result = await handleTool(ctx, 'consolidate', {
+      action: 'merge', target_id: T, source_ids: [S1],
+    }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(storage.sqlite.archiveMemory).not.toHaveBeenCalled();
+  });
+
+  it('merge rejects target_id inside source_ids at the schema level', async () => {
+    const { ctx } = createCtx();
+    const result = await handleTool(ctx, 'consolidate', {
+      action: 'merge', target_id: T, source_ids: [T],
+    }, 'c1') as BrainErrorEnvelope;
+    expect(result.error.code).toBe('INVALID_INPUT');
+  });
+
+  it('idempotent retry: an already-archived source is skipped, not failed, and the rest still merge', async () => {
+    const { ctx, storage } = createCtx();
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      if (id === T) return baseMemory({ id: T });
+      if (id === S2) return baseMemory({ id: S2 });
+      return null; // S1 not found live
+    });
+    (storage.sqlite.getArchiveByMemoryId as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === S1 ? { id: 1, memory_id: S1 } : null);
+
+    const result = await handleTool(ctx, 'consolidate', {
+      action: 'merge', target_id: T, source_ids: [S1, S2],
+    }, 'c1') as { target_id: string; merged: string[]; failed: string[] };
+
+    expect(result.merged).toEqual([S2]);
+    expect(result.failed).toEqual([]);
+    expect(storage.deleteMemory).toHaveBeenCalledWith(S2);
+    expect(storage.deleteMemory).not.toHaveBeenCalledWith(S1);
+  });
+
+  it('partial failure: a mid-loop deleteMemory throw leaves the failed source unarchived and reports both lists', async () => {
+    const { ctx, storage } = createCtx();
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
+      if (id === T) return baseMemory({ id: T });
+      if (id === S1) return baseMemory({ id: S1 });
+      if (id === S2) return baseMemory({ id: S2 });
+      return null;
+    });
+    storage.deleteMemory = vi.fn(async (id: string) => {
+      if (id === S1) throw new Error('qdrant down');
+      return true;
+    });
+
+    const result = await handleTool(ctx, 'consolidate', {
+      action: 'merge', target_id: T, source_ids: [S1, S2],
+    }, 'c1') as { target_id: string; merged: string[]; failed: string[] };
+
+    expect(result.merged).toEqual([S2]);
+    expect(result.failed).toEqual([S1]);
+    expect(storage.sqlite.deleteArchive).toHaveBeenCalledWith(S1);
+    expect(storage.sqlite.deleteArchive).not.toHaveBeenCalledWith(S2);
+  });
+});
+
 type RepairResult = {
   dry_run: boolean;
   all_devices: boolean;

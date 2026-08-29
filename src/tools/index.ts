@@ -12,8 +12,8 @@ import {
   RememberInputSchema, RecallInputSchema, ForgetInputSchema,
   SearchInputSchema, TagInputSchema, CollectionsInputSchema,
   CategoryInputSchema, BackupInputSchema, RepairInputSchema,
-  RevisionsInputSchema, ReviewInputSchema,
-  type RepairInput,
+  RevisionsInputSchema, ReviewInputSchema, ConsolidateInputSchema,
+  type RepairInput, type ConsolidateInput,
 } from '../domain/schemas.js';
 import type { WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter } from '../domain/types.js';
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
@@ -131,6 +131,7 @@ async function dispatch(
     case 'revisions': return handleRevisions(ctx, args, clientId, logCtx);
     case 'review': return handleReview(ctx, args, clientId, logCtx);
     case 'repair': return handleRepair(ctx, args);
+    case 'consolidate': return handleConsolidate(ctx, args, clientId, logCtx);
     default:
       throw invalidInput(`Unknown tool: ${toolName}`);
   }
@@ -527,6 +528,211 @@ async function handleReview(
 
   ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
   return { id: restoredId, restored_from: archived.memory_id, archive_id: archived.id, restored: true };
+}
+
+interface ConsolidateClusterMember {
+  id: string;
+  summary: string;
+  tags: string[];
+  importance: number;
+  access_count: number;
+  updated_at: string;
+}
+
+interface ConsolidateCluster {
+  members: ConsolidateClusterMember[];
+  suggested_target: string;
+}
+
+// Closes the read-side gap write-time dedup leaves open for imports and
+// degraded-window writes (add-duplicate-cluster-consolidation): `list`
+// discovers clusters of near-duplicate *existing* memories via bounded,
+// paginated per-point ANN neighbor queries (no full pairwise scan); `merge`
+// consolidates an explicit, human-chosen cluster into one target, reusing
+// `review`'s archive-transition code path per source.
+async function handleConsolidate(
+  ctx: ToolContext, args: unknown, clientId: string, logCtx: ToolLogContext,
+): Promise<unknown> {
+  const input = parseInput(ConsolidateInputSchema, args);
+  logCtx.namespace = input.namespace;
+
+  if (!ctx.config.consolidation.enabled) {
+    throw invalidInput('The consolidate tool is disabled (consolidation.enabled = false)');
+  }
+
+  if (input.action === 'list') {
+    return handleConsolidateList(ctx, input);
+  }
+  return handleConsolidateMerge(ctx, input, clientId);
+}
+
+async function handleConsolidateList(
+  ctx: ToolContext, input: ConsolidateInput,
+): Promise<{ clusters: ConsolidateCluster[]; cursor: string | null }> {
+  const { namespace, collection } = input;
+  const maxScan = ctx.config.consolidation.max_scan_per_call;
+  const page = ctx.storage.sqlite.listMemoriesInCollection(namespace, collection, maxScan, input.cursor);
+
+  const byId = new Map(page.map(m => [m.id, m]));
+  const parent = new Map<string, string>();
+  for (const m of page) parent.set(m.id, m.id);
+
+  const find = (x: string): string => {
+    let root = x;
+    while (parent.get(root) !== root) root = parent.get(root)!;
+    let cur = x;
+    while (parent.get(cur) !== root) {
+      const next = parent.get(cur)!;
+      parent.set(cur, root);
+      cur = next;
+    }
+    return root;
+  };
+  const union = (a: string, b: string): void => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(ra, rb);
+  };
+
+  for (const m of page) {
+    const neighbors = await ctx.storage.qdrant.findNeighborsById(
+      namespace, collection, m.id,
+      ctx.config.consolidation.neighbor_top_k,
+      ctx.config.consolidation.similarity_threshold,
+    );
+    for (const n of neighbors) {
+      // Only edges between memories both present in this scanned page can be
+      // clustered — metadata for the suggested-target tie-break is only
+      // available for page members (design.md: "union-find over the page's
+      // neighbor edges").
+      if (byId.has(n.id)) {
+        union(m.id, n.id);
+      }
+    }
+  }
+
+  const groups = new Map<string, string[]>();
+  for (const m of page) {
+    const root = find(m.id);
+    const arr = groups.get(root) ?? [];
+    arr.push(m.id);
+    groups.set(root, arr);
+  }
+
+  const clusters: ConsolidateCluster[] = [];
+  for (const ids of groups.values()) {
+    if (ids.length < input.min_cluster_size) continue;
+    const members = ids.map(id => byId.get(id)!);
+    const suggested = members.reduce((best, cur) => {
+      if (cur.importance !== best.importance) return cur.importance > best.importance ? cur : best;
+      if (cur.access_count !== best.access_count) return cur.access_count > best.access_count ? cur : best;
+      return cur.updated_at > best.updated_at ? cur : best;
+    });
+    clusters.push({
+      members: members.map(m => ({
+        id: m.id, summary: m.summary, tags: m.tags,
+        importance: m.importance, access_count: m.access_count, updated_at: m.updated_at,
+      })),
+      suggested_target: suggested.id,
+    });
+  }
+
+  const last = page[page.length - 1];
+  const cursor = page.length === maxScan && last
+    ? `${last.created_at}|${last.id}`
+    : null;
+
+  return { clusters, cursor };
+}
+
+async function handleConsolidateMerge(
+  ctx: ToolContext, input: ConsolidateInput, clientId: string,
+): Promise<{ target_id: string; merged: string[]; failed: string[] }> {
+  const targetId = input.target_id!;
+  const sourceIds = input.source_ids!;
+
+  const target = ctx.storage.sqlite.getMemoryById(targetId);
+  if (!target) throw notFound(`Target memory ${targetId} not found`);
+
+  // Resolve every source up front, before any mutation: an unknown id or a
+  // namespace/collection mismatch rejects the whole request without
+  // archiving anything (spec: "No target/source overlap or cross-collection
+  // merge"). Already-archived sources are excluded from the merge set
+  // rather than rejected, so a retried merge over a partially-completed
+  // attempt is safe (spec: "Retrying a partially completed merge").
+  const liveSources: Array<Omit<MemoryRecord, 'embedding'>> = [];
+  for (const id of sourceIds) {
+    const mem = ctx.storage.sqlite.getMemoryById(id);
+    if (mem) {
+      if (mem.namespace !== target.namespace || mem.collection !== target.collection) {
+        throw invalidInput(
+          `Source ${id} belongs to namespace/collection "${mem.namespace}/${mem.collection}", ` +
+          `but target ${targetId} belongs to "${target.namespace}/${target.collection}"`,
+        );
+      }
+      liveSources.push(mem);
+    } else if (!ctx.storage.sqlite.getArchiveByMemoryId(id)) {
+      throw notFound(`Source memory ${id} not found`);
+    }
+    // else: already archived — skipped (idempotent retry).
+  }
+
+  if (liveSources.length === 0) {
+    return { target_id: targetId, merged: [], failed: [] };
+  }
+
+  const unionTags = new Set(target.tags);
+  for (const s of liveSources) for (const t of s.tags) unionTags.add(t);
+  const maxImportance = Math.max(target.importance, ...liveSources.map(s => s.importance));
+  const mergedFromIds = liveSources.map(s => s.id);
+  const mergedFrom = target.merged_from
+    ? `${target.merged_from},${mergedFromIds.join(',')}`
+    : mergedFromIds.join(',');
+
+  // Metadata-only update: no newVector, so the target's content/embedding
+  // are left untouched (spec: "target's content and embedding SHALL remain
+  // unchanged").
+  await ctx.storage.updateMemory(targetId, {
+    tags: [...unionTags],
+    importance: maxImportance,
+    merged_from: mergedFrom,
+    updated_at: new Date().toISOString(),
+  });
+
+  const merged: string[] = [];
+  const failed: string[] = [];
+  for (const source of liveSources) {
+    const nowIso = new Date().toISOString();
+    ctx.storage.sqlite.archiveMemory(source, nowIso);
+    try {
+      await ctx.storage.deleteMemory(source.id);
+    } catch {
+      // Vector/SQLite removal failed: undo the archive row so the source
+      // isn't left both archived and live (same rollback `review`'s
+      // `archive` action uses).
+      ctx.storage.sqlite.deleteArchive(source.id);
+      ctx.storage.sqlite.flushIfDirty();
+      failed.push(source.id);
+      continue;
+    }
+
+    ctx.storage.logAudit('ARCHIVE', source.id, source.namespace, clientId, {
+      details: {
+        memory_id: source.id,
+        prior_tier: source.retention_tier,
+        new_tier: null,
+        actor: clientId,
+        timestamp: nowIso,
+        action: 'consolidate',
+        merged_into: targetId,
+      },
+    });
+    merged.push(source.id);
+  }
+
+  ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
+
+  return { target_id: targetId, merged, failed };
 }
 
 async function handleCollections(

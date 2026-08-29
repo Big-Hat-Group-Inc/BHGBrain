@@ -207,12 +207,18 @@ export interface LifecycleAuditDetails {
   new_tier: RetentionTier | null;
   actor: string;
   timestamp: string;
-  action: 'promote' | 'archive' | 'revise' | 'delete' | 'restore';
+  action: 'promote' | 'archive' | 'revise' | 'delete' | 'restore' | 'consolidate';
   // Present only on the explicit `revisions` tool `revert` action's REVISE
   // audit entry — the revision number the memory was reverted to. Absent on
   // the generic T0-snapshot REVISE that `StorageManager.updateMemory` emits
   // on every T0 content change, so the two are distinguishable in the log.
   source_revision?: number;
+  // Present only on `action: 'consolidate'` ARCHIVE entries (the `consolidate`
+  // tool's `merge` action): the target memory id each archived source was
+  // merged into, distinguishing a consolidation-driven archive from `review`'s
+  // ordinary `action: 'archive'` entries. See
+  // add-duplicate-cluster-consolidation.
+  merged_into?: string;
 }
 
 export interface PaginatedResult<T> {
