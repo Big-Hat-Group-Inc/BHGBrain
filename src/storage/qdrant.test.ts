@@ -131,7 +131,7 @@ describe('QdrantStore namespace/collection name encoding (slash safety)', () => 
     await store.upsert('test/mcp-verify', 'general', 'id-1', [1, 2, 3], { content: 'x' });
 
     expect(upsert).toHaveBeenCalledWith(
-      'bhgbrain_test.mcp-verify_general',
+      'bhgbrain_test.xmcp-verify_general',
       expect.objectContaining({ points: expect.any(Array) }),
     );
   });
@@ -155,7 +155,7 @@ describe('QdrantStore namespace/collection name encoding (slash safety)', () => 
       getCollections: vi.fn<QdrantClient['getCollections']>(async () => ({
         collections: [
           { name: 'bhgbrain_a_general' }, // namespace "a"
-          { name: 'bhgbrain_a.b_general' }, // namespace "a/b" — must stay distinct
+          { name: 'bhgbrain_a.xb_general' }, // namespace "a/b" — must stay distinct
         ],
       })),
       query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
@@ -166,7 +166,48 @@ describe('QdrantStore namespace/collection name encoding (slash safety)', () => 
 
     const searched = client.query.mock.calls.map(c => c[0]);
     expect(searched).toContain('bhgbrain_a_general');
-    expect(searched).not.toContain('bhgbrain_a.b_general');
+    expect(searched).not.toContain('bhgbrain_a.xb_general');
+  });
+});
+
+describe('QdrantStore collection-name encoding (dot/slash collision safety)', () => {
+  // fix-collection-name-collision: the namespace-slash fix above assumed raw
+  // `collection` input could never contain the `.` substitution marker, but
+  // `collection`'s schema (pre-fix) had no charset restriction — so
+  // `collection: "a.b"` (literal dot) and `collection: "a/b"` (slash, encoded
+  // to `.`) both resolved to the identical Qdrant collection name. The
+  // encoder is now injective independent of schema (escapes literal `.`
+  // before encoding `/`), verified directly here at the store layer.
+  it('does not collide a literal-dot collection with a slash-containing one', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+
+    await store.searchSimilar('global', 'a.b', [1, 2, 3], 5);
+    await store.searchSimilar('global', 'a/b', [1, 2, 3], 5);
+
+    const [nameForLiteralDot, nameForSlash] = client.query.mock.calls.map(c => c[0]);
+    expect(nameForLiteralDot).not.toBe(nameForSlash);
+  });
+
+  it('does not collide a literal-slash-marker sequence with a doubled-dot escape', async () => {
+    // Adversarial case for the escaping scheme itself: a collection value
+    // containing the literal two-character sequence produced by escaping a
+    // dot ("..") must not collide with one containing the literal sequence
+    // produced by encoding a slash (".x").
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+
+    await store.searchSimilar('global', 'a..b', [1, 2, 3], 5);
+    await store.searchSimilar('global', 'a.xb', [1, 2, 3], 5);
+
+    const [nameForDoubleDot, nameForDotX] = client.query.mock.calls.map(c => c[0]);
+    expect(nameForDoubleDot).not.toBe(nameForDotX);
   });
 });
 

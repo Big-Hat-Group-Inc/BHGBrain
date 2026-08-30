@@ -8,25 +8,41 @@ import type { RecallFilter } from '../domain/types.js';
 const COLLECTION_PREFIX = 'bhgbrain_';
 
 // Only `.`/`_`/`-` plus alphanumerics may appear in an encoded segment. Raw
-// `namespace` (`^[a-zA-Z0-9/-]{1,200}$`) and `collection` (alphanumeric/hyphen
-// by convention, though its schema only enforces a length cap) inputs never
-// contain `.` or `_`, so `encodeCollectionNameSegment` below is injective
-// across the full valid input space, and the first bare `_` after an encoded
-// namespace remains unambiguously the namespace/collection separator the
-// prefix scan in `search()` relies on.
+// `namespace` (`^[a-zA-Z0-9/-]{1,200}$`) and `collection`/`category.name`
+// (`^[a-zA-Z0-9-]{1,100}$`, `CollectionNameSchema`) inputs never contain `.`
+// or `_`, so the first bare `_` after an encoded namespace remains
+// unambiguously the namespace/collection separator the prefix scan in
+// `search()` relies on.
 const SAFE_COLLECTION_NAME_SEGMENT = /^[a-zA-Z0-9._-]+$/;
 
 // Qdrant's REST client embeds the collection name as a literal URL path
 // segment, so a raw `/` breaks routing instead of producing a clear error
 // (see qdrant/qdrant-client#807) — this is why a namespace like "team/project"
 // previously made every tool call fail with a bare, unhelpful INTERNAL error.
-// `.` is substituted because Qdrant's server accepts dots in real collection
-// names (qdrant/qdrant-web-ui#172 shows `create_collection(collection_name:
-// "dotted.name")` succeeding), and `.` cannot appear in raw namespace/collection
-// input, so this substitution can never collide two distinct raw values onto
-// the same encoded segment.
+// `.` is substituted for `/` because Qdrant's server accepts dots in real
+// collection names (qdrant/qdrant-web-ui#172 shows
+// `create_collection(collection_name: "dotted.name")` succeeding).
+//
+// This is injective for ANY input, not only input the current schema happens
+// to allow (fix-collection-name-collision: `collection`'s schema used to
+// allow `.` too, which silently collided `collection: "a.b"` with
+// `collection: "a/b"` once both were "encoded"). Every input character
+// produces either a 1-character token (anything but `.`/`/`, passed through
+// unchanged) or a 2-character token starting with `.` (`..` for a literal
+// `.`, `.x` for a `/`) — `.` is never emitted as a 1-character token, so a
+// left-to-right scan of the output has exactly one valid parse: on a
+// non-`.` character, consume it as a literal 1-character token; on `.`,
+// consume it with the next character and decode `..` -> `.` or `.x` -> `/`.
+// That greedy parse is a total, deterministic left inverse of this function,
+// which makes the function injective regardless of what any schema allows.
 function encodeCollectionNameSegment(value: string): string {
-  return value.replace(/\//g, '.');
+  let out = '';
+  for (const ch of value) {
+    if (ch === '.') out += '..';
+    else if (ch === '/') out += '.x';
+    else out += ch;
+  }
+  return out;
 }
 
 // Narrows Qdrant's `ScoredPoint.vector` (unnamed dense vector | named vectors |
