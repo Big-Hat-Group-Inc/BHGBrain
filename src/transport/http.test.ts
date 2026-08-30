@@ -19,7 +19,15 @@ describe('createHttpServer', () => {
       embedding: { provider: 'openai', model: 'test-model', api_key_env: 'OPENAI_API_KEY', dimensions: 3 },
       qdrant: { mode: 'embedded', embedded_path: './qdrant', external_url: null, api_key_env: null },
       transport: {
-        http: { enabled: true, host: '127.0.0.1', port: 3721, bearer_token_env: 'BHGBRAIN_TOKEN' },
+        http: {
+          enabled: true,
+          host: '127.0.0.1',
+          port: 3721,
+          bearer_token_env: 'BHGBRAIN_TOKEN',
+          keep_alive_timeout_ms: 65000,
+          headers_timeout_ms: 66000,
+          request_timeout_ms: 300000,
+        },
         stdio: { enabled: true },
       },
       defaults: {
@@ -314,6 +322,147 @@ describe('createHttpServer', () => {
       .set('X-Forwarded-For', '203.0.113.20')
       .send({ content: 'hello' });
     expect(clientB.status).toBe(200);
+  });
+
+  // harden-http-server-lifecycle task 6.2: every HTTP failure path returns
+  // the structured {error:{code,message,retryable}} envelope, never an HTML
+  // stack trace, regardless of the failure's source (body-parser, a thrown
+  // TypeError inside a resource handler, or an arbitrary route error).
+  describe('JSON error envelope on every HTTP failure path (task 6.2)', () => {
+    it('malformed JSON body to a tool endpoint returns a 400 INVALID_INPUT envelope', async () => {
+      const { app } = await buildApp(createConfig(false, true));
+
+      const response = await request(app)
+        .post('/tool/remember')
+        .set('Content-Type', 'application/json')
+        .set('Authorization', 'Bearer secret-token')
+        .send('{not valid json');
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({
+        error: { code: 'INVALID_INPUT', message: expect.any(String), retryable: false },
+      });
+      expect(response.headers['content-type']).toMatch(/json/);
+    });
+
+    it('GET /resource?uri=not-a-url returns a 400 envelope with no stack trace and a JSON content type', async () => {
+      // ResourceHandler.handle itself is unit-tested against a real
+      // `new URL(uri)` failure in resources/index.test.ts (task 3.2); this
+      // test is about the HTTP layer mapping the INVALID_INPUT envelope it
+      // returns onto an actual 400 status line, so the mock reproduces that
+      // return-not-throw contract directly.
+      const resourcesHandle = vi.fn(async (uri: string) =>
+        ({ error: { code: 'INVALID_INPUT', message: `Malformed resource URI: ${uri}`, retryable: false } }));
+      const { app } = await buildApp(createConfig(false, true), {
+        resources: { handle: resourcesHandle },
+      });
+
+      const response = await request(app)
+        .get('/resource')
+        .query({ uri: 'not-a-url' })
+        .set('Authorization', 'Bearer secret-token');
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({
+        error: { code: 'INVALID_INPUT', message: expect.any(String), retryable: false },
+      });
+      expect(response.headers['content-type']).toMatch(/json/);
+      expect(JSON.stringify(response.body)).not.toMatch(/at .*\(.*:\d+:\d+\)/); // no stack-trace frames
+    });
+
+    it('a route handler that throws a generic Error returns a 500 INTERNAL envelope with only the generic message', async () => {
+      const resourcesHandle = vi.fn(async () => {
+        throw new Error('boom: something exploded deep in a handler');
+      });
+      const { app } = await buildApp(createConfig(false, true), {
+        resources: { handle: resourcesHandle },
+      });
+
+      const response = await request(app)
+        .get('/resource')
+        .query({ uri: 'memory://list' })
+        .set('Authorization', 'Bearer secret-token');
+
+      expect(response.status).toBe(500);
+      expect(response.body).toEqual({
+        error: { code: 'INTERNAL', message: 'An unexpected error occurred', retryable: true },
+      });
+      // The real error message/stack must never reach the response body.
+      expect(JSON.stringify(response.body)).not.toContain('boom');
+    });
+  });
+
+  // harden-http-server-lifecycle task 6.3: header hygiene.
+  describe('security headers (task 6.3)', () => {
+    it('sends no X-Powered-By and sends X-Content-Type-Options: nosniff', async () => {
+      const { app } = await buildApp(createConfig(false, true));
+
+      const response = await request(app).get('/health');
+
+      expect(response.headers['x-powered-by']).toBeUndefined();
+      expect(response.headers['x-content-type-options']).toBe('nosniff');
+    });
+  });
+
+  // harden-http-server-lifecycle task 6.4: compression respects SSE.
+  describe('compression (task 6.4)', () => {
+    it('compresses a large JSON response when the client sends Accept-Encoding: gzip', async () => {
+      const largeMetrics = Array.from({ length: 2000 }, (_, i) => ({
+        name: `bhgbrain_metric_${i}`,
+        type: 'counter' as const,
+        value: i,
+      }));
+      const { app } = await buildApp(createConfig(true, true), {
+        metrics: { getMetrics: vi.fn(() => largeMetrics as never) },
+      });
+
+      const response = await request(app)
+        .get('/metrics')
+        .set('Authorization', 'Bearer secret-token')
+        .set('Accept-Encoding', 'gzip');
+
+      expect(response.headers['content-encoding']).toBe('gzip');
+    });
+
+    // Driving a real long-lived `text/event-stream` response through the app
+    // end-to-end would hang supertest (an SSE response never completes on
+    // its own), so this exercises the filter directly instead — the same
+    // function `app.use(compression({ filter }))` is wired to above.
+    it('declines to compress a text/event-stream response', async () => {
+      const { compressionFilter } = await import('./http.js');
+      const res = { getHeader: () => 'text/event-stream' } as unknown as import('express').Response;
+      expect(compressionFilter({} as import('express').Request, res)).toBe(false);
+    });
+
+    it('defers to the default filter for a compressible content type', async () => {
+      const { compressionFilter } = await import('./http.js');
+      const res = { getHeader: () => 'application/json; charset=utf-8' } as unknown as import('express').Response;
+      expect(compressionFilter({} as import('express').Request, res)).toBe(true);
+    });
+  });
+
+  // harden-http-server-lifecycle task 6.5 (first half — Zod rejection is
+  // covered in config/index.test.ts): the socket-timeout config keys land on
+  // the real `http.Server`, not merely on the config object.
+  describe('applyHttpServerTimeouts (task 6.5)', () => {
+    it("sets keepAliveTimeout/headersTimeout/requestTimeout from config.transport.http", async () => {
+      const { applyHttpServerTimeouts } = await import('./http.js');
+      const { createServer } = await import('node:http');
+
+      const config = createConfig(false, true);
+      config.transport.http.keep_alive_timeout_ms = 12345;
+      config.transport.http.headers_timeout_ms = 23456;
+      config.transport.http.request_timeout_ms = 34567;
+
+      const server = createServer();
+      applyHttpServerTimeouts(server, config);
+
+      expect(server.keepAliveTimeout).toBe(12345);
+      expect(server.headersTimeout).toBe(23456);
+      expect(server.requestTimeout).toBe(34567);
+
+      server.close();
+    });
   });
 
 // Real MCP over HTTP (Streamable HTTP transport) at /mcp — session

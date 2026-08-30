@@ -27,6 +27,11 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ENV BHGBRAIN_DATA_DIR=/data
 ENV BHGBRAIN_HTTP_HOST=0.0.0.0
 ENV BHGBRAIN_REQUIRE_LOOPBACK=false
+# Defense in depth, not the primary fix: the terminal JSON error middleware in
+# createHttpServer guarantees structured envelopes (no HTML/stack traces) in
+# every environment, including bare `npm start`. This just also drops
+# Express's dev-mode overhead. See harden-http-server-lifecycle.
+ENV NODE_ENV=production
 
 # Run as the unprivileged `node` user (present in the base image). Pre-create the
 # data dir owned by that user so the mounted volume inherits writable ownership.

@@ -309,7 +309,19 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
       // Puerto en el que escuchar
       "port": 3721,
       // Nombre de la variable de entorno que contiene el bearer token para autenticación HTTP
-      "bearer_token_env": "BHGBRAIN_TOKEN"
+      "bearer_token_env": "BHGBRAIN_TOKEN",
+      // Timeouts de socket aplicados al http.Server subyacente (ms). Los valores por
+      // defecto son seguros para proxies: keep-alive por encima del timeout de
+      // inactividad de 60s habitual en un proxy inverso, y headers timeout por encima
+      // de ese (Node requiere headers_timeout_ms > keep_alive_timeout_ms para evitar
+      // condiciones de carrera ECONNRESET — la validación de configuración rechaza un
+      // valor que no cumpla esto).
+      "keep_alive_timeout_ms": 65000,
+      "headers_timeout_ms": 66000,
+      // Tiempo permitido para recibir completamente una solicitud; no limita las
+      // respuestas SSE de larga duración en GET /mcp, que solo reciben una
+      // solicitud, no envían una.
+      "request_timeout_ms": 300000
     },
     "stdio": {
       // Habilitar transporte MCP stdio
@@ -3813,6 +3825,12 @@ está **autenticado por defecto**:
 
 El contenedor también se ejecuta como un usuario no root (`node`).
 
+La imagen también establece `NODE_ENV=production` como defensa adicional (elimina la
+sobrecarga del modo de desarrollo de Express). Esto no es lo que evita que las
+respuestas de error filtren stack traces — eso lo garantiza el middleware de error
+JSON terminal en cualquier entorno, contenedor o no —, pero es de todas formas un
+valor por defecto sensato para una imagen en tiempo de ejecución.
+
 ### Perfiles de Compose
 
 | Comando | Qué se ejecuta |
@@ -3985,6 +4003,21 @@ Una vez que termina la comprobación de drift, se libera el bloqueo — la reinc
 - El límite de tasa se basa en la identidad de solicitud confiable (IP) e ignora `x-client-id` para su aplicación.
 - El `client_id` de los logs de auditoría/solicitud también se deriva de la identidad de solicitud confiable (`req.ip`), nunca del encabezado `x-client-id` proporcionado por el llamante; ese encabezado solo se acepta como una pista de depuración no autoritativa y nunca se confía en él para el registro de auditoría.
 - `memory://list` aplica límites de `limit` de `1..100`; los valores inválidos devuelven `INVALID_INPUT`.
+- Toda ruta de error HTTP — un manejador de ruta que lanza o rechaza, un cuerpo de solicitud JSON mal formado, un `?uri=` mal formado en `GET /resource` — devuelve el sobre estructurado `{error:{code,message,retryable}}`. Ningún stack trace ni página de error HTML sale jamás del proceso, sin importar `NODE_ENV`; un middleware de error terminal de Express respalda cualquier cosa que una ruta no maneje por sí misma, y los errores inesperados se siguen registrando en el servidor (solo que no se reflejan en el cuerpo de la respuesta).
+- Las respuestas deshabilitan el encabezado `X-Powered-By` y establecen `X-Content-Type-Options: nosniff`. Las respuestas se comprimen con gzip cuando el cliente envía `Accept-Encoding: gzip`, excepto `text/event-stream` (el stream SSE de `/mcp`), que nunca se almacena en búfer para compresión.
+- `transport.http.keep_alive_timeout_ms` / `headers_timeout_ms` / `request_timeout_ms` (valores por defecto 65 s / 66 s / 300 s) reemplazan los valores por defecto de timeout de socket propios de Node, que son demasiado cortos para keep-alive detrás de un proxy inverso y demasiado permisivos frente a ataques slow-loris. `headers_timeout_ms` debe ser mayor que `keep_alive_timeout_ms` — la validación de configuración rechaza un valor que no cumpla esto. `request_timeout_ms` limita solo la recepción de una solicitud, por lo que no corta una respuesta SSE de larga duración en `GET /mcp`.
+
+### Apagado Ordenado (Graceful Shutdown)
+
+Ante `SIGINT`/`SIGTERM` (ambos transportes) — y, para stdio, cuando el cliente cierra su extremo de la tubería — el servidor:
+
+1. Vacía inmediatamente cualquier estado SQLite sucio a disco.
+2. Drena las conexiones activas: cierra cada sesión MCP abierta (HTTP) o el `Server`/transporte MCP (stdio).
+3. Detiene los temporizadores programados de limpieza y destilación.
+4. Cierra la conexión SQLite (aplica checkpoint al write-ahead log y vuelve a vaciar si algo quedó sucio durante el drenaje).
+5. Termina con código de salida `0`.
+
+Una segunda señal durante el apagado se ignora — la secuencia anterior se ejecuta como máximo una vez. Si el drenaje no ha terminado dentro de **10 segundos**, el servidor registra un evento `shutdown_timeout`, vacía SQLite de forma síncrona una vez más, y termina con código de salida `1` para que los orquestadores (Docker, systemd, Kubernetes) puedan distinguir un apagado forzado de uno limpio. Esto acota los apagados por `docker stop`/reinicio de contenedor a una ventana predecible en lugar de agotar el tiempo hasta un `SIGKILL`.
 
 ### Autenticación Fail-Closed
 

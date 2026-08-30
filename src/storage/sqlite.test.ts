@@ -1361,6 +1361,33 @@ describe('SqliteStore origin/confidence (add-memory-provenance-metadata)', () =>
     store = reopened;
   });
 
+  // harden-http-server-lifecycle task 6.1: the shutdown sequence calls
+  // scheduleDeferredFlush() (from access-tracking writes) and then close() —
+  // this proves that ordering persists state on its own, with no extra
+  // flushIfDirty() call after close() required for the data to survive a
+  // fresh load from disk. Under the current WAL engine flushIfDirty/
+  // scheduleDeferredFlush/cancelDeferredFlush are documented no-ops
+  // (src/storage/sqlite.ts) — every commit is already durable at commit
+  // time — so this is really re-confirming the durability test above under
+  // the exact call sequence createShutdown() (src/index.ts) uses, including
+  // a "timer" that (under this engine) never does anything to unwind.
+  it('close() persists a write made while a deferred flush is (nominally) pending, without a flushIfDirty() call after close()', async () => {
+    const mem = sampleMemory({ id: '660e8400-e29b-41d4-a716-446655440099' });
+    store.insertMemory(mem);
+    store.scheduleDeferredFlush();
+    store.close();
+    // Deliberately no flushIfDirty() call here: close() alone must be
+    // sufficient for the data to be present on reopen.
+
+    const reopened = new SqliteStore(tempDir);
+    await reopened.init();
+    const found = reopened.getMemoryById(mem.id);
+    expect(found).not.toBeNull();
+    expect(found!.content).toBe(mem.content);
+
+    store = reopened;
+  });
+
   // migrate-sqlite-to-native-engine task 4.4: backup/restore round trip.
   describe('exportData / activateDatabaseImage (backup/restore round trip)', () => {
     it('exportData() produces a standalone image openable with no sidecar files', async () => {

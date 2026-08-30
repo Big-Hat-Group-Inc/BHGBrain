@@ -309,7 +309,18 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
       // Port, auf dem gehört werden soll
       "port": 3721,
       // Name der Umgebungsvariable mit dem Bearer-Token für HTTP-Authentifizierung
-      "bearer_token_env": "BHGBRAIN_TOKEN"
+      "bearer_token_env": "BHGBRAIN_TOKEN",
+      // Socket-Timeouts für den zugrunde liegenden http.Server (ms). Die Standardwerte
+      // sind proxy-sicher: Keep-Alive über dem üblichen 60s-Idle-Timeout eines
+      // Reverse-Proxys, und Headers-Timeout darüber (Node erfordert
+      // headers_timeout_ms > keep_alive_timeout_ms, um ECONNRESET-Race-Conditions
+      // zu vermeiden — die Konfigurationsvalidierung lehnt einen Wert ab, der dies nicht erfüllt).
+      "keep_alive_timeout_ms": 65000,
+      "headers_timeout_ms": 66000,
+      // Zeit, die zum vollständigen Empfangen einer Anfrage erlaubt ist; begrenzt
+      // nicht lang laufende SSE-Antworten auf GET /mcp, die nur eine Anfrage
+      // empfangen, keine senden.
+      "request_timeout_ms": 300000
     },
     "stdio": {
       // MCP stdio-Transport aktivieren
@@ -3821,6 +3832,12 @@ und ist **standardmäßig authentifiziert**:
 
 Der Container läuft außerdem als Nicht-root-Benutzer (`node`).
 
+Das Image setzt außerdem `NODE_ENV=production` als zusätzliche Absicherung (verringert
+Express' Entwicklungsmodus-Overhead). Das ist nicht der Grund, warum Fehlerantworten
+keine Stack-Traces preisgeben — das garantiert die abschließende JSON-Fehler-Middleware
+in jeder Umgebung, ob Container oder nicht —, aber es ist trotzdem eine sinnvolle
+Voreinstellung für ein Laufzeit-Image.
+
 ### Compose-Profile
 
 | Befehl | Was läuft |
@@ -3993,6 +4010,21 @@ Sobald die Drift-Prüfung abgeschlossen ist, wird die Sperre freigegeben — das
 - Rate Limiting verwendet die vertrauenswürdige Anfragen-Identität (IP) und ignoriert `x-client-id` für die Durchsetzung.
 - Die `client_id` in Audit-/Anfrageprotokollen wird ebenso von der vertrauenswürdigen Anfragen-Identität (`req.ip`) abgeleitet, niemals vom vom Aufrufer angegebenen `x-client-id`-Header — dieser Header wird nur als nicht-maßgeblicher Debug-Hinweis akzeptiert und nie für die Audit-Spur vertraut.
 - `memory://list` erzwingt `limit`-Grenzen von `1..100`; ungültige Werte geben `INVALID_INPUT` zurück.
+- Jeder HTTP-Fehlerpfad — ein Route-Handler, der wirft oder ablehnt, ein fehlerhafter JSON-Anfragetext, ein fehlerhaftes `?uri=` bei `GET /resource` — liefert die strukturierte `{error:{code,message,retryable}}`-Hülle zurück. Kein Stack-Trace und keine HTML-Fehlerseite verlässt jemals den Prozess, unabhängig von `NODE_ENV`; eine abschließende Express-Fehler-Middleware fängt alles ab, was eine Route nicht selbst behandelt, und unerwartete Fehler werden weiterhin serverseitig protokolliert (nur nicht in die Antwort übernommen).
+- Antworten deaktivieren den `X-Powered-By`-Header und setzen `X-Content-Type-Options: nosniff`. Antworten werden gzip-komprimiert, wenn der Client `Accept-Encoding: gzip` sendet, außer bei `text/event-stream` (dem `/mcp`-SSE-Stream), das niemals für die Komprimierung gepuffert wird.
+- `transport.http.keep_alive_timeout_ms` / `headers_timeout_ms` / `request_timeout_ms` (Standard 65 s / 66 s / 300 s) ersetzen Nodes eigene Socket-Timeout-Standards, die für Keep-Alive hinter einem Reverse-Proxy zu kurz und gegenüber Slow-Loris-Angriffen zu nachsichtig sind. `headers_timeout_ms` muss größer als `keep_alive_timeout_ms` sein — die Konfigurationsvalidierung lehnt einen Wert ab, der dies nicht erfüllt. `request_timeout_ms` begrenzt nur den Empfang einer Anfrage und unterbricht daher keine lang laufende `GET /mcp`-SSE-Antwort.
+
+### Ordnungsgemäßes Herunterfahren
+
+Bei `SIGINT`/`SIGTERM` (beide Transporte) — und bei stdio, wenn der Client sein Ende der Pipe schließt — führt der Server Folgendes aus:
+
+1. Sofortiges Schreiben aller unsauberen SQLite-Zustände auf die Festplatte.
+2. Drainage aktiver Verbindungen: Schließen jeder offenen MCP-Sitzung (HTTP) oder des MCP-`Server`/Transports (stdio).
+3. Stoppen der geplanten Cleanup- und Distillation-Timer.
+4. Schließen der SQLite-Verbindung (Checkpoint des Write-Ahead-Logs und erneutes Schreiben, falls während der Drainage etwas unsauber wurde).
+5. Beenden mit Exit-Code `0`.
+
+Ein zweites Signal während des Herunterfahrens wird ignoriert — die obige Sequenz läuft höchstens einmal. Wenn die Drainage nicht innerhalb von **10 Sekunden** abgeschlossen ist, protokolliert der Server ein `shutdown_timeout`-Ereignis, schreibt SQLite ein letztes Mal synchron und beendet sich mit Exit-Code `1`, damit Orchestratoren (Docker, systemd, Kubernetes) ein erzwungenes von einem sauberen Herunterfahren unterscheiden können. Dies begrenzt `docker stop`/Container-Neustart-Beendigungen auf ein vorhersehbares Zeitfenster, anstatt bis zu einem `SIGKILL` zu warten.
 
 ### Fail-Closed-Authentifizierung
 

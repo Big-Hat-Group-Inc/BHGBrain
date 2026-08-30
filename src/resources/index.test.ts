@@ -78,6 +78,17 @@ describe('resource pagination bounds', () => {
     expect(result.total_results).toBe(2);
   });
 
+  // harden-http-server-lifecycle task 3.2: a malformed URI must not let
+  // `new URL(uri)`'s TypeError escape `handle()` — reached from stdio and
+  // `/mcp` as well as HTTP's `/resource`, none of which all have an Express
+  // error middleware to backstop it.
+  it('returns an INVALID_INPUT envelope for a malformed URI instead of throwing', async () => {
+    const handler = createHandler();
+    await expect(handler.handle('not-a-url')).resolves.toEqual({
+      error: { code: 'INVALID_INPUT', message: expect.stringContaining('not-a-url'), retryable: false },
+    });
+  });
+
   it('excludes an expired decay-eligible T2/T3 memory from memory://{id}', async () => {
     const expiredMemory = {
       id: '550e8400-e29b-41d4-a716-446655440002',

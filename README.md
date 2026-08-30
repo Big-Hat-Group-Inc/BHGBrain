@@ -319,7 +319,17 @@ The file is created automatically on first run with all defaults applied. Edit i
       // Port to listen on
       "port": 3721,
       // Name of the env var holding the bearer token for HTTP auth
-      "bearer_token_env": "BHGBRAIN_TOKEN"
+      "bearer_token_env": "BHGBRAIN_TOKEN",
+      // Socket timeouts applied to the underlying http.Server (ms). Defaults
+      // are proxy-safe: keep-alive above the common 60s reverse-proxy idle
+      // timeout, and headers timeout above that (Node requires
+      // headers_timeout_ms > keep_alive_timeout_ms to avoid ECONNRESET
+      // races — config validation rejects a value that doesn't satisfy this).
+      "keep_alive_timeout_ms": 65000,
+      "headers_timeout_ms": 66000,
+      // Time allowed to fully receive a request; does not bound long-lived
+      // SSE responses on GET /mcp, which only receive a request, not send one.
+      "request_timeout_ms": 300000
     },
     "stdio": {
       // Enable MCP stdio transport
@@ -3842,6 +3852,11 @@ is **authenticated by default**:
 
 The container also runs as a non-root user (`node`).
 
+The image also sets `NODE_ENV=production` as defense in depth (dropping Express's
+dev-mode overhead). This is not what keeps error responses from leaking stack traces —
+the terminal JSON error middleware guarantees structured envelopes in every
+environment, container or not — but it's a sane default for a runtime image regardless.
+
 ### Compose Profiles
 
 | Command | What runs |
@@ -4014,6 +4029,21 @@ Once the drift check finishes, the guard is released — re-embedding the drifte
 - Rate limiting keys on trusted request identity (IP) and ignores `x-client-id` for enforcement.
 - Audit/request-log `client_id` is likewise derived from the trusted request identity (`req.ip`), never from the caller-supplied `x-client-id` header — that header is accepted only as a non-authoritative debug hint and is never trusted for the audit trail.
 - `memory://list` enforces `limit` bounds of `1..100`; invalid values return `INVALID_INPUT`.
+- Every HTTP failure path — a thrown/rejected route handler, a malformed JSON request body, a malformed `?uri=` on `GET /resource` — returns the structured `{error:{code,message,retryable}}` envelope. No stack trace or HTML error page ever leaves the process, regardless of `NODE_ENV`; a terminal Express error middleware backstops anything a route doesn't handle itself, and unanticipated errors are still logged server-side (just not echoed into the response body).
+- Responses disable the `X-Powered-By` header and set `X-Content-Type-Options: nosniff`. Responses are gzip-compressed when the client sends `Accept-Encoding: gzip`, except `text/event-stream` (the `/mcp` SSE stream), which is never buffered for compression.
+- `transport.http.keep_alive_timeout_ms` / `headers_timeout_ms` / `request_timeout_ms` (defaults 65 s / 66 s / 300 s) replace Node's own socket-timeout defaults, which are too short for keep-alive behind a reverse proxy and too permissive against slow-loris holds. `headers_timeout_ms` must be greater than `keep_alive_timeout_ms` — config validation rejects a value that doesn't satisfy this. `request_timeout_ms` bounds only receiving a request, so it does not cut off a long-lived `GET /mcp` SSE response.
+
+### Graceful Shutdown
+
+On `SIGINT`/`SIGTERM` (both transports) — and, for stdio, when the client closes its end of the pipe — the server:
+
+1. Immediately flushes any dirty SQLite state to disk.
+2. Drains live connections: closes every open MCP session (HTTP) or the MCP `Server`/transport (stdio).
+3. Stops the scheduled cleanup and distillation timers.
+4. Closes the SQLite connection (checkpoints the write-ahead log and flushes again if anything became dirty during the drain).
+5. Exits with code `0`.
+
+A second signal during shutdown is ignored — the sequence above runs at most once. If the drain hasn't finished within **10 seconds**, the server logs a `shutdown_timeout` event, flushes SQLite synchronously one more time, and exits with code `1` so orchestrators (Docker, systemd, Kubernetes) can distinguish a forced shutdown from a clean one. This bounds `docker stop`/container-restart shutdowns to a predictable window instead of running out the clock to a `SIGKILL`.
 
 ### Fail-Closed Authentication
 

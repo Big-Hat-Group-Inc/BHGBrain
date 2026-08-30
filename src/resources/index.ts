@@ -36,7 +36,18 @@ export class ResourceHandler {
   }
 
   async handle(uri: string): Promise<unknown> {
-    const url = new URL(uri);
+    let url: URL;
+    try {
+      url = new URL(uri);
+    } catch {
+      // Matches the existing convention below of *returning* an envelope
+      // for an unrecognized resource rather than throwing — this handler is
+      // reached from stdio and `/mcp` as well as the HTTP `/resource`
+      // endpoint, none of which have Express error middleware to backstop a
+      // thrown TypeError from a malformed URI (harden-http-server-lifecycle
+      // task 3.2).
+      return { error: { code: 'INVALID_INPUT', message: `Malformed resource URI: ${uri}`, retryable: false } };
+    }
     const scheme = url.protocol.replace(':', '');
     const host = url.hostname || url.pathname.replace('//', '');
 
