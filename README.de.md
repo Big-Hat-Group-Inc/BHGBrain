@@ -398,6 +398,18 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Qdrant-Segment-Kompaktierungsschwelle (kompaktieren, wenn dieser Anteil eines Segments gelöscht ist)
     "compaction_deleted_threshold": 0.10,
 
+    // Obergrenzen für die beiden nur-anfügenden Verlaufstabellen (audit_log,
+    // memory_revisions), durchgesetzt durch denselben geplanten Cleanup-Lauf
+    // (bhgbrain gc / scheduled_cleanup_enabled) wie oben. `null` deaktiviert
+    // die jeweilige Bereinigung (bisheriges "für immer behalten"-Verhalten).
+    // audit_log_max_entries behält die neuesten N Zeilen nach Zeitstempel;
+    // revisions_per_memory_max behält die höchsten N Revisionen pro Erinnerung.
+    // Die Standardwerte sind großzügig — ein Store muss wirklich langlebig
+    // sein, bevor eine Bereinigung überhaupt eine Zeile entfernt. Ein
+    // Trockenlauf (`bhgbrain gc --dry-run`) bereinigt nie.
+    "audit_log_max_entries": 50000,
+    "revisions_per_memory_max": 20,
+
     // Geplante Gedächtnis-Destillation: gruppiert verwandte, noch aktive T2/T3-
     // episodische Erinnerungen und verschmilzt jeden qualifizierenden Cluster
     // per LLM-Aufruf zu einer dauerhaften T1-semantischen Erinnerung, wobei die
@@ -1725,9 +1737,11 @@ Der Server führt einen geplanten Bereinigungsauftrag aus (Standard: täglich um
 
 6. **Kompaktierung (schwellenwertgesteuert, nicht pro Löschung):** Für jeden Namespace/Collection-Bereich, in dem dieser Lauf gelöscht hat, wird der Qdrant-Segmentoptimierer über `optimizers_config.deleted_threshold` zur Freigabe von Speicherplatz angestoßen, sobald der Anteil gelöschter Vektoren `retention.compaction_deleted_threshold` überschreitet.
 
-7. **Flush:** SQLite wird nach allen Löschungen atomar auf die Festplatte geschrieben.
+7. **Bereinigung der Verlaufstabellen:** `audit_log` (die neuesten `retention.audit_log_max_entries` Zeilen nach Zeitstempel) und `memory_revisions` (die höchsten `retention.revisions_per_memory_max` Revisionen pro Erinnerung) werden auf ihre konfigurierten Obergrenzen zurückgeschnitten — beide nur-anfügenden Tabellen würden sonst unbegrenzt wachsen. `null` bei einer der beiden Grenzen deaktiviert die jeweilige Bereinigung. Bei einem Trockenlauf entfällt dieser Schritt vollständig. Die bereinigten Anzahlen werden als `audit_pruned`/`revisions_pruned` im GC-Ergebnis gemeldet und im `retention_gc`-Ereignis protokolliert.
 
-8. **Gesundheitssignal:** Ist während eines Laufs ein Archivierungs- oder Löschschritt fehlgeschlagen, wird das Ergebnis gespeichert und erscheint bis zum nächsten sauberen GC-Lauf als degradierte `retention`-Komponente in `health://status`.
+8. **Flush:** SQLite wird nach allen Löschungen atomar auf die Festplatte geschrieben.
+
+9. **Gesundheitssignal:** Ist während eines Laufs ein Archivierungs- oder Löschschritt fehlgeschlagen, wird das Ergebnis gespeichert und erscheint bis zum nächsten sauberen GC-Lauf als degradierte `retention`-Komponente in `health://status`.
 
 Ein GC-Lauf — manuell oder geplant — wirft nie eine Ausnahme an seinen Aufrufer: Unerwartete Fehler werden abgefangen, die laufende Lifecycle-Sperre wird immer freigegeben, und das Ergebnis wird als `degraded: true` mit dem bereits abgeschlossenen Arbeitsstand gemeldet.
 

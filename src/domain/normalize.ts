@@ -13,7 +13,12 @@ export function computeChecksum(normalizedContent: string): string {
 }
 
 export function generateSummary(content: string, maxLen = 120): string {
-  const firstLine = content.split('\n')[0] ?? '';
+  // `indexOf`/`substring` instead of `split('\n')[0]` (trim-sqlite-query-and-
+  // health-overhead task 6.1): equivalent for every input — content is
+  // already `\r\n`-normalized upstream by `normalizeContent` — without
+  // allocating an array of every line in `content` just to read the first.
+  const newlineIndex = content.indexOf('\n');
+  const firstLine = newlineIndex === -1 ? content : content.substring(0, newlineIndex);
   if (firstLine.length <= maxLen) return firstLine;
   return firstLine.substring(0, maxLen - 3) + '...';
 }

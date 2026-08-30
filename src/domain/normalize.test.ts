@@ -46,6 +46,23 @@ describe('generateSummary', () => {
   it('uses only first line', () => {
     expect(generateSummary('first\nsecond')).toBe('first');
   });
+
+  // trim-sqlite-query-and-health-overhead task 6.2: indexOf/substring must
+  // match split('\n')[0]'s behavior exactly for every input.
+  it('returns empty string for empty content', () => {
+    expect(generateSummary('')).toBe('');
+  });
+
+  it('truncates a first line longer than maxLen even when later lines exist', () => {
+    const firstLine = 'B'.repeat(200);
+    const summary = generateSummary(`${firstLine}\nsecond line`);
+    expect(summary.length).toBeLessThanOrEqual(120);
+    expect(summary).toBe(`${firstLine.substring(0, 117)}...`);
+  });
+
+  it('respects a custom maxLen', () => {
+    expect(generateSummary('exactly ten', 5)).toBe('ex...');
+  });
 });
 
 describe('containsSecret', () => {

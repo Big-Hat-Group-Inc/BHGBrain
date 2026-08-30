@@ -399,6 +399,19 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     // Umbral de compactación de segmentos de Qdrant (compactar cuando esta fracción de un segmento está eliminada)
     "compaction_deleted_threshold": 0.10,
 
+    // Límites para las dos tablas de historial de solo inserción (audit_log,
+    // memory_revisions), aplicados por la misma limpieza programada
+    // (bhgbrain gc / scheduled_cleanup_enabled) que ejecuta el resto de la
+    // retención anterior. `null` desactiva la poda correspondiente (el
+    // comportamiento previo de "conservar para siempre"). audit_log_max_entries
+    // conserva las N filas más recientes por marca de tiempo;
+    // revisions_per_memory_max conserva las N revisiones más altas por
+    // memoria. Los valores por defecto son generosos — un almacén debe ser
+    // realmente longevo antes de que cualquiera de las dos pode una fila. Una
+    // ejecución en seco (`bhgbrain gc --dry-run`) nunca poda.
+    "audit_log_max_entries": 50000,
+    "revisions_per_memory_max": 20,
+
     // Destilación de memoria programada: agrupa memorias episódicas T2/T3
     // relacionadas y aún activas, y consolida cada clúster calificado en una
     // memoria semántica T1 duradera mediante una llamada LLM, archivando las
@@ -1729,9 +1742,11 @@ El servidor ejecuta un trabajo de limpieza programado (por defecto: diariamente 
 
 6. **Compactación (dirigida por umbral, no por eliminación):** Para cada par namespace/colección del que esta ejecución eliminó memorias, una vez que la proporción de vectores eliminados supera `retention.compaction_deleted_threshold`, la ejecución impulsa al optimizador de segmentos de Qdrant a recuperar espacio vía `optimizers_config.deleted_threshold`.
 
-7. **Volcado:** SQLite se vuelca atómicamente a disco después de todas las eliminaciones.
+7. **Poda de tablas de historial:** `audit_log` (las `retention.audit_log_max_entries` filas más recientes, por marca de tiempo) y `memory_revisions` (las `retention.revisions_per_memory_max` revisiones más altas por memoria) se recortan a sus límites configurados — ambas tablas de solo inserción crecerían indefinidamente en caso contrario. Cualquiera de los dos límites en `null` desactiva su poda. Se omite por completo en una ejecución en seco. Los recuentos podados se reportan como `audit_pruned`/`revisions_pruned` en el resultado del GC y se registran en el evento `retention_gc`.
 
-8. **Señal de salud:** Si algún paso de archivado o eliminación falla a mitad de camino, el resultado de la ejecución se persiste y aparece como un componente `retention` degradado en `health://status` hasta la próxima ejecución de GC limpia.
+8. **Volcado:** SQLite se vuelca atómicamente a disco después de todas las eliminaciones.
+
+9. **Señal de salud:** Si algún paso de archivado o eliminación falla a mitad de camino, el resultado de la ejecución se persiste y aparece como un componente `retention` degradado en `health://status` hasta la próxima ejecución de GC limpia.
 
 Una ejecución de GC — manual o programada — nunca lanza un error a quien la invoca: los fallos inesperados se capturan, el bloqueo de ciclo de vida en curso siempre se libera, y el resultado se reporta como `degraded: true` con el trabajo ya completado intacto.
 

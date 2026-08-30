@@ -18,6 +18,9 @@ type MockSqliteStore = SqliteStore & {
   listRevisions: ReturnType<typeof vi.fn>;
   insertRevision: ReturnType<typeof vi.fn>;
   insertAudit: ReturnType<typeof vi.fn>;
+  deleteMemoriesByIds: ReturnType<typeof vi.fn>;
+  listMemoryIds: ReturnType<typeof vi.fn>;
+  hydrateBatch: ReturnType<typeof vi.fn>;
 };
 type MockQdrantStore = QdrantStore & {
   upsert: ReturnType<typeof vi.fn>;
@@ -42,6 +45,51 @@ function createMockSqlite(): MockSqliteStore {
       }
     }),
     deleteMemory: vi.fn((id: string) => memoryStore.delete(id)),
+    deleteMemoriesByIds: vi.fn((ids: string[]) => {
+      let deleted = 0;
+      for (const id of ids) {
+        if (memoryStore.delete(id)) deleted++;
+      }
+      return deleted;
+    }),
+    listMemoryIds: vi.fn(() => new Set(memoryStore.keys())),
+    hydrateBatch: vi.fn((
+      points: Array<{ id: string; payload: Record<string, unknown> }>,
+      existingIds: Set<string>,
+    ) => {
+      let hydrated = 0;
+      const failures: Array<{ id: string; error: string }> = [];
+      for (const point of points) {
+        if (existingIds.has(point.id)) continue;
+        if (typeof point.payload.__throw === 'string') {
+          failures.push({ id: point.id, error: point.payload.__throw });
+          continue;
+        }
+        const now = new Date().toISOString();
+        memoryStore.set(point.id, {
+          id: point.id,
+          namespace: 'global',
+          collection: 'general',
+          type: 'semantic',
+          category: null,
+          content: typeof point.payload.content === 'string' ? point.payload.content : '',
+          summary: typeof point.payload.summary === 'string' ? point.payload.summary : '',
+          tags: [],
+          source: 'import',
+          checksum: '',
+          importance: 0.5,
+          access_count: 0,
+          last_operation: 'ADD',
+          merged_from: null,
+          created_at: now,
+          updated_at: now,
+          last_accessed: now,
+        });
+        existingIds.add(point.id);
+        hydrated++;
+      }
+      return { hydrated, failures };
+    }),
     markVectorSync: vi.fn((id: string, synced: boolean) => {
       const existing = memoryStore.get(id);
       if (existing) {
@@ -683,12 +731,15 @@ describe('StorageManager cross-store consistency', () => {
         }
         return [{ id: 'p3', payload: { content: 'c3', summary: 's3' } }];
       });
-      (sqlite as unknown as Record<string, unknown>).upsertMemoryFromPayload = vi.fn(() => true);
 
       const total = await storage.bootstrapFromQdrant();
 
       expect(total).toBe(3);
-      expect((sqlite as unknown as { upsertMemoryFromPayload: ReturnType<typeof vi.fn> }).upsertMemoryFromPayload).toHaveBeenCalledTimes(3);
+      // One preload of existing ids for the whole run (task 2.3), and one
+      // batched hydrateBatch call per collection (task 2.4) rather than a
+      // per-point upsert call.
+      expect(sqlite.listMemoryIds).toHaveBeenCalledTimes(1);
+      expect(sqlite.hydrateBatch).toHaveBeenCalledTimes(2);
       expect(sqlite.flushIfDirty).toHaveBeenCalled();
     });
 
@@ -704,20 +755,25 @@ describe('StorageManager cross-store consistency', () => {
       expect(total).toBe(0);
     });
 
-    it('skips existing rows via upsert idempotency', async () => {
+    it('skips existing rows via the preloaded id Set', async () => {
       const sqlite = createMockSqlite();
       const qdrant = createMockQdrant(false);
       const embedding = createMockEmbedding();
       const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      // Seeded so listMemoryIds() (preloaded once, task 2.3) already contains it.
+      sqlite.insertMemory({
+        id: 'existing', namespace: 'global', collection: 'general', type: 'semantic', category: null,
+        content: 'c0', summary: 's0', tags: [], source: 'cli', checksum: 'chk0', importance: 0.5,
+        access_count: 0, last_operation: 'ADD', merged_from: null,
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString(), last_accessed: new Date().toISOString(),
+      });
 
       (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => ['bhgbrain_global_general']);
       (qdrant as unknown as Record<string, unknown>).scrollAll = vi.fn(async () => [
         { id: 'existing', payload: { content: 'c1' } },
         { id: 'new', payload: { content: 'c2' } },
       ]);
-      // First call returns false (already exists), second returns true (inserted)
-      const upsertMock = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
-      (sqlite as unknown as Record<string, unknown>).upsertMemoryFromPayload = upsertMock;
 
       const total = await storage.bootstrapFromQdrant();
       expect(total).toBe(1); // only the new one counted
@@ -745,20 +801,15 @@ describe('StorageManager cross-store consistency', () => {
       (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => ['bhgbrain_global_general']);
       (qdrant as unknown as Record<string, unknown>).scrollAll = vi.fn(async () => [
         { id: 'p1', payload: { content: 'c1' } },
-        { id: 'bad', payload: { content: 'bad' } },
+        { id: 'bad', payload: { content: 'bad', __throw: 'constraint violation' } },
         { id: 'p2', payload: { content: 'c2' } },
       ]);
-      const upsertMock = vi.fn((id: string) => {
-        if (id === 'bad') throw new Error('constraint violation');
-        return true;
-      });
-      (sqlite as unknown as Record<string, unknown>).upsertMemoryFromPayload = upsertMock;
       const logger = { info: vi.fn(), warn: vi.fn() };
 
       const total = await storage.bootstrapFromQdrant(logger);
 
       expect(total).toBe(2); // p1 and p2 counted; bad is not
-      expect(upsertMock).toHaveBeenCalledTimes(3); // all three attempted
+      expect(sqlite.hydrateBatch).toHaveBeenCalledTimes(1); // one batched call for the collection
       expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
         event: 'bootstrap_hydration_failed',
         point_id: 'bad',
@@ -777,14 +828,15 @@ describe('StorageManager cross-store consistency', () => {
         { id: 'theirs', payload: { content: 'c2', device_id: 'device-b' } },
         { id: 'unowned', payload: { content: 'c3' } },
       ]);
-      const upsertMock = vi.fn(() => true);
-      (sqlite as unknown as Record<string, unknown>).upsertMemoryFromPayload = upsertMock;
 
       const total = await storage.bootstrapFromQdrant(undefined, { deviceId: 'device-a' });
 
       expect(total).toBe(1);
-      expect(upsertMock).toHaveBeenCalledTimes(1);
-      expect(upsertMock).toHaveBeenCalledWith('mine', expect.objectContaining({ device_id: 'device-a' }));
+      expect(sqlite.hydrateBatch).toHaveBeenCalledTimes(1);
+      expect(sqlite.hydrateBatch).toHaveBeenCalledWith(
+        [expect.objectContaining({ id: 'mine', payload: expect.objectContaining({ device_id: 'device-a' }) })],
+        expect.any(Set),
+      );
     });
 
     it('--all-devices hydrates every device regardless of deviceId', async () => {
@@ -798,13 +850,11 @@ describe('StorageManager cross-store consistency', () => {
         { id: 'mine', payload: { content: 'c1', device_id: 'device-a' } },
         { id: 'theirs', payload: { content: 'c2', device_id: 'device-b' } },
       ]);
-      const upsertMock = vi.fn(() => true);
-      (sqlite as unknown as Record<string, unknown>).upsertMemoryFromPayload = upsertMock;
 
       const total = await storage.bootstrapFromQdrant(undefined, { deviceId: 'device-a', allDevices: true });
 
       expect(total).toBe(2);
-      expect(upsertMock).toHaveBeenCalledTimes(2);
+      expect(sqlite.hydrateBatch).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -854,6 +904,9 @@ describe('StorageManager cross-store consistency', () => {
 
       expect(result).toEqual({ deleted: 1, unreconciled: [], degraded: false });
       expect(sqlite.getMemoryById('mem-a')).toBeNull();
+      // task 2.2: one chunked deleteMemoriesByIds call, not a deleteMemory loop.
+      expect(sqlite.deleteMemoriesByIds).toHaveBeenCalledTimes(1);
+      expect(sqlite.deleteMemoriesByIds).toHaveBeenCalledWith(['mem-a']);
     });
   });
 

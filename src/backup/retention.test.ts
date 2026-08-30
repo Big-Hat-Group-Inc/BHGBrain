@@ -110,7 +110,12 @@ describe('RetentionService', () => {
     } as unknown as StorageManager;
 
     const config = {
-      retention: { archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1 },
+      retention: {
+        archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+        // null disables history pruning for these pre-existing GC tests, which
+        // aren't exercising pruneAuditLog/pruneRevisions and don't mock them.
+        audit_log_max_entries: null, revisions_per_memory_max: null,
+      },
     } as unknown as BrainConfig;
     const logger = { info: vi.fn() };
     const retention = new RetentionService(config, storage, logger);
@@ -176,7 +181,12 @@ describe('RetentionService', () => {
     } as unknown as StorageManager;
 
     const config = {
-      retention: { archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1 },
+      retention: {
+        archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+        // null disables history pruning for these pre-existing GC tests, which
+        // aren't exercising pruneAuditLog/pruneRevisions and don't mock them.
+        audit_log_max_entries: null, revisions_per_memory_max: null,
+      },
     } as unknown as BrainConfig;
     const logger = { info: vi.fn() };
     const retention = new RetentionService(config, storage, logger);
@@ -248,7 +258,12 @@ describe('RetentionService', () => {
     } as unknown as StorageManager;
 
     const config = {
-      retention: { archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1 },
+      retention: {
+        archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+        // null disables history pruning for these pre-existing GC tests, which
+        // aren't exercising pruneAuditLog/pruneRevisions and don't mock them.
+        audit_log_max_entries: null, revisions_per_memory_max: null,
+      },
     } as unknown as BrainConfig;
     const retention = new RetentionService(config, storage, { info: vi.fn() });
 
@@ -278,7 +293,12 @@ describe('RetentionService', () => {
       },
     } as unknown as StorageManager;
     const config = {
-      retention: { archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1 },
+      retention: {
+        archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+        // null disables history pruning for these pre-existing GC tests, which
+        // aren't exercising pruneAuditLog/pruneRevisions and don't mock them.
+        audit_log_max_entries: null, revisions_per_memory_max: null,
+      },
     } as unknown as BrainConfig;
     const retention = new RetentionService(config, storage, { info: vi.fn() });
 
@@ -313,7 +333,12 @@ describe('RetentionService', () => {
     } as unknown as StorageManager;
 
     const config = {
-      retention: { archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1 },
+      retention: {
+        archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+        // null disables history pruning for these pre-existing GC tests, which
+        // aren't exercising pruneAuditLog/pruneRevisions and don't mock them.
+        audit_log_max_entries: null, revisions_per_memory_max: null,
+      },
     } as unknown as BrainConfig;
     const retention = new RetentionService(config, storage, { info: vi.fn() });
 
@@ -367,7 +392,12 @@ describe('RetentionService', () => {
     } as unknown as StorageManager;
 
     const config = {
-      retention: { archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1 },
+      retention: {
+        archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+        // null disables history pruning for these pre-existing GC tests, which
+        // aren't exercising pruneAuditLog/pruneRevisions and don't mock them.
+        audit_log_max_entries: null, revisions_per_memory_max: null,
+      },
     } as unknown as BrainConfig;
     const retention = new RetentionService(config, storage, { info: vi.fn() });
 
@@ -402,7 +432,12 @@ describe('RetentionService', () => {
     } as unknown as StorageManager;
 
     const config = {
-      retention: { archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1 },
+      retention: {
+        archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+        // null disables history pruning for these pre-existing GC tests, which
+        // aren't exercising pruneAuditLog/pruneRevisions and don't mock them.
+        audit_log_max_entries: null, revisions_per_memory_max: null,
+      },
     } as unknown as BrainConfig;
     const retention = new RetentionService(config, storage, { info: vi.fn() });
 
@@ -433,7 +468,12 @@ describe('RetentionService', () => {
       logAudit: vi.fn(),
     } as unknown as StorageManager;
     const config = {
-      retention: { archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1 },
+      retention: {
+        archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+        // null disables history pruning for these pre-existing GC tests, which
+        // aren't exercising pruneAuditLog/pruneRevisions and don't mock them.
+        audit_log_max_entries: null, revisions_per_memory_max: null,
+      },
     } as unknown as BrainConfig;
     const metrics = {
       recordHistogram: vi.fn(),
@@ -498,5 +538,138 @@ describe('RetentionService', () => {
       outcome: 'dry_run',
       scanned: 1,
     }));
+  });
+
+  // -- trim-sqlite-query-and-health-overhead task 4.5: history-table pruning --
+
+  describe('history-table pruning', () => {
+    // `pruneAuditLog`/`pruneRevisions`/`listAudit`/`listRevisions` are bound to
+    // the REAL sqlite store so pruning runs genuinely (real row survival, not a
+    // stubbed count) — but `beginLifecycleOperation`/`setRetentionDegraded`/etc.
+    // are the plain lifecycleOpMocks() no-ops the rest of this file uses for
+    // runGc, since driving those for real against the same store instance
+    // that's mid-'gc' lifecycle op is unrelated to what these tests verify
+    // (assertMutableAllowed would reject the real store's own writes while its
+    // own 'gc' lifecycle op is open — a separate, pre-existing behavior outside
+    // this change's scope).
+    function pruningStorage() {
+      return {
+        sqlite: {
+          listExpiredMemories: vi.fn(() => []),
+          pruneAuditLog: sqlite.pruneAuditLog.bind(sqlite),
+          pruneRevisions: sqlite.pruneRevisions.bind(sqlite),
+          listAudit: sqlite.listAudit.bind(sqlite),
+          listRevisions: sqlite.listRevisions.bind(sqlite),
+          flushIfDirty: vi.fn(),
+          ...lifecycleOpMocks(),
+        },
+        qdrant: qdrantStub(),
+        deleteMemories: vi.fn(async () => ({ deleted: 0, unreconciled: [], degraded: false })),
+        logAudit: vi.fn(),
+      } as unknown as StorageManager;
+    }
+
+    function seedAuditRows(count: number) {
+      for (let i = 1; i <= count; i++) {
+        sqlite.insertAudit({
+          id: `audit-${i}`,
+          timestamp: `2026-01-${String(i).padStart(2, '0')}T00:00:00.000Z`,
+          namespace: 'global',
+          operation: 'ADD',
+          memory_id: `mem-${i}`,
+          client_id: 'test',
+        });
+      }
+    }
+
+    function seedRevisions(memoryId: string, count: number) {
+      for (let r = 1; r <= count; r++) {
+        sqlite.insertRevision(memoryId, r, `content v${r}`, '2026-01-01T00:00:00.000Z');
+      }
+    }
+
+    it('prunes audit_log and memory_revisions to the configured caps and surfaces the counts', async () => {
+      seedAuditRows(5);
+      seedRevisions('mem-x', 5);
+
+      const config = {
+        retention: {
+          archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+          audit_log_max_entries: 3, revisions_per_memory_max: 2,
+        },
+      } as unknown as BrainConfig;
+      const logger = { info: vi.fn() };
+      const retention = new RetentionService(config, pruningStorage(), logger);
+
+      const result = await retention.runGc();
+
+      expect(result.audit_pruned).toBe(2);
+      expect(result.revisions_pruned).toBe(3);
+      expect(sqlite.listAudit(10)).toHaveLength(3);
+      expect(sqlite.listRevisions('mem-x')).toHaveLength(2);
+      expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'retention_gc',
+        audit_pruned: 2,
+        revisions_pruned: 3,
+      }));
+    });
+
+    it('a null cap disables the corresponding prune', async () => {
+      seedAuditRows(5);
+      seedRevisions('mem-y', 5);
+
+      const config = {
+        retention: {
+          archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+          audit_log_max_entries: null, revisions_per_memory_max: null,
+        },
+      } as unknown as BrainConfig;
+      const retention = new RetentionService(config, pruningStorage(), { info: vi.fn() });
+
+      const result = await retention.runGc();
+
+      expect(result.audit_pruned).toBe(0);
+      expect(result.revisions_pruned).toBe(0);
+      expect(sqlite.listAudit(10)).toHaveLength(5);
+      expect(sqlite.listRevisions('mem-y')).toHaveLength(5);
+    });
+
+    it('dry-run prunes nothing even with caps configured', async () => {
+      seedAuditRows(5);
+
+      const config = {
+        retention: {
+          archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+          audit_log_max_entries: 1, revisions_per_memory_max: 1,
+        },
+      } as unknown as BrainConfig;
+      const retention = new RetentionService(config, pruningStorage(), { info: vi.fn() });
+
+      const result = await retention.runGc({ dryRun: true });
+
+      expect(result.audit_pruned).toBe(0);
+      expect(result.revisions_pruned).toBe(0);
+      expect(sqlite.listAudit(10)).toHaveLength(5);
+    });
+
+    it('a pruned store round-trips through flush + reloadFromDisk', async () => {
+      seedAuditRows(5);
+
+      const config = {
+        retention: {
+          archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+          audit_log_max_entries: 2, revisions_per_memory_max: null,
+        },
+      } as unknown as BrainConfig;
+      const retention = new RetentionService(config, pruningStorage(), { info: vi.fn() });
+
+      await retention.runGc();
+      expect(sqlite.listAudit(10)).toHaveLength(2);
+
+      sqlite.flush();
+      await sqlite.reloadFromDisk();
+
+      expect(sqlite.listAudit(10)).toHaveLength(2);
+    });
   });
 });

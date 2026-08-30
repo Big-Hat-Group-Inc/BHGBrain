@@ -392,6 +392,15 @@ BHGBrain 从以下位置加载配置文件：
     // Qdrant 分段压缩阈值（当某分段中已删除数据占比超过此比例时触发压缩）
     "compaction_deleted_threshold": 0.10,
 
+    // 对两张只追加写入的历史表（audit_log、memory_revisions）设置上限，由与上面
+    // 保留策略相同的定时清理任务（bhgbrain gc / scheduled_cleanup_enabled）执行。
+    // `null` 表示禁用对应的清理（即此前"永久保留"的行为）。audit_log_max_entries
+    // 按时间戳保留最新的 N 行；revisions_per_memory_max 按每条记忆保留修订号最高
+    // 的 N 条修订记录。默认值较为宽松——存储必须经过相当长时间的积累，才会真正
+    // 触发清理删除。干跑模式（`bhgbrain gc --dry-run`）永远不会执行清理。
+    "audit_log_max_entries": 50000,
+    "revisions_per_memory_max": 20,
+
     // 定时记忆蒸馏：将相关且仍处于活跃状态的 T2/T3 情景记忆聚类，并通过 LLM
     // 调用将每个符合条件的簇合并为一条持久的 T1 语义记忆，同时保留来源关系
     // 归档源记忆（参见下方"记忆蒸馏"）。默认关闭；未配置提取 API 密钥时不生效。
@@ -1632,9 +1641,11 @@ camelCase/PascalCase 形态的品牌名称标记为标签（例如 `GitHub` → 
 
 6. **压缩（由阈值驱动，而非逐条删除触发）：** 对本次运行涉及删除的每个命名空间/集合，一旦已删除向量占比超过 `retention.compaction_deleted_threshold`，本次运行会通过 `optimizers_config.deleted_threshold` 促使 Qdrant 的分段优化器回收空间。
 
-7. **刷写：** 所有删除完成后，SQLite 原子性刷写到磁盘。
+7. **历史表清理：** 将 `audit_log`（按时间戳保留最新的 `retention.audit_log_max_entries` 行）和 `memory_revisions`（按每条记忆保留修订号最高的 `retention.revisions_per_memory_max` 条）裁剪到各自配置的上限——这两张只追加写入的表若不清理会无限增长。任一上限设为 `null` 即可禁用对应的清理。干跑模式下完全跳过此步骤。清理数量会在 GC 结果中以 `audit_pruned`/`revisions_pruned` 字段体现，并记录在 `retention_gc` 事件中。
 
-8. **健康信号：** 若归档或删除步骤中途失败，本次运行的结果会被持久化，并在 `health://status` 中显示为降级的 `retention` 组件，直到下一次干净的 GC 运行为止。
+8. **刷写：** 所有删除完成后，SQLite 原子性刷写到磁盘。
+
+9. **健康信号：** 若归档或删除步骤中途失败，本次运行的结果会被持久化，并在 `health://status` 中显示为降级的 `retention` 组件，直到下一次干净的 GC 运行为止。
 
 无论是手动还是定时的 GC 运行，都不会向调用方抛出异常：意外故障会被捕获，进行中的生命周期锁始终会被释放，运行结果会以 `degraded: true` 的形式报告，并保留已完成的工作。
 

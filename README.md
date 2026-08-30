@@ -406,6 +406,17 @@ The file is created automatically on first run with all defaults applied. Edit i
     // Qdrant segment compaction threshold (compact when this fraction of a segment is deleted)
     "compaction_deleted_threshold": 0.10,
 
+    // Bounds on the two insert-only history tables (audit_log, memory_revisions),
+    // enforced by the same scheduled cleanup (bhgbrain gc / scheduled_cleanup_enabled)
+    // that runs the rest of retention above. `null` disables the corresponding
+    // prune (the previous "keep forever" behavior). audit_log_max_entries keeps
+    // the newest N rows by timestamp; revisions_per_memory_max keeps the highest
+    // N revisions per memory. Defaults are generous — a store must be genuinely
+    // long-lived before either prune drops a row. A dry-run GC (`bhgbrain gc
+    // --dry-run`) never prunes.
+    "audit_log_max_entries": 50000,
+    "revisions_per_memory_max": 20,
+
     // Scheduled memory distillation: clusters related, still-active T2/T3
     // episodic memories and consolidates each qualifying cluster into one
     // durable T1 semantic memory via an LLM call, archiving the sources with
@@ -1713,9 +1724,11 @@ The server runs a scheduled cleanup job (default: daily at 2:00 AM UTC, configur
 
 6. **Compaction (threshold-driven, not per-delete):** For each namespace/collection this run deleted from, once the deleted-vector ratio crosses `retention.compaction_deleted_threshold`, the run nudges Qdrant's segment optimizer to reclaim space via `optimizers_config.deleted_threshold`.
 
-7. **Flush:** SQLite is flushed atomically to disk after all deletions.
+7. **History-table pruning:** `audit_log` (newest `retention.audit_log_max_entries` rows, by timestamp) and `memory_revisions` (highest `retention.revisions_per_memory_max` revisions per memory) are trimmed to their configured caps — both insert-only tables otherwise grow forever. Either cap set to `null` disables its prune. Skipped entirely on a dry run. Pruned counts are reported as `audit_pruned`/`revisions_pruned` in the GC result and logged in the `retention_gc` event.
 
-8. **Health signal:** If any archive or delete step failed partway through, the run's outcome is persisted and surfaces as a degraded `retention` component in `health://status` until the next clean GC run.
+8. **Flush:** SQLite is flushed atomically to disk after all deletions.
+
+9. **Health signal:** If any archive or delete step failed partway through, the run's outcome is persisted and surfaces as a degraded `retention` component in `health://status` until the next clean GC run.
 
 A GC run — manual or scheduled — never throws out to its caller: unexpected failures are caught, the in-progress lifecycle lock is always released, and the result is reported as `degraded: true` with whatever work completed intact.
 

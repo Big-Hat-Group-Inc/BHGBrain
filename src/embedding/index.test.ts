@@ -47,6 +47,8 @@ describe('OpenAIEmbeddingProvider', () => {
         scheduled_cleanup_enabled: true,
         pre_expiry_warning_days: 7,
         compaction_deleted_threshold: 0.1,
+        audit_log_max_entries: 50000,
+        revisions_per_memory_max: 20,
       },
       deduplication: { enabled: true, similarity_threshold: 0.92 },
       resilience: {
