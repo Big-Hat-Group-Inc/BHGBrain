@@ -309,7 +309,18 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
       // Port, auf dem gehört werden soll
       "port": 3721,
       // Name der Umgebungsvariable mit dem Bearer-Token für HTTP-Authentifizierung
-      "bearer_token_env": "BHGBRAIN_TOKEN"
+      "bearer_token_env": "BHGBRAIN_TOKEN",
+      // Socket-Timeouts für den zugrunde liegenden http.Server (ms). Die Standardwerte
+      // sind proxy-sicher: Keep-Alive über dem üblichen 60s-Idle-Timeout eines
+      // Reverse-Proxys, und Headers-Timeout darüber (Node erfordert
+      // headers_timeout_ms > keep_alive_timeout_ms, um ECONNRESET-Race-Conditions
+      // zu vermeiden — die Konfigurationsvalidierung lehnt einen Wert ab, der dies nicht erfüllt).
+      "keep_alive_timeout_ms": 65000,
+      "headers_timeout_ms": 66000,
+      // Zeit, die zum vollständigen Empfangen einer Anfrage erlaubt ist; begrenzt
+      // nicht lang laufende SSE-Antworten auf GET /mcp, die nur eine Anfrage
+      // empfangen, keine senden.
+      "request_timeout_ms": 300000
     },
     "stdio": {
       // MCP stdio-Transport aktivieren
@@ -386,6 +397,18 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
 
     // Qdrant-Segment-Kompaktierungsschwelle (kompaktieren, wenn dieser Anteil eines Segments gelöscht ist)
     "compaction_deleted_threshold": 0.10,
+
+    // Obergrenzen für die beiden nur-anfügenden Verlaufstabellen (audit_log,
+    // memory_revisions), durchgesetzt durch denselben geplanten Cleanup-Lauf
+    // (bhgbrain gc / scheduled_cleanup_enabled) wie oben. `null` deaktiviert
+    // die jeweilige Bereinigung (bisheriges "für immer behalten"-Verhalten).
+    // audit_log_max_entries behält die neuesten N Zeilen nach Zeitstempel;
+    // revisions_per_memory_max behält die höchsten N Revisionen pro Erinnerung.
+    // Die Standardwerte sind großzügig — ein Store muss wirklich langlebig
+    // sein, bevor eine Bereinigung überhaupt eine Zeile entfernt. Ein
+    // Trockenlauf (`bhgbrain gc --dry-run`) bereinigt nie.
+    "audit_log_max_entries": 50000,
+    "revisions_per_memory_max": 20,
 
     // Geplante Gedächtnis-Destillation: gruppiert verwandte, noch aktive T2/T3-
     // episodische Erinnerungen und verschmilzt jeden qualifizierenden Cluster
@@ -1714,9 +1737,11 @@ Der Server führt einen geplanten Bereinigungsauftrag aus (Standard: täglich um
 
 6. **Kompaktierung (schwellenwertgesteuert, nicht pro Löschung):** Für jeden Namespace/Collection-Bereich, in dem dieser Lauf gelöscht hat, wird der Qdrant-Segmentoptimierer über `optimizers_config.deleted_threshold` zur Freigabe von Speicherplatz angestoßen, sobald der Anteil gelöschter Vektoren `retention.compaction_deleted_threshold` überschreitet.
 
-7. **Flush:** SQLite wird nach allen Löschungen atomar auf die Festplatte geschrieben.
+7. **Bereinigung der Verlaufstabellen:** `audit_log` (die neuesten `retention.audit_log_max_entries` Zeilen nach Zeitstempel) und `memory_revisions` (die höchsten `retention.revisions_per_memory_max` Revisionen pro Erinnerung) werden auf ihre konfigurierten Obergrenzen zurückgeschnitten — beide nur-anfügenden Tabellen würden sonst unbegrenzt wachsen. `null` bei einer der beiden Grenzen deaktiviert die jeweilige Bereinigung. Bei einem Trockenlauf entfällt dieser Schritt vollständig. Die bereinigten Anzahlen werden als `audit_pruned`/`revisions_pruned` im GC-Ergebnis gemeldet und im `retention_gc`-Ereignis protokolliert.
 
-8. **Gesundheitssignal:** Ist während eines Laufs ein Archivierungs- oder Löschschritt fehlgeschlagen, wird das Ergebnis gespeichert und erscheint bis zum nächsten sauberen GC-Lauf als degradierte `retention`-Komponente in `health://status`.
+8. **Flush:** SQLite wird nach allen Löschungen atomar auf die Festplatte geschrieben.
+
+9. **Gesundheitssignal:** Ist während eines Laufs ein Archivierungs- oder Löschschritt fehlgeschlagen, wird das Ergebnis gespeichert und erscheint bis zum nächsten sauberen GC-Lauf als degradierte `retention`-Komponente in `health://status`.
 
 Ein GC-Lauf — manuell oder geplant — wirft nie eine Ausnahme an seinen Aufrufer: Unerwartete Fehler werden abgefangen, die laufende Lifecycle-Sperre wird immer freigegeben, und das Ergebnis wird als `degraded: true` mit dem bereits abgeschlossenen Arbeitsstand gemeldet.
 
@@ -3821,6 +3846,12 @@ und ist **standardmäßig authentifiziert**:
 
 Der Container läuft außerdem als Nicht-root-Benutzer (`node`).
 
+Das Image setzt außerdem `NODE_ENV=production` als zusätzliche Absicherung (verringert
+Express' Entwicklungsmodus-Overhead). Das ist nicht der Grund, warum Fehlerantworten
+keine Stack-Traces preisgeben — das garantiert die abschließende JSON-Fehler-Middleware
+in jeder Umgebung, ob Container oder nicht —, aber es ist trotzdem eine sinnvolle
+Voreinstellung für ein Laufzeit-Image.
+
 ### Compose-Profile
 
 | Befehl | Was läuft |
@@ -3993,6 +4024,21 @@ Sobald die Drift-Prüfung abgeschlossen ist, wird die Sperre freigegeben — das
 - Rate Limiting verwendet die vertrauenswürdige Anfragen-Identität (IP) und ignoriert `x-client-id` für die Durchsetzung.
 - Die `client_id` in Audit-/Anfrageprotokollen wird ebenso von der vertrauenswürdigen Anfragen-Identität (`req.ip`) abgeleitet, niemals vom vom Aufrufer angegebenen `x-client-id`-Header — dieser Header wird nur als nicht-maßgeblicher Debug-Hinweis akzeptiert und nie für die Audit-Spur vertraut.
 - `memory://list` erzwingt `limit`-Grenzen von `1..100`; ungültige Werte geben `INVALID_INPUT` zurück.
+- Jeder HTTP-Fehlerpfad — ein Route-Handler, der wirft oder ablehnt, ein fehlerhafter JSON-Anfragetext, ein fehlerhaftes `?uri=` bei `GET /resource` — liefert die strukturierte `{error:{code,message,retryable}}`-Hülle zurück. Kein Stack-Trace und keine HTML-Fehlerseite verlässt jemals den Prozess, unabhängig von `NODE_ENV`; eine abschließende Express-Fehler-Middleware fängt alles ab, was eine Route nicht selbst behandelt, und unerwartete Fehler werden weiterhin serverseitig protokolliert (nur nicht in die Antwort übernommen).
+- Antworten deaktivieren den `X-Powered-By`-Header und setzen `X-Content-Type-Options: nosniff`. Antworten werden gzip-komprimiert, wenn der Client `Accept-Encoding: gzip` sendet, außer bei `text/event-stream` (dem `/mcp`-SSE-Stream), das niemals für die Komprimierung gepuffert wird.
+- `transport.http.keep_alive_timeout_ms` / `headers_timeout_ms` / `request_timeout_ms` (Standard 65 s / 66 s / 300 s) ersetzen Nodes eigene Socket-Timeout-Standards, die für Keep-Alive hinter einem Reverse-Proxy zu kurz und gegenüber Slow-Loris-Angriffen zu nachsichtig sind. `headers_timeout_ms` muss größer als `keep_alive_timeout_ms` sein — die Konfigurationsvalidierung lehnt einen Wert ab, der dies nicht erfüllt. `request_timeout_ms` begrenzt nur den Empfang einer Anfrage und unterbricht daher keine lang laufende `GET /mcp`-SSE-Antwort.
+
+### Ordnungsgemäßes Herunterfahren
+
+Bei `SIGINT`/`SIGTERM` (beide Transporte) — und bei stdio, wenn der Client sein Ende der Pipe schließt — führt der Server Folgendes aus:
+
+1. Sofortiges Schreiben aller unsauberen SQLite-Zustände auf die Festplatte.
+2. Drainage aktiver Verbindungen: Schließen jeder offenen MCP-Sitzung (HTTP) oder des MCP-`Server`/Transports (stdio).
+3. Stoppen der geplanten Cleanup- und Distillation-Timer.
+4. Schließen der SQLite-Verbindung (Checkpoint des Write-Ahead-Logs und erneutes Schreiben, falls während der Drainage etwas unsauber wurde).
+5. Beenden mit Exit-Code `0`.
+
+Ein zweites Signal während des Herunterfahrens wird ignoriert — die obige Sequenz läuft höchstens einmal. Wenn die Drainage nicht innerhalb von **10 Sekunden** abgeschlossen ist, protokolliert der Server ein `shutdown_timeout`-Ereignis, schreibt SQLite ein letztes Mal synchron und beendet sich mit Exit-Code `1`, damit Orchestratoren (Docker, systemd, Kubernetes) ein erzwungenes von einem sauberen Herunterfahren unterscheiden können. Dies begrenzt `docker stop`/Container-Neustart-Beendigungen auf ein vorhersehbares Zeitfenster, anstatt bis zu einem `SIGKILL` zu warten.
 
 ### Fail-Closed-Authentifizierung
 

@@ -50,6 +50,8 @@ describe('HealthService', () => {
         scheduled_cleanup_enabled: true,
         pre_expiry_warning_days: 7,
         compaction_deleted_threshold: 0.1,
+        audit_log_max_entries: 50000,
+        revisions_per_memory_max: 20,
       },
       deduplication: { enabled: true, similarity_threshold: 0.92 },
       resilience: {
@@ -229,6 +231,73 @@ describe('HealthService', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // -- trim-sqlite-query-and-health-overhead task 5.3: single-pass + TTL cache --
+
+  it('invokes countByTier and countUnsyncedVectors exactly once per (uncached) poll', async () => {
+    const storage = createStorage();
+    const embedding = createEmbedding(true);
+    const health = new HealthService(storage, embedding, createConfig());
+
+    await health.check();
+
+    expect(storage.sqlite.countByTier).toHaveBeenCalledTimes(1);
+    expect(storage.sqlite.countUnsyncedVectors).toHaveBeenCalledTimes(1);
+  });
+
+  it('a second poll inside the TTL invokes no sqlite aggregates again', async () => {
+    const storage = createStorage();
+    const embedding = createEmbedding(true);
+    const health = new HealthService(storage, embedding, createConfig());
+
+    await health.check();
+    await health.check();
+
+    expect(storage.sqlite.countByTier).toHaveBeenCalledTimes(1);
+    expect(storage.sqlite.countUnsyncedVectors).toHaveBeenCalledTimes(1);
+    expect(storage.sqlite.countMemories).toHaveBeenCalledTimes(1);
+    expect(storage.sqlite.getDbSizeBytes).toHaveBeenCalledTimes(1);
+    expect(storage.sqlite.countExpiringMemories).toHaveBeenCalledTimes(1);
+    expect(storage.sqlite.countArchivedMemories).toHaveBeenCalledTimes(1);
+  });
+
+  it('a poll after the 5s TTL refreshes the sqlite stats', async () => {
+    vi.useFakeTimers();
+    try {
+      const storage = createStorage();
+      const embedding = createEmbedding(true);
+      const health = new HealthService(storage, embedding, createConfig());
+
+      await health.check();
+      expect(storage.sqlite.countByTier).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(4_000);
+      await health.check();
+      expect(storage.sqlite.countByTier).toHaveBeenCalledTimes(1); // still within TTL
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      await health.check();
+      expect(storage.sqlite.countByTier).toHaveBeenCalledTimes(2); // TTL elapsed
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('degraded-status transitions from lifecycle state are visible immediately, regardless of the stats cache', async () => {
+    const storage = createStorage();
+    const embedding = createEmbedding(true);
+    const health = new HealthService(storage, embedding, createConfig());
+
+    await health.check(); // populates the 5s stats cache
+
+    // Live, uncached signal: a restore lifecycle operation starting must be
+    // reflected on the very next call even though the stats cache is fresh.
+    (storage.sqlite.getLifecycleOperation as ReturnType<typeof vi.fn>).mockReturnValue('restore');
+    const result = await health.check();
+
+    expect(result.components.vector_reconciliation.status).toBe('degraded');
+    expect(result.components.vector_reconciliation.state).toBe('reconciling');
   });
 
   it('returns memory count and db size', async () => {

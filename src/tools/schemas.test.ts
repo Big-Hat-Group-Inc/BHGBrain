@@ -65,6 +65,33 @@ describe('MCP_TOOL_DEFINITIONS (task 2.1)', () => {
   });
 });
 
+describe('collection/category name charset (fix-collection-name-collision)', () => {
+  // `collection` and `category.name` are embedded directly in a Qdrant
+  // collection name (`QdrantStore.collectionName`); a literal `.` or `/`
+  // used to pass schema validation and could collide two distinct values
+  // onto the same physical Qdrant collection. Both must now be rejected at
+  // the input boundary instead of silently colliding downstream.
+  it("rejects a literal dot in remember's collection with INVALID_INPUT", async () => {
+    const result = await handleTool(bareCtx(), 'remember', { content: 'x', collection: 'a.b' }, 'c1') as { error: { code: string } };
+    expect(result.error.code).toBe('INVALID_INPUT');
+  });
+
+  it("rejects a slash in remember's collection with INVALID_INPUT", async () => {
+    const result = await handleTool(bareCtx(), 'remember', { content: 'x', collection: 'a/b' }, 'c1') as { error: { code: string } };
+    expect(result.error.code).toBe('INVALID_INPUT');
+  });
+
+  it('rejects a slash in collections.name with INVALID_INPUT', async () => {
+    const result = await handleTool(bareCtx(), 'collections', { action: 'create', name: 'a/b' }, 'c1') as { error: { code: string } };
+    expect(result.error.code).toBe('INVALID_INPUT');
+  });
+
+  it("rejects a literal dot in category's name with INVALID_INPUT", async () => {
+    const result = await handleTool(bareCtx(), 'category', { action: 'set', name: 'a.b', slot: 'custom', content: 'x' }, 'c1') as { error: { code: string } };
+    expect(result.error.code).toBe('INVALID_INPUT');
+  });
+});
+
 describe('MCP_TOOL_NAMES lockstep with dispatch (task 3.2)', () => {
   it('every name in MCP_TOOL_NAMES has a dispatch case (does not return "Unknown tool")', async () => {
     for (const name of MCP_TOOL_NAMES) {

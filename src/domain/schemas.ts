@@ -2,6 +2,11 @@ import { z } from 'zod';
 
 const NAMESPACE_RE = /^[a-zA-Z0-9/-]{1,200}$/;
 const TAG_RE = /^[a-zA-Z0-9-]+$/;
+// `collection`/`category.name` are identifier-shaped fields embedded directly
+// in a Qdrant collection name (see `QdrantStore.collectionName`) — excluding
+// `.` and `/` here is what makes that encoding step collision-free, not just
+// a style convention. See fix-collection-name-collision.
+const COLLECTION_NAME_RE = /^[a-zA-Z0-9-]{1,100}$/;
 
 export const MemoryTypeSchema = z.enum(['episodic', 'semantic', 'procedural']);
 export const CategorySlotSchema = z.enum(['company-values', 'architecture', 'coding-requirements', 'custom']);
@@ -15,7 +20,7 @@ export const TagSchema = z.string().max(100).regex(TAG_RE, 'Tag must match ^[a-z
 export const TagsSchema = z.array(TagSchema).max(20);
 export const ContentSchema = z.string().min(1).max(100000);
 export const QuerySchema = z.string().min(1).max(500);
-export const NameSchema = z.string().min(1).max(100);
+export const CollectionNameSchema = z.string().regex(COLLECTION_NAME_RE, 'Name must match ^[a-zA-Z0-9-]{1,100}$');
 
 function stripControlChars(s: string): string {
   return s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
@@ -26,7 +31,7 @@ function stripControlChars(s: string): string {
 export const RememberInputSchema = z.object({
   content: ContentSchema.transform(stripControlChars),
   namespace: NamespaceSchema.default('global'),
-  collection: NameSchema.default('general'),
+  collection: CollectionNameSchema.default('general'),
   type: MemoryTypeSchema.optional(),
   tags: TagsSchema.optional().default([]),
   category: z.string().max(100).optional(),
@@ -51,7 +56,7 @@ export const RememberInputSchema = z.object({
 export const RecallInputSchema = z.object({
   query: QuerySchema.transform(stripControlChars),
   namespace: NamespaceSchema.default('global'),
-  collection: NameSchema.optional(),
+  collection: CollectionNameSchema.optional(),
   type: MemoryTypeSchema.optional(),
   tags: TagsSchema.optional(),
   limit: z.number().int().min(1).max(20).default(5),
@@ -76,7 +81,7 @@ export const ForgetInputSchema = z.object({
 export const SearchInputSchema = z.object({
   query: QuerySchema.transform(stripControlChars),
   namespace: NamespaceSchema.default('global'),
-  collection: NameSchema.optional(),
+  collection: CollectionNameSchema.optional(),
   mode: SearchModeSchema.default('hybrid'),
   limit: z.number().int().min(1).max(50).default(10),
   // Additive opt-in (add-review-and-archive-recall): archived matches are
@@ -101,13 +106,13 @@ export const TagInputSchema = z.object({
 export const CollectionsInputSchema = z.object({
   action: z.enum(['list', 'create', 'delete']),
   namespace: NamespaceSchema.default('global'),
-  name: NameSchema.optional(),
+  name: CollectionNameSchema.optional(),
   force: z.boolean().optional().default(false),
 }).strict();
 
 export const CategoryInputSchema = z.object({
   action: z.enum(['list', 'get', 'set', 'delete']),
-  name: NameSchema.optional(),
+  name: CollectionNameSchema.optional(),
   slot: CategorySlotSchema.optional(),
   content: ContentSchema.transform(stripControlChars).optional(),
 }).strict();
@@ -203,7 +208,7 @@ export const RepairInputSchema = z.object({
 export const ConsolidateInputSchema = z.object({
   action: z.enum(['list', 'merge']),
   namespace: NamespaceSchema.default('global'),
-  collection: NameSchema.default('general'),
+  collection: CollectionNameSchema.default('general'),
   // list only: cursor from a prior list call, and the minimum cluster size
   // (edges within the scanned page) below which a cluster is dropped.
   cursor: z.string().optional(),

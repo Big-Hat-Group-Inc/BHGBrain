@@ -342,13 +342,11 @@ export class StorageManager {
       }
     }
 
-    let deleted = 0;
-    for (const memory of memories) {
-      if (!confirmed.has(memory.id)) continue;
-      if (this.sqlite.deleteMemory(memory.id)) {
-        deleted++;
-      }
-    }
+    // Chunked, single-transaction batch delete (trim-sqlite-query-and-health-overhead
+    // task 2.2) instead of a per-row `deleteMemory` loop — no per-row existence
+    // probe, and `deleteMemoriesByIds` already scopes cleanly to the confirmed set.
+    const confirmedIds = memories.map(m => m.id).filter(id => confirmed.has(id));
+    const deleted = this.sqlite.deleteMemoriesByIds(confirmedIds);
 
     if (options?.flush !== false) {
       this.sqlite.flushIfDirty();
@@ -443,30 +441,33 @@ export class StorageManager {
     const collections = await this.qdrant.listAllCollections();
     log(`[bootstrap] hydrating from qdrant: found ${collections.length} collections`, { collections_count: collections.length });
 
+    // Preloaded once for the whole bootstrap run (trim-sqlite-query-and-health-overhead
+    // task 2.3) so per-point existence checks become a Set lookup instead of a
+    // `getMemoryById` query; `hydrateBatch` mutates this in place as it inserts.
+    const existingIds = this.sqlite.listMemoryIds();
+
     let total = 0;
     for (const collectionName of collections) {
       const points = await this.qdrant.scrollAll(collectionName);
-      let hydrated = 0;
-      for (const point of points) {
-        if (deviceFilter) {
-          const pointDeviceId = typeof point.payload.device_id === 'string' ? point.payload.device_id : null;
-          if (pointDeviceId !== deviceFilter) {
-            continue;
-          }
-        }
-        // Hydration is best-effort across the whole scan: one point that fails a
-        // SQLite constraint (fails loudly, atomically — see upsertMemoryFromPayload)
-        // must not silently succeed, but it also must not abort the remaining points
-        // in this collection or in later collections.
-        try {
-          const inserted = this.sqlite.upsertMemoryFromPayload(point.id, point.payload);
-          if (inserted) hydrated++;
-        } catch (err) {
-          logFailure(`[bootstrap] failed to hydrate point ${point.id} in ${collectionName}: ${(err as Error).message}`, {
-            collection: collectionName,
-            point_id: point.id,
-          });
-        }
+      const filteredPoints = deviceFilter
+        ? points.filter(point => {
+            const pointDeviceId = typeof point.payload.device_id === 'string' ? point.payload.device_id : null;
+            return pointDeviceId === deviceFilter;
+          })
+        : points;
+
+      // Hydration is best-effort across the whole scan: one point that fails a
+      // SQLite constraint (fails loudly, atomically — see hydrateBatch) must not
+      // silently succeed, but it also must not abort the remaining points in this
+      // collection or in later collections. One BEGIN/COMMIT per collection (task
+      // 2.4) instead of one per point, with a SAVEPOINT per point preserving that
+      // same per-point atomicity/isolation.
+      const { hydrated, failures } = this.sqlite.hydrateBatch(filteredPoints, existingIds);
+      for (const failure of failures) {
+        logFailure(`[bootstrap] failed to hydrate point ${failure.id} in ${collectionName}: ${failure.error}`, {
+          collection: collectionName,
+          point_id: failure.id,
+        });
       }
       this.sqlite.flushIfDirty();
       log(`[bootstrap] collection ${collectionName}: ${hydrated} points hydrated`, { collection: collectionName, hydrated });

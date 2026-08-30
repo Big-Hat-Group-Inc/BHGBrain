@@ -33,6 +33,11 @@ export interface GarbageCollectionResult {
   // Namespace/collection pairs whose Qdrant deleted-vector ratio crossed
   // `compaction_deleted_threshold` after this run and were nudged to compact.
   compacted: string[];
+  // Rows removed from `audit_log` / `memory_revisions` by this run's history
+  // pruning (trim-sqlite-query-and-health-overhead), 0 when the corresponding
+  // cap is `null` (pruning disabled) or nothing was over the cap.
+  audit_pruned: number;
+  revisions_pruned: number;
 }
 
 export class RetentionService {
@@ -95,6 +100,8 @@ export class RetentionService {
         candidates,
         reviewCandidates: reviewCandidateSummaries,
         compacted: [],
+        audit_pruned: 0,
+        revisions_pruned: 0,
       };
     }
 
@@ -167,6 +174,16 @@ export class RetentionService {
         });
       }
 
+      // History-table pruning (trim-sqlite-query-and-health-overhead task 4.4):
+      // runs inside GC's destructive phase, before the flush/degraded-state
+      // bookkeeping below, so it inherits GC's lifecycle bracketing and dry-run
+      // exclusion (the dryRun branch returns above without reaching here).
+      // `null` disables the corresponding prune.
+      const auditCap = this.config.retention.audit_log_max_entries;
+      const auditPruned = auditCap !== null ? this.storage.sqlite.pruneAuditLog(auditCap) : 0;
+      const revisionsCap = this.config.retention.revisions_per_memory_max;
+      const revisionsPruned = revisionsCap !== null ? this.storage.sqlite.pruneRevisions(revisionsCap) : 0;
+
       this.storage.sqlite.flushIfDirty();
 
       const degraded = deleteResult.degraded || archiveFailed;
@@ -197,6 +214,8 @@ export class RetentionService {
         review_candidates: reviewCandidateSummaries.length,
         compacted: compacted.length,
         duration_ms: durationMs,
+        audit_pruned: auditPruned,
+        revisions_pruned: revisionsPruned,
       });
 
       return {
@@ -208,6 +227,8 @@ export class RetentionService {
         candidates,
         reviewCandidates: reviewCandidateSummaries,
         compacted,
+        audit_pruned: auditPruned,
+        revisions_pruned: revisionsPruned,
       };
     } catch (err) {
       // A truly unexpected failure (not one of the per-item catches above):
@@ -234,6 +255,8 @@ export class RetentionService {
         candidates,
         reviewCandidates: reviewCandidateSummaries,
         compacted: [],
+        audit_pruned: 0,
+        revisions_pruned: 0,
       };
     } finally {
       this.storage.sqlite.endLifecycleOperation('gc');

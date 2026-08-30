@@ -664,6 +664,68 @@ describe('env-var config overlay', () => {
   });
 });
 
+// harden-http-server-lifecycle tasks 1.1/1.2, 6.5 (Zod half).
+describe('transport.http socket timeout config', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to proxy-safe timeouts (65s / 66s / 300s) when unset', () => {
+    const config = loadConfig('/nonexistent/config.json');
+    expect(config.transport.http.keep_alive_timeout_ms).toBe(65000);
+    expect(config.transport.http.headers_timeout_ms).toBe(66000);
+    expect(config.transport.http.request_timeout_ms).toBe(300000);
+  });
+
+  it('accepts custom timeouts that satisfy headers_timeout_ms > keep_alive_timeout_ms', () => {
+    const configPath = writeConfig({
+      transport: {
+        http: {
+          keep_alive_timeout_ms: 10000,
+          headers_timeout_ms: 11000,
+          request_timeout_ms: 60000,
+        },
+      },
+    });
+
+    const config = loadConfig(configPath);
+    expect(config.transport.http.keep_alive_timeout_ms).toBe(10000);
+    expect(config.transport.http.headers_timeout_ms).toBe(11000);
+    expect(config.transport.http.request_timeout_ms).toBe(60000);
+  });
+
+  it('rejects headers_timeout_ms equal to keep_alive_timeout_ms', () => {
+    const configPath = writeConfig({
+      transport: { http: { keep_alive_timeout_ms: 5000, headers_timeout_ms: 5000 } },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow(/headers_timeout_ms.*must be greater than.*keep_alive_timeout_ms/);
+  });
+
+  it('rejects headers_timeout_ms less than keep_alive_timeout_ms', () => {
+    const configPath = writeConfig({
+      transport: { http: { keep_alive_timeout_ms: 5000, headers_timeout_ms: 4000 } },
+    });
+
+    expect(() => loadConfig(configPath)).toThrow(/headers_timeout_ms.*must be greater than.*keep_alive_timeout_ms/);
+  });
+});
+
 function makeConfig(deviceId?: string): BrainConfig {
   return {
     device: { id: deviceId },

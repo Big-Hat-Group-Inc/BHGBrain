@@ -1,8 +1,13 @@
 import type { BrainConfig } from '../config/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { CircuitBreaker } from '../resilience/index.js';
-import { embeddingUnavailable } from '../errors/index.js';
+import { BrainError, embeddingUnavailable } from '../errors/index.js';
 import { AzureFoundryEmbeddingProvider } from './azure-foundry.js';
+import { executeSingleEmbeddingRequest, requestEmbeddingsWithRetry } from './request.js';
+
+function getErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : 'Unknown error';
+}
 
 function isMissingCredentialError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith('Missing environment variable: ');
@@ -41,6 +46,9 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   readonly identity: string;
   private apiKey: string;
   private baseUrl = 'https://api.openai.com/v1';
+  private readonly requestTimeoutMs: number;
+  private readonly retryMaxAttempts: number;
+  private readonly retryBackoffMs: number;
 
   constructor(
     config: BrainConfig,
@@ -50,6 +58,9 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.model = config.embedding.model;
     this.dimensions = config.embedding.dimensions;
     this.identity = formatEmbeddingIdentity(this.provider, this.model, this.dimensions);
+    this.requestTimeoutMs = config.embedding.request_timeout_ms;
+    this.retryMaxAttempts = config.embedding.retry.max_attempts;
+    this.retryBackoffMs = config.embedding.retry.backoff_ms;
     const key = process.env[config.embedding.api_key_env];
     if (!key) {
       throw new Error(`Missing environment variable: ${config.embedding.api_key_env}`);
@@ -62,13 +73,25 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     return results[0]!;
   }
 
+  // cut-embedding-and-qdrant-round-trips: routed through the shared
+  // timeout/retry/classification helper (see ./request.ts) so
+  // `request_timeout_ms` and `retry.*` apply identically to the Azure
+  // provider — previously this issued a bare `fetch` with neither. A
+  // classified error (e.g. rateLimited, a non-retryable BrainError) is
+  // rethrown as-is rather than re-wrapped, mirroring the Azure provider so
+  // callers see the same error taxonomy across providers; only an
+  // unclassified failure (network error, timeout after retries exhausted)
+  // gets wrapped as embeddingUnavailable here.
   async embedBatch(texts: string[]): Promise<number[][]> {
     const start = Date.now();
     try {
       const response = await this.requestEmbeddings(texts, true);
       return await this.parseEmbeddingsResponse(response);
     } catch (err) {
-      throw embeddingUnavailable(`Embedding provider unreachable: ${(err as Error).message}`);
+      if (err instanceof BrainError) {
+        throw err;
+      }
+      throw embeddingUnavailable(`Embedding provider unreachable: ${getErrorMessage(err)}`);
     } finally {
       this.metrics?.recordHistogram('embedding_embed_batch_ms', Date.now() - start);
     }
@@ -76,7 +99,10 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
 
   async healthCheck(): Promise<boolean> {
     try {
-      const response = await this.requestEmbeddings(['health check'], false);
+      // Single-shot, bounded probe (respects requestTimeoutMs via the abort
+      // controller in executeSingleEmbeddingRequest) — no retry/backoff loop,
+      // no breaker, mirroring AzureFoundryEmbeddingProvider.healthCheck().
+      const response = await this.executeSingleRequest(['health check']);
       await this.parseEmbeddingsResponse(response);
       return true;
     } catch {
@@ -84,24 +110,37 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     }
   }
 
+  private requestBody(texts: string[]): { model: string; input: string[] } {
+    return { model: this.model, input: texts };
+  }
+
+  private requestHeaders(): Record<string, string> {
+    return {
+      'Authorization': `Bearer ${this.apiKey}`,
+      'Content-Type': 'application/json',
+    };
+  }
+
   private async requestEmbeddings(texts: string[], useBreaker: boolean): Promise<Response> {
-    const executeFetch = () => fetch(`${this.baseUrl}/embeddings`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: this.model,
-        input: texts,
-      }),
+    return requestEmbeddingsWithRetry({
+      url: `${this.baseUrl}/embeddings`,
+      headers: this.requestHeaders(),
+      body: this.requestBody(texts),
+      timeoutMs: this.requestTimeoutMs,
+      retry: { max_attempts: this.retryMaxAttempts, backoff_ms: this.retryBackoffMs },
+      breaker: this.breaker,
+      useBreaker,
+      errorPrefix: 'OpenAI',
     });
+  }
 
-    if (useBreaker && this.breaker) {
-      return this.breaker.execute(executeFetch);
-    }
-
-    return executeFetch();
+  private async executeSingleRequest(texts: string[]): Promise<Response> {
+    return executeSingleEmbeddingRequest({
+      url: `${this.baseUrl}/embeddings`,
+      headers: this.requestHeaders(),
+      body: this.requestBody(texts),
+      timeoutMs: this.requestTimeoutMs,
+    });
   }
 
   private async parseEmbeddingsResponse(response: Response): Promise<number[][]> {

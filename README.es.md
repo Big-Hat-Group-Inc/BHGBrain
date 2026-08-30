@@ -309,7 +309,19 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
       // Puerto en el que escuchar
       "port": 3721,
       // Nombre de la variable de entorno que contiene el bearer token para autenticación HTTP
-      "bearer_token_env": "BHGBRAIN_TOKEN"
+      "bearer_token_env": "BHGBRAIN_TOKEN",
+      // Timeouts de socket aplicados al http.Server subyacente (ms). Los valores por
+      // defecto son seguros para proxies: keep-alive por encima del timeout de
+      // inactividad de 60s habitual en un proxy inverso, y headers timeout por encima
+      // de ese (Node requiere headers_timeout_ms > keep_alive_timeout_ms para evitar
+      // condiciones de carrera ECONNRESET — la validación de configuración rechaza un
+      // valor que no cumpla esto).
+      "keep_alive_timeout_ms": 65000,
+      "headers_timeout_ms": 66000,
+      // Tiempo permitido para recibir completamente una solicitud; no limita las
+      // respuestas SSE de larga duración en GET /mcp, que solo reciben una
+      // solicitud, no envían una.
+      "request_timeout_ms": 300000
     },
     "stdio": {
       // Habilitar transporte MCP stdio
@@ -386,6 +398,19 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
 
     // Umbral de compactación de segmentos de Qdrant (compactar cuando esta fracción de un segmento está eliminada)
     "compaction_deleted_threshold": 0.10,
+
+    // Límites para las dos tablas de historial de solo inserción (audit_log,
+    // memory_revisions), aplicados por la misma limpieza programada
+    // (bhgbrain gc / scheduled_cleanup_enabled) que ejecuta el resto de la
+    // retención anterior. `null` desactiva la poda correspondiente (el
+    // comportamiento previo de "conservar para siempre"). audit_log_max_entries
+    // conserva las N filas más recientes por marca de tiempo;
+    // revisions_per_memory_max conserva las N revisiones más altas por
+    // memoria. Los valores por defecto son generosos — un almacén debe ser
+    // realmente longevo antes de que cualquiera de las dos pode una fila. Una
+    // ejecución en seco (`bhgbrain gc --dry-run`) nunca poda.
+    "audit_log_max_entries": 50000,
+    "revisions_per_memory_max": 20,
 
     // Destilación de memoria programada: agrupa memorias episódicas T2/T3
     // relacionadas y aún activas, y consolida cada clúster calificado en una
@@ -1717,9 +1742,11 @@ El servidor ejecuta un trabajo de limpieza programado (por defecto: diariamente 
 
 6. **Compactación (dirigida por umbral, no por eliminación):** Para cada par namespace/colección del que esta ejecución eliminó memorias, una vez que la proporción de vectores eliminados supera `retention.compaction_deleted_threshold`, la ejecución impulsa al optimizador de segmentos de Qdrant a recuperar espacio vía `optimizers_config.deleted_threshold`.
 
-7. **Volcado:** SQLite se vuelca atómicamente a disco después de todas las eliminaciones.
+7. **Poda de tablas de historial:** `audit_log` (las `retention.audit_log_max_entries` filas más recientes, por marca de tiempo) y `memory_revisions` (las `retention.revisions_per_memory_max` revisiones más altas por memoria) se recortan a sus límites configurados — ambas tablas de solo inserción crecerían indefinidamente en caso contrario. Cualquiera de los dos límites en `null` desactiva su poda. Se omite por completo en una ejecución en seco. Los recuentos podados se reportan como `audit_pruned`/`revisions_pruned` en el resultado del GC y se registran en el evento `retention_gc`.
 
-8. **Señal de salud:** Si algún paso de archivado o eliminación falla a mitad de camino, el resultado de la ejecución se persiste y aparece como un componente `retention` degradado en `health://status` hasta la próxima ejecución de GC limpia.
+8. **Volcado:** SQLite se vuelca atómicamente a disco después de todas las eliminaciones.
+
+9. **Señal de salud:** Si algún paso de archivado o eliminación falla a mitad de camino, el resultado de la ejecución se persiste y aparece como un componente `retention` degradado en `health://status` hasta la próxima ejecución de GC limpia.
 
 Una ejecución de GC — manual o programada — nunca lanza un error a quien la invoca: los fallos inesperados se capturan, el bloqueo de ciclo de vida en curso siempre se libera, y el resultado se reporta como `degraded: true` con el trabajo ya completado intacto.
 
@@ -3813,6 +3840,12 @@ está **autenticado por defecto**:
 
 El contenedor también se ejecuta como un usuario no root (`node`).
 
+La imagen también establece `NODE_ENV=production` como defensa adicional (elimina la
+sobrecarga del modo de desarrollo de Express). Esto no es lo que evita que las
+respuestas de error filtren stack traces — eso lo garantiza el middleware de error
+JSON terminal en cualquier entorno, contenedor o no —, pero es de todas formas un
+valor por defecto sensato para una imagen en tiempo de ejecución.
+
 ### Perfiles de Compose
 
 | Comando | Qué se ejecuta |
@@ -3985,6 +4018,21 @@ Una vez que termina la comprobación de drift, se libera el bloqueo — la reinc
 - El límite de tasa se basa en la identidad de solicitud confiable (IP) e ignora `x-client-id` para su aplicación.
 - El `client_id` de los logs de auditoría/solicitud también se deriva de la identidad de solicitud confiable (`req.ip`), nunca del encabezado `x-client-id` proporcionado por el llamante; ese encabezado solo se acepta como una pista de depuración no autoritativa y nunca se confía en él para el registro de auditoría.
 - `memory://list` aplica límites de `limit` de `1..100`; los valores inválidos devuelven `INVALID_INPUT`.
+- Toda ruta de error HTTP — un manejador de ruta que lanza o rechaza, un cuerpo de solicitud JSON mal formado, un `?uri=` mal formado en `GET /resource` — devuelve el sobre estructurado `{error:{code,message,retryable}}`. Ningún stack trace ni página de error HTML sale jamás del proceso, sin importar `NODE_ENV`; un middleware de error terminal de Express respalda cualquier cosa que una ruta no maneje por sí misma, y los errores inesperados se siguen registrando en el servidor (solo que no se reflejan en el cuerpo de la respuesta).
+- Las respuestas deshabilitan el encabezado `X-Powered-By` y establecen `X-Content-Type-Options: nosniff`. Las respuestas se comprimen con gzip cuando el cliente envía `Accept-Encoding: gzip`, excepto `text/event-stream` (el stream SSE de `/mcp`), que nunca se almacena en búfer para compresión.
+- `transport.http.keep_alive_timeout_ms` / `headers_timeout_ms` / `request_timeout_ms` (valores por defecto 65 s / 66 s / 300 s) reemplazan los valores por defecto de timeout de socket propios de Node, que son demasiado cortos para keep-alive detrás de un proxy inverso y demasiado permisivos frente a ataques slow-loris. `headers_timeout_ms` debe ser mayor que `keep_alive_timeout_ms` — la validación de configuración rechaza un valor que no cumpla esto. `request_timeout_ms` limita solo la recepción de una solicitud, por lo que no corta una respuesta SSE de larga duración en `GET /mcp`.
+
+### Apagado Ordenado (Graceful Shutdown)
+
+Ante `SIGINT`/`SIGTERM` (ambos transportes) — y, para stdio, cuando el cliente cierra su extremo de la tubería — el servidor:
+
+1. Vacía inmediatamente cualquier estado SQLite sucio a disco.
+2. Drena las conexiones activas: cierra cada sesión MCP abierta (HTTP) o el `Server`/transporte MCP (stdio).
+3. Detiene los temporizadores programados de limpieza y destilación.
+4. Cierra la conexión SQLite (aplica checkpoint al write-ahead log y vuelve a vaciar si algo quedó sucio durante el drenaje).
+5. Termina con código de salida `0`.
+
+Una segunda señal durante el apagado se ignora — la secuencia anterior se ejecuta como máximo una vez. Si el drenaje no ha terminado dentro de **10 segundos**, el servidor registra un evento `shutdown_timeout`, vacía SQLite de forma síncrona una vez más, y termina con código de salida `1` para que los orquestadores (Docker, systemd, Kubernetes) puedan distinguir un apagado forzado de uno limpio. Esto acota los apagados por `docker stop`/reinicio de contenedor a una ventana predecible en lugar de agotar el tiempo hasta un `SIGKILL`.
 
 ### Autenticación Fail-Closed
 

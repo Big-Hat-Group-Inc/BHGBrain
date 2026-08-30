@@ -1,4 +1,4 @@
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { readFileSync, writeFileSync, existsSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -83,6 +83,7 @@ export interface SqliteStorage {
   insertMemory(mem: MemoryRecordWithoutEmbedding): void;
   updateMemory(id: string, fields: Partial<MemoryRecordWithoutEmbedding>): void;
   deleteMemory(id: string): boolean;
+  deleteMemoriesByIds(ids: string[]): number;
   getMemoryById(id: string, includeArchived?: boolean): MemoryRecordWithoutEmbedding | null;
   getMemoryByChecksum(namespace: string, checksum: string, collection?: string): MemoryRecordWithoutEmbedding | null;
   listMemories(namespace: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
@@ -144,6 +145,8 @@ export interface SqliteStorage {
   deleteArchive(memoryId: string): void;
   insertRevision(memoryId: string, revision: number, content: string, updatedAt: string, updatedBy?: string): void;
   listRevisions(memoryId: string): MemoryRevisionRecord[];
+  pruneAuditLog(maxEntries: number): number;
+  pruneRevisions(maxPerMemory: number): number;
   addMemoryLink(
     namespace: string, fromId: string, toId: string, relation: MemoryLinkRelation, createdBy: string | null,
   ): { record: MemoryLinkRecord; created: boolean };
@@ -177,7 +180,12 @@ export interface SqliteStorage {
   getLifecycleOperation(): string | null;
   getMemoriesByIds(ids: string[]): MemoryRecordWithoutEmbedding[];
   listMemoryIdsInCollection(namespace: string, collection: string): string[];
+  listMemoryIds(): Set<string>;
   upsertMemoryFromPayload(id: string, payload: Record<string, unknown>): boolean;
+  hydrateBatch(
+    points: Array<{ id: string; payload: Record<string, unknown> }>,
+    existingIds: Set<string>,
+  ): { hydrated: number; failures: Array<{ id: string; error: string }> };
   listCategoryHeaders(): CategoryHeader[];
   getCategoryContentSlice(name: string, maxChars: number): CategoryContentSlice | null;
 
@@ -225,8 +233,6 @@ CREATE TABLE IF NOT EXISTS memories (
   last_accessed TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
-CREATE INDEX IF NOT EXISTS idx_memories_collection ON memories(namespace, collection);
 CREATE INDEX IF NOT EXISTS idx_memories_checksum ON memories(namespace, checksum);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(namespace, type);
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
@@ -238,6 +244,20 @@ CREATE INDEX IF NOT EXISTS idx_memories_review_due ON memories(retention_tier, r
 CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(archived);
 CREATE INDEX IF NOT EXISTS idx_memories_vector_synced ON memories(vector_synced);
 CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(namespace, pinned);
+
+-- trim-sqlite-query-and-health-overhead task 1.1: covering indexes for the
+-- hot list/sweep predicates so SQLite can satisfy ORDER BY from the index
+-- (no temp B-tree sort) and the staleness/vector-sync sweeps can index-seek
+-- instead of full-scanning. idx_memories_ns_created and
+-- idx_memories_ns_coll_created subsume the leftmost prefixes of the
+-- dropped idx_memories_namespace / idx_memories_collection above, so
+-- those two are dropped here rather than kept alongside (net +4/-2 indexes).
+CREATE INDEX IF NOT EXISTS idx_memories_ns_created ON memories(namespace, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_ns_coll_created ON memories(namespace, collection, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_stale_accessed ON memories(stale, last_accessed);
+CREATE INDEX IF NOT EXISTS idx_memories_unsynced_created ON memories(vector_synced, created_at, id);
+DROP INDEX IF EXISTS idx_memories_namespace;
+DROP INDEX IF EXISTS idx_memories_collection;
 
 -- memories_fts is intentionally NOT created here. It is derived data
 -- (rebuildable from memories at any time) whose *shape* depends on runtime
@@ -431,6 +451,17 @@ export class SqliteStore implements SqliteStorage {
   // gracefully and visibly" requirement.
   private ftsAvailable = false;
 
+  // Prepared-statement cache (trim-sqlite-query-and-health-overhead task 3.1):
+  // fixed-SQL hot-path queries (getMemoryById, countMemories, countByTier,
+  // countUnsyncedVectors, countArchivedMemories, listAudit) are compiled once
+  // per database handle and reused via `preparedStatement()`/`queryOneCached()`/
+  // `queryAllCached()` below, instead of `db.prepare()` recompiling the same
+  // SQL text on every call. Keyed by exact SQL string — the key space is the
+  // fixed set of literals at those call sites, so no size bound is needed.
+  // Dynamically assembled SQL (cursor/filter variants elsewhere in this file)
+  // keeps using the prepare-per-call `execSql`/`queryAll`/`queryOne` path.
+  private preparedStatements = new Map<string, StatementSync>();
+
   constructor(private dataDir: string) {
     this.dbPath = join(dataDir, 'brain.db');
   }
@@ -458,6 +489,33 @@ export class SqliteStore implements SqliteStorage {
   }
 
   /**
+   * Returns a cached `StatementSync` for `sql`, compiling it once per
+   * database handle and reusing it thereafter (task 3.1). Only for
+   * fixed-SQL call sites; the caller re-binds params on every `get()`/
+   * `all()` call, which `node:sqlite`'s `StatementSync` supports directly
+   * (no explicit `reset()` step exists on this API).
+   */
+  private preparedStatement(sql: string): StatementSync {
+    let stmt = this.preparedStatements.get(sql);
+    if (!stmt) {
+      stmt = this.db.prepare(sql);
+      this.preparedStatements.set(sql, stmt);
+    }
+    return stmt;
+  }
+
+  /** Cached-statement counterpart to `queryOne`, for fixed-SQL call sites. */
+  private queryOneCached(sql: string, params: SqlParams = []): SqlRow | null {
+    const row = this.preparedStatement(sql).get(...params);
+    return row === undefined ? null : this.getRow(row);
+  }
+
+  /** Cached-statement counterpart to `queryAll`, for fixed-SQL call sites. */
+  private queryAllCached(sql: string, params: SqlParams = []): SqlRow[] {
+    return this.preparedStatement(sql).all(...params).map(row => this.getRow(row));
+  }
+
+  /**
    * Opens (creating if absent) `this.dbPath` directly with `DatabaseSync` — no
    * whole-file read — applies the WAL pragmas, runs column migrations and
    * `SCHEMA_SQL`, and re-probes FTS5 support. Shared by `init()`,
@@ -465,6 +523,12 @@ export class SqliteStore implements SqliteStorage {
    * stay identical.
    */
   private openDatabase(): void {
+    // A cached Statement is bound to the `DatabaseSync` handle that compiled
+    // it; every path that assigns a new `this.db` (init/reloadFromDisk/
+    // activateDatabaseImage all funnel through here) must invalidate the
+    // cache first, or a later cached-query call would run against a closed
+    // handle (task 3.2 — "must never outlive its Database handle").
+    this.preparedStatements.clear();
     this.db = new DatabaseSync(this.dbPath);
     // WAL: page-level journaling instead of sql.js's whole-file export/rewrite.
     // synchronous=NORMAL: durable at every commit (fsynced on WAL checkpoint
@@ -799,6 +863,68 @@ export class SqliteStore implements SqliteStorage {
 
   upsertMemoryFromPayload(id: string, payload: Record<string, unknown>): boolean {
     this.assertMutableAllowed();
+    if (this.getMemoryById(id)) {
+      return false;
+    }
+    this.insertMemoryFromPayloadAtomic(id, payload);
+    return true;
+  }
+
+  /**
+   * Batched counterpart to `upsertMemoryFromPayload` (trim-sqlite-query-and-
+   * health-overhead task 2.4): the whole `points` batch (one Qdrant
+   * collection's worth, per `bootstrapFromQdrant`) runs inside one
+   * `BEGIN`/`COMMIT`, with each point's insert wrapped in its own
+   * `SAVEPOINT`/`RELEASE` (`ROLLBACK TO` on failure) so one bad point rolls
+   * back only itself — the outer transaction stays committable and every
+   * other point in the batch still lands, exactly matching
+   * `upsertMemoryFromPayload`'s existing best-effort, per-point-atomic
+   * contract. `existingIds` (preloaded once per bootstrap via
+   * `listMemoryIds()`) is consulted instead of a per-point `getMemoryById`
+   * query, and is mutated in place with every id this call inserts so a
+   * later batch in the same bootstrap run sees it as already present.
+   */
+  hydrateBatch(
+    points: Array<{ id: string; payload: Record<string, unknown> }>,
+    existingIds: Set<string>,
+  ): { hydrated: number; failures: Array<{ id: string; error: string }> } {
+    this.assertMutableAllowed();
+    let hydrated = 0;
+    const failures: Array<{ id: string; error: string }> = [];
+    if (points.length === 0) return { hydrated, failures };
+
+    this.execSql('BEGIN TRANSACTION');
+    try {
+      for (const point of points) {
+        if (existingIds.has(point.id)) continue;
+        try {
+          this.insertMemoryFromPayloadAtomic(point.id, point.payload);
+          hydrated++;
+          existingIds.add(point.id);
+        } catch (err) {
+          failures.push({ id: point.id, error: (err as Error).message });
+        }
+      }
+      this.execSql('COMMIT');
+    } catch (err) {
+      this.execSql('ROLLBACK');
+      throw err;
+    }
+    return { hydrated, failures };
+  }
+
+  /**
+   * Parses a Qdrant payload into `memories`/`memories_fts` rows and inserts
+   * both atomically via `SAVEPOINT`/`RELEASE` (`ROLLBACK TO` + rethrow on
+   * failure) — a plain (non-`OR IGNORE`) insert into `memories` fails loudly
+   * on a constraint violation instead of being swallowed, and the savepoint
+   * guarantees no orphan FTS row survives a rolled-back `memories` insert.
+   * A `SAVEPOINT` works whether or not an outer `BEGIN` is already active
+   * (it implicitly opens one otherwise), so this is safe to call both
+   * standalone (`upsertMemoryFromPayload`) and nested inside `hydrateBatch`'s
+   * outer transaction.
+   */
+  private insertMemoryFromPayloadAtomic(id: string, payload: Record<string, unknown>): void {
     const now = new Date().toISOString();
     const content = typeof payload.content === 'string' ? payload.content : '';
     const summary = typeof payload.summary === 'string' ? payload.summary : '';
@@ -844,17 +970,7 @@ export class SqliteStore implements SqliteStorage {
       expiresAt = payload.expires_at;
     }
 
-    // Check if already exists — skip if so (idempotent)
-    if (this.getMemoryById(id)) {
-      return false;
-    }
-
-    // Hydration must be atomic per memory: the `memories` insert and its
-    // `memories_fts` companion either both apply or neither does. A plain (non-`OR
-    // IGNORE`) insert into `memories` fails loudly on a constraint violation instead
-    // of being swallowed, and the surrounding transaction guarantees no orphan FTS
-    // row survives a rolled-back memories insert.
-    this.execSql('BEGIN TRANSACTION');
+    this.execSql('SAVEPOINT sp_hydrate');
     try {
       this.execSql(
         `INSERT INTO memories (
@@ -873,12 +989,12 @@ export class SqliteStore implements SqliteStorage {
         `INSERT OR IGNORE INTO memories_fts (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
         [id, namespace, collection, content, summary, tags.join(' ')],
       );
-      this.execSql('COMMIT');
+      this.execSql('RELEASE sp_hydrate');
     } catch (err) {
-      this.execSql('ROLLBACK');
+      this.execSql('ROLLBACK TO sp_hydrate');
+      this.execSql('RELEASE sp_hydrate');
       throw err;
     }
-    return true;
   }
 
   updateMemory(id: string, fields: Partial<MemoryRecordWithoutEmbedding>): void {
@@ -939,11 +1055,46 @@ export class SqliteStore implements SqliteStorage {
     return true;
   }
 
+  /**
+   * Chunked `WHERE id IN (...)` delete against `memories` and `memories_fts`
+   * (trim-sqlite-query-and-health-overhead task 2.1): one `BEGIN`/`COMMIT`
+   * covering every chunk (chunk size 500, comfortably under any SQLite
+   * bound-parameter limit) instead of a per-row existence probe plus two
+   * single-row DELETEs. `id`s the caller has already confirmed (there is no
+   * per-row existence check here) that don't exist are a harmless no-op —
+   * the returned count only reflects rows actually removed from `memories`,
+   * via `changes` on each chunk's result. Memory-links cascade cleanup
+   * (mirroring `deleteMemory`) runs per chunk too, so a bulk delete never
+   * leaves dangling edges the way the single-row path avoids.
+   */
+  deleteMemoriesByIds(ids: string[]): number {
+    this.assertMutableAllowed();
+    if (ids.length === 0) return 0;
+    const CHUNK = 500;
+    let deleted = 0;
+    this.execSql('BEGIN TRANSACTION');
+    try {
+      for (let i = 0; i < ids.length; i += CHUNK) {
+        const chunk = ids.slice(i, i + CHUNK);
+        const placeholders = chunk.map(() => '?').join(', ');
+        const result = this.db.prepare(`DELETE FROM memories WHERE id IN (${placeholders})`).run(...chunk);
+        deleted += Number(result.changes);
+        this.execSql(`DELETE FROM memories_fts WHERE id IN (${placeholders})`, chunk);
+        this.execSql(`DELETE FROM memory_links WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})`, [...chunk, ...chunk]);
+      }
+      this.execSql('COMMIT');
+    } catch (err) {
+      this.execSql('ROLLBACK');
+      throw err;
+    }
+    return deleted;
+  }
+
   getMemoryById(id: string, includeArchived = false): MemoryRecordWithoutEmbedding | null {
     const sql = includeArchived
       ? `SELECT * FROM memories WHERE id = ?`
       : `SELECT * FROM memories WHERE id = ? AND archived = 0`;
-    const row = this.queryOne(sql, [id]);
+    const row = this.queryOneCached(sql, [id]);
     return row ? this.rowToMemory(row) : null;
   }
 
@@ -1027,7 +1178,7 @@ export class SqliteStore implements SqliteStorage {
       ? `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND archived = 0`
       : `SELECT COUNT(*) as cnt FROM memories WHERE archived = 0`;
     const params: SqlParams = namespace ? [namespace] : [];
-    const row = this.queryOne(sql, params);
+    const row = this.queryOneCached(sql, params);
     return row ? this.getNumber(row, 'cnt') : 0;
   }
 
@@ -1432,7 +1583,7 @@ export class SqliteStore implements SqliteStorage {
 
   countByTier(): Record<RetentionTier, number> {
     const counts: Record<RetentionTier, number> = { T0: 0, T1: 0, T2: 0, T3: 0 };
-    const rows = this.queryAll(
+    const rows = this.queryAllCached(
       `SELECT retention_tier, COUNT(*) as cnt FROM memories WHERE archived = 0 GROUP BY retention_tier`,
     );
     for (const row of rows) {
@@ -1533,12 +1684,12 @@ export class SqliteStore implements SqliteStorage {
   }
 
   countArchivedMemories(): number {
-    const row = this.queryOne(`SELECT COUNT(*) as cnt FROM memory_archive`);
+    const row = this.queryOneCached(`SELECT COUNT(*) as cnt FROM memory_archive`);
     return row ? this.getNumber(row, 'cnt') : 0;
   }
 
   countUnsyncedVectors(): number {
-    const row = this.queryOne(`SELECT COUNT(*) as cnt FROM memories WHERE archived = 0 AND vector_synced = 0`);
+    const row = this.queryOneCached(`SELECT COUNT(*) as cnt FROM memories WHERE archived = 0 AND vector_synced = 0`);
     return row ? this.getNumber(row, 'cnt') : 0;
   }
 
@@ -1915,8 +2066,49 @@ export class SqliteStore implements SqliteStorage {
     );
   }
 
+  /**
+   * Keeps the newest `maxEntries` rows in `audit_log` (by `timestamp`,
+   * served by `idx_audit_timestamp`) and deletes the rest — the append-only
+   * table's only prune path (trim-sqlite-query-and-health-overhead task
+   * 4.2). `timestamp` is an ISO-8601 string, so `ORDER BY timestamp DESC`
+   * sorts newest-first lexicographically the same as chronologically. `id`
+   * is included as a tie-break so rows sharing a `timestamp` still resolve
+   * to a stable "keep" set across repeated calls.
+   */
+  pruneAuditLog(maxEntries: number): number {
+    this.assertMutableAllowed();
+    const result = this.db.prepare(
+      `DELETE FROM audit_log WHERE id NOT IN (
+         SELECT id FROM audit_log ORDER BY timestamp DESC, id DESC LIMIT ?
+       )`,
+    ).run(maxEntries);
+    return Number(result.changes);
+  }
+
+  /**
+   * For every `memory_id`, keeps the `maxPerMemory` highest `revision`
+   * numbers in `memory_revisions` and deletes the rest (task 4.3). A
+   * per-memory `ROW_NUMBER()` window (partitioned by `memory_id`, ordered by
+   * `revision DESC`) identifies the rows to keep without needing a
+   * correlated subquery per memory. `listRevisions`' `ORDER BY revision
+   * DESC` and the `memory://{id}/revisions` resource it backs are unaffected
+   * — pruning only removes rows from the tail of that ordering.
+   */
+  pruneRevisions(maxPerMemory: number): number {
+    this.assertMutableAllowed();
+    const result = this.db.prepare(
+      `DELETE FROM memory_revisions WHERE id IN (
+         SELECT id FROM (
+           SELECT id, ROW_NUMBER() OVER (PARTITION BY memory_id ORDER BY revision DESC) AS rn
+           FROM memory_revisions
+         ) WHERE rn > ?
+       )`,
+    ).run(maxPerMemory);
+    return Number(result.changes);
+  }
+
   listAudit(limit: number): AuditEntry[] {
-    const rows = this.queryAll(`SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?`, [limit]);
+    const rows = this.queryAllCached(`SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?`, [limit]);
     return rows.map(row => ({
       id: this.getString(row, 'id'),
       timestamp: this.getString(row, 'timestamp'),
@@ -2008,6 +2200,7 @@ export class SqliteStore implements SqliteStorage {
     // TRUNCATE first".
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     this.db.close();
+    this.preparedStatements.clear();
   }
 
   beginLifecycleOperation(reason: string): void {
@@ -2045,6 +2238,18 @@ export class SqliteStore implements SqliteStorage {
   listMemoryIdsInCollection(namespace: string, collection: string): string[] {
     const rows = this.queryAll(`SELECT id FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`, [namespace, collection]);
     return rows.map(row => this.getString(row, 'id'));
+  }
+
+  /**
+   * Every memory id currently in the store (archived included — hydration
+   * must recognize a point as already-present regardless of lifecycle
+   * state). Used by `bootstrapFromQdrant` to preload a `Set` once per
+   * bootstrap instead of a `getMemoryById` existence probe per Qdrant point
+   * (trim-sqlite-query-and-health-overhead task 2.3).
+   */
+  listMemoryIds(): Set<string> {
+    const rows = this.queryAll(`SELECT id FROM memories`);
+    return new Set(rows.map(row => this.getString(row, 'id')));
   }
 
   listCategoryHeaders(): CategoryHeader[] {

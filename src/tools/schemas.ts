@@ -51,7 +51,7 @@ export const MCP_TOOL_DEFINITIONS = [
       properties: {
         content: { type: 'string', description: 'The content to remember', maxLength: 100000 },
         namespace: { type: 'string', description: 'Namespace scope (default: global)', pattern: '^[a-zA-Z0-9/-]{1,200}$' },
-        collection: { type: 'string', description: 'Collection name (default: general)', maxLength: 100 },
+        collection: { type: 'string', description: 'Collection name (default: general)', pattern: '^[a-zA-Z0-9-]{1,100}$' },
         type: { type: 'string', enum: ['episodic', 'semantic', 'procedural'], description: 'Memory type' },
         tags: { type: 'array', items: { type: 'string', pattern: '^[a-zA-Z0-9-]+$', maxLength: 100 }, maxItems: 20 },
         category: { type: 'string', description: 'Category name for persistent policy context', maxLength: 100 },
@@ -96,7 +96,7 @@ export const MCP_TOOL_DEFINITIONS = [
       properties: {
         query: { type: 'string', description: 'The recall query', maxLength: 500 },
         namespace: { type: 'string', pattern: '^[a-zA-Z0-9/-]{1,200}$' },
-        collection: { type: 'string', maxLength: 100 },
+        collection: { type: 'string', pattern: '^[a-zA-Z0-9-]{1,100}$' },
         type: { type: 'string', enum: ['episodic', 'semantic', 'procedural'] },
         tags: { type: 'array', items: { type: 'string' }, maxItems: 20 },
         limit: { type: 'number', minimum: 1, maximum: 20, default: 5 },
@@ -144,7 +144,7 @@ export const MCP_TOOL_DEFINITIONS = [
       properties: {
         query: { type: 'string', maxLength: 500 },
         namespace: { type: 'string', pattern: '^[a-zA-Z0-9/-]{1,200}$' },
-        collection: { type: 'string', maxLength: 100 },
+        collection: { type: 'string', pattern: '^[a-zA-Z0-9-]{1,100}$' },
         mode: { type: 'string', enum: ['semantic', 'fulltext', 'hybrid'], default: 'hybrid' },
         limit: { type: 'number', minimum: 1, maximum: 50, default: 10 },
         include_archived: { type: 'boolean', description: 'Also search archived memories (retained summary/tags only), appended and marked archived: true. Default false.', default: false },
@@ -191,7 +191,7 @@ export const MCP_TOOL_DEFINITIONS = [
       properties: {
         action: { type: 'string', enum: ['list', 'create', 'delete'] },
         namespace: { type: 'string', pattern: '^[a-zA-Z0-9/-]{1,200}$', description: 'Namespace scope (default: global)' },
-        name: { type: 'string', maxLength: 100 },
+        name: { type: 'string', pattern: '^[a-zA-Z0-9-]{1,100}$' },
         force: { type: 'boolean', description: 'Required to delete non-empty collections' },
       },
       required: ['action'],
@@ -208,7 +208,7 @@ export const MCP_TOOL_DEFINITIONS = [
       type: 'object' as const,
       properties: {
         action: { type: 'string', enum: ['list', 'get', 'set', 'delete'] },
-        name: { type: 'string', maxLength: 100 },
+        name: { type: 'string', pattern: '^[a-zA-Z0-9-]{1,100}$' },
         slot: { type: 'string', enum: ['company-values', 'architecture', 'coding-requirements', 'custom'] },
         content: { type: 'string', maxLength: 100000 },
       },
@@ -374,7 +374,7 @@ export const MCP_TOOL_DEFINITIONS = [
       properties: {
         action: { type: 'string', enum: ['list', 'merge'], description: 'The action to perform' },
         namespace: { type: 'string', description: 'Namespace scope (default: global)', pattern: '^[a-zA-Z0-9/-]{1,200}$' },
-        collection: { type: 'string', description: 'Collection name (default: general)', maxLength: 100 },
+        collection: { type: 'string', description: 'Collection name (default: general)', pattern: '^[a-zA-Z0-9-]{1,100}$' },
         cursor: { type: 'string', description: '(list only) Pagination cursor from a prior list call' },
         min_cluster_size: { type: 'number', minimum: 2, default: 2, description: '(list only) Minimum members for a cluster to be reported' },
         target_id: { type: 'string', format: 'uuid', description: '(merge only) The memory id every source is merged into' },

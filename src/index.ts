@@ -24,8 +24,86 @@ import { createLogger } from './health/logger.js';
 import { CircuitBreaker } from './resilience/index.js';
 import { ResourceHandler } from './resources/index.js';
 import type { ToolContext } from './tools/index.js';
-import { createHttpServer } from './transport/http.js';
+import { createHttpServer, applyHttpServerTimeouts } from './transport/http.js';
 import { buildMcpServer } from './transport/mcp-server.js';
+import type pino from 'pino';
+
+/** Milliseconds a shutdown drain is given before the hard deadline forces exit. */
+const SHUTDOWN_DEADLINE_MS = 10_000;
+
+interface ShutdownDeps {
+  logger: pino.Logger;
+  sqlite: SqliteStore;
+  cleanupScheduler: CleanupScheduler;
+  distillationScheduler: DistillationScheduler;
+  transport: 'http' | 'stdio';
+  /**
+   * Transport-specific drain step: for HTTP, close live MCP sessions then the
+   * listener; for stdio, close the MCP `Server` (which closes its transport).
+   * Runs between the immediate synchronous flush and the final `sqlite.close()`.
+   */
+  drain: () => Promise<void>;
+}
+
+/**
+ * Builds a re-entrant-safe shutdown handler shared by both transport
+ * branches (harden-http-server-lifecycle design.md "Shutdown ordering" /
+ * "Stdio parity"). Ordering: (1) synchronous `flushIfDirty()` immediately —
+ * cheap when clean, caps the loss window before the async drain can hang;
+ * (2) the transport-specific drain (session/listener or MCP server close);
+ * (3) stop the lifecycle-timer schedulers; (4) `sqlite.close()` (cancels the
+ * deferred-flush timer, flushes if dirty, checkpoints WAL, closes); (5) exit
+ * 0. A 10 s unref'd hard deadline runs in parallel: if the drain hasn't
+ * finished by then, it logs `shutdown_timeout`, flushes synchronously one
+ * last time, and exits non-zero so orchestrators can tell a forced shutdown
+ * from a clean one.
+ */
+function createShutdown(deps: ShutdownDeps): (signal: string) => void {
+  let shuttingDown = false;
+
+  return (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    deps.logger.info({ event: 'shutdown_start', signal, transport: deps.transport });
+
+    const deadline = setTimeout(() => {
+      deps.logger.error({ event: 'shutdown_timeout', signal, transport: deps.transport });
+      try {
+        deps.sqlite.cancelDeferredFlush();
+        deps.sqlite.flushIfDirty();
+      } catch (err) {
+        deps.logger.error({ event: 'shutdown_timeout_flush_failed', error: (err as Error).message });
+      }
+      process.exit(1);
+    }, SHUTDOWN_DEADLINE_MS);
+    deadline.unref();
+
+    try {
+      deps.sqlite.flushIfDirty();
+    } catch (err) {
+      deps.logger.error({ event: 'shutdown_flush_failed', error: (err as Error).message });
+    }
+
+    void (async () => {
+      try {
+        await deps.drain();
+      } catch (err) {
+        deps.logger.error({ event: 'shutdown_drain_failed', error: (err as Error).message });
+      } finally {
+        deps.cleanupScheduler.stop();
+        deps.distillationScheduler.stop();
+        try {
+          deps.sqlite.close();
+        } catch (err) {
+          deps.logger.error({ event: 'shutdown_close_failed', error: (err as Error).message });
+        }
+        clearTimeout(deadline);
+        deps.logger.info({ event: 'shutdown_complete', signal, transport: deps.transport });
+        process.exit(0);
+      }
+    })();
+  };
+}
 
 async function main() {
   const args = process.argv.slice(2);
@@ -206,6 +284,24 @@ async function main() {
         logger.debug({ event: 'resource_list_changed_notify_failed', error: (err as Error).message });
       });
     };
+
+    // Graceful teardown on both a signal and the client dropping the pipe
+    // (MCP stdio clients typically end the child by closing stdin rather
+    // than signaling) — see createShutdown's doc comment for ordering.
+    const shutdown = createShutdown({
+      logger,
+      sqlite,
+      cleanupScheduler,
+      distillationScheduler,
+      transport: 'stdio',
+      drain: async () => {
+        await server.close();
+      },
+    });
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    server.onclose = () => shutdown('transport-close');
+
     const transport = new StdioServerTransport();
     await server.connect(transport);
     logger.info({ event: 'connected', transport: 'stdio' });
@@ -220,27 +316,30 @@ async function main() {
       console.log(`BHGBrain server listening on http://${host}:${port}`);
     });
 
+    // Socket timeouts: Node's own defaults (5 s keep-alive, 300 s request,
+    // 60 s headers) are wrong for this deployment shape — see
+    // harden-http-server-lifecycle design.md "Timeout config keys".
+    // `requestTimeout` bounds only receiving the request, so long-lived SSE
+    // responses on `GET /mcp` are unaffected.
+    applyHttpServerTimeouts(httpServer, config);
+
     // Clean teardown on shutdown: close every live MCP session's transport,
-    // stop the scheduled-cleanup timer, then close the listener before
-    // exiting — mirrors the ordering the SDK expects (sessions closed while
-    // the process can still flush their final I/O).
-    let shuttingDown = false;
-    const shutdown = (signal: NodeJS.Signals) => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      logger.info({ event: 'shutdown_start', signal });
-      void (async () => {
+    // then the listener, then persist SQLite state before exiting — mirrors
+    // the ordering the SDK expects (sessions closed while the process can
+    // still flush their final I/O). See createShutdown's doc comment.
+    const shutdown = createShutdown({
+      logger,
+      sqlite,
+      cleanupScheduler,
+      distillationScheduler,
+      transport: 'http',
+      drain: async () => {
         await mcpSessions.closeAll();
-        cleanupScheduler.stop();
-        distillationScheduler.stop();
-        httpServer.close(() => {
-          logger.info({ event: 'shutdown_complete', signal });
-          process.exit(0);
-        });
-      })();
-    };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+        await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      },
+    });
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
   }
 }
 

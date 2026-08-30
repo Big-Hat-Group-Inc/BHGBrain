@@ -306,7 +306,16 @@ BHGBrain 从以下位置加载配置文件：
       // 监听端口
       "port": 3721,
       // 保存 HTTP 认证 Bearer token 的环境变量名称
-      "bearer_token_env": "BHGBRAIN_TOKEN"
+      "bearer_token_env": "BHGBRAIN_TOKEN",
+      // 应用于底层 http.Server 的套接字超时（毫秒）。默认值对代理是安全的：
+      // keep-alive 高于反向代理常见的 60 秒空闲超时，headers timeout 又高于
+      // keep-alive（Node 要求 headers_timeout_ms > keep_alive_timeout_ms 以避免
+      // ECONNRESET 竞态——配置校验会拒绝不满足该条件的值）。
+      "keep_alive_timeout_ms": 65000,
+      "headers_timeout_ms": 66000,
+      // 完整接收一个请求所允许的时间；不会限制 GET /mcp 上长期存在的 SSE
+      // 响应，因为该响应只接收请求，不发送请求。
+      "request_timeout_ms": 300000
     },
     "stdio": {
       // 启用 MCP stdio 传输
@@ -382,6 +391,15 @@ BHGBrain 从以下位置加载配置文件：
 
     // Qdrant 分段压缩阈值（当某分段中已删除数据占比超过此比例时触发压缩）
     "compaction_deleted_threshold": 0.10,
+
+    // 对两张只追加写入的历史表（audit_log、memory_revisions）设置上限，由与上面
+    // 保留策略相同的定时清理任务（bhgbrain gc / scheduled_cleanup_enabled）执行。
+    // `null` 表示禁用对应的清理（即此前"永久保留"的行为）。audit_log_max_entries
+    // 按时间戳保留最新的 N 行；revisions_per_memory_max 按每条记忆保留修订号最高
+    // 的 N 条修订记录。默认值较为宽松——存储必须经过相当长时间的积累，才会真正
+    // 触发清理删除。干跑模式（`bhgbrain gc --dry-run`）永远不会执行清理。
+    "audit_log_max_entries": 50000,
+    "revisions_per_memory_max": 20,
 
     // 定时记忆蒸馏：将相关且仍处于活跃状态的 T2/T3 情景记忆聚类，并通过 LLM
     // 调用将每个符合条件的簇合并为一条持久的 T1 语义记忆，同时保留来源关系
@@ -1623,9 +1641,11 @@ camelCase/PascalCase 形态的品牌名称标记为标签（例如 `GitHub` → 
 
 6. **压缩（由阈值驱动，而非逐条删除触发）：** 对本次运行涉及删除的每个命名空间/集合，一旦已删除向量占比超过 `retention.compaction_deleted_threshold`，本次运行会通过 `optimizers_config.deleted_threshold` 促使 Qdrant 的分段优化器回收空间。
 
-7. **刷写：** 所有删除完成后，SQLite 原子性刷写到磁盘。
+7. **历史表清理：** 将 `audit_log`（按时间戳保留最新的 `retention.audit_log_max_entries` 行）和 `memory_revisions`（按每条记忆保留修订号最高的 `retention.revisions_per_memory_max` 条）裁剪到各自配置的上限——这两张只追加写入的表若不清理会无限增长。任一上限设为 `null` 即可禁用对应的清理。干跑模式下完全跳过此步骤。清理数量会在 GC 结果中以 `audit_pruned`/`revisions_pruned` 字段体现，并记录在 `retention_gc` 事件中。
 
-8. **健康信号：** 若归档或删除步骤中途失败，本次运行的结果会被持久化，并在 `health://status` 中显示为降级的 `retention` 组件，直到下一次干净的 GC 运行为止。
+8. **刷写：** 所有删除完成后，SQLite 原子性刷写到磁盘。
+
+9. **健康信号：** 若归档或删除步骤中途失败，本次运行的结果会被持久化，并在 `health://status` 中显示为降级的 `retention` 组件，直到下一次干净的 GC 运行为止。
 
 无论是手动还是定时的 GC 运行，都不会向调用方抛出异常：意外故障会被捕获，进行中的生命周期锁始终会被释放，运行结果会以 `degraded: true` 的形式报告，并保留已完成的工作。
 
@@ -3635,6 +3655,10 @@ curl http://localhost:3721/health
 
 容器同时以非 root 用户（`node`）运行。
 
+镜像还设置了 `NODE_ENV=production` 作为纵深防御手段（同时减少 Express 开发模式的开销）。
+这并不是错误响应不泄露堆栈跟踪的关键所在——真正保证这一点的是终端 JSON 错误中间件，
+它在任何环境（容器与否）下都生效——但无论如何，这对运行时镜像来说都是一个合理的默认值。
+
 ### Compose 配置文件
 
 | 命令 | 运行内容 |
@@ -3807,6 +3831,21 @@ bhgbrain backup create
 - 速率限制以受信任的请求身份（IP）为键，忽略 `x-client-id` 用于强制执行。
 - 审计/请求日志中的 `client_id` 同样源自受信任的请求身份（`req.ip`），而非调用方提供的 `x-client-id` 头部——该头部仅作为非权威的调试提示接受，绝不用于审计追踪的信任来源。
 - `memory://list` 强制 `limit` 范围为 `1..100`；无效值返回 `INVALID_INPUT`。
+- 每一条 HTTP 失败路径——抛出或拒绝的路由处理程序、格式错误的 JSON 请求体、`GET /resource` 上格式错误的 `?uri=`——都会返回结构化的 `{error:{code,message,retryable}}` 信封。无论 `NODE_ENV` 为何，进程都绝不会泄露堆栈跟踪或 HTML 错误页面；一个终端 Express 错误中间件会兜底任何路由自身未处理的错误，未预料到的错误仍会在服务端记录日志（只是不会回显到响应体中）。
+- 响应会禁用 `X-Powered-By` 头部并设置 `X-Content-Type-Options: nosniff`。当客户端发送 `Accept-Encoding: gzip` 时响应会以 gzip 压缩，但 `text/event-stream`（`/mcp` 的 SSE 流）除外——该类型响应绝不会为压缩而被缓冲。
+- `transport.http.keep_alive_timeout_ms` / `headers_timeout_ms` / `request_timeout_ms`（默认 65 秒 / 66 秒 / 300 秒）取代了 Node 自身的套接字超时默认值——这些默认值对于反向代理后的 keep-alive 而言过短，对慢速攻击（slow-loris）而言又过于宽松。`headers_timeout_ms` 必须大于 `keep_alive_timeout_ms`——配置校验会拒绝不满足此条件的值。`request_timeout_ms` 仅限制接收请求的时间，因此不会截断 `GET /mcp` 上长期存在的 SSE 响应。
+
+### 优雅关闭
+
+在收到 `SIGINT`/`SIGTERM`（两种传输方式）时——对于 stdio，则是客户端关闭其管道一端时——服务器会执行以下步骤：
+
+1. 立即将任何脏的 SQLite 状态刷新到磁盘。
+2. 排空存活连接：关闭每一个打开的 MCP 会话（HTTP）或 MCP `Server`/传输（stdio）。
+3. 停止已调度的清理与蒸馏（distillation）定时器。
+4. 关闭 SQLite 连接（对预写日志执行检查点，并在排空期间产生新的脏状态时再次刷新）。
+5. 以退出码 `0` 退出。
+
+关闭过程中收到的第二个信号会被忽略——上述流程最多执行一次。如果排空未能在 **10 秒** 内完成，服务器会记录一个 `shutdown_timeout` 事件，同步再刷新一次 SQLite，并以非零退出码 `1` 退出，以便编排系统（Docker、systemd、Kubernetes）能够区分强制关闭与正常关闭。这将 `docker stop`/容器重启的关闭过程限定在一个可预测的时间窗口内，而不是一直拖到 `SIGKILL`。
 
 ### 安全失败关闭认证
 

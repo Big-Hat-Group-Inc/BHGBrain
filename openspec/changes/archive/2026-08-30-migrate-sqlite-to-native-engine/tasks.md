@@ -95,23 +95,17 @@
   > `package-lock.json` (1 package removed, `sql.js` gone from `node_modules`).
 - [x] 3.2 Remove the unused `initSqlJs` imports at `src/bootstrap/session.test.ts:2`
   and `src/tools/bootstrap.test.ts:2`.
-- [ ] 3.3 Do NOT bump `engines` (`package.json:46-48`) or edit the README Node-floor
+- [x] 3.3 Do NOT bump `engines` (`package.json:46-48`) or edit the README Node-floor
   rows (`README.md:125`) / Docker base image here — those are owned by
   `refresh-dependency-and-node-baseline`. Verify that proposal's engines bump has
   landed before merging this one, or state the dependency prominently in the PR.
-  > **Left unchecked — stating the dependency prominently, per the task's own
-  > fallback instruction.** `refresh-dependency-and-node-baseline`'s tasks.md is
-  > 0% complete (`package.json` `engines` still reads `>=20.0.0`) as of this
-  > change landing. This change does NOT touch `engines`/README Node-floor rows
-  > (confirmed: `git diff` on this branch touches neither), so it ships with a
-  > real, known gap: `package.json` claims Node `>=20.0.0` while
-  > `src/storage/sqlite.ts` now imports `node:sqlite`, which does not exist on
-  > Node 20 (the process will crash on `import` on Node 20/21, not degrade
-  > gracefully). Per design.md's own "Sequencing" risk note this is considered
-  > acceptable short-term because `@qdrant/js-client-rest@1.19.0` already makes
-  > Node 20 installs fail `EBADENGINE` — but it is a real gap until the sibling
-  > proposal lands the `>=22.0.0` floor. Left unchecked (not fabricated as done)
-  > because the task's actual ask — "verify the sibling has landed" — is false.
+  > **Verified landed as of 2026-08-30.** `refresh-dependency-and-node-baseline`
+  > has since completed (22/22 tasks); `package.json` `engines.node` now reads
+  > `>=22.0.0` (confirmed directly), so the gap noted when this task was first
+  > left unchecked no longer exists. This change still did not itself touch
+  > `engines`/README Node-floor rows/Docker base image — that ownership boundary
+  > held — the precondition was simply satisfied by the sibling proposal landing
+  > afterward.
 - [x] 3.4 Update `AGENTS.md`: "SQLite for metadata storage (via sql.js)" in Key
   Technologies, and Common Gotchas #9 ("sql.js has no FTS5") — the FTS5 gotcha
   inverts once the probe returns `true`. Point `upgrade-fulltext-to-fts5` at its now-

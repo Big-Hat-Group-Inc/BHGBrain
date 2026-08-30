@@ -105,6 +105,24 @@ const ConfigSchema = z.object({
       host: z.string().default('127.0.0.1'),
       port: z.number().int().default(3721),
       bearer_token_env: z.string().default('BHGBRAIN_TOKEN'),
+      // Applied directly to the captured `http.Server` (`httpServer.keepAliveTimeout`
+      // etc. in `src/index.ts`). Defaults chosen to be proxy-safe: keep-alive above
+      // the common 60 s reverse-proxy idle timeout, headers timeout above that per
+      // Node's own documented requirement, and Node's stock 300 s request timeout
+      // made tunable. See harden-http-server-lifecycle design.md "Timeout config keys".
+      keep_alive_timeout_ms: z.number().int().positive().default(65000),
+      headers_timeout_ms: z.number().int().positive().default(66000),
+      request_timeout_ms: z.number().int().positive().default(300000),
+    }).superRefine((value, ctx) => {
+      if (value.headers_timeout_ms <= value.keep_alive_timeout_ms) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `headers_timeout_ms (${value.headers_timeout_ms}) must be greater than ` +
+            `keep_alive_timeout_ms (${value.keep_alive_timeout_ms}) — Node requires the headers ` +
+            'timeout to exceed the keep-alive timeout to avoid ECONNRESET races.',
+          path: ['headers_timeout_ms'],
+        });
+      }
     }).prefault({}),
     stdio: z.object({
       enabled: z.boolean().default(true),
@@ -146,6 +164,13 @@ const ConfigSchema = z.object({
     scheduled_cleanup_enabled: z.boolean().default(true),
     pre_expiry_warning_days: z.number().int().nonnegative().default(7),
     compaction_deleted_threshold: z.number().min(0).max(1).default(0.10),
+    // Bounds on the two insert-only history tables, enforced by `runGc`'s
+    // pruning step (trim-sqlite-query-and-health-overhead). `null` disables
+    // the corresponding prune — the pre-existing "keep forever" behavior.
+    // Defaults are generous enough that a store must be genuinely
+    // long-lived before any row is dropped.
+    audit_log_max_entries: z.number().int().positive().nullable().default(50000),
+    revisions_per_memory_max: z.number().int().positive().nullable().default(20),
     // Scheduled "sleep" job that clusters related T2/T3 episodic memories and
     // consolidates each qualifying cluster into one durable T1 semantic
     // memory via an LLM call, archiving the sources with lineage

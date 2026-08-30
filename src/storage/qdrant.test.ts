@@ -16,6 +16,7 @@ type MockClient = {
   createCollection?: Mock<QdrantClient['createCollection']>;
   createPayloadIndex?: Mock<QdrantClient['createPayloadIndex']>;
   upsert?: Mock<QdrantClient['upsert']>;
+  deleteCollection?: Mock<QdrantClient['deleteCollection']>;
 };
 
 function createStore(
@@ -131,7 +132,7 @@ describe('QdrantStore namespace/collection name encoding (slash safety)', () => 
     await store.upsert('test/mcp-verify', 'general', 'id-1', [1, 2, 3], { content: 'x' });
 
     expect(upsert).toHaveBeenCalledWith(
-      'bhgbrain_test.mcp-verify_general',
+      'bhgbrain_test.xmcp-verify_general',
       expect.objectContaining({ points: expect.any(Array) }),
     );
   });
@@ -155,7 +156,7 @@ describe('QdrantStore namespace/collection name encoding (slash safety)', () => 
       getCollections: vi.fn<QdrantClient['getCollections']>(async () => ({
         collections: [
           { name: 'bhgbrain_a_general' }, // namespace "a"
-          { name: 'bhgbrain_a.b_general' }, // namespace "a/b" — must stay distinct
+          { name: 'bhgbrain_a.xb_general' }, // namespace "a/b" — must stay distinct
         ],
       })),
       query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
@@ -166,7 +167,48 @@ describe('QdrantStore namespace/collection name encoding (slash safety)', () => 
 
     const searched = client.query.mock.calls.map(c => c[0]);
     expect(searched).toContain('bhgbrain_a_general');
-    expect(searched).not.toContain('bhgbrain_a.b_general');
+    expect(searched).not.toContain('bhgbrain_a.xb_general');
+  });
+});
+
+describe('QdrantStore collection-name encoding (dot/slash collision safety)', () => {
+  // fix-collection-name-collision: the namespace-slash fix above assumed raw
+  // `collection` input could never contain the `.` substitution marker, but
+  // `collection`'s schema (pre-fix) had no charset restriction — so
+  // `collection: "a.b"` (literal dot) and `collection: "a/b"` (slash, encoded
+  // to `.`) both resolved to the identical Qdrant collection name. The
+  // encoder is now injective independent of schema (escapes literal `.`
+  // before encoding `/`), verified directly here at the store layer.
+  it('does not collide a literal-dot collection with a slash-containing one', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+
+    await store.searchSimilar('global', 'a.b', [1, 2, 3], 5);
+    await store.searchSimilar('global', 'a/b', [1, 2, 3], 5);
+
+    const [nameForLiteralDot, nameForSlash] = client.query.mock.calls.map(c => c[0]);
+    expect(nameForLiteralDot).not.toBe(nameForSlash);
+  });
+
+  it('does not collide a literal-slash-marker sequence with a doubled-dot escape', async () => {
+    // Adversarial case for the escaping scheme itself: a collection value
+    // containing the literal two-character sequence produced by escaping a
+    // dot ("..") must not collide with one containing the literal sequence
+    // produced by encoding a slash (".x").
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+
+    await store.searchSimilar('global', 'a..b', [1, 2, 3], 5);
+    await store.searchSimilar('global', 'a.xb', [1, 2, 3], 5);
+
+    const [nameForDoubleDot, nameForDotX] = client.query.mock.calls.map(c => c[0]);
+    expect(nameForDoubleDot).not.toBe(nameForDotX);
   });
 });
 
@@ -600,6 +642,205 @@ describe('QdrantStore.ensureCollection created_at datetime index migration', () 
     const store = createStore(client);
 
     await expect(store.ensureCollection('global', 'general')).resolves.toBeUndefined();
+  });
+});
+
+describe('QdrantStore ensured-collection memoization (cut-embedding-and-qdrant-round-trips)', () => {
+  it('issues no getCollection/createPayloadIndex calls on a second upsert to the same collection', async () => {
+    const getCollection = vi.fn<QdrantClient['getCollection']>(async () => ({}) as never);
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never);
+    const upsert = vi.fn<QdrantClient['upsert']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection,
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+      upsert,
+    };
+    const store = createStore(client);
+
+    await store.upsert('global', 'general', 'id-1', [1, 2, 3], { content: 'a' });
+    expect(getCollection).toHaveBeenCalledTimes(1);
+    expect(createPayloadIndex).toHaveBeenCalledTimes(2); // device_id + created_at (collection already existed)
+
+    await store.upsert('global', 'general', 'id-2', [4, 5, 6], { content: 'b' });
+
+    // No further ensure round trips against the now-warm collection.
+    expect(getCollection).toHaveBeenCalledTimes(1);
+    expect(createPayloadIndex).toHaveBeenCalledTimes(2);
+    expect(upsert).toHaveBeenCalledTimes(2);
+  });
+
+  it('re-ensures the collection after a local deleteCollection', async () => {
+    const getCollection = vi.fn<QdrantClient['getCollection']>(async () => ({}) as never);
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never);
+    const upsert = vi.fn<QdrantClient['upsert']>(async () => ({}) as never);
+    const deleteCollection = vi.fn<QdrantClient['deleteCollection']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection,
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+      upsert,
+      deleteCollection,
+    };
+    const store = createStore(client);
+
+    await store.upsert('global', 'general', 'id-1', [1, 2, 3], { content: 'a' });
+    expect(getCollection).toHaveBeenCalledTimes(1);
+
+    await store.deleteCollection('global', 'general');
+
+    await store.upsert('global', 'general', 'id-2', [4, 5, 6], { content: 'b' });
+    expect(getCollection).toHaveBeenCalledTimes(2);
+  });
+
+  it('a not-found during upsert invalidates the memo, re-ensures, and retries exactly once', async () => {
+    const getCollection = vi.fn<QdrantClient['getCollection']>(async () => ({}) as never);
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never);
+    let upsertCalls = 0;
+    const upsert = vi.fn<QdrantClient['upsert']>(async () => {
+      upsertCalls++;
+      if (upsertCalls === 2) {
+        const err = new Error('Collection `bhgbrain_global_general` doesn\'t exist!') as Error & { status?: number };
+        err.status = 404;
+        throw err;
+      }
+      return {} as never;
+    });
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection,
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+      upsert,
+    };
+    const store = createStore(client);
+
+    // Warm the memo first (upsert call #1, succeeds).
+    await store.upsert('global', 'general', 'id-1', [1, 2, 3], { content: 'a' });
+    expect(getCollection).toHaveBeenCalledTimes(1);
+
+    // Second upsert's first attempt (#2) hits a not-found — collection
+    // deleted out from under this process — and must self-heal and retry.
+    await store.upsert('global', 'general', 'id-2', [4, 5, 6], { content: 'b' });
+    expect(getCollection).toHaveBeenCalledTimes(2);
+    expect(upsert).toHaveBeenCalledTimes(3); // ok, 404, retry-ok
+  });
+
+  it('propagates a second not-found instead of retrying indefinitely', async () => {
+    const getCollection = vi.fn<QdrantClient['getCollection']>(async () => ({}) as never);
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never);
+    const upsert = vi.fn<QdrantClient['upsert']>(async () => {
+      const err = new Error('Collection `bhgbrain_global_general` doesn\'t exist!') as Error & { status?: number };
+      err.status = 404;
+      throw err;
+    });
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection,
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+      upsert,
+    };
+    const store = createStore(client);
+
+    await expect(store.upsert('global', 'general', 'id-1', [1, 2, 3], { content: 'a' }))
+      .rejects.toThrow('doesn\'t exist');
+    expect(upsert).toHaveBeenCalledTimes(2); // one attempt + one self-heal retry, both 404
+  });
+
+  it('leaves the collection un-memoized when the ensure sequence fails partway', async () => {
+    const getCollection = vi.fn<QdrantClient['getCollection']>(async () => ({}) as never);
+    let deviceIdCallCount = 0;
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async (_name, opts) => {
+      if (opts?.field_name === 'device_id') {
+        deviceIdCallCount++;
+        if (deviceIdCallCount === 1) {
+          throw new TypeError('transport failure');
+        }
+      }
+      return {} as never;
+    });
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection,
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await expect(store.ensureCollection('global', 'general')).rejects.toThrow('transport failure');
+    expect(getCollection).toHaveBeenCalledTimes(1);
+
+    // Un-memoized: the next call retries the full sequence, including
+    // getCollection again.
+    await store.ensureCollection('global', 'general');
+    expect(getCollection).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('QdrantStore.listAllCollections TTL cache (cut-embedding-and-qdrant-round-trips)', () => {
+  it('issues one getCollections call for two namespace-wide searches within the TTL', async () => {
+    const getCollections = vi.fn<QdrantClient['getCollections']>(async () => ({
+      collections: [{ name: 'bhgbrain_global_work' }],
+    }));
+    const client: MockClient = {
+      getCollections,
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client);
+
+    await store.search('global', undefined, [1, 2, 3], 10);
+    await store.search('global', undefined, [1, 2, 3], 10);
+
+    expect(getCollections).toHaveBeenCalledTimes(1);
+  });
+
+  it('forces a refetch after a local deleteCollection even within the TTL', async () => {
+    const getCollections = vi.fn<QdrantClient['getCollections']>(async () => ({
+      collections: [{ name: 'bhgbrain_global_work' }],
+    }));
+    const deleteCollection = vi.fn<QdrantClient['deleteCollection']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections,
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+      deleteCollection,
+    };
+    const store = createStore(client);
+
+    await store.search('global', undefined, [1, 2, 3], 10);
+    await store.deleteCollection('global', 'work');
+    await store.search('global', undefined, [1, 2, 3], 10);
+
+    expect(getCollections).toHaveBeenCalledTimes(2);
+  });
+
+  it('forces a refetch once the TTL expires', async () => {
+    vi.useFakeTimers();
+    try {
+      const getCollections = vi.fn<QdrantClient['getCollections']>(async () => ({
+        collections: [{ name: 'bhgbrain_global_work' }],
+      }));
+      const client: MockClient = {
+        getCollections,
+        query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+      };
+      const store = createStore(client);
+
+      await store.search('global', undefined, [1, 2, 3], 10);
+      await vi.advanceTimersByTimeAsync(5001);
+      await store.search('global', undefined, [1, 2, 3], 10);
+
+      expect(getCollections).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

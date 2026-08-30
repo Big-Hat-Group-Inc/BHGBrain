@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SqliteStore } from './sqlite.js';
-import type { DatabaseSync, StatementSync } from 'node:sqlite';
+import { DatabaseSync } from 'node:sqlite';
+import type { StatementSync } from 'node:sqlite';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -1361,6 +1362,33 @@ describe('SqliteStore origin/confidence (add-memory-provenance-metadata)', () =>
     store = reopened;
   });
 
+  // harden-http-server-lifecycle task 6.1: the shutdown sequence calls
+  // scheduleDeferredFlush() (from access-tracking writes) and then close() —
+  // this proves that ordering persists state on its own, with no extra
+  // flushIfDirty() call after close() required for the data to survive a
+  // fresh load from disk. Under the current WAL engine flushIfDirty/
+  // scheduleDeferredFlush/cancelDeferredFlush are documented no-ops
+  // (src/storage/sqlite.ts) — every commit is already durable at commit
+  // time — so this is really re-confirming the durability test above under
+  // the exact call sequence createShutdown() (src/index.ts) uses, including
+  // a "timer" that (under this engine) never does anything to unwind.
+  it('close() persists a write made while a deferred flush is (nominally) pending, without a flushIfDirty() call after close()', async () => {
+    const mem = sampleMemory({ id: '660e8400-e29b-41d4-a716-446655440099' });
+    store.insertMemory(mem);
+    store.scheduleDeferredFlush();
+    store.close();
+    // Deliberately no flushIfDirty() call here: close() alone must be
+    // sufficient for the data to be present on reopen.
+
+    const reopened = new SqliteStore(tempDir);
+    await reopened.init();
+    const found = reopened.getMemoryById(mem.id);
+    expect(found).not.toBeNull();
+    expect(found!.content).toBe(mem.content);
+
+    store = reopened;
+  });
+
   // migrate-sqlite-to-native-engine task 4.4: backup/restore round trip.
   describe('exportData / activateDatabaseImage (backup/restore round trip)', () => {
     it('exportData() produces a standalone image openable with no sidecar files', async () => {
@@ -1532,5 +1560,311 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
       type: 'semantic',
     });
     expect(store.getMemoryById('550e8400-e29b-41d4-a716-446655440098')!.pinned).toBe(false);
+  });
+
+  // -- trim-sqlite-query-and-health-overhead task 1.2: covering-index plans --
+
+  describe('composite index EXPLAIN QUERY PLAN', () => {
+    function plan(sql: string, params: Array<string | number> = []): string {
+      const dbInternal = (store as unknown as { db: DatabaseSync }).db;
+      const rows = dbInternal.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as unknown as Array<{ detail: string }>;
+      return rows.map(row => row.detail).join(' | ');
+    }
+
+    it('listMemories uses idx_memories_ns_created with no temp B-tree sort', () => {
+      const detail = plan(
+        `SELECT * FROM memories WHERE namespace = ? AND archived = 0 ORDER BY created_at DESC, id DESC LIMIT ?`,
+        ['global', 10],
+      );
+      expect(detail).toContain('USING INDEX idx_memories_ns_created');
+      expect(detail).not.toContain('USE TEMP B-TREE');
+    });
+
+    it('listMemoriesInCollection uses idx_memories_ns_coll_created with no temp B-tree sort', () => {
+      const detail = plan(
+        `SELECT * FROM memories WHERE namespace = ? AND collection = ? AND archived = 0 ORDER BY created_at DESC, id DESC LIMIT ?`,
+        ['global', 'general', 10],
+      );
+      expect(detail).toContain('USING INDEX idx_memories_ns_coll_created');
+      expect(detail).not.toContain('USE TEMP B-TREE');
+    });
+
+    it('listStaleCandidateIds uses idx_memories_stale_accessed', () => {
+      const detail = plan(
+        `SELECT id FROM memories WHERE last_accessed < ? AND stale = 0 AND category IS NULL AND archived = 0`,
+        ['2026-01-01T00:00:00Z'],
+      );
+      expect(detail).toContain('USING INDEX idx_memories_stale_accessed');
+    });
+
+    it('listMemoriesNeedingVectorSync uses idx_memories_unsynced_created', () => {
+      const detail = plan(
+        `SELECT * FROM memories WHERE archived = 0 AND vector_synced = 0 ORDER BY created_at ASC, id ASC LIMIT ?`,
+        [10],
+      );
+      expect(detail).toContain('USING INDEX idx_memories_unsynced_created');
+    });
+  });
+
+  // -- task 1.3: migration from the old single-column-prefix indexes --
+
+  it('migrates an existing database from idx_memories_namespace/collection to the new composite indexes on init()', async () => {
+    const migDir = mkdtempSync(join(tmpdir(), 'bhgbrain-migration-test-'));
+    try {
+      const legacyDb = new DatabaseSync(join(migDir, 'brain.db'));
+      legacyDb.exec(`
+        CREATE TABLE memories (
+          id TEXT PRIMARY KEY,
+          namespace TEXT NOT NULL DEFAULT 'global',
+          collection TEXT NOT NULL DEFAULT 'general',
+          type TEXT NOT NULL CHECK(type IN ('episodic','semantic','procedural')),
+          category TEXT,
+          content TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          tags TEXT NOT NULL DEFAULT '[]',
+          source TEXT NOT NULL DEFAULT 'cli',
+          checksum TEXT NOT NULL,
+          importance REAL NOT NULL DEFAULT 0.5,
+          access_count INTEGER NOT NULL DEFAULT 0,
+          last_operation TEXT NOT NULL DEFAULT 'ADD',
+          merged_from TEXT,
+          stale INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_accessed TEXT NOT NULL
+        );
+        CREATE INDEX idx_memories_namespace ON memories(namespace);
+        CREATE INDEX idx_memories_collection ON memories(namespace, collection);
+      `);
+      legacyDb.close();
+
+      const migStore = new SqliteStore(migDir);
+      await migStore.init();
+      try {
+        const dbInternal = (migStore as unknown as { db: DatabaseSync }).db;
+        const indexNames = (dbInternal.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all() as unknown as Array<{ name: string }>)
+          .map(row => row.name);
+        expect(indexNames).not.toContain('idx_memories_namespace');
+        expect(indexNames).not.toContain('idx_memories_collection');
+        expect(indexNames).toContain('idx_memories_ns_created');
+        expect(indexNames).toContain('idx_memories_ns_coll_created');
+        expect(indexNames).toContain('idx_memories_stale_accessed');
+        expect(indexNames).toContain('idx_memories_unsynced_created');
+      } finally {
+        migStore.close();
+      }
+    } finally {
+      rmSync(migDir, { recursive: true, force: true });
+    }
+  });
+
+  // -- task 2: batched deletes and hydration transactions --
+
+  describe('deleteMemoriesByIds', () => {
+    it('removes rows from memories and memories_fts and returns the exact count', () => {
+      const mem1 = sampleMemory();
+      const mem2 = { ...sampleMemory(), id: '00000000-0000-0000-0000-000000000002', checksum: 'b' };
+      store.insertMemory(mem1);
+      store.insertMemory(mem2);
+
+      const deleted = store.deleteMemoriesByIds([mem1.id, mem2.id]);
+
+      expect(deleted).toBe(2);
+      expect(store.getMemoryById(mem1.id)).toBeNull();
+      expect(store.getMemoryById(mem2.id)).toBeNull();
+      expect(store.fullTextSearch('global', mem1.content.split(' ')[0]!, 10)).toEqual([]);
+    });
+
+    it('counts missing ids as zero without throwing', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      const deleted = store.deleteMemoriesByIds([mem.id, 'does-not-exist']);
+      expect(deleted).toBe(1);
+    });
+
+    it('returns 0 for an empty id list', () => {
+      expect(store.deleteMemoriesByIds([])).toBe(0);
+    });
+  });
+
+  describe('listMemoryIds', () => {
+    it('returns every memory id, including archived rows', () => {
+      const mem1 = sampleMemory();
+      const mem2 = { ...sampleMemory(), id: '00000000-0000-0000-0000-000000000002', checksum: 'b' };
+      store.insertMemory(mem1);
+      store.insertMemory(mem2);
+      store.updateMemory(mem2.id, { archived: true });
+
+      const ids = store.listMemoryIds();
+      expect(ids.has(mem1.id)).toBe(true);
+      expect(ids.has(mem2.id)).toBe(true);
+      expect(ids.size).toBe(2);
+    });
+  });
+
+  describe('hydrateBatch', () => {
+    it('inserts every non-existing point, mutating existingIds, and returns the hydrated count', () => {
+      const existingIds = new Set<string>();
+      const { hydrated, failures } = store.hydrateBatch(
+        [
+          { id: 'h1', payload: { content: 'c1', summary: 's1' } },
+          { id: 'h2', payload: { content: 'c2', summary: 's2' } },
+        ],
+        existingIds,
+      );
+
+      expect(hydrated).toBe(2);
+      expect(failures).toEqual([]);
+      expect(existingIds.has('h1')).toBe(true);
+      expect(existingIds.has('h2')).toBe(true);
+      expect(store.getMemoryById('h1')).not.toBeNull();
+      expect(store.getMemoryById('h2')).not.toBeNull();
+    });
+
+    it('skips ids already present in existingIds without touching the store', () => {
+      const existingIds = new Set<string>(['already-there']);
+      const { hydrated } = store.hydrateBatch(
+        [{ id: 'already-there', payload: { content: 'should not be written' } }],
+        existingIds,
+      );
+      expect(hydrated).toBe(0);
+      expect(store.getMemoryById('already-there')).toBeNull();
+    });
+
+    it('a mid-batch constraint violation rolls back only that point, leaving every other point in the batch committed', () => {
+      const existingIds = new Set<string>();
+      // 'bad' is pre-seeded directly (bypassing existingIds) so hydrateBatch's own
+      // INSERT hits a real PRIMARY KEY violation instead of a simulated one.
+      store.insertMemory({ ...sampleMemory(), id: 'bad', checksum: 'seed' });
+
+      const { hydrated, failures } = store.hydrateBatch(
+        [
+          { id: 'ok1', payload: { content: 'c1' } },
+          { id: 'bad', payload: { content: 'conflicting' } },
+          { id: 'ok2', payload: { content: 'c2' } },
+        ],
+        existingIds,
+      );
+
+      expect(hydrated).toBe(2);
+      expect(failures).toHaveLength(1);
+      expect(failures[0]!.id).toBe('bad');
+      expect(store.getMemoryById('ok1')).not.toBeNull();
+      expect(store.getMemoryById('ok2')).not.toBeNull();
+      // The pre-seeded row survives untouched — the failed insert rolled back
+      // to its savepoint rather than corrupting the row or aborting the batch.
+      expect(store.getMemoryById('bad')!.checksum).toBe('seed');
+    });
+
+    it('leaves the outer transaction committable after a savepoint rollback (sql engine sanity)', () => {
+      const existingIds = new Set<string>();
+      store.insertMemory({ ...sampleMemory(), id: 'conflict-seed', checksum: 'seed' });
+      store.hydrateBatch(
+        [{ id: 'conflict-seed', payload: { content: 'x' } }],
+        new Set<string>(), // deliberately NOT pre-populated, so this hits the real constraint
+      );
+      // A further, unrelated call after the failed batch must still work —
+      // proof the failed SAVEPOINT didn't leave the connection/transaction wedged.
+      const { hydrated } = store.hydrateBatch([{ id: 'after', payload: { content: 'y' } }], existingIds);
+      expect(hydrated).toBe(1);
+      expect(store.getMemoryById('after')).not.toBeNull();
+    });
+
+    it('returns immediately for an empty points array', () => {
+      const result = store.hydrateBatch([], new Set());
+      expect(result).toEqual({ hydrated: 0, failures: [] });
+    });
+  });
+
+  // -- task 3: prepared-statement cache --
+
+  describe('prepared-statement cache', () => {
+    it('reuses one compiled statement across repeated getMemoryById calls', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+
+      const dbInternal = (store as unknown as { db: DatabaseSync }).db;
+      const prepareSpy = vi.spyOn(dbInternal, 'prepare');
+
+      store.getMemoryById(mem.id);
+      store.getMemoryById(mem.id);
+      store.getMemoryById(mem.id);
+
+      const getMemoryByIdSql = 'SELECT * FROM memories WHERE id = ? AND archived = 0';
+      const prepareCallsForThisSql = prepareSpy.mock.calls.filter(call => call[0] === getMemoryByIdSql);
+      expect(prepareCallsForThisSql).toHaveLength(1);
+      prepareSpy.mockRestore();
+    });
+
+    it('cached and uncached paths return identical results', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      const first = store.getMemoryById(mem.id);
+      const second = store.getMemoryById(mem.id);
+      expect(second).toEqual(first);
+      expect(store.countMemories()).toBe(1);
+      expect(store.countMemories('global')).toBe(1);
+    });
+
+    it('a reloadFromDisk() followed by a cached query neither crashes nor returns stale data', async () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      store.getMemoryById(mem.id); // populate the cache pre-reload
+      store.flush();
+
+      await store.reloadFromDisk();
+
+      // Post-reload cached call must use a statement bound to the NEW handle,
+      // not a stale one from the closed pre-reload handle.
+      expect(store.getMemoryById(mem.id)).not.toBeNull();
+      store.insertMemory({ ...sampleMemory(), id: '00000000-0000-0000-0000-000000000099', checksum: 'post-reload' });
+      expect(store.countMemories()).toBe(2);
+    });
+  });
+
+  // -- task 4: history-table pruning --
+
+  describe('pruneAuditLog', () => {
+    it('keeps the newest maxEntries rows and deletes the rest', () => {
+      for (let i = 1; i <= 5; i++) {
+        store.insertAudit({
+          id: `audit-${i}`,
+          timestamp: `2026-01-0${i}T00:00:00Z`,
+          namespace: 'global',
+          operation: 'ADD',
+          memory_id: `mem-${i}`,
+          client_id: 'test',
+        });
+      }
+      const pruned = store.pruneAuditLog(3);
+      expect(pruned).toBe(2);
+      const remaining = store.listAudit(10);
+      expect(remaining.map(e => e.id).sort()).toEqual(['audit-3', 'audit-4', 'audit-5'].sort());
+    });
+
+    it('is a no-op when under the cap', () => {
+      store.insertAudit({
+        id: 'audit-1', timestamp: new Date().toISOString(), namespace: 'global',
+        operation: 'ADD', memory_id: 'mem-1', client_id: 'test',
+      });
+      expect(store.pruneAuditLog(50)).toBe(0);
+      expect(store.listAudit(10)).toHaveLength(1);
+    });
+  });
+
+  describe('pruneRevisions', () => {
+    it('keeps the highest-numbered revisions per memory and deletes the rest', () => {
+      for (let r = 1; r <= 5; r++) {
+        store.insertRevision('mem-a', r, `content v${r}`, new Date().toISOString());
+      }
+      store.insertRevision('mem-b', 1, 'other content', new Date().toISOString());
+
+      const pruned = store.pruneRevisions(2);
+
+      expect(pruned).toBe(3);
+      const remainingA = store.listRevisions('mem-a').map(r => r.revision).sort((a, b) => a - b);
+      expect(remainingA).toEqual([4, 5]);
+      expect(store.listRevisions('mem-b')).toHaveLength(1);
+    });
   });
 });

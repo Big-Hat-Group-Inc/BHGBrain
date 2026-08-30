@@ -641,6 +641,59 @@ describe('SearchService', () => {
     ).rejects.toThrow('vector store unavailable');
   });
 
+  // cut-embedding-and-qdrant-round-trips
+  describe('hybrid search: parallel legs', () => {
+    it('dispatches the embedding request before the fulltext scan runs', async () => {
+      // Query expansion disabled so there is no intervening LLM-variant-
+      // generation await hop between dispatching the embed call and this
+      // observation — with expansion enabled, `embedQueryVariants` awaits
+      // `generateLlmVariants` first regardless of the dispatch-order fix
+      // under test here.
+      const { service, storage, embedding } = createSearchService({
+        queryExpansion: {
+          enabled: false, max_variants: 2, keyword_stripped: true,
+          llm_paraphrase: { enabled: false, mode: 'paraphrase', variant_count: 2, timeout_ms: 3000 },
+        },
+      });
+      const callOrder: string[] = [];
+      (embedding.embed as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        callOrder.push('embed-dispatched');
+        return [1, 2, 3];
+      });
+      (storage.sqlite.fullTextSearch as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        callOrder.push('fulltext-scan');
+        return [{ id: 'mem-1', rank: -1 }];
+      });
+
+      await service.search('hello', 'global', undefined, 'hybrid', 10);
+
+      expect(callOrder).toEqual(['embed-dispatched', 'fulltext-scan']);
+    });
+
+    it('degrades gracefully with no unhandled rejection when the embed rejects while the scan is still running', async () => {
+      const { service, embedding, metrics, logger } = createSearchService();
+      (embedding.embed as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('embeddings down'));
+
+      const unhandled: unknown[] = [];
+      const onUnhandledRejection = (reason: unknown) => { unhandled.push(reason); };
+      process.on('unhandledRejection', onUnhandledRejection);
+      try {
+        const results = await service.search('hello', 'global', undefined, 'hybrid', 10);
+        // Give any queued unhandledRejection event a tick to surface before asserting.
+        await new Promise(resolve => setImmediate(resolve));
+
+        expect(results.length).toBeGreaterThan(0);
+        expect(metrics.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { namespace: 'global' });
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.objectContaining({ event: 'embedding_degraded', degraded: 'fulltext_only' }),
+        );
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.off('unhandledRejection', onUnhandledRejection);
+      }
+    });
+  });
+
   describe('push-down-recall-filters: filter plumbing', () => {
     it('pushes a type/tags filter down to the vector store in semantic mode', async () => {
       const { service, storage } = createSearchService();
@@ -1343,6 +1396,91 @@ describe('SearchService', () => {
       const results = await service.search('how do we deploy', 'global', undefined, 'semantic', 10);
       expect(results.map(r => r.id).sort()).toEqual(['mem-keyword-only', 'mem-literal']);
     });
+  });
+
+  // cut-embedding-and-qdrant-round-trips
+  describe('query embedding cache (read path only)', () => {
+    const expansionDisabled = {
+      enabled: false, max_variants: 2, keyword_stripped: true,
+      llm_paraphrase: { enabled: false, mode: 'paraphrase' as const, variant_count: 2, timeout_ms: 3000 },
+    };
+
+    it('does not call the provider again for a repeated identical query under the same embedding identity', async () => {
+      const { service, embedding } = createSearchService({ queryExpansion: expansionDisabled });
+
+      await service.search('hello', 'global', undefined, 'semantic', 10);
+      await service.search('hello', 'global', undefined, 'semantic', 10);
+
+      expect(embedding.embed).toHaveBeenCalledTimes(1);
+    });
+
+    it('embeds distinct queries separately', async () => {
+      const { service, embedding } = createSearchService({ queryExpansion: expansionDisabled });
+
+      await service.search('hello', 'global', undefined, 'semantic', 10);
+      await service.search('world', 'global', undefined, 'semantic', 10);
+
+      expect(embedding.embed).toHaveBeenCalledTimes(2);
+      expect(embedding.embed).toHaveBeenNthCalledWith(1, 'hello');
+      expect(embedding.embed).toHaveBeenNthCalledWith(2, 'world');
+    });
+
+    it('records query_embedding_cache_miss then query_embedding_cache_hit', async () => {
+      const { service, metrics } = createSearchService({ queryExpansion: expansionDisabled });
+
+      await service.search('hello', 'global', undefined, 'semantic', 10);
+      expect(metrics.incCounter).toHaveBeenCalledWith('query_embedding_cache_miss');
+      expect(metrics.incCounter).not.toHaveBeenCalledWith('query_embedding_cache_hit');
+
+      await service.search('hello', 'global', undefined, 'semantic', 10);
+      expect(metrics.incCounter).toHaveBeenCalledWith('query_embedding_cache_hit');
+    });
+
+    it('misses when the embedding provider identity changes (never serves a vector from a different space)', async () => {
+      const { service, embedding } = createSearchService({ queryExpansion: expansionDisabled });
+
+      await service.search('hello', 'global', undefined, 'semantic', 10);
+      (embedding as unknown as { identity: string }).identity = 'openai/other-model@1536';
+      await service.search('hello', 'global', undefined, 'semantic', 10);
+
+      expect(embedding.embed).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not cache a failed embed; the next call retries the provider', async () => {
+      const { service, embedding } = createSearchService({ queryExpansion: expansionDisabled });
+      (embedding.embed as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('provider down'));
+
+      await expect(service.search('hello', 'global', undefined, 'semantic', 10)).rejects.toThrow();
+      await service.search('hello', 'global', undefined, 'semantic', 10);
+
+      expect(embedding.embed).toHaveBeenCalledTimes(2);
+    });
+
+    it('evicts the least-recently-used entry once capacity (256) is exceeded', async () => {
+      const { service, embedding } = createSearchService({ queryExpansion: expansionDisabled });
+
+      for (let i = 0; i < 256; i++) {
+        await service.search(`q-${i}`, 'global', undefined, 'semantic', 10);
+      }
+      // Pushes the cache past capacity — 'q-0' (least recently used) is evicted.
+      await service.search('q-overflow', 'global', undefined, 'semantic', 10);
+
+      const callsBefore = (embedding.embed as ReturnType<typeof vi.fn>).mock.calls.length;
+      // Check the still-cached entry first: re-checking 'q-0' before 'q-1'
+      // would itself evict 'q-1' (now the new least-recently-used), so order
+      // matters here.
+      await service.search('q-1', 'global', undefined, 'semantic', 10); // still cached -> no call
+      await service.search('q-0', 'global', undefined, 'semantic', 10); // evicted -> re-embeds
+
+      expect((embedding.embed as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callsBefore + 1);
+    });
+
+    // Structural guard, not a behavioral one: write-path call sites
+    // (src/pipeline/index.ts, src/storage/index.ts, src/backup/retention.ts,
+    // src/tools/index.ts) call `this.embedding.embed`/`embedBatch` directly —
+    // the cache lives entirely inside SearchService's private methods, so a
+    // write path has no reference through which it could ever receive a
+    // cached vector. See task 4.2.
   });
 
   // add-opt-in-rerank-stage

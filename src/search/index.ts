@@ -79,6 +79,16 @@ interface RankedItem {
 export class SearchService {
   private lifecycle: MemoryLifecycleService;
 
+  // cut-embedding-and-qdrant-round-trips: bounded, per-instance LRU of query
+  // embeddings, read-path only (`embedQuery`/`embedQueryBatch`, used by
+  // `semanticSearch` and `hybridSearch` via `embedQueryVariants`). Keyed by
+  // `${embedding.identity} ${text}` so a provider/model/dimension change can
+  // never serve a vector from the wrong embedding space. Never touched by
+  // any write-path call site — those call `this.embedding.embed`/
+  // `embedBatch` directly, structurally unable to receive a cached vector.
+  private queryEmbeddingCache = new Map<string, number[]>();
+  private static readonly QUERY_EMBEDDING_CACHE_CAPACITY = 256;
+
   constructor(
     private config: BrainConfig,
     private storage: StorageManager,
@@ -132,12 +142,84 @@ export class SearchService {
   private async embedQueryVariants(query: string): Promise<{ vectors: number[][]; variantCount: number }> {
     const qe = this.config.search.query_expansion;
     if (!qe.enabled) {
-      return { vectors: [await this.embedding.embed(query)], variantCount: 1 };
+      return { vectors: [await this.embedQuery(query)], variantCount: 1 };
     }
     const llmVariants = await this.generateLlmVariants(query);
     const variants = buildVariants(query, qe, llmVariants);
-    const vectors = await this.embedding.embedBatch(variants);
+    const vectors = await this.embedQueryBatch(variants);
     return { vectors, variantCount: variants.length };
+  }
+
+  // Read-path-only cache wrapper around `this.embedding.embed`
+  // (cut-embedding-and-qdrant-round-trips), used for the single-query path
+  // (query expansion disabled) so the call-site convention — `embed` for one
+  // string, `embedBatch` for several — is preserved exactly as before this
+  // cache existed. A failed provider call never populates the cache.
+  private async embedQuery(query: string): Promise<number[]> {
+    const identity = this.embedding.identity;
+    const key = `${identity} ${query}`;
+    const cached = this.queryEmbeddingCache.get(key);
+    if (cached) {
+      // Recency-reinsert for LRU eviction ordering.
+      this.queryEmbeddingCache.delete(key);
+      this.queryEmbeddingCache.set(key, cached);
+      this.metrics?.incCounter('query_embedding_cache_hit');
+      return cached;
+    }
+    this.metrics?.incCounter('query_embedding_cache_miss');
+    const vector = await this.embedding.embed(query);
+    this.cacheQueryEmbedding(key, vector);
+    return vector;
+  }
+
+  // Read-path-only cache wrapper around `this.embedding.embedBatch`
+  // (cut-embedding-and-qdrant-round-trips): serves already-embedded variant
+  // strings from the LRU and only calls the provider for the misses,
+  // preserving each text's position in the returned array. A failed provider
+  // call never populates the cache — the whole batch rejects exactly as an
+  // uncached `embedBatch` call would, so the next attempt retries the
+  // provider for every text, cached or not.
+  private async embedQueryBatch(texts: string[]): Promise<number[][]> {
+    const identity = this.embedding.identity;
+    const results: (number[] | undefined)[] = new Array(texts.length);
+    const missIndices: number[] = [];
+    const missTexts: string[] = [];
+
+    texts.forEach((text, i) => {
+      const key = `${identity} ${text}`;
+      const cached = this.queryEmbeddingCache.get(key);
+      if (cached) {
+        // Recency-reinsert for LRU eviction ordering.
+        this.queryEmbeddingCache.delete(key);
+        this.queryEmbeddingCache.set(key, cached);
+        results[i] = cached;
+        this.metrics?.incCounter('query_embedding_cache_hit');
+      } else {
+        missIndices.push(i);
+        missTexts.push(text);
+        this.metrics?.incCounter('query_embedding_cache_miss');
+      }
+    });
+
+    if (missTexts.length > 0) {
+      const embedded = await this.embedding.embedBatch(missTexts);
+      missIndices.forEach((idx, j) => {
+        const vector = embedded[j]!;
+        results[idx] = vector;
+        this.cacheQueryEmbedding(`${identity} ${texts[idx]}`, vector);
+      });
+    }
+
+    return results as number[][];
+  }
+
+  private cacheQueryEmbedding(key: string, vector: number[]): void {
+    this.queryEmbeddingCache.set(key, vector);
+    while (this.queryEmbeddingCache.size > SearchService.QUERY_EMBEDDING_CACHE_CAPACITY) {
+      const oldestKey = this.queryEmbeddingCache.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.queryEmbeddingCache.delete(oldestKey);
+    }
   }
 
   // Merges per-variant candidate arrays by `id`, keeping the max score per id
@@ -337,14 +419,23 @@ export class SearchService {
   ): Promise<SearchResult[]> {
     const weights = this.config.search.hybrid_weights;
 
-    // Run both searches in parallel where possible
+    // Dispatch the embedding request before the synchronous SQLite fulltext
+    // scan below so the two legs overlap rather than serializing
+    // (cut-embedding-and-qdrant-round-trips). A no-op `.catch` is attached
+    // immediately: since this promise isn't awaited until after the scan
+    // completes, a rejection that settles in the meantime must not surface
+    // as an unhandled rejection — the real handling still happens via the
+    // `await` inside the `try` block below, which sees the same rejection.
+    const vectorPromise = this.embedQueryVariants(query);
+    vectorPromise.catch(() => {});
+
     let semanticItems: Array<{ id: string; score: number; vector?: number[] }> = [];
     const fulltextItems = filter
       ? this.storage.sqlite.fullTextSearch(namespace, query, limit * 2, collection, filter)
       : this.storage.sqlite.fullTextSearch(namespace, query, limit * 2, collection);
 
     try {
-      const { vectors, variantCount } = await this.embedQueryVariants(query);
+      const { vectors, variantCount } = await vectorPromise;
       this.metrics?.recordHistogram('search_query_expansion_variant_count', variantCount);
       // Preserve exact call arity for every pre-existing caller: `filter` is
       // passed through untouched (same reference, no `withVector` key added)

@@ -8,10 +8,31 @@ import type { CircuitBreaker } from '../resilience/index.js';
 
 const startTime = Date.now();
 
+interface SqliteStatsSnapshot {
+  countsByTier: Record<RetentionTier, number>;
+  unsyncedVectors: number;
+  memoryCount: number;
+  dbSizeBytes: number;
+  expiringSoon: number;
+  archivedCount: number;
+}
+
 export class HealthService {
   private cachedEmbeddingHealth: ComponentHealth | null = null;
   private cachedEmbeddingAt = 0;
   private static readonly EMBEDDING_CACHE_MS = 30_000; // cache for 30s
+
+  // trim-sqlite-query-and-health-overhead task 5.2: `/health` bypasses auth
+  // (src/transport/middleware.ts) and its handler recomputes everything per
+  // request, so unauthenticated poll storms would otherwise re-run every
+  // SQLite aggregate on every request. A short TTL (well inside any real
+  // monitoring poll interval) absorbs that while keeping numbers near-live.
+  // Component *statuses* derived from lifecycle/degraded flags (not from
+  // these counts) are read fresh every call regardless — see
+  // `checkRetention`/`checkVectorReconciliation`.
+  private cachedSqliteStats: SqliteStatsSnapshot | null = null;
+  private cachedSqliteStatsAt = 0;
+  private static readonly SQLITE_STATS_CACHE_MS = 5_000; // cache for 5s
 
   constructor(
     private storage: StorageManager,
@@ -27,13 +48,15 @@ export class HealthService {
       this.checkQdrant(),
       this.checkEmbedding(),
     ]);
-    const retentionOk = this.checkRetention();
-    const vectorReconciliation = this.checkVectorReconciliation();
+    // Single-pass + short-TTL cache (task 5.1/5.2): `countByTier` and
+    // `countUnsyncedVectors` are each computed at most once per (uncached)
+    // snapshot, not once for the retention/vector-reconciliation component
+    // status and again for the reported stats block.
+    const stats = this.getSqliteStats();
+    const retentionOk = this.checkRetention(stats.countsByTier);
+    const vectorReconciliation = this.checkVectorReconciliation(stats.unsyncedVectors);
 
     const overall = this.computeOverall(sqliteOk, qdrantOk, embeddingOk, vectorReconciliation, retentionOk);
-    const countsByTier = this.storage.sqlite.countByTier();
-    const now = new Date();
-    const until = new Date(now.getTime() + (7 * 24 * 60 * 60 * 1000));
 
     return {
       status: overall,
@@ -44,20 +67,47 @@ export class HealthService {
         vector_reconciliation: vectorReconciliation,
         retention: retentionOk,
       },
-      memory_count: this.storage.sqlite.countMemories(),
-      db_size_bytes: this.storage.sqlite.getDbSizeBytes(),
+      memory_count: stats.memoryCount,
+      db_size_bytes: stats.dbSizeBytes,
       uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
       circuitBreakers: this.getCircuitBreakerStates(),
       retention: {
-        counts_by_tier: countsByTier,
-        expiring_soon: this.storage.sqlite.countExpiringMemories(now.toISOString(), until.toISOString()),
-        archived_count: this.storage.sqlite.countArchivedMemories(),
-        unsynced_vectors: this.storage.sqlite.countUnsyncedVectors(),
-        over_capacity: this.isOverCapacity(countsByTier),
-        cleanup_lag_seconds: this.computeCleanupLagSeconds(now),
+        counts_by_tier: stats.countsByTier,
+        expiring_soon: stats.expiringSoon,
+        archived_count: stats.archivedCount,
+        unsynced_vectors: stats.unsyncedVectors,
+        over_capacity: this.isOverCapacity(stats.countsByTier),
+        cleanup_lag_seconds: this.computeCleanupLagSeconds(new Date()),
         distillation: this.buildDistillationRollup(),
       },
     };
+  }
+
+  /**
+   * Returns the SQLite stats bundle (tier counts, unsynced-vector count,
+   * memory count, DB size, expiring-soon/archived counts), computing every
+   * aggregate exactly once and caching the bundle for
+   * `SQLITE_STATS_CACHE_MS` (task 5.2), mirroring `checkEmbedding`'s
+   * `cachedEmbeddingHealth` pattern above.
+   */
+  private getSqliteStats(): SqliteStatsSnapshot {
+    const now = Date.now();
+    if (this.cachedSqliteStats && (now - this.cachedSqliteStatsAt) < HealthService.SQLITE_STATS_CACHE_MS) {
+      return this.cachedSqliteStats;
+    }
+    const nowDate = new Date(now);
+    const until = new Date(now + (7 * 24 * 60 * 60 * 1000));
+    const stats: SqliteStatsSnapshot = {
+      countsByTier: this.storage.sqlite.countByTier(),
+      unsyncedVectors: this.storage.sqlite.countUnsyncedVectors(),
+      memoryCount: this.storage.sqlite.countMemories(),
+      dbSizeBytes: this.storage.sqlite.getDbSizeBytes(),
+      expiringSoon: this.storage.sqlite.countExpiringMemories(nowDate.toISOString(), until.toISOString()),
+      archivedCount: this.storage.sqlite.countArchivedMemories(),
+    };
+    this.cachedSqliteStats = stats;
+    this.cachedSqliteStatsAt = now;
+    return stats;
   }
 
   // Additive rollup (add-memory-distillation, task 6.2): read straight from
@@ -177,7 +227,11 @@ export class HealthService {
     return Math.max(0, Math.floor((now.getTime() - lastSuccessMs) / 1000));
   }
 
-  private checkRetention(): ComponentHealth {
+  private checkRetention(counts: Record<RetentionTier, number>): ComponentHealth {
+    // `getRetentionDegraded()` is a single-row read, not an aggregate scan,
+    // so it stays live on every call (task 5.2's "component statuses are not
+    // cached") — only the tier counts driving `isOverCapacity` come from the
+    // shared, possibly-cached snapshot passed in by `check()`.
     const gcState = this.storage.sqlite.getRetentionDegraded();
     if (gcState.degraded) {
       return {
@@ -186,15 +240,18 @@ export class HealthService {
       };
     }
 
-    const counts = this.storage.sqlite.countByTier();
     if (this.isOverCapacity(counts)) {
       return { status: 'degraded', message: 'Retention tier or total capacity threshold exceeded' };
     }
     return { status: 'healthy' };
   }
 
-  private checkVectorReconciliation(): VectorReconciliationStatus {
-    const unsyncedVectors = this.storage.sqlite.countUnsyncedVectors();
+  private checkVectorReconciliation(unsyncedVectors: number): VectorReconciliationStatus {
+    // `getLifecycleOperation()`/`isBackgroundReconciliationActive()` are live
+    // in-memory/single-row reads, so the "reconciling" transition is visible
+    // immediately regardless of the stats cache above — only `unsyncedVectors`
+    // itself (the "pending" vs. "healthy" count) is sourced from the shared
+    // snapshot.
     const lifecycleOperation = this.storage.sqlite.getLifecycleOperation();
 
     if (lifecycleOperation === 'restore') {

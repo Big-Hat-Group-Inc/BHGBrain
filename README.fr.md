@@ -310,7 +310,19 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
       // Port d'écoute
       "port": 3721,
       // Nom de la variable d'env contenant le token Bearer pour l'auth HTTP
-      "bearer_token_env": "BHGBRAIN_TOKEN"
+      "bearer_token_env": "BHGBRAIN_TOKEN",
+      // Timeouts de socket appliqués au http.Server sous-jacent (ms). Les valeurs par
+      // défaut sont sûres pour un proxy : keep-alive au-dessus du timeout d'inactivité
+      // courant de 60s d'un reverse proxy, et headers timeout au-dessus de cela (Node
+      // exige headers_timeout_ms > keep_alive_timeout_ms pour éviter les conditions de
+      // course ECONNRESET — la validation de la configuration rejette une valeur qui ne
+      // satisfait pas cela).
+      "keep_alive_timeout_ms": 65000,
+      "headers_timeout_ms": 66000,
+      // Temps autorisé pour recevoir entièrement une requête ; ne borne pas les
+      // réponses SSE de longue durée sur GET /mcp, qui ne font que recevoir une
+      // requête, pas en envoyer une.
+      "request_timeout_ms": 300000
     },
     "stdio": {
       // Activer le transport MCP stdio
@@ -387,6 +399,19 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
 
     // Seuil de compaction de segment Qdrant (compacter quand cette fraction d'un segment est supprimée)
     "compaction_deleted_threshold": 0.10,
+
+    // Limites sur les deux tables d'historique en ajout seul (audit_log,
+    // memory_revisions), appliquées par le même nettoyage planifié
+    // (bhgbrain gc / scheduled_cleanup_enabled) qui exécute le reste de la
+    // rétention ci-dessus. `null` désactive la purge correspondante (le
+    // comportement précédent « conserver indéfiniment »). audit_log_max_entries
+    // conserve les N lignes les plus récentes par horodatage ;
+    // revisions_per_memory_max conserve les N révisions les plus élevées par
+    // souvenir. Les valeurs par défaut sont généreuses — un store doit être
+    // réellement pérenne avant qu'une purge ne supprime la moindre ligne. Une
+    // exécution à blanc (`bhgbrain gc --dry-run`) ne purge jamais.
+    "audit_log_max_entries": 50000,
+    "revisions_per_memory_max": 20,
 
     // Distillation de mémoire planifiée : regroupe les souvenirs épisodiques
     // T2/T3 liés et encore actifs, et consolide chaque cluster qualifiant en
@@ -1725,9 +1750,11 @@ Le serveur exécute une tâche de nettoyage planifiée (par défaut : quotidienn
 
 6. **Compaction (pilotée par seuil, pas par suppression) :** Pour chaque paire espace de noms/collection touchée par des suppressions durant cette exécution, une fois que le ratio de vecteurs supprimés dépasse `retention.compaction_deleted_threshold`, l'exécution incite l'optimiseur de segments Qdrant à récupérer de l'espace via `optimizers_config.deleted_threshold`.
 
-7. **Vidange :** SQLite est vidé atomiquement sur disque après toutes les suppressions.
+7. **Purge des tables d'historique :** `audit_log` (les `retention.audit_log_max_entries` lignes les plus récentes, par horodatage) et `memory_revisions` (les `retention.revisions_per_memory_max` révisions les plus élevées par souvenir) sont réduites à leurs limites configurées — ces deux tables en ajout seul grossiraient sinon indéfiniment. `null` sur l'une ou l'autre limite désactive la purge correspondante. Entièrement ignorée lors d'une exécution à blanc. Les nombres purgés sont rapportés comme `audit_pruned`/`revisions_pruned` dans le résultat du GC et journalisés dans l'événement `retention_gc`.
 
-8. **Signal de santé :** Si une étape d'archivage ou de suppression échoue en cours de route, le résultat de l'exécution est persisté et apparaît comme un composant `retention` dégradé dans `health://status` jusqu'à la prochaine exécution de GC propre.
+8. **Vidange :** SQLite est vidé atomiquement sur disque après toutes les suppressions.
+
+9. **Signal de santé :** Si une étape d'archivage ou de suppression échoue en cours de route, le résultat de l'exécution est persisté et apparaît comme un composant `retention` dégradé dans `health://status` jusqu'à la prochaine exécution de GC propre.
 
 Une exécution de GC — manuelle ou planifiée — ne lève jamais d'erreur vers son appelant : les échecs inattendus sont capturés, le verrou de cycle de vie en cours est toujours libéré, et le résultat est signalé comme `degraded: true` avec le travail déjà accompli intact.
 
@@ -3825,6 +3852,12 @@ est **authentifié par défaut** :
 
 Le conteneur s'exécute également en tant qu'utilisateur non-root (`node`).
 
+L'image définit également `NODE_ENV=production` en défense en profondeur (ce qui
+supprime la surcharge du mode développement d'Express). Ce n'est pas ce qui empêche
+les réponses d'erreur de fuir des traces de pile — cela est garanti par le middleware
+d'erreur JSON terminal dans tous les environnements, conteneur ou non — mais c'est
+tout de même une valeur par défaut sensée pour une image d'exécution.
+
 ### Profils Compose
 
 | Commande | Ce qui s'exécute |
@@ -3997,6 +4030,21 @@ Une fois la vérification de dérive terminée, le verrou est libéré — le r�
 - La limitation de débit est indexée sur l'identité de requête de confiance (IP) et ignore `x-client-id` pour l'application.
 - L'identité `client_id` des journaux d'audit/de requête est de même dérivée de l'identité de requête de confiance (`req.ip`), jamais de l'en-tête `x-client-id` fourni par l'appelant — cet en-tête n'est accepté que comme indice de débogage non autoritaire et n'est jamais approuvé pour la piste d'audit.
 - `memory://list` applique des bornes `limit` de `1..100` ; les valeurs invalides renvoient `INVALID_INPUT`.
+- Chaque chemin d'erreur HTTP — un gestionnaire de route qui lève une exception ou rejette, un corps de requête JSON mal formé, un `?uri=` mal formé sur `GET /resource` — renvoie l'enveloppe structurée `{error:{code,message,retryable}}`. Aucune trace de pile ni page d'erreur HTML ne sort jamais du processus, quel que soit `NODE_ENV` ; un middleware d'erreur terminal Express sert de filet pour tout ce qu'une route ne gère pas elle-même, et les erreurs inattendues sont toujours journalisées côté serveur (simplement pas répercutées dans le corps de la réponse).
+- Les réponses désactivent l'en-tête `X-Powered-By` et définissent `X-Content-Type-Options: nosniff`. Les réponses sont compressées en gzip lorsque le client envoie `Accept-Encoding: gzip`, sauf `text/event-stream` (le flux SSE de `/mcp`), qui n'est jamais mis en tampon pour compression.
+- `transport.http.keep_alive_timeout_ms` / `headers_timeout_ms` / `request_timeout_ms` (par défaut 65 s / 66 s / 300 s) remplacent les valeurs par défaut des timeouts de socket de Node, trop courtes pour le keep-alive derrière un reverse proxy et trop permissives face aux attaques slow-loris. `headers_timeout_ms` doit être supérieur à `keep_alive_timeout_ms` — la validation de la configuration rejette une valeur qui ne satisfait pas cette contrainte. `request_timeout_ms` ne borne que la réception d'une requête, donc il n'interrompt pas une réponse SSE de longue durée sur `GET /mcp`.
+
+### Arrêt propre (Graceful Shutdown)
+
+Sur `SIGINT`/`SIGTERM` (les deux transports) — et, pour stdio, lorsque le client ferme son extrémité du tube — le serveur :
+
+1. Vide immédiatement tout état SQLite non synchronisé sur le disque.
+2. Draine les connexions actives : ferme chaque session MCP ouverte (HTTP) ou le `Server`/transport MCP (stdio).
+3. Arrête les minuteries planifiées de nettoyage et de distillation.
+4. Ferme la connexion SQLite (point de contrôle du write-ahead log et nouveau vidage si quelque chose est devenu non synchronisé pendant le drainage).
+5. Se termine avec le code de sortie `0`.
+
+Un second signal pendant l'arrêt est ignoré — la séquence ci-dessus s'exécute au plus une fois. Si le drainage ne s'est pas terminé dans les **10 secondes**, le serveur journalise un événement `shutdown_timeout`, vide SQLite de manière synchrone une dernière fois, et se termine avec le code de sortie `1` afin que les orchestrateurs (Docker, systemd, Kubernetes) puissent distinguer un arrêt forcé d'un arrêt propre. Cela borne les arrêts par `docker stop`/redémarrage de conteneur à une fenêtre prévisible plutôt que de laisser s'écouler le temps jusqu'à un `SIGKILL`.
 
 ### Authentification sécurisée en cas d'échec
 
