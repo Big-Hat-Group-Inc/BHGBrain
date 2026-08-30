@@ -60,6 +60,26 @@ export class QdrantStore {
   private client: QdrantClient;
   private dimensions: number;
 
+  // cut-embedding-and-qdrant-round-trips: per-instance memo of collections
+  // this process has already fully ensured (create-or-get + every payload
+  // index), so `upsert` stops paying a `getCollection` + tolerated-409
+  // `createPayloadIndex` round trip on every write once a collection is
+  // warm. Only ever grows via `ensureCollection` after the *entire* ensure
+  // sequence succeeds — a partial failure leaves the name un-memoized so the
+  // next call retries the full sequence. Invalidated on `deleteCollection`,
+  // `clearManagedCollections`, and a not-found surfaced during `upsert`
+  // (collection deleted out from under this process).
+  private ensuredCollections = new Set<string>();
+
+  // Short-TTL cache for `listAllCollections`, which namespace-wide `search`
+  // calls on every request absent a specific `collection`. TTL (not pure
+  // event-invalidation) because other devices can create/delete collections
+  // remotely without this process observing it; eagerly invalidated on any
+  // local create/delete so this process's own mutations are never stale to
+  // itself.
+  private static readonly COLLECTION_LIST_TTL_MS = 5000;
+  private collectionListCache: { names: string[]; expiresAt: number } | null = null;
+
   constructor(
     private config: BrainConfig,
     private readonly breaker?: CircuitBreaker,
@@ -100,6 +120,15 @@ export class QdrantStore {
 
   async ensureCollection(namespace: string, collection: string): Promise<void> {
     const name = this.collectionName(namespace, collection);
+    // cut-embedding-and-qdrant-round-trips: once this process has fully
+    // ensured a collection, every subsequent write to it is a no-op here —
+    // no `getCollection` round trip, no tolerated-409 `createPayloadIndex`
+    // calls. See the `ensuredCollections` field comment for invalidation.
+    if (this.ensuredCollections.has(name)) {
+      return;
+    }
+
+    let created = false;
     try {
       await this.client.getCollection(name);
     } catch {
@@ -129,6 +158,7 @@ export class QdrantStore {
         field_name: 'expires_at',
         field_schema: 'integer',
       });
+      created = true;
     }
 
     // Ensured unconditionally (not just on first create) so that collections
@@ -145,6 +175,20 @@ export class QdrantStore {
     // filters on unindexed fields, just slower), so this is a performance
     // addition, not a correctness dependency.
     await this.ensureCreatedAtIndex(name);
+
+    // Only memoized once the *entire* sequence above has succeeded — a
+    // partial failure (e.g. an index call rejecting) must not be memoized,
+    // so the next call retries the full sequence from scratch.
+    this.ensuredCollections.add(name);
+    if (created) {
+      // A newly created collection changes what `listAllCollections` should
+      // return; invalidate eagerly rather than waiting out the TTL.
+      this.invalidateCollectionListCache();
+    }
+  }
+
+  private invalidateCollectionListCache(): void {
+    this.collectionListCache = null;
   }
 
   private async ensureDeviceIdIndex(name: string): Promise<void> {
@@ -185,14 +229,26 @@ export class QdrantStore {
     await this.executeWithBreaker(async () => {
       const name = this.collectionName(namespace, collection);
       await this.ensureCollection(namespace, collection);
-      await this.client.upsert(name, {
-        wait: true,
-        points: [{
-          id,
-          vector,
-          payload: { ...payload, namespace },
-        }],
-      });
+      const points = [{
+        id,
+        vector,
+        payload: { ...payload, namespace },
+      }];
+      try {
+        await this.client.upsert(name, { wait: true, points });
+      } catch (err) {
+        // The memoized collection no longer exists on the server (deleted by
+        // another device, or an operator) — invalidate the memo, re-ensure,
+        // and retry exactly once. A second not-found propagates rather than
+        // looping.
+        if (!this.isNotFoundError(err)) {
+          throw err;
+        }
+        this.ensuredCollections.delete(name);
+        this.invalidateCollectionListCache();
+        await this.ensureCollection(namespace, collection);
+        await this.client.upsert(name, { wait: true, points });
+      }
     });
   }
 
@@ -462,11 +518,14 @@ export class QdrantStore {
     try {
       await this.client.deleteCollection(name);
     } catch (err) {
-      if (this.isNotFoundError(err)) {
-        return;
+      if (!this.isNotFoundError(err)) {
+        throw err;
       }
-      throw err;
+      // Already gone — the ensured-memo and list cache still need clearing
+      // below so a later write re-ensures instead of trusting a stale memo.
     }
+    this.ensuredCollections.delete(name);
+    this.invalidateCollectionListCache();
   }
 
   async createSnapshot(namespace: string, collection: string): Promise<string | null> {
@@ -480,10 +539,16 @@ export class QdrantStore {
   }
 
   async listAllCollections(): Promise<string[]> {
+    const now = Date.now();
+    if (this.collectionListCache && this.collectionListCache.expiresAt > now) {
+      return this.collectionListCache.names;
+    }
     const response = await this.client.getCollections();
-    return response.collections
+    const names = response.collections
       .map(c => c.name)
       .filter(name => name.startsWith(COLLECTION_PREFIX));
+    this.collectionListCache = { names, expiresAt: now + QdrantStore.COLLECTION_LIST_TTL_MS };
+    return names;
   }
 
   async scrollAll(
@@ -594,6 +659,11 @@ export class QdrantStore {
         throw err;
       }
     }
+
+    // Every managed collection is gone (or never existed) — clear the whole
+    // ensured-memo and the list cache rather than pruning entry by entry.
+    this.ensuredCollections.clear();
+    this.invalidateCollectionListCache();
 
     return managedNames.length;
   }

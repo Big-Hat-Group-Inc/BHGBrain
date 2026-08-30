@@ -1,8 +1,9 @@
 import type { BrainConfig } from '../config/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { CircuitBreaker } from '../resilience/index.js';
-import { BrainError, embeddingUnavailable, rateLimited } from '../errors/index.js';
+import { BrainError, embeddingUnavailable } from '../errors/index.js';
 import { formatEmbeddingIdentity, type EmbeddingProvider } from './index.js';
+import { executeSingleEmbeddingRequest, requestEmbeddingsWithRetry } from './request.js';
 
 function shouldIncludeDimensions(model: string): boolean {
   return model === 'text-embedding-3-small' || model === 'text-embedding-3-large';
@@ -114,63 +115,7 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
     }
   }
 
-  // Wraps the whole logical operation (all retry attempts) in a single breaker
-  // call so one `embedBatch` records at most one breaker failure, regardless of
-  // how many attempts `retry.max_attempts` allows internally.
-  private async requestWithRetry(texts: string[], useBreaker: boolean): Promise<Response> {
-    const executeRequest = async (attempt: number): Promise<Response> => {
-      try {
-        const response = await this.executeSingleRequest(texts);
-        if (response.ok) {
-          return response;
-        }
-
-        const status = response.status;
-        if (status === 429) {
-          throw rateLimited('Azure embeddings rate limited');
-        }
-
-        if (status >= 500 && status < 600) {
-          throw embeddingUnavailable(`Azure embedding provider error ${status}`);
-        }
-
-        // Non-retryable errors
-        if ([400, 401, 403, 404].includes(status)) {
-          throw new BrainError('EMBEDDING_UNAVAILABLE', `Azure embeddings request rejected (HTTP ${status})`, false);
-        }
-
-        // Other 4xx errors are not retryable
-        if (status >= 400 && status < 500) {
-          throw new BrainError('EMBEDDING_UNAVAILABLE', `Azure embeddings client error ${status}`, false);
-        }
-
-        // Should not happen
-        throw embeddingUnavailable(`Azure embeddings unexpected status ${status}`);
-      } catch (err) {
-        // Determine if error is retryable
-        const isRetryable = this.isRetryableError(err);
-        if (!isRetryable || attempt >= this.retryMaxAttempts) {
-          throw err;
-        }
-
-        // Wait with exponential backoff
-        const delay = this.retryBackoffMs * Math.pow(2, attempt - 1);
-        await new Promise(resolve => setTimeout(resolve, delay));
-        return executeRequest(attempt + 1);
-      }
-    };
-
-    if (useBreaker && this.breaker) {
-      return this.breaker.execute(() => executeRequest(1));
-    }
-
-    return executeRequest(1);
-  }
-
-  private async executeSingleRequest(texts: string[]): Promise<Response> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.requestTimeoutMs);
-
+  private buildRequestBody(texts: string[]): AzureEmbeddingsRequestBody {
     const body: AzureEmbeddingsRequestBody = {
       model: this.model,
       input: texts,
@@ -178,16 +123,41 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
     if (shouldIncludeDimensions(this.model)) {
       body.dimensions = this.dimensions;
     }
+    return body;
+  }
 
-    return fetch(`${this.baseUrl}/embeddings`, {
-      method: 'POST',
-      headers: {
-        'api-key': this.apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timeoutId));
+  private requestHeaders(): Record<string, string> {
+    return {
+      'api-key': this.apiKey,
+      'Content-Type': 'application/json',
+    };
+  }
+
+  // Wraps the whole logical operation (all retry attempts) in a single breaker
+  // call so one `embedBatch` records at most one breaker failure, regardless of
+  // how many attempts `retry.max_attempts` allows internally. Delegates the
+  // timeout/retry/classification machinery to the shared helper (see
+  // ./request.ts) so it is identical to the OpenAI provider's.
+  private async requestWithRetry(texts: string[], useBreaker: boolean): Promise<Response> {
+    return requestEmbeddingsWithRetry({
+      url: `${this.baseUrl}/embeddings`,
+      headers: this.requestHeaders(),
+      body: this.buildRequestBody(texts),
+      timeoutMs: this.requestTimeoutMs,
+      retry: { max_attempts: this.retryMaxAttempts, backoff_ms: this.retryBackoffMs },
+      breaker: this.breaker,
+      useBreaker,
+      errorPrefix: 'Azure',
+    });
+  }
+
+  private async executeSingleRequest(texts: string[]): Promise<Response> {
+    return executeSingleEmbeddingRequest({
+      url: `${this.baseUrl}/embeddings`,
+      headers: this.requestHeaders(),
+      body: this.buildRequestBody(texts),
+      timeoutMs: this.requestTimeoutMs,
+    });
   }
 
   private async parseEmbeddingsResponse(response: Response): Promise<number[][]> {
@@ -203,15 +173,5 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
     return data.data
       .sort((a, b) => a.index - b.index)
       .map(d => d.embedding);
-  }
-
-  private isRetryableError(err: unknown): boolean {
-    if (err instanceof BrainError) {
-      return err.retryable;
-    }
-    if (err instanceof Error) {
-      return err.name === 'AbortError' || err instanceof TypeError || /fetch|network/i.test(err.message);
-    }
-    return false;
   }
 }

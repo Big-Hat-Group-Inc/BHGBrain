@@ -132,16 +132,139 @@ describe('OpenAIEmbeddingProvider', () => {
       throw new Error('network down');
     }));
 
-    const provider = new OpenAIEmbeddingProvider(createConfig());
+    const config = createConfig();
+    // No retry noise: this test only cares about the terminal wrapping
+    // behavior, not the retry loop (covered separately below).
+    config.embedding.retry.max_attempts = 1;
+    const provider = new OpenAIEmbeddingProvider(config);
     await expect(provider.embed('hello')).rejects.toThrow('Embedding provider unreachable: network down');
   });
 
-  it('includes HTTP status code in embedding API failures', async () => {
+  it('includes HTTP status code in non-retryable embedding API failures', async () => {
     process.env.OPENAI_API_KEY = 'test-key';
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('slow down', { status: 429 })));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('bad request', { status: 400 })));
 
     const provider = new OpenAIEmbeddingProvider(createConfig());
-    await expect(provider.embed('hello')).rejects.toThrow('Embedding API error 429');
+    await expect(provider.embed('hello')).rejects.toMatchObject({
+      code: 'EMBEDDING_UNAVAILABLE',
+      message: 'OpenAI embeddings request rejected (HTTP 400)',
+      retryable: false,
+    });
+  });
+
+  // cut-embedding-and-qdrant-round-trips: OpenAI now shares the Azure
+  // provider's timeout/retry/classification machinery (src/embedding/
+  // request.ts) instead of a bare, unbounded `fetch`.
+  it('aborts an OpenAI request at request_timeout_ms', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      signal?.addEventListener('abort', () => {
+        const abortError = new Error('Request timed out');
+        abortError.name = 'AbortError';
+        reject(abortError);
+      });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const config = createConfig();
+    config.embedding.request_timeout_ms = 10;
+    config.embedding.retry.max_attempts = 1;
+    const provider = new OpenAIEmbeddingProvider(config);
+    await expect(provider.embed('hello')).rejects.toMatchObject({
+      code: 'EMBEDDING_UNAVAILABLE',
+      message: 'Embedding provider unreachable: Request timed out',
+      retryable: true,
+    });
+  });
+
+  it('retries transient 5xx/429 failures up to retry.max_attempts then surfaces the classified error', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    const fetchMock = vi.fn(async () => new Response('', { status: 503 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const config = createConfig();
+    config.embedding.retry.max_attempts = 3;
+    config.embedding.retry.backoff_ms = 1;
+    const provider = new OpenAIEmbeddingProvider(config);
+
+    await expect(provider.embed('hello')).rejects.toMatchObject({
+      code: 'EMBEDDING_UNAVAILABLE',
+      message: 'OpenAI embedding provider error 503',
+      retryable: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('a transient failure that succeeds on retry resolves without exhausting attempts', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    let callCount = 0;
+    const fetchMock = vi.fn(async () => {
+      callCount++;
+      if (callCount <= 1) {
+        return new Response('', { status: 502 });
+      }
+      return new Response(JSON.stringify({
+        data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
+      }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const config = createConfig();
+    config.embedding.retry.max_attempts = 3;
+    config.embedding.retry.backoff_ms = 1;
+    const provider = new OpenAIEmbeddingProvider(config);
+
+    await expect(provider.embed('hello')).resolves.toEqual([0.1, 0.2, 0.3]);
+    expect(callCount).toBe(2);
+  });
+
+  it('401 fails immediately without retry', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    const fetchMock = vi.fn(async () => new Response('', { status: 401 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const config = createConfig();
+    config.embedding.retry.max_attempts = 3;
+    const provider = new OpenAIEmbeddingProvider(config);
+
+    await expect(provider.embed('hello')).rejects.toMatchObject({
+      code: 'EMBEDDING_UNAVAILABLE',
+      message: 'OpenAI embeddings request rejected (HTTP 401)',
+      retryable: false,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('records at most one breaker failure per embedBatch even when retries are exhausted', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    const breaker = {
+      execute: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
+    } as unknown as CircuitBreaker;
+
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 502 })));
+
+    const config = createConfig();
+    config.embedding.retry.max_attempts = 3;
+    config.embedding.retry.backoff_ms = 1;
+    const provider = new OpenAIEmbeddingProvider(config, breaker);
+
+    await expect(provider.embed('hello')).rejects.toThrow();
+    expect(breaker.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('healthCheck issues a single request with no retry/backoff on a retryable failure', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    const fetchMock = vi.fn(async () => new Response('', { status: 503 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const config = createConfig();
+    config.embedding.retry.max_attempts = 3;
+    config.embedding.retry.backoff_ms = 1;
+    const provider = new OpenAIEmbeddingProvider(config);
+
+    await expect(provider.healthCheck()).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('bypasses the breaker during health checks', async () => {
