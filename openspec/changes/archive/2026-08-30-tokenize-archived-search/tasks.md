@@ -36,7 +36,7 @@
 - [x] 2.6 Confirm the existing test at `src/storage/sqlite.test.ts:1020`
   ("searchArchived matches retained summary/tags and scopes to the given namespace")
   passes unmodified — single-term matching and namespace scoping are unchanged.
-- [ ] 2.7 Active-path regression: existing `fullTextSearch` tests pass unmodified
+- [x] 2.7 Active-path regression: existing `fullTextSearch` tests pass unmodified
   after the 1.1 helper extraction.
 
 ## 3. Docs and validation
@@ -47,7 +47,7 @@
   the retained summary or tags (case-insensitive substring per term).
 - [x] 3.2 Mirror the same edits into `README.de.md`, `README.es.md`, `README.fr.md`,
   `README.zh-CN.md` — all five or none, per CLAUDE.md.
-- [ ] 3.3 Bump `package.json` via `npm version patch` (currently `1.34.3`; never
-  hand-edit — keeps `package-lock.json` in sync).
-- [ ] 3.4 Run `npm run lint && npm test`; fix any fallout before declaring the change
-  complete.
+- [x] 3.3 Bump `package.json` via `npm version patch` (currently `1.34.3`; never
+  hand-edit — keeps `package-lock.json` in sync). → `1.34.4`.
+- [x] 3.4 Run `npm run lint && npm test`; fix any fallout before declaring the change
+  complete. → lint clean; 1044/1044 tests pass (48 files).
