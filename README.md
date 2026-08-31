@@ -1777,8 +1777,9 @@ The restored memory receives fresh timestamps and a new UUID, and is re-embedded
 Qdrant. The CLI's `archive restore` additionally deletes the archive row once restored.
 
 MCP clients have an equivalent path: the `search` tool's `include_archived` parameter
-finds archived memories by summary/tag term (marked `archived: true`, never
-access-recorded), and the `review` tool's `restore` action recreates an active memory
+finds archived memories by summary/tag term — each whitespace-separated query term
+must independently match the retained summary or tags (marked `archived: true`, never
+access-recorded) — and the `review` tool's `restore` action recreates an active memory
 from an archived record — tagged `restored-from-archive`, with the archive row
 **retained** (unlike the CLI path) so its origin stays inspectable. See
 [MCP Tools Reference](#mcp-tools-reference).
@@ -3132,7 +3133,7 @@ Search memories using semantic, fulltext, or hybrid modes. Offers more control t
 | `collection` | `string` | No | - | Filter to a specific collection. |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | No | `"hybrid"` | Search algorithm. |
 | `limit` | `integer (1-50)` | No | `10` | Maximum number of results. |
-| `include_archived` | `boolean` | No | `false` | Also search archived memories (see [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving)) for a summary/tag term match. Matches are appended after active results, marked `archived: true`, and never reduce how many active results `limit` allows. Archived hits are not access-recorded. |
+| `include_archived` | `boolean` | No | `false` | Also search archived memories (see [Decay, Cleanup, and Archiving](#decay-cleanup-and-archiving)) for a summary/tag term match: every whitespace-separated query term must match the retained summary or tags (case-insensitive substring per term); a query with no terms matches nothing. Matches are appended after active results, marked `archived: true`, and never reduce how many active results `limit` allows. Archived hits are not access-recorded. |
 | `after` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at >= after` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the vector/fulltext store so `limit` counts matching memories - `search`'s first pushed-down filter. |
 | `before` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at <= before` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the vector/fulltext store so `limit` counts matching memories. |
 

@@ -1688,7 +1688,7 @@ bhgbrain archive restore <memory_id>  # 恢复已归档的记忆
 
 **恢复语义：** 恢复的记忆从归档摘要文本重新创建为一条**新的**记忆（沿用其原始层级）。原始内容（如果比摘要更长）无法恢复——归档仅存储 120 字符的摘要。恢复的记忆获得全新的时间戳和新 UUID，并在 Qdrant 中重新嵌入。CLI 的 `archive restore` 在恢复后还会删除该归档记录行。
 
-MCP 客户端也有对应的路径：`search` 工具的 `include_archived` 参数可按摘要/标签词条匹配找到已归档的记忆（标记为 `archived: true`，从不记录访问），而 `review` 工具的 `restore` 动作可根据归档记录重新创建一条活跃记忆——标记为 `restored-from-archive`，且归档记录行会被**保留**（这与 CLI 路径不同），以便其来源始终可追溯。参见 [MCP 工具参考](#mcp-工具参考)。
+MCP 客户端也有对应的路径：`search` 工具的 `include_archived` 参数可按摘要/标签词条匹配找到已归档的记忆——查询中每个以空白分隔的词条都必须独立匹配保留的摘要或标签（标记为 `archived: true`，从不记录访问），而 `review` 工具的 `restore` 动作可根据归档记录重新创建一条活跃记忆——标记为 `restored-from-archive`，且归档记录行会被**保留**（这与 CLI 路径不同），以便其来源始终可追溯。参见 [MCP 工具参考](#mcp-工具参考)。
 
 ---
 
@@ -2996,7 +2996,7 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `collection` | `string` | 否 | — | 过滤到特定集合。 |
 | `mode` | `"semantic" \| "fulltext" \| "hybrid"` | 否 | `"hybrid"` | 搜索算法。 |
 | `limit` | `integer (1–50)` | 否 | `10` | 最大结果数量。 |
-| `include_archived` | `boolean` | 否 | `false` | 同时搜索已归档的记忆（参见[衰减、清理与归档](#衰减清理与归档)），按摘要/标签进行词条匹配。归档命中会追加在活跃结果之后，标记为 `archived: true`，且从不减少 `limit` 允许的活跃结果数量。归档命中不会记录访问。 |
+| `include_archived` | `boolean` | 否 | `false` | 同时搜索已归档的记忆（参见[衰减、清理与归档](#衰减清理与归档)），按摘要/标签进行词条匹配：查询中每个以空白分隔的词条都必须匹配保留的摘要或标签（每个词条按不区分大小写的子串匹配）；不含词条的查询不返回任何结果。归档命中会追加在活跃结果之后，标记为 `archived: true`，且从不减少 `limit` 允许的活跃结果数量。归档命中不会记录访问。 |
 | `after` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at >= after`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到向量/全文存储层——这是 `search` 的第一个下推过滤条件。 |
 | `before` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at <= before`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到向量/全文存储层。 |
 

@@ -1036,6 +1036,81 @@ describe('SqliteStore', () => {
     expect(noMatch).toEqual([]);
   });
 
+  it('searchArchived matches multi-word queries whose terms are non-contiguous in the summary', () => {
+    const mem = { ...sampleMemory(), namespace: 'global', retention_tier: 'T2' as const };
+    store.archiveMemory(
+      { ...mem, summary: 'deployment note for the functional test', tags: [] },
+      '2026-01-01T00:00:00.000Z',
+    );
+
+    // "for the" breaks contiguity — the whole-substring implementation missed this.
+    const hits = store.searchArchived('global', 'deployment functional test', 10);
+    expect(hits.map(r => r.memory_id)).toEqual([mem.id]);
+  });
+
+  it('searchArchived lets different terms be satisfied by summary and tags independently', () => {
+    const mem = { ...sampleMemory(), namespace: 'global', retention_tier: 'T2' as const };
+    store.archiveMemory(
+      { ...mem, summary: 'a note about kubernetes', tags: ['ops'] },
+      '2026-01-01T00:00:00.000Z',
+    );
+
+    const hits = store.searchArchived('global', 'kubernetes ops', 10);
+    expect(hits.map(r => r.memory_id)).toEqual([mem.id]);
+  });
+
+  it('searchArchived requires every term to match (AND semantics)', () => {
+    const mem = { ...sampleMemory(), namespace: 'global', retention_tier: 'T2' as const };
+    store.archiveMemory(
+      { ...mem, summary: 'a note about kubernetes', tags: ['ops'] },
+      '2026-01-01T00:00:00.000Z',
+    );
+
+    expect(store.searchArchived('global', 'kubernetes zeppelin', 10)).toEqual([]);
+  });
+
+  it('searchArchived returns nothing for empty or whitespace-only queries', () => {
+    const mem = { ...sampleMemory(), namespace: 'global', retention_tier: 'T2' as const };
+    store.archiveMemory(
+      { ...mem, summary: 'a note about kubernetes', tags: ['ops'] },
+      '2026-01-01T00:00:00.000Z',
+    );
+
+    // Regression: the old `LIKE '%%'` shape matched every archived row.
+    expect(store.searchArchived('global', '', 10)).toEqual([]);
+    expect(store.searchArchived('global', '   ', 10)).toEqual([]);
+  });
+
+  it('searchArchive (CLI, namespace-agnostic) tokenizes the same way', () => {
+    const mem = { ...sampleMemory(), namespace: 'global', retention_tier: 'T2' as const };
+    store.archiveMemory(
+      { ...mem, summary: 'deployment note for the functional test', tags: [] },
+      '2026-01-01T00:00:00.000Z',
+    );
+    store.archiveMemory(
+      { ...mem, id: '00000000-0000-0000-0000-0000000000b2', namespace: 'other', summary: 'functional deployment elsewhere', tags: [] },
+      '2026-01-02T00:00:00.000Z',
+    );
+
+    // Multi-word, non-contiguous terms match, across all namespaces.
+    const hits = store.searchArchive('deployment functional', 10);
+    expect(hits.map(r => r.memory_id).sort()).toEqual([mem.id, '00000000-0000-0000-0000-0000000000b2'].sort());
+
+    // Empty query matches nothing rather than everything.
+    expect(store.searchArchive('', 10)).toEqual([]);
+  });
+
+  it('searchArchived still matches contiguous-substring and single-term queries as before', () => {
+    const mem = { ...sampleMemory(), namespace: 'global', retention_tier: 'T2' as const };
+    store.archiveMemory(
+      { ...mem, summary: 'deployment note for the functional test', tags: [] },
+      '2026-01-01T00:00:00.000Z',
+    );
+
+    expect(store.searchArchived('global', 'functional test', 10).map(r => r.memory_id)).toEqual([mem.id]);
+    expect(store.searchArchived('global', 'Deployment', 10).map(r => r.memory_id)).toEqual([mem.id]);
+  });
+
   // -- Health --
 
   it('passes health check', () => {
