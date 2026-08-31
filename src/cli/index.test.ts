@@ -191,6 +191,13 @@ describe('CLI', () => {
     return { createContext };
   }
 
+  it('reports --version equal to package.json version', async () => {
+    const { createProgram } = await import('./index.js');
+    const { PACKAGE_VERSION } = await import('../version.js');
+
+    expect(createProgram(vi.fn() as never).version()).toBe(PACKAGE_VERSION);
+  });
+
   it('exits with code 1 and logs a fatal error when config loading fails', async () => {
     const { loadConfig } = await import('../config/index.js');
     vi.mocked(loadConfig).mockImplementation(() => {
