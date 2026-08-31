@@ -1198,7 +1198,7 @@ export class SqliteStore implements SqliteStorage {
    * (task 3.2) — so callers never need to know which path ran.
    */
   fullTextSearch(namespace: string, query: string, limit: number, collection?: string, filter?: RecallFilter): Array<{ id: string; rank: number }> {
-    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+    const terms = SqliteStore.splitQueryTerms(query);
     if (terms.length === 0) return [];
 
     return this.ftsAvailable
@@ -1260,6 +1260,16 @@ export class SqliteStore implements SqliteStorage {
     `;
     const rows = this.queryAll(sql, params);
     return rows.map(row => ({ id: this.getString(row, 'id'), rank: -this.getNumber(row, 'score') }));
+  }
+
+  /**
+   * Single query-tokenization contract shared by `fullTextSearch` and
+   * `searchArchived`: lowercase, split on whitespace, drop empty tokens. Both
+   * callers treat zero terms as "match nothing" — keep them on this one
+   * definition so their tokenization can never drift apart.
+   */
+  private static splitQueryTerms(query: string): string[] {
+    return query.toLowerCase().split(/\s+/).filter(Boolean);
   }
 
   /**
@@ -1819,27 +1829,48 @@ export class SqliteStore implements SqliteStorage {
   }
 
   searchArchive(query: string, limit: number): ArchiveRecord[] {
-    const like = `%${query.toLowerCase()}%`;
-    const rows = this.queryAll(
-      `SELECT * FROM memory_archive WHERE LOWER(summary) LIKE ? OR LOWER(tags) LIKE ? ORDER BY expired_at DESC LIMIT ?`,
-      [like, like, limit],
-    );
-    return rows.map(row => this.rowToArchive(row));
+    return this.searchArchiveByTerms(null, query, limit);
   }
 
   /**
    * Namespace-scoped companion to `searchArchive` (which is deliberately
    * namespace-agnostic for the CLI/operator surface): the `search` tool's
    * `include_archived` results must not leak archived memories across
-   * namespace boundaries the way an unscoped LIKE query would. Matches on
-   * retained summary/tags only — content and vectors are not kept for
-   * archived rows, so this is metadata-term search, not semantic search.
+   * namespace boundaries the way an unscoped LIKE query would.
    */
   searchArchived(namespace: string, query: string, limit: number): ArchiveRecord[] {
-    const like = `%${query.toLowerCase()}%`;
+    return this.searchArchiveByTerms(namespace, query, limit);
+  }
+
+  /**
+   * Term-matches archived rows on their retained summary/tags (content and
+   * vectors are not kept for archived rows, so this is metadata-term search,
+   * not semantic search): the query is tokenized via `splitQueryTerms` (the
+   * same contract `fullTextSearch` uses) and every term must independently
+   * substring-match the summary or tags (ANDed conjuncts, mirroring
+   * `fullTextSearchLike`'s per-term shape). A query with no terms matches
+   * nothing — never the whole archive.
+   */
+  private searchArchiveByTerms(namespace: string | null, query: string, limit: number): ArchiveRecord[] {
+    const terms = SqliteStore.splitQueryTerms(query);
+    if (terms.length === 0) return [];
+
+    const conditions: string[] = [];
+    const params: SqlParams = [];
+    if (namespace !== null) {
+      conditions.push('namespace = ?');
+      params.push(namespace);
+    }
+    for (const term of terms) {
+      conditions.push(`(LOWER(summary) LIKE ? OR LOWER(tags) LIKE ?)`);
+      const like = `%${term}%`;
+      params.push(like, like);
+    }
+    params.push(limit);
+
     const rows = this.queryAll(
-      `SELECT * FROM memory_archive WHERE namespace = ? AND (LOWER(summary) LIKE ? OR LOWER(tags) LIKE ?) ORDER BY expired_at DESC LIMIT ?`,
-      [namespace, like, like, limit],
+      `SELECT * FROM memory_archive WHERE ${conditions.join(' AND ')} ORDER BY expired_at DESC LIMIT ?`,
+      params,
     );
     return rows.map(row => this.rowToArchive(row));
   }
