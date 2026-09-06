@@ -37,13 +37,28 @@ function tokenize(text: string): string[] {
  * (ties broken by earliest position), truncated to `maxLen` with the same
  * `...` convention as `generateSummary`. See improve-memory-summarization
  * design.md, "Extractive algorithm — TF-scored sentence, length-normalized".
+ *
+ * Sentence boundaries are `.`/`!`/`?` **followed by whitespace or end-of-input**,
+ * or a newline (always). The lookahead is load-bearing, not incidental: a bare
+ * `/[.!?\n]+/` treats the dots inside URLs, domains, semantic versions, and
+ * filenames as boundaries, shredding `https://example.eth.limo` into
+ * `["https://example", "eth", "limo"]` and leaving the scorer to return a
+ * fragment of a URL as the summary. In well-formed prose a terminal period is
+ * always followed by whitespace or the end of the string; inside a compound
+ * token it never is. Do not "simplify" the lookahead away — see
+ * fix-summarizer-url-splitting.
+ *
+ * Known limitation (accepted, see that change's design.md Non-Goals):
+ * abbreviations such as `e.g.` still split at their final dot. Fixing that
+ * needs an abbreviation lexicon, i.e. the dependency this summarizer exists to
+ * avoid.
  */
 export function extractiveSummary(content: string, maxLen = 120): string {
   const trimmed = content.trim();
   if (trimmed.length === 0) return '';
 
   const rawSentences = trimmed
-    .split(/[.!?\n]+/)
+    .split(/[.!?]+(?=\s|$)|\n+/)
     .map(s => s.trim())
     .filter(s => s.length > 0);
 
