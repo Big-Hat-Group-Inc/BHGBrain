@@ -18,6 +18,7 @@ import { DistillationService } from '../pipeline/distillation.js';
 import { DistillationLLMClient } from '../pipeline/distillation-llm.js';
 import { MetricsCollector } from '../health/metrics.js';
 import { createLogger } from '../health/logger.js';
+import { PACKAGE_VERSION } from '../version.js';
 import { CircuitBreaker } from '../resilience/index.js';
 import { handleTool, type ToolContext } from '../tools/index.js';
 
@@ -58,7 +59,12 @@ export function createProgram(createContextImpl: typeof createContext = createCo
   const program = new Command()
     .name('bhgbrain')
     .description('BHGBrain companion CLI for managing persistent memory')
-    .version('1.4.1');
+    // Read from package.json via src/version.ts rather than hardcoded: the
+    // literal here had drifted to '1.4.1' while the package was at 1.34.4,
+    // so `bhgbrain --version` reported a version 30 minors stale. Same fix
+    // task 1.1/1.2 of `complete-mcp-protocol-surface` applied to the MCP
+    // `serverInfo.version`; this call site was missed at the time.
+    .version(PACKAGE_VERSION);
 
   program
     .command('list')
