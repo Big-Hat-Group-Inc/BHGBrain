@@ -1272,6 +1272,76 @@ describe('lifecycle-conflict classification at the handleTool boundary', () => {
   });
 });
 
+// harden-dual-store-mutations task 2.5: a residual SQLite lock error that
+// survives the configured busy_timeout (see SqliteStore.openDatabase and
+// errors/index.ts's classifyResidualLockError) is retryable ordinary write
+// contention, not a permanent failure — handleTool's outer catch, the one
+// place every REST/MCP tool call funnels through, classifies it into a
+// retryable CONFLICT instead of a non-retryable-looking INTERNAL error,
+// whether the raw `node:sqlite` error reaches it directly or has already
+// been flattened into an `internal(...)` BrainError's message by an
+// intermediate storage-layer catch.
+describe('residual SQLite lock classification at the handleTool boundary', () => {
+  function createCtx(overrides?: { storage?: Partial<StorageManager> }): ToolContext {
+    return {
+      config: {} as ToolContext['config'],
+      storage: (overrides?.storage ?? {}) as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('reports a retryable CONFLICT for a raw node:sqlite busy error (code/errcode shape)', async () => {
+    const busyError = Object.assign(new Error('database is locked'), {
+      code: 'ERR_SQLITE_ERROR',
+      errcode: 5,
+      errstr: 'database is locked',
+    });
+    const ctx = createCtx({
+      storage: { sqlite: {
+        getCategory: () => { throw busyError; },
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    const result = await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('CONFLICT');
+    expect(result.error.retryable).toBe(true);
+    expect(result.error.message).toMatch(/database is locked/);
+  });
+
+  it('reclassifies a lock error already wrapped by an intermediate internal(...) catch', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        getCategory: () => { throw new Error('SQLite write failed: database is locked'); },
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    const result = await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('CONFLICT');
+    expect(result.error.retryable).toBe(true);
+    expect(result.error.message).toBe('SQLite write failed: database is locked');
+  });
+
+  it('leaves an unrelated internal error classified as INTERNAL, not CONFLICT', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        getCategory: () => { throw new Error('disk full'); },
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    const result = await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INTERNAL');
+  });
+});
+
 describe('handleRecall filter pushdown and score semantics (push-down-recall-filters)', () => {
   let ctx: ToolContext;
   let searchMock: ReturnType<typeof vi.fn>;

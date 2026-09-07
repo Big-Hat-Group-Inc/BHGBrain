@@ -686,6 +686,79 @@ describe('QdrantStore.ensureCollection device_id index migration', () => {
       'this.client.createPayloadIndex is not a function',
     );
   });
+
+  // harden-dual-store-mutations task 3.6: tags is the one keyword index used
+  // for filtering by tag (RecallFilter.tags -> `{ key: 'tags', match: {
+  // any: ... } }` in `search`), so it must be ensured the same unconditional
+  // way as device_id/created_at above, not only on first collection creation.
+  it('creates the tags keyword index when the collection already exists', async () => {
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async () => ({}) as never);
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => ({}) as never),
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    await store.ensureCollection('global', 'general');
+
+    expect(createPayloadIndex).toHaveBeenCalledWith(
+      'bhgbrain_global_general',
+      { field_name: 'tags', field_schema: 'keyword' },
+    );
+  });
+
+  // harden-dual-store-mutations task 3.6 / design.md decision 6: a
+  // collection is memoized as "ensured" only once the *entire*
+  // REQUIRED_PAYLOAD_INDEXES sequence succeeds, so a call that fails partway
+  // through must retry the full sequence (not just the missing index) on the
+  // next use, and must converge (no further retry needed) once the retry
+  // succeeds.
+  it('retries the whole index sequence on the next call after a partial index-creation failure, and converges', async () => {
+    let call = 0;
+    const createPayloadIndex = vi.fn<QdrantClient['createPayloadIndex']>(async (_name, index) => {
+      call++;
+      // Fail the 4th index call (mid-sequence) on the first attempt only.
+      if (call === 4) {
+        throw new TypeError('transient index-service error');
+      }
+      return { field_name: index.field_name } as never;
+    });
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => ({}) as never),
+      createCollection: vi.fn<QdrantClient['createCollection']>(),
+      createPayloadIndex,
+    };
+    const store = createStore(client);
+
+    // First call fails partway through the index sequence.
+    await expect(store.ensureCollection('global', 'general')).rejects.toThrow('transient index-service error');
+    const callsAfterFirstAttempt = createPayloadIndex.mock.calls.length;
+    expect(callsAfterFirstAttempt).toBeGreaterThan(0);
+    expect(callsAfterFirstAttempt).toBeLessThan(8); // fewer than every required index — it really did fail partway
+
+    // The failed attempt must not have been memoized: the next call retries
+    // the FULL sequence from scratch (getCollection is called again, not
+    // skipped as an already-ensured collection).
+    await store.ensureCollection('global', 'general');
+    expect(client.getCollection).toHaveBeenCalledTimes(2);
+    // Every required index was (re-)created on the successful retry.
+    const fieldsOnRetry = createPayloadIndex.mock.calls.slice(callsAfterFirstAttempt).map(c => c[1]?.field_name);
+    expect(fieldsOnRetry).toEqual(expect.arrayContaining([
+      'namespace', 'type', 'tags', 'retention_tier', 'decay_eligible', 'expires_at', 'device_id', 'created_at',
+    ]));
+
+    // Now converged: a third call issues no further getCollection/index
+    // calls at all (memoized).
+    const totalCallsBeforeThirdAttempt = createPayloadIndex.mock.calls.length;
+    await store.ensureCollection('global', 'general');
+    expect(client.getCollection).toHaveBeenCalledTimes(2);
+    expect(createPayloadIndex.mock.calls.length).toBe(totalCallsBeforeThirdAttempt);
+  });
 });
 
 describe('QdrantStore.ensureCollection created_at datetime index migration', () => {

@@ -2794,8 +2794,16 @@ export class SqliteStore implements SqliteStorage {
     });
   }
 
+  // harden-dual-store-mutations task 1.4: fixed SQL, called on every
+  // vector-producing write (StorageManager.ensureCollectionCompatible) and
+  // every reconciliation batch item, so it is compiled once per database
+  // handle via the same `queryOneCached`/`preparedStatement` cache
+  // `getMemoryById` already uses, instead of `db.prepare()` recompiling this
+  // statement on every call.
   getCollection(namespace: string, name: string): CollectionRecord | null {
-    const row = this.queryOne(`SELECT * FROM collections WHERE namespace = ? AND name = ?`, [namespace, name]);
+    const row = this.queryOneCached(
+      `SELECT * FROM collections WHERE namespace = ? AND name = ?`, [namespace, name],
+    );
     if (!row) return null;
     return {
       name: this.getString(row, 'name'),

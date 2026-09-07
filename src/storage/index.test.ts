@@ -20,6 +20,9 @@ type MockSqliteStore = SqliteStore & {
   insertNextRevision: ReturnType<typeof vi.fn>;
   insertAudit: ReturnType<typeof vi.fn>;
   deleteMemoriesByIds: ReturnType<typeof vi.fn>;
+  stageDeletionIntent: ReturnType<typeof vi.fn>;
+  clearDeletionIntent: ReturnType<typeof vi.fn>;
+  markVectorSyncFailure: ReturnType<typeof vi.fn>;
   listMemoryIds: ReturnType<typeof vi.fn>;
   hydrateBatch: ReturnType<typeof vi.fn>;
   listMemoriesWithStaleEmbeddingStamp: ReturnType<typeof vi.fn>;
@@ -60,6 +63,28 @@ function createMockSqlite(): MockSqliteStore {
         if (memoryStore.delete(id)) deleted++;
       }
       return deleted;
+    }),
+    // harden-dual-store-mutations tasks 2.1/2.2: SQLite-first deletion
+    // staging/compensation. Real `SqliteStore` hides a staged row from reads
+    // and clears the pending flag on compensation (see sqlite.test.ts); this
+    // mock only tracks the calls themselves — StorageManager's orchestration
+    // (call order, which primary/compensation error the caller ultimately
+    // sees) is what `describe('StorageManager.deleteMemory ...')`/
+    // `describe('deleteMemories SQLite-first staging ...')` below exercise,
+    // not the row-hiding behavior already covered at the SqliteStore layer.
+    stageDeletionIntent: vi.fn((_ids: string[], _options?: { lifecycleToken?: unknown }) => {}),
+    clearDeletionIntent: vi.fn((ids: string[], options?: { lifecycleToken?: unknown; vectorSynced?: boolean }) => {
+      // Mirrors SqliteStore.clearDeletionIntent: clears the pending flag and
+      // sets vector_synced to the given value (default false), so it stays
+      // detectable as cross-store drift until reconciled.
+      for (const id of ids) {
+        const existing = memoryStore.get(id);
+        if (existing) existing.vector_synced = options?.vectorSynced ?? false;
+      }
+    }),
+    markVectorSyncFailure: vi.fn((id: string, _error: string, _permanent: boolean) => {
+      const existing = memoryStore.get(id);
+      if (existing) existing.vector_synced = false;
     }),
     listMemoryIds: vi.fn(() => new Set(memoryStore.keys())),
     hydrateBatch: vi.fn((
@@ -1124,6 +1149,105 @@ describe('StorageManager cross-store consistency', () => {
       // task 2.2: one chunked deleteMemoriesByIds call, not a deleteMemory loop.
       expect(sqlite.deleteMemoriesByIds).toHaveBeenCalledTimes(1);
       expect(sqlite.deleteMemoriesByIds).toHaveBeenCalledWith(['mem-a']);
+    });
+  });
+
+  // harden-dual-store-mutations task 2.1: single-delete SQLite-first staging
+  // orchestration — stageDeletionIntent before the Qdrant call, so a failure
+  // at any boundary leaves recoverable authoritative data or explicit,
+  // detectable drift, never a silently-clean row with a deleted vector.
+  describe('StorageManager.deleteMemory SQLite-first staging (harden-dual-store-mutations task 2.1)', () => {
+    it('stages the deletion intent, then confirms the vector delete, before removing the SQLite row', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a' });
+
+      const order: string[] = [];
+      const originalDeleteMemoriesByIds = sqlite.deleteMemoriesByIds.getMockImplementation() as (ids: string[]) => number;
+      sqlite.stageDeletionIntent.mockImplementation(() => { order.push('stage'); });
+      qdrant.delete = vi.fn(async () => { order.push('qdrant-delete'); });
+      sqlite.deleteMemoriesByIds.mockImplementation((ids: string[]) => {
+        order.push('sqlite-delete');
+        return originalDeleteMemoriesByIds(ids);
+      });
+
+      const deleted = await storage.deleteMemory('mem-a');
+
+      expect(deleted).toBe(true);
+      expect(order).toEqual(['stage', 'qdrant-delete', 'sqlite-delete']);
+      expect(sqlite.stageDeletionIntent).toHaveBeenCalledWith(['mem-a']);
+      expect(sqlite.clearDeletionIntent).not.toHaveBeenCalled();
+    });
+
+    it('a failed Qdrant delete clears the staged intent (compensation) and leaves the SQLite row recoverable', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a' });
+
+      qdrant.delete = vi.fn(async () => { throw new Error('qdrant unreachable'); });
+
+      await expect(storage.deleteMemory('mem-a')).rejects.toThrow('Qdrant delete failed: qdrant unreachable');
+
+      // Row survives (the SQLite delete step was never reached), and its
+      // pending intent was cleared with vectorSynced:false so it remains
+      // visible as detectable cross-store drift rather than silently
+      // staying "pending" forever.
+      expect(sqlite.deleteMemoriesByIds).not.toHaveBeenCalled();
+      expect(sqlite.getMemoryById('mem-a')).not.toBeNull();
+      expect(sqlite.clearDeletionIntent).toHaveBeenCalledWith(['mem-a'], { vectorSynced: false });
+    });
+
+    it('a confirmed vector delete followed by a failed SQLite delete leaves the tombstone pending and records the failure, not a revived row', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a' });
+
+      sqlite.deleteMemoriesByIds.mockImplementation(() => { throw new Error('disk full'); });
+
+      await expect(storage.deleteMemory('mem-a')).rejects.toThrow(
+        'SQLite delete failed after Qdrant cleanup; deletion remains pending',
+      );
+
+      // No compensation clears the pending intent here — the vector really
+      // is gone, so reviving the row would silently desync it again.
+      expect(sqlite.clearDeletionIntent).not.toHaveBeenCalled();
+      expect(sqlite.insertAudit).toHaveBeenCalledWith(expect.objectContaining({
+        operation: 'DELETE',
+        memory_id: 'mem-a',
+        details: expect.stringContaining('"consistency_error":"disk full"'),
+      }));
+    });
+
+    it('a compensation failure is logged alongside the primary error, but the primary error is still what the caller sees', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+      sqlite.insertMemory({ ...baseMem, id: 'mem-a' });
+
+      qdrant.delete = vi.fn(async () => { throw new Error('qdrant unreachable'); });
+      sqlite.clearDeletionIntent.mockImplementation(() => { throw new Error('compensation write failed'); });
+
+      // The primary (Qdrant) failure, not the compensation failure, is what
+      // propagates to the caller.
+      await expect(storage.deleteMemory('mem-a')).rejects.toThrow('Qdrant delete failed: qdrant unreachable');
+
+      expect(sqlite.insertAudit).toHaveBeenCalledWith(expect.objectContaining({
+        operation: 'DELETE',
+        memory_id: 'mem-a',
+        details: expect.stringContaining('"consistency_error":"qdrant unreachable"'),
+      }));
+      const auditCall = sqlite.insertAudit.mock.calls[0]![0] as { details: string };
+      expect(JSON.parse(auditCall.details)).toMatchObject({
+        consistency_error: 'qdrant unreachable',
+        compensation_error: 'compensation write failed',
+      });
     });
   });
 

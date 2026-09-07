@@ -49,6 +49,47 @@ export function internal(message: string): BrainError {
   return new BrainError('INTERNAL', message, true);
 }
 
+// harden-dual-store-mutations task 2.5 / design.md decision 3: SQLite's own
+// busy_timeout (SqliteStore.openDatabase) waits out ordinary CLI/server
+// overlap; a lock error that survives that wait is a residual, retryable
+// contention condition, not a permanent failure — the caller should retry
+// rather than treat it as an unrecoverable INTERNAL error. `node:sqlite`
+// (DatabaseSync) throws a plain `Error` for this with `code:
+// 'ERR_SQLITE_ERROR'` and `errcode: 5` (SQLITE_BUSY) or `6` (SQLITE_LOCKED);
+// the message-substring check covers both that raw shape and the case where
+// the message has already been re-wrapped (e.g. "SQLite write failed:
+// database is locked") by an intermediate `internal(...)` call, once the
+// original error's own `code`/`errcode` properties are no longer reachable.
+const SQLITE_LOCK_ERRCODES = new Set([5, 6]);
+
+export function isResidualSqliteLockError(err: unknown): boolean {
+  if (err && typeof err === 'object') {
+    const candidate = err as { code?: unknown; errcode?: unknown };
+    if (candidate.code === 'ERR_SQLITE_ERROR' && typeof candidate.errcode === 'number' &&
+      SQLITE_LOCK_ERRCODES.has(candidate.errcode)) {
+      return true;
+    }
+  }
+  const message = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+  return /database is locked|database table is locked/i.test(message);
+}
+
+/**
+ * Reclassifies a residual SQLite lock condition — whether still a raw
+ * `node:sqlite` error or already wrapped into a non-CONFLICT `BrainError` by
+ * an intermediate catch — into a retryable `CONFLICT`, preserving the
+ * original message. Returns the input unchanged when it isn't one.
+ */
+export function classifyResidualLockError(err: unknown): unknown {
+  if (!isResidualSqliteLockError(err)) return err;
+  if (err instanceof BrainError) {
+    if (err.code === 'CONFLICT' && err.retryable) return err;
+    return new BrainError('CONFLICT', err.message, true);
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return new BrainError('CONFLICT', message, true);
+}
+
 /**
  * Canonical mapping from a classified error code to its REST HTTP status —
  * the single source every transport-facing adapter (REST's route handlers

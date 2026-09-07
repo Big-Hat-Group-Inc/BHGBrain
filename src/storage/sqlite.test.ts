@@ -68,6 +68,126 @@ describe('SqliteStore', () => {
     configured.close();
   });
 
+  // harden-dual-store-mutations task 1.1: proves the configured busy_timeout
+  // actually makes a second connection WAIT for a held write lock and then
+  // succeed, rather than failing immediately with SQLITE_BUSY. A second
+  // `DatabaseSync` handle on the same file (this test's own `store` plus one
+  // opened directly here) can't contend from the same JS thread — SQLite's
+  // busy-handler blocks synchronously in native code, which would starve the
+  // event loop needed to release the lock on a timer — so the lock is held
+  // from a `worker_threads` Worker instead, genuinely concurrent with this
+  // thread's insert.
+  it('a second connection waits out a held write lock (via busy_timeout) and succeeds, instead of failing immediately', async () => {
+    const { Worker } = await import('node:worker_threads');
+    const dbPath = store.getDatabasePath();
+    const HOLD_MS = 400;
+
+    // A one-word shared flag: the worker sets it (and wakes this thread via
+    // Atomics.notify) the instant its write transaction has actually
+    // acquired the lock, so this thread starts contending for it exactly
+    // once contention is real — never guessing at a fixed head-start delay,
+    // which would be flaky under the variable worker-thread startup latency
+    // a full, parallel test-suite run introduces.
+    const syncBuffer = new SharedArrayBuffer(4);
+    const syncFlag = new Int32Array(syncBuffer);
+
+    // Worker holds the exclusive write lock for HOLD_MS (blocking via
+    // Atomics.wait, which needs no event loop) before committing.
+    const workerCode = `
+      const { workerData } = require('node:worker_threads');
+      const { DatabaseSync } = require('node:sqlite');
+      const syncFlag = new Int32Array(workerData.syncBuffer);
+      const db = new DatabaseSync(workerData.dbPath);
+      db.exec('PRAGMA busy_timeout = 2000');
+      db.exec('BEGIN IMMEDIATE');
+      db.prepare("INSERT INTO categories (name, slot, content, revision, updated_at) VALUES ('lock-holder', 'custom', 'x', 1, '2026-01-01T00:00:00Z')").run();
+      Atomics.store(syncFlag, 0, 1);
+      Atomics.notify(syncFlag, 0);
+      const holdBuffer = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(holdBuffer, 0, 0, ${HOLD_MS});
+      db.exec('COMMIT');
+      db.close();
+    `;
+    const worker = new Worker(workerCode, { eval: true, workerData: { dbPath, syncBuffer } });
+    const workerExited = new Promise<void>((resolve, reject) => {
+      worker.on('exit', () => resolve());
+      worker.on('error', reject);
+    });
+
+    // Block (synchronously, without the event loop) until the worker signals
+    // its transaction is actually open and holding the lock.
+    Atomics.wait(syncFlag, 0, 0, 5_000);
+    expect(Atomics.load(syncFlag, 0)).toBe(1);
+
+    const startedAt = Date.now();
+    const mem = sampleMemory();
+    expect(() => store.insertMemory(mem)).not.toThrow();
+    const elapsedMs = Date.now() - startedAt;
+
+    await workerExited;
+
+    // Succeeded only by waiting out most of the worker's HOLD_MS hold (not by
+    // getting the lock instantly, and not by throwing SQLITE_BUSY).
+    expect(elapsedMs).toBeGreaterThan(HOLD_MS / 2);
+    expect(store.getMemoryById(mem.id)).not.toBeNull();
+  }, 10_000);
+
+  // harden-dual-store-mutations task 1.2: `withSavepoint`'s own compensation
+  // (ROLLBACK TO/RELEASE, run in its `catch`) can itself fail — e.g. a
+  // connection-level error surfacing while unwinding. That must never
+  // replace the caller-visible error with the (usually less informative)
+  // cleanup failure; the primary error's message is what propagates, with
+  // the cleanup failure attached (non-enumerable `rollbackError`) for
+  // structured callers/tests, not swallowed.
+  it('preserves the primary error (not the rollback failure) when the savepoint rollback itself fails', async () => {
+    // A dedicated store/connection (not the shared per-test fixture): once
+    // ROLLBACK TO itself is made to fail below, the savepoint it was meant
+    // to close is left open on this connection for the rest of the test —
+    // exactly the scenario under verification — so this must not be the
+    // connection the outer `afterEach` unconditionally closes.
+    const localDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-rollback-'));
+    const localStore = new SqliteStore(localDir);
+    await localStore.init();
+
+    try {
+      const dbInternal = (localStore as unknown as { db: DatabaseSync }).db;
+      const realPrepare = dbInternal.prepare.bind(dbInternal);
+      const prepareSpy = vi.spyOn(dbInternal, 'prepare').mockImplementation((sql: string) => {
+        if (sql.startsWith('ROLLBACK TO')) {
+          throw new Error('rollback connection error');
+        }
+        return realPrepare(sql);
+      });
+
+      const mem = sampleMemory();
+      localStore.insertMemory(mem);
+      // Re-inserting the same id violates the PRIMARY KEY constraint inside
+      // `withSavepoint`'s work(), triggering its rollback-on-failure path —
+      // whose own ROLLBACK TO is made to fail by the spy above.
+      let caught: unknown;
+      try {
+        localStore.insertMemory(mem);
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(Error);
+      // The primary (constraint violation) error propagates, not the
+      // "rollback connection error".
+      expect((caught as Error).message).toMatch(/UNIQUE constraint failed|constraint/i);
+      expect((caught as Error & { rollbackError?: unknown }).rollbackError).toBeInstanceOf(Error);
+      expect(((caught as Error & { rollbackError?: Error }).rollbackError as Error).message).toBe('rollback connection error');
+
+      prepareSpy.mockRestore();
+      // The original row survives untouched — the failed cleanup did not
+      // corrupt or lose it.
+      expect(localStore.getMemoryById(mem.id)).not.toBeNull();
+    } finally {
+      try { localStore.close(); } catch { /* the connection may legitimately be left mid-transaction by the injected failure above; best-effort cleanup only. */ }
+      rmSync(localDir, { recursive: true, force: true });
+    }
+  });
+
   // add-memory-distillation, task 7.2: derived_from round-trips through
   // insert/rowToMemory (null for an ordinary write, populated array for a
   // distillation write) and through updateMemory's special-cased column.
@@ -240,6 +360,40 @@ describe('SqliteStore', () => {
     expect(r2.expires_at).toBeNull();
     expect(r2.retention_tier).toBe('T2');
     expect(r2.review_due).toBeNull();
+  });
+
+  it('recordAccessBatch commits one logical batch transaction, not one per row (harden-dual-store-mutations task 1.4)', () => {
+    const mem1 = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440023' };
+    const mem2 = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440024', checksum: 'def789' };
+    store.insertMemory(mem1);
+    store.insertMemory(mem2);
+
+    const dbInternal = (store as unknown as { db: DatabaseSync }).db;
+    const prepareSpy = vi.spyOn(dbInternal, 'prepare');
+
+    store.recordAccessBatch([
+      { id: mem1.id, access_count: 1, last_accessed: '2026-02-01T00:00:00Z' },
+      { id: mem2.id, access_count: 2, last_accessed: '2026-02-02T00:00:00Z' },
+    ]);
+
+    // Exactly one SAVEPOINT/RELEASE pair (withSavepoint) wraps the whole
+    // batch, not one per row.
+    const savepointCalls = prepareSpy.mock.calls.filter(call => typeof call[0] === 'string' && call[0].startsWith('SAVEPOINT'));
+    const releaseCalls = prepareSpy.mock.calls.filter(call => typeof call[0] === 'string' && call[0].startsWith('RELEASE'));
+    expect(savepointCalls).toHaveLength(1);
+    expect(releaseCalls).toHaveLength(1);
+    // The per-row UPDATE statement is compiled exactly once and reused for
+    // both rows, not recompiled per row.
+    const updateSql = `UPDATE memories SET
+          access_count = ?,
+          last_accessed = ?,
+          expires_at = CASE WHEN ? THEN ? ELSE expires_at END,
+          retention_tier = CASE WHEN ? THEN ? ELSE retention_tier END,
+          review_due = CASE WHEN ? THEN ? ELSE review_due END
+        WHERE id = ?`;
+    expect(prepareSpy.mock.calls.filter(call => call[0] === updateSql)).toHaveLength(1);
+
+    prepareSpy.mockRestore();
   });
 
   it('recordAccessBatch clears expires_at when explicitly passed null', () => {
@@ -2314,6 +2468,22 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
 
       const getMemoryByIdSql = 'SELECT * FROM memories WHERE id = ? AND archived = 0 AND deletion_pending = 0';
       const prepareCallsForThisSql = prepareSpy.mock.calls.filter(call => call[0] === getMemoryByIdSql);
+      expect(prepareCallsForThisSql).toHaveLength(1);
+      prepareSpy.mockRestore();
+    });
+
+    it('reuses one compiled statement across repeated getCollection calls (harden-dual-store-mutations task 1.4)', () => {
+      store.createCollection('global', 'general', 'test-model', 3);
+
+      const dbInternal = (store as unknown as { db: DatabaseSync }).db;
+      const prepareSpy = vi.spyOn(dbInternal, 'prepare');
+
+      store.getCollection('global', 'general');
+      store.getCollection('global', 'general');
+      store.getCollection('global', 'general');
+
+      const getCollectionSql = 'SELECT * FROM collections WHERE namespace = ? AND name = ?';
+      const prepareCallsForThisSql = prepareSpy.mock.calls.filter(call => call[0] === getCollectionSql);
       expect(prepareCallsForThisSql).toHaveLength(1);
       prepareSpy.mockRestore();
     });

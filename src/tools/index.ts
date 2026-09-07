@@ -18,7 +18,7 @@ import {
 import type {
   WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter, RetentionTier,
 } from '../domain/types.js';
-import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
+import { BrainError, invalidInput, notFound, conflict, classifyResidualLockError } from '../errors/index.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { assembleWithinCharBudget } from '../domain/response-budget.js';
 import { buildRestoredMemoryFromArchive } from '../domain/archive-restore.js';
@@ -133,9 +133,18 @@ export async function handleTool(
     // it here, at the one place every tool call funnels through, so the
     // client sees a retryable CONFLICT (and a real reason) instead of a
     // generic INTERNAL error masking what actually happened.
-    const err = (!(rawErr instanceof BrainError) && /Storage lifecycle operation.*in progress/.test((rawErr as Error).message))
+    const lifecycleClassified = (!(rawErr instanceof BrainError) && /Storage lifecycle operation.*in progress/.test((rawErr as Error).message))
       ? new BrainError('CONFLICT', (rawErr as Error).message, true)
       : rawErr;
+    // harden-dual-store-mutations task 2.5: a residual SQLite lock error —
+    // raw (a call site that never wrapped it) or already flattened into a
+    // non-CONFLICT BrainError's message by an intermediate `internal(...)`
+    // catch — is reclassified the same way as the lifecycle-lock case above,
+    // so every REST/MCP caller sees a retryable CONFLICT rather than a
+    // generic non-retryable INTERNAL error for what is, in fact, ordinary
+    // transient write contention. See errors/index.ts's
+    // `classifyResidualLockError`.
+    const err = classifyResidualLockError(lifecycleClassified);
     if (err instanceof BrainError) {
       // strengthen-operational-observability task 1.2: the exception is
       // logged under the standardized `err` field (pino's serializer picks
