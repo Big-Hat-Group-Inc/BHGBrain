@@ -1,4 +1,4 @@
-import { cosineSimilarity } from '../search/similarity.js';
+import { cosineSimilarityWithNorms, vectorNorm } from '../search/similarity.js';
 
 export interface ClusterCandidate {
   id: string;
@@ -10,6 +10,18 @@ export interface ClusterOptions {
   minClusterSize: number;
   maxClusterSize: number;
   maxClustersPerRun: number;
+}
+
+// bound-corpus-scale-workflows task 2.2: the outer (`i`) loop runs the O(n)
+// event-loop yield check this often — small enough that a large collection's
+// O(n^2) comparison pass cedes the event loop regularly (health checks,
+// shutdown, other requests stay responsive), large enough that the yield
+// overhead itself stays negligible next to the O(n) inner-loop work each
+// outer iteration already does.
+const YIELD_EVERY_OUTER_ITERATIONS = 200;
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve));
 }
 
 /**
@@ -29,13 +41,25 @@ export interface ClusterOptions {
  *   a chance to be distilled, just across more than one resulting cluster.
  * - Clusters are returned largest-first (ties broken by first-member id, for
  *   determinism) and truncated to `maxClustersPerRun`.
+ *
+ * Async (bound-corpus-scale-workflows task 2.2): each candidate's vector
+ * norm is computed once up front (`vectorNorm`) rather than recomputed on
+ * every pairwise comparison inside the O(n^2) loop below, and the outer loop
+ * cedes the event loop every `YIELD_EVERY_OUTER_ITERATIONS` iterations
+ * (`yieldToEventLoop`) so a large collection's clustering pass never
+ * monopolizes it for the whole comparison. Output is unchanged — the
+ * similarity formula and thresholding are identical to the previous
+ * synchronous implementation, just with the norms hoisted out and a
+ * scheduling yield inserted.
  */
-export function clusterEpisodicMemories(
+export async function clusterEpisodicMemories(
   candidates: ClusterCandidate[],
   options: ClusterOptions,
-): string[][] {
+): Promise<string[][]> {
   const parent = new Map<string, string>();
   for (const c of candidates) parent.set(c.id, c.id);
+
+  const norms = candidates.map(c => vectorNorm(c.vector));
 
   const find = (x: string): string => {
     let root = x;
@@ -55,12 +79,18 @@ export function clusterEpisodicMemories(
   };
 
   for (let i = 0; i < candidates.length; i++) {
+    const a = candidates[i]!;
+    const normA = norms[i]!;
     for (let j = i + 1; j < candidates.length; j++) {
-      const a = candidates[i]!;
       const b = candidates[j]!;
-      if (cosineSimilarity(a.vector, b.vector) >= options.similarityThreshold) {
+      const normB = norms[j]!;
+      if (cosineSimilarityWithNorms(a.vector, b.vector, normA, normB) >= options.similarityThreshold) {
         union(a.id, b.id);
       }
+    }
+
+    if ((i + 1) % YIELD_EVERY_OUTER_ITERATIONS === 0) {
+      await yieldToEventLoop();
     }
   }
 

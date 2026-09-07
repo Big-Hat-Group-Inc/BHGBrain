@@ -385,12 +385,16 @@ describe('consolidation config (add-duplicate-cluster-consolidation)', () => {
     expect(config.consolidation.similarity_threshold).toBe(0.9);
     expect(config.consolidation.neighbor_top_k).toBe(20);
     expect(config.consolidation.max_scan_per_call).toBe(500);
+    // bound-corpus-scale-workflows task 2.5
+    expect(config.consolidation.neighbor_discovery_concurrency).toBe(8);
+    expect(config.consolidation.neighbor_discovery_deadline_ms).toBe(10_000);
   });
 
   it('honors explicit overrides', () => {
     const configPath = writeConfig({
       consolidation: {
         enabled: false, similarity_threshold: 0.85, neighbor_top_k: 10, max_scan_per_call: 100,
+        neighbor_discovery_concurrency: 3, neighbor_discovery_deadline_ms: 5000,
       },
     });
 
@@ -400,6 +404,8 @@ describe('consolidation config (add-duplicate-cluster-consolidation)', () => {
     expect(config.consolidation.similarity_threshold).toBe(0.85);
     expect(config.consolidation.neighbor_top_k).toBe(10);
     expect(config.consolidation.max_scan_per_call).toBe(100);
+    expect(config.consolidation.neighbor_discovery_concurrency).toBe(3);
+    expect(config.consolidation.neighbor_discovery_deadline_ms).toBe(5000);
   });
 
   it('rejects a similarity_threshold outside [0,1]', () => {

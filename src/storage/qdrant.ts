@@ -7,6 +7,29 @@ import type { RecallFilter } from '../domain/types.js';
 
 const COLLECTION_PREFIX = 'bhgbrain_';
 
+/** Options accepted by `QdrantStore.scrollAllPages`/`scrollCollectionPages` — see their doc comments. */
+export interface ScrollPageOptions {
+  batchSize?: number;
+  withVector?: boolean;
+  /** Restrict the server-side payload projection to these fields; omit for the full payload. */
+  payloadFields?: string[];
+  /** Resume from a cursor returned by a prior page (see `ScrollPageResult.cursor`). */
+  cursor?: string | number;
+  /** Polled before each page fetch; once true, scanning stops and the final page reports `cancelled: true`. */
+  isCancelled?: () => boolean;
+}
+
+/** One page yielded by `QdrantStore.scrollAllPages`/`scrollCollectionPages`. */
+export interface ScrollPageResult {
+  points: Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>;
+  /** Stable resumption token — pass back via `ScrollPageOptions.cursor` to continue after this page. `null` once exhausted. */
+  cursor: string | number | null;
+  /** True when this is the last page (no further page remains). */
+  done: boolean;
+  /** True when this page was cut short by `ScrollPageOptions.isCancelled` rather than reaching the end of the collection. */
+  cancelled: boolean;
+}
+
 const REQUIRED_PAYLOAD_INDEXES: ReadonlyArray<{ field_name: string; field_schema: 'keyword' | 'bool' | 'integer' | 'datetime' }> = [
   { field_name: 'namespace', field_schema: 'keyword' },
   { field_name: 'type', field_schema: 'keyword' },
@@ -543,34 +566,66 @@ export class QdrantStore {
    * Pages through `collectionName` one server round trip at a time, yielding
    * each page as it arrives rather than accumulating the whole collection in
    * memory — used by callers that only need to inspect points once each (a
-   * restored-ID/checksum reconciliation scan) instead of holding a
-   * potentially large corpus's payloads live for the whole pass. See
-   * make-backup-restore-transactional task 3.1. `scrollAll` below is a thin
+   * restored-ID/checksum reconciliation scan, bootstrap/repair hydration,
+   * distillation clustering) instead of holding a potentially large corpus's
+   * payloads live for the whole pass. See make-backup-restore-transactional
+   * task 3.1 and bound-corpus-scale-workflows task 1.1.
+   *
+   * `options.payloadFields` lets a caller that only inspects a handful of
+   * payload keys (checksum-drift detection: `checksum`/`device_id`/
+   * `namespace`/`collection`) request Qdrant's server-side field-projected
+   * `with_payload` (an explicit field list rather than `true`) instead of
+   * the full record, trimming both the wire payload and the memory retained
+   * per page — omit it (the default) for callers that reconstruct a whole
+   * memory record and therefore need every field (bootstrap/repair
+   * hydration).
+   *
+   * Each yielded page carries a stable `cursor` (Qdrant's own
+   * `next_page_offset`, opaque to the caller) that can be handed back via
+   * `options.cursor` to resume scanning a collection from exactly where a
+   * prior pass left off — e.g. across a deadline-bounded caller's
+   * invocations — and `done`, true once no further page remains.
+   *
+   * `options.isCancelled`, when provided, is polled before each server round
+   * trip; once it reports true the generator yields one final page with
+   * `cancelled: true` and an empty `points` array and returns, so a caller
+   * enforcing a deadline or responding to shutdown never blocks the event
+   * loop waiting on a page it no longer needs. `scrollAll` below is a thin
    * accumulator over this for callers that do need the full list at once.
    */
   async *scrollAllPages(
     collectionName: string,
-    batchSize = 100,
-    withVector = false,
-  ): AsyncGenerator<Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>> {
-    let offset: string | number | undefined = undefined;
+    options: ScrollPageOptions = {},
+  ): AsyncGenerator<ScrollPageResult> {
+    const batchSize = options.batchSize ?? 100;
+    const withVector = options.withVector ?? false;
+    let offset: string | number | undefined = options.cursor;
 
     while (true) {
+      if (options.isCancelled?.()) {
+        yield { points: [], cursor: offset ?? null, done: false, cancelled: true };
+        return;
+      }
+
       const response = await this.client.scroll(collectionName, {
         limit: batchSize,
         offset,
-        with_payload: true,
+        with_payload: options.payloadFields ?? true,
         with_vector: withVector,
       });
 
-      yield response.points.map(point => ({
+      const points = response.points.map(point => ({
         id: point.id as string,
         payload: (point.payload ?? {}) as Record<string, unknown>,
         vector: withVector ? extractDenseVector(point.vector) : undefined,
       }));
 
-      if (!response.next_page_offset) break;
-      offset = response.next_page_offset as string | number | undefined;
+      const nextOffset = response.next_page_offset as string | number | undefined;
+      const done = !nextOffset;
+      yield { points, cursor: nextOffset ?? null, done, cancelled: false };
+
+      if (done) break;
+      offset = nextOffset;
     }
   }
 
@@ -584,18 +639,18 @@ export class QdrantStore {
     withVector = false,
   ): Promise<Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>> {
     const allPoints: Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }> = [];
-    for await (const page of this.scrollAllPages(collectionName, batchSize, withVector)) {
-      allPoints.push(...page);
+    for await (const page of this.scrollAllPages(collectionName, { batchSize, withVector })) {
+      allPoints.push(...page.points);
     }
     return allPoints;
   }
 
   /**
    * `scrollAll` scoped to one namespace/collection, resolving the internal
-   * prefixed collection name so callers (e.g. `DistillationService`'s
-   * clustering pass) never need to duplicate `collectionName`'s prefix
-   * convention. A collection that has never been written to simply yields no
-   * points, same convention as `searchSimilar`/`findNeighborsById`.
+   * prefixed collection name so callers never need to duplicate
+   * `collectionName`'s prefix convention. A collection that has never been
+   * written to simply yields no points, same convention as
+   * `searchSimilar`/`findNeighborsById`.
    */
   async scrollCollection(
     namespace: string,
@@ -609,6 +664,29 @@ export class QdrantStore {
     } catch (err) {
       if (this.isNotFoundError(err)) {
         return [];
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Paged counterpart to `scrollCollection` — namespace/collection-scoped
+   * `scrollAllPages`, for callers (distillation clustering) that need
+   * incremental pages rather than a fully-buffered array. A collection that
+   * has never been written to simply yields no pages, same tolerant
+   * convention as `scrollCollection`.
+   */
+  async *scrollCollectionPages(
+    namespace: string,
+    collection: string,
+    options: ScrollPageOptions = {},
+  ): AsyncGenerator<ScrollPageResult> {
+    const name = this.collectionName(namespace, collection);
+    try {
+      yield* this.scrollAllPages(name, options);
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return;
       }
       throw err;
     }

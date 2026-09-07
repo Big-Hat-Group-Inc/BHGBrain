@@ -1848,6 +1848,115 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
       );
       expect(detail).toContain('USING INDEX idx_memories_unsynced_created');
     });
+
+    // -- bound-corpus-scale-workflows task 2.4 --
+
+    it('listExpiringMemories uses idx_memories_archived_expiry with no temp B-tree sort', () => {
+      const detail = plan(
+        `SELECT * FROM memories WHERE archived = 0 AND expires_at IS NOT NULL AND expires_at >= ? AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?`,
+        ['2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z', 10],
+      );
+      expect(detail).toContain('USING INDEX idx_memories_archived_expiry');
+      expect(detail).not.toContain('USE TEMP B-TREE');
+    });
+
+    it('listReviewDue uses idx_memories_tier_review_due with no temp B-tree sort', () => {
+      const detail = plan(
+        `SELECT * FROM memories WHERE archived = 0 AND namespace = ? AND retention_tier = 'T1'
+         AND review_due IS NOT NULL AND review_due <= ? AND (review_due > ? OR (review_due = ? AND id > ?))
+         ORDER BY review_due ASC, id ASC LIMIT ?`,
+        ['global', '2026-06-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'cursor-id', 10],
+      );
+      expect(detail).toContain('USING INDEX idx_memories_tier_review_due');
+      expect(detail).not.toContain('USE TEMP B-TREE');
+    });
+
+    it('listPinnedMemories uses idx_memories_pinned_updated with no temp B-tree sort', () => {
+      const detail = plan(
+        `SELECT * FROM memories WHERE namespace = ? AND archived = 0 AND deletion_pending = 0 AND pinned = 1 ORDER BY updated_at DESC`,
+        ['global'],
+      );
+      expect(detail).toContain('USING INDEX idx_memories_pinned_updated');
+      expect(detail).not.toContain('USE TEMP B-TREE');
+    });
+
+    // No covering index for listMemoriesWithStaleEmbeddingStamp: see the
+    // SCHEMA_SQL comment above idx_memories_archived_expiry for why one
+    // (archived, created_at, id)) was deliberately not added — at a
+    // realistic scale it displaced idx_memories_ns_created/
+    // idx_memories_unsynced_created for their own unrelated, hotter-path
+    // queries. `embedding_model != ?` is not seekable by any index
+    // regardless; the selector stays keyset-paginated and
+    // deadline/batch-bounded instead (StorageManager.reembedMismatchedVectors).
+  });
+
+  // -- bound-corpus-scale-workflows task 2.3: FTS5 maintenance seeks by rowid --
+
+  describe('memories_fts rowid-seek maintenance', () => {
+    it('a single-memory delete issues a rowid-keyed FTS delete (an O(1) seek, not an unindexed-column scan)', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+
+      const dbInternal = (store as unknown as { db: DatabaseSync }).db;
+      const originalPrepare = dbInternal.prepare.bind(dbInternal);
+      const seen: string[] = [];
+      dbInternal.prepare = ((sql: string) => {
+        if (sql.includes('memories_fts')) seen.push(sql);
+        return originalPrepare(sql);
+      }) as typeof dbInternal.prepare;
+
+      try {
+        expect(store.deleteMemory(mem.id)).toBe(true);
+      } finally {
+        dbInternal.prepare = originalPrepare;
+      }
+
+      expect(seen.some(sql => /DELETE FROM memories_fts WHERE rowid = \?/.test(sql))).toBe(true);
+      // Word-boundary match: "rowid = ?" itself contains the substring
+      // "id =", so a plain .includes('id =') would false-positive here.
+      expect(seen.some(sql => /\bid\s*=/.test(sql))).toBe(false);
+
+      // The deleted memory is really gone from the FTS index, not just from `memories`.
+      expect(store.fullTextSearch('global', mem.content.split(' ')[0]!, 10).some(r => r.id === mem.id)).toBe(false);
+    });
+
+    it('a content-changing update issues a rowid-keyed FTS delete+reinsert', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+
+      const dbInternal = (store as unknown as { db: DatabaseSync }).db;
+      const originalPrepare = dbInternal.prepare.bind(dbInternal);
+      const seen: string[] = [];
+      dbInternal.prepare = ((sql: string) => {
+        if (sql.includes('memories_fts')) seen.push(sql);
+        return originalPrepare(sql);
+      }) as typeof dbInternal.prepare;
+
+      try {
+        store.updateMemory(mem.id, { content: 'updated searchable content about kayaking' });
+      } finally {
+        dbInternal.prepare = originalPrepare;
+      }
+
+      expect(seen.some(sql => /DELETE FROM memories_fts WHERE rowid = \?/.test(sql))).toBe(true);
+      expect(seen.some(sql => /INSERT INTO memories_fts \(rowid,/.test(sql))).toBe(true);
+      expect(store.fullTextSearch('global', 'kayaking', 10).some(r => r.id === mem.id)).toBe(true);
+    });
+
+    it('a rowid-keyed delete against memories_fts is a seek, not a full shadow-table scan (EXPLAIN QUERY PLAN)', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      const dbInternal = (store as unknown as { db: DatabaseSync }).db;
+      const rows = dbInternal.prepare(`EXPLAIN QUERY PLAN DELETE FROM memories_fts WHERE rowid = ?`)
+        .all(1) as unknown as Array<{ detail: string }>;
+      const detail = rows.map(r => r.detail).join(' | ');
+      // FTS5's own EXPLAIN QUERY PLAN detail marks a satisfied equality
+      // constraint with a trailing "=" ("INDEX 0:="); an unconstrained scan
+      // (what the removed `id UNINDEXED` column forced) reports "INDEX 0:"
+      // with no trailing "=" — verified directly against a scratch FTS5
+      // table before writing this assertion.
+      expect(detail).toContain('VIRTUAL TABLE INDEX 0:=');
+    });
   });
 
   // -- task 1.3: migration from the old single-column-prefix indexes --
@@ -1894,6 +2003,65 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
         expect(indexNames).toContain('idx_memories_ns_coll_created');
         expect(indexNames).toContain('idx_memories_stale_accessed');
         expect(indexNames).toContain('idx_memories_unsynced_created');
+        // bound-corpus-scale-workflows task 2.4
+        expect(indexNames).toContain('idx_memories_tier_review_due');
+        expect(indexNames).toContain('idx_memories_pinned_updated');
+        expect(indexNames).toContain('idx_memories_archived_expiry');
+      } finally {
+        migStore.close();
+      }
+    } finally {
+      rmSync(migDir, { recursive: true, force: true });
+    }
+  });
+
+  // bound-corpus-scale-workflows task 2.4: an existing database carrying the
+  // superseded two-column idx_memories_review_due/idx_memories_pinned
+  // indexes must have them dropped and replaced by the new
+  // ORDER-BY-covering ones on the next init(), not left alongside them.
+  it('drops the superseded idx_memories_review_due/idx_memories_pinned indexes and replaces them on init()', async () => {
+    const migDir = mkdtempSync(join(tmpdir(), 'bhgbrain-index-migration-test-'));
+    try {
+      const legacyDb = new DatabaseSync(join(migDir, 'brain.db'));
+      legacyDb.exec(`
+        CREATE TABLE memories (
+          id TEXT PRIMARY KEY,
+          namespace TEXT NOT NULL DEFAULT 'global',
+          collection TEXT NOT NULL DEFAULT 'general',
+          type TEXT NOT NULL CHECK(type IN ('episodic','semantic','procedural')),
+          category TEXT,
+          content TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          tags TEXT NOT NULL DEFAULT '[]',
+          source TEXT NOT NULL DEFAULT 'cli',
+          checksum TEXT NOT NULL,
+          importance REAL NOT NULL DEFAULT 0.5,
+          retention_tier TEXT NOT NULL DEFAULT 'T2',
+          review_due TEXT,
+          pinned INTEGER NOT NULL DEFAULT 0,
+          access_count INTEGER NOT NULL DEFAULT 0,
+          last_operation TEXT NOT NULL DEFAULT 'ADD',
+          merged_from TEXT,
+          stale INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_accessed TEXT NOT NULL
+        );
+        CREATE INDEX idx_memories_review_due ON memories(retention_tier, review_due);
+        CREATE INDEX idx_memories_pinned ON memories(namespace, pinned);
+      `);
+      legacyDb.close();
+
+      const migStore = new SqliteStore(migDir);
+      await migStore.init();
+      try {
+        const dbInternal = (migStore as unknown as { db: DatabaseSync }).db;
+        const indexNames = (dbInternal.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all() as unknown as Array<{ name: string }>)
+          .map(row => row.name);
+        expect(indexNames).not.toContain('idx_memories_review_due');
+        expect(indexNames).not.toContain('idx_memories_pinned');
+        expect(indexNames).toContain('idx_memories_tier_review_due');
+        expect(indexNames).toContain('idx_memories_pinned_updated');
       } finally {
         migStore.close();
       }

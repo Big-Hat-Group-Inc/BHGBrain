@@ -165,6 +165,8 @@ export interface SqliteStorage {
     last_run_at: string | null; last_run_degraded: boolean; distilled_total: number; skipped_total: number;
   };
   listDistillationCollections(): Array<{ namespace: string; collection: string }>;
+  getDistillationCursor(namespace: string, collection: string): number;
+  setDistillationCursor(namespace: string, collection: string, offset: number): void;
   countArchivedMemories(): number;
   countUnsyncedVectors(): number;
   listMemoriesNeedingVectorSync(limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
@@ -285,11 +287,9 @@ CREATE INDEX IF NOT EXISTS idx_memories_stale ON memories(stale, importance);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(namespace, collection, retention_tier);
 CREATE INDEX IF NOT EXISTS idx_memories_expiry ON memories(decay_eligible, expires_at);
-CREATE INDEX IF NOT EXISTS idx_memories_review_due ON memories(retention_tier, review_due);
 CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(archived);
 CREATE INDEX IF NOT EXISTS idx_memories_vector_synced ON memories(vector_synced);
 CREATE INDEX IF NOT EXISTS idx_memories_deletion_pending ON memories(deletion_pending);
-CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(namespace, pinned);
 
 -- trim-sqlite-query-and-health-overhead task 1.1: covering indexes for the
 -- hot list/sweep predicates so SQLite can satisfy ORDER BY from the index
@@ -304,6 +304,37 @@ CREATE INDEX IF NOT EXISTS idx_memories_stale_accessed ON memories(stale, last_a
 CREATE INDEX IF NOT EXISTS idx_memories_unsynced_created ON memories(vector_synced, created_at, id);
 DROP INDEX IF EXISTS idx_memories_namespace;
 DROP INDEX IF EXISTS idx_memories_collection;
+
+-- bound-corpus-scale-workflows task 2.4: covering indexes for the
+-- expiry/pinned selectors, verified against EXPLAIN QUERY PLAN (at a
+-- realistic multi-namespace row count, since SQLite's planner falls back to
+-- coarse heuristics without ANALYZE/sqlite_stat1, which this codebase never
+-- runs) to eliminate both a corpus-wide SCAN and a "USE TEMP B-TREE FOR
+-- ORDER BY". idx_memories_tier_review_due and idx_memories_pinned_updated
+-- replace idx_memories_review_due/idx_memories_pinned (now dropped below)
+-- by appending the ORDER BY's tie-break/sort column so the index alone
+-- satisfies the query's ordering; idx_memories_archived_expiry is new,
+-- covering a selector that previously matched no index's leading column at
+-- all (a full SCAN memories before this).
+--
+-- A fourth candidate, an (archived, created_at, id) index meant to cover
+-- the re-embed migration's listMemoriesWithStaleEmbeddingStamp selector,
+-- was deliberately NOT added: measured at 20k rows across 5 namespaces with
+-- no ANALYZE stats (this codebase's actual runtime condition), the planner
+-- preferred it over both idx_memories_ns_created and
+-- idx_memories_unsynced_created for their own (unrelated, much
+-- hotter-path) queries -- trading a narrow namespace-scoped seek for a
+-- corpus-wide archived=0 scan filtered post-hoc by namespace, a real
+-- regression, not just a cosmetic plan change. embedding_model != ? is
+-- not seekable by any index regardless, so the re-embed selector keeps
+-- paying a scan+sort per page; it is already keyset-paginated and
+-- deadline/batch-bounded (StorageManager.reembedMismatchedVectors), which
+-- is what keeps it resumable and non-blocking even without this index.
+CREATE INDEX IF NOT EXISTS idx_memories_tier_review_due ON memories(retention_tier, review_due, id);
+CREATE INDEX IF NOT EXISTS idx_memories_pinned_updated ON memories(namespace, pinned, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_archived_expiry ON memories(archived, expires_at);
+DROP INDEX IF EXISTS idx_memories_review_due;
+DROP INDEX IF EXISTS idx_memories_pinned;
 
 -- memories_fts is intentionally NOT created here. It is derived data
 -- (rebuildable from memories at any time) whose *shape* depends on runtime
@@ -428,6 +459,22 @@ CREATE TABLE IF NOT EXISTS distillation_state (
   last_run_degraded INTEGER NOT NULL DEFAULT 0,
   distilled_total INTEGER NOT NULL DEFAULT 0,
   skipped_total INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-namespace/collection deterministic rotation cursor for distillation's
+-- candidate cap (retention.distillation.max_candidates_per_collection):
+-- when a collection has more eligible T2/T3 episodic candidates than the
+-- cap, one run clusters only a cap-sized window of them (in stable id
+-- order) starting at cursor_offset, and advances the cursor by the window
+-- size so the next run covers the following slice — eventually rotating
+-- through the whole candidate pool instead of always reprocessing the same
+-- prefix and starving the rest. See bound-corpus-scale-workflows task 2.1.
+CREATE TABLE IF NOT EXISTS distillation_collection_state (
+  namespace TEXT NOT NULL,
+  collection TEXT NOT NULL,
+  cursor_offset INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (namespace, collection)
 );
 
 -- Single-row record of the store's expected embedding identity
@@ -920,7 +967,7 @@ export class SqliteStore implements SqliteStorage {
       this.db.exec(`ALTER TABLE memories_fts ADD COLUMN collection TEXT NOT NULL DEFAULT ''`);
     }
     if (existingIsFts5) {
-      this.backfillFtsFromMemories('memories_fts');
+      this.backfillFtsFromMemories('memories_fts', false);
     }
   }
 
@@ -958,6 +1005,17 @@ export class SqliteStore implements SqliteStorage {
    * backfilling from `memories` — the source of truth — inside one
    * transaction so a crash mid-migration rolls back to the pre-migration
    * state rather than leaving a half-swapped schema (task 2.1).
+   *
+   * No `id` column (bound-corpus-scale-workflows task 2.3): an FTS5 virtual
+   * table has no secondary index on an ordinary column, so `WHERE id = ?`
+   * against a prior version of this table (`id UNINDEXED`) forced a full
+   * shadow-table scan on every single-memory update/delete. The table's own
+   * `rowid` — which FTS5 always supports seeking on directly — is used as
+   * the row identity instead, explicitly set to `memories`' native rowid
+   * (`insertFtsRow`/`deleteFtsRow(s)`/`backfillFtsFromMemories` below) so a
+   * maintenance write targets exactly one row via an O(1) seek, and reads
+   * join back to `memories` via `m.rowid = t.rowid` (`fullTextSearchFts5`)
+   * instead of a TEXT `id` comparison.
    */
   private migrateToFts5(): void {
     this.execSql('BEGIN TRANSACTION');
@@ -965,12 +1023,12 @@ export class SqliteStore implements SqliteStorage {
       this.execSql('DROP TABLE IF EXISTS memories_fts5_migrating');
       this.db.exec(`
         CREATE VIRTUAL TABLE memories_fts5_migrating USING fts5(
-          id UNINDEXED, namespace UNINDEXED, collection UNINDEXED,
+          namespace UNINDEXED, collection UNINDEXED,
           content, summary, tags,
           tokenize = 'porter unicode61'
         );
       `);
-      this.backfillFtsFromMemories('memories_fts5_migrating');
+      this.backfillFtsFromMemories('memories_fts5_migrating', true);
       this.execSql('DROP TABLE IF EXISTS memories_fts');
       this.db.exec('ALTER TABLE memories_fts5_migrating RENAME TO memories_fts');
       this.execSql('COMMIT');
@@ -982,32 +1040,40 @@ export class SqliteStore implements SqliteStorage {
 
   /**
    * Batch-copies non-archived rows from `memories` into `tableName`'s
-   * (id, namespace, collection, content, summary, tags) columns, 500 rows per
-   * JS-side batch (keyset-paginated by id, not OFFSET, so no batch re-scans
-   * rows already copied), translating the JSON-encoded `tags` column into the
-   * space-joined plain text both fulltext table shapes index. Shared by
-   * `migrateToFts5` (populating the new table before the atomic swap) and
+   * (namespace, collection, content, summary, tags) columns plus either an
+   * explicit `rowid` (the FTS5 shape, `useRowid: true` — `memories`' own
+   * native rowid, so the copied row is seekable the same way a live write
+   * makes it seekable) or an `id` column (the legacy plain-table shape,
+   * `useRowid: false`, whose declared `id TEXT PRIMARY KEY` is already a
+   * real index), 500 rows per JS-side batch (keyset-paginated by id, not
+   * OFFSET, so no batch re-scans rows already copied), translating the
+   * JSON-encoded `tags` column into the space-joined plain text both
+   * fulltext table shapes index. Shared by `migrateToFts5` (populating the
+   * new table before the atomic swap, `useRowid: true`) and
    * `ensureFtsSchema`'s downgrade branch (rebuilding the legacy table
-   * directly) — task 2.1.
+   * directly, `useRowid: false`) — task 2.1, extended by
+   * bound-corpus-scale-workflows task 2.3.
    */
-  private backfillFtsFromMemories(tableName: string): void {
+  private backfillFtsFromMemories(tableName: string, useRowid: boolean): void {
     const memoriesExists = this.queryOne(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memories'`);
     if (!memoriesExists) return;
     const insertStmt = this.db.prepare(
-      `INSERT INTO ${tableName} (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
+      useRowid
+        ? `INSERT INTO ${tableName} (rowid, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`
+        : `INSERT INTO ${tableName} (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
     );
     const BATCH = 500;
     let cursorId = '';
     for (;;) {
       const rows = this.queryAll(
-        `SELECT id, namespace, collection, content, summary, tags FROM memories
+        `SELECT rowid, id, namespace, collection, content, summary, tags FROM memories
          WHERE archived = 0 AND id > ? ORDER BY id LIMIT ?`,
         [cursorId, BATCH],
       );
       if (rows.length === 0) break;
       for (const row of rows) {
         insertStmt.run(
-          this.getString(row, 'id'),
+          useRowid ? this.getNumber(row, 'rowid') : this.getString(row, 'id'),
           this.getString(row, 'namespace'),
           this.getString(row, 'collection'),
           this.getString(row, 'content'),
@@ -1017,6 +1083,87 @@ export class SqliteStore implements SqliteStorage {
       }
       cursorId = this.getString(rows[rows.length - 1], 'id');
       if (rows.length < BATCH) break;
+    }
+  }
+
+  /**
+   * `memories`' own native rowid for `id` (its declared `PRIMARY KEY` is a
+   * regular unique index, not a rowid alias, since it is `TEXT`) — an
+   * index-backed lookup, not a scan. Used to seek the FTS5 `memories_fts`
+   * table by rowid instead of an unindexed column. `null` when the row is
+   * gone (already deleted, or never existed).
+   */
+  private getMemoryRowid(id: string): number | null {
+    const row = this.queryOne(`SELECT rowid FROM memories WHERE id = ?`, [id]);
+    return row ? this.getNumber(row, 'rowid') : null;
+  }
+
+  /**
+   * Inserts one live row into `memories_fts`, keyed for O(1) seek (see
+   * `migrateToFts5`'s doc comment): in FTS5 mode the table's rowid is set
+   * explicitly to `id`'s corresponding `memories` row (which must already
+   * exist — call after the `memories` insert/update, never before), so a
+   * later `deleteFtsRow(s)` or `fullTextSearchFts5` join can seek it
+   * directly; the legacy plain-table fallback is unaffected (its `id
+   * TEXT PRIMARY KEY` was already index-backed) and keeps inserting `id`.
+   * `ignoreConflict` mirrors the caller's own `INSERT` vs `INSERT OR
+   * IGNORE` choice into `memories`.
+   */
+  private insertFtsRow(
+    id: string, namespace: string, collection: string, content: string, summary: string, tagsText: string,
+    ignoreConflict = false,
+  ): void {
+    const verb = ignoreConflict ? 'INSERT OR IGNORE' : 'INSERT';
+    if (this.ftsAvailable) {
+      const rowid = this.getMemoryRowid(id);
+      this.execSql(
+        `${verb} INTO memories_fts (rowid, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
+        [rowid, namespace, collection, content, summary, tagsText],
+      );
+    } else {
+      this.execSql(
+        `${verb} INTO memories_fts (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
+        [id, namespace, collection, content, summary, tagsText],
+      );
+    }
+  }
+
+  /**
+   * Deletes one `memories_fts` row by seeking on rowid in FTS5 mode (see
+   * `migrateToFts5`'s doc comment) — call this BEFORE deleting the
+   * corresponding `memories` row, since the rowid lookup depends on it
+   * still existing. A `memories` row already gone (rowid lookup misses) is
+   * a harmless no-op — nothing left to seek by, consistent with the legacy
+   * `id`-keyed delete's existing no-op-on-miss behavior.
+   */
+  private deleteFtsRow(id: string): void {
+    if (this.ftsAvailable) {
+      const rowid = this.getMemoryRowid(id);
+      if (rowid === null) return;
+      this.execSql(`DELETE FROM memories_fts WHERE rowid = ?`, [rowid]);
+    } else {
+      this.execSql(`DELETE FROM memories_fts WHERE id = ?`, [id]);
+    }
+  }
+
+  /**
+   * Batched counterpart to `deleteFtsRow` for a chunk of ids — same
+   * before-the-`memories`-delete ordering requirement, same rowid-seek
+   * rationale. The FTS5 branch's rowid lookup itself uses `memories`' `id`
+   * primary-key index (an `IN (...)` over an indexed column, not a
+   * `memories_fts` scan).
+   */
+  private deleteFtsRows(ids: string[]): void {
+    if (ids.length === 0) return;
+    const placeholders = ids.map(() => '?').join(', ');
+    if (this.ftsAvailable) {
+      const rows = this.queryAll(`SELECT rowid FROM memories WHERE id IN (${placeholders})`, ids);
+      if (rows.length === 0) return;
+      const rowids = rows.map(row => this.getNumber(row, 'rowid'));
+      const rowidPlaceholders = rowids.map(() => '?').join(', ');
+      this.execSql(`DELETE FROM memories_fts WHERE rowid IN (${rowidPlaceholders})`, rowids);
+    } else {
+      this.execSql(`DELETE FROM memories_fts WHERE id IN (${placeholders})`, ids);
     }
   }
 
@@ -1138,10 +1285,7 @@ export class SqliteStore implements SqliteStorage {
         mem.last_accessed,
       ],
       );
-      this.execSql(
-      `INSERT INTO memories_fts (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
-      [mem.id, mem.namespace, mem.collection, mem.content, mem.summary, mem.tags.join(' ')],
-      );
+      this.insertFtsRow(mem.id, mem.namespace, mem.collection, mem.content, mem.summary, mem.tags.join(' '));
     });
   }
 
@@ -1279,10 +1423,7 @@ export class SqliteStore implements SqliteStorage {
           deviceId, embeddingModel, origin, confidence, createdAt, now, lastAccessed,
         ],
       );
-      this.execSql(
-        `INSERT OR IGNORE INTO memories_fts (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
-        [id, namespace, collection, content, summary, tags.join(' ')],
-      );
+      this.insertFtsRow(id, namespace, collection, content, summary, tags.join(' '), true);
       this.execSql('RELEASE sp_hydrate');
     } catch (err) {
       this.execSql('ROLLBACK TO sp_hydrate');
@@ -1326,13 +1467,12 @@ export class SqliteStore implements SqliteStorage {
       this.execSql(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, vals);
 
       if ('content' in fields || 'summary' in fields || 'tags' in fields || 'archived' in fields) {
-        this.execSql(`DELETE FROM memories_fts WHERE id = ?`, [id]);
+        // `memories` was just UPDATEd above (not deleted), so `id`'s rowid
+        // is still resolvable for `deleteFtsRow`'s seek.
+        this.deleteFtsRow(id);
         const mem = this.getMemoryById(id, true);
         if (mem && !mem.archived) {
-          this.execSql(
-            `INSERT INTO memories_fts (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
-            [mem.id, mem.namespace, mem.collection, mem.content, mem.summary, mem.tags.join(' ')],
-          );
+          this.insertFtsRow(mem.id, mem.namespace, mem.collection, mem.content, mem.summary, mem.tags.join(' '));
         }
       }
     });
@@ -1363,8 +1503,11 @@ export class SqliteStore implements SqliteStorage {
     const mem = this.getMemoryById(id, true);
     if (!mem) return false;
     this.withSavepoint('delete_memory', () => {
+      // FTS row deleted first (bound-corpus-scale-workflows task 2.3): its
+      // rowid-based seek is looked up from `memories`, so it must run while
+      // that row still exists.
+      this.deleteFtsRow(id);
       this.execSql(`DELETE FROM memories WHERE id = ?`, [id]);
-      this.execSql(`DELETE FROM memories_fts WHERE id = ?`, [id]);
       // Cascade-clean edges (add-memory-links) so both `forget` and `review`'s
       // `archive` action (which calls this same method after archiveMemory)
       // never leave a memory_links row pointing at a now-missing memory.
@@ -1394,9 +1537,12 @@ export class SqliteStore implements SqliteStorage {
       for (let i = 0; i < ids.length; i += CHUNK) {
         const chunk = ids.slice(i, i + CHUNK);
         const placeholders = chunk.map(() => '?').join(', ');
+        // FTS rows deleted first (bound-corpus-scale-workflows task 2.3): the
+        // rowid seek this chunk uses is looked up from `memories`, so it
+        // must run while those rows still exist.
+        this.deleteFtsRows(chunk);
         const result = this.db.prepare(`DELETE FROM memories WHERE id IN (${placeholders})`).run(...chunk);
         deleted += Number(result.changes);
-        this.execSql(`DELETE FROM memories_fts WHERE id IN (${placeholders})`, chunk);
         this.execSql(`DELETE FROM memory_links WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})`, [...chunk, ...chunk]);
       }
     });
@@ -1556,11 +1702,19 @@ export class SqliteStore implements SqliteStorage {
    * embedded in user input can never be interpreted as an operator (task
    * 4.4), matched against the porter/unicode61-tokenized `content`/
    * `summary`/`tags` columns (stemmed, so e.g. "deploy" matches "deployed" —
-   * task 4.1), and ranked with `bm25(memories_fts, 1.0, 2.0, 2.0)` — column
-   * weights mirroring the 1×/2×/2× content/summary/tags intent the legacy
-   * term-frequency ranker used (task 4.2). `bm25()` returns *lower is
-   * better*; negate it so the existing "higher rank first" contract keeps
-   * working (task 3.2).
+   * task 4.1), and ranked with `bm25(memories_fts, 1.0, 1.0, 1.0, 2.0, 2.0)` —
+   * column weights mirroring the 1×/2×/2× content/summary/tags intent the
+   * legacy term-frequency ranker used (task 4.2). `bm25()`'s weight
+   * arguments align positionally with *every* declared FTS5 column,
+   * `UNINDEXED` ones included (verified directly against a scratch table —
+   * bound-corpus-scale-workflows task 2.3), so the two leading `1.0`s cover
+   * this table's `namespace`/`collection` `UNINDEXED` columns before the
+   * real `content`/`summary`/`tags` weights — omitting them (as a prior
+   * revision of this table, which also carried an `UNINDEXED id` column,
+   * did) silently misaligns every real weight onto the wrong column instead
+   * of erroring, which is exactly what made this bug easy to miss. `bm25()`
+   * returns *lower is better*; negate it so the existing "higher rank
+   * first" contract keeps working (task 3.2).
    */
   private fullTextSearchFts5(
     namespace: string, terms: string[], limit: number, collection?: string, filter?: RecallFilter, nowIso?: string,
@@ -1597,11 +1751,15 @@ export class SqliteStore implements SqliteStorage {
     params.push(nowIso ?? new Date().toISOString());
     params.push(limit);
 
+    // Joined on rowid, not id (bound-corpus-scale-workflows task 2.3): both
+    // sides are the table's own native integer rowid — an O(1) per-row
+    // comparison — rather than a TEXT `id` equality that the old `t.id`
+    // FTS5 column (now removed) required.
     const sql = `
-      SELECT t.id AS id, bm25(memories_fts, 1.0, 2.0, 2.0) AS score
-      FROM memories_fts t JOIN memories m ON m.id = t.id AND m.archived = 0 AND m.deletion_pending = 0
+      SELECT m.id AS id, bm25(memories_fts, 1.0, 1.0, 1.0, 2.0, 2.0) AS score
+      FROM memories_fts t JOIN memories m ON m.rowid = t.rowid AND m.archived = 0 AND m.deletion_pending = 0
       WHERE ${conditions.join(' AND ')}
-      ORDER BY score ASC, t.id ASC
+      ORDER BY score ASC, m.id ASC
       LIMIT ?
     `;
     const rows = this.queryAll(sql, params);
@@ -2118,6 +2276,33 @@ export class SqliteStore implements SqliteStorage {
     return rows.map(row => ({ namespace: this.getString(row, 'namespace'), collection: this.getString(row, 'collection') }));
   }
 
+  /**
+   * The deterministic rotation offset a collection's next distillation run
+   * should start its candidate window at (0 for a collection never
+   * capped before). See `distillation_collection_state` and
+   * bound-corpus-scale-workflows task 2.1.
+   */
+  getDistillationCursor(namespace: string, collection: string): number {
+    const row = this.queryOne(
+      `SELECT cursor_offset FROM distillation_collection_state WHERE namespace = ? AND collection = ?`,
+      [namespace, collection],
+    );
+    return row ? this.getNumber(row, 'cursor_offset') : 0;
+  }
+
+  /** Persists the next run's rotation offset for one namespace/collection. */
+  setDistillationCursor(namespace: string, collection: string, offset: number): void {
+    this.assertMutableAllowed();
+    this.execSql(
+      `INSERT INTO distillation_collection_state (namespace, collection, cursor_offset, updated_at)
+       VALUES (?1, ?2, ?3, ?4)
+       ON CONFLICT(namespace, collection) DO UPDATE SET
+         cursor_offset = ?3,
+         updated_at = ?4`,
+      [namespace, collection, offset, new Date().toISOString()],
+    );
+  }
+
   countArchivedMemories(): number {
     const row = this.queryOneCached(`SELECT COUNT(*) as cnt FROM memory_archive`);
     return row ? this.getNumber(row, 'cnt') : 0;
@@ -2546,7 +2731,7 @@ export class SqliteStore implements SqliteStorage {
 
     this.withSavepoint('delete_collection_memories', () => {
       const placeholders = ids.map(() => '?').join(', ');
-      this.execSql(`DELETE FROM memories_fts WHERE id IN (${placeholders})`, ids);
+      this.deleteFtsRows(ids);
       this.execSql(`DELETE FROM memory_links WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})`, [...ids, ...ids]);
       this.execSql(`DELETE FROM memories WHERE id IN (${placeholders})`, ids);
     });

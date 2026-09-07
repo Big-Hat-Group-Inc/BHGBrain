@@ -8,6 +8,7 @@ import { DistillationLLMError, type DistillationLLMClient } from './distillation
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { WritePipeline } from './index.js';
+import type { MetricsCollector } from '../health/metrics.js';
 
 function baseMemory(id: string, overrides: Record<string, unknown> = {}) {
   return {
@@ -50,6 +51,7 @@ function config(overrides: Record<string, unknown> = {}): BrainConfig {
         min_cluster_size: 3,
         max_cluster_size: 20,
         max_clusters_per_run: 10,
+        max_candidates_per_collection: 500,
         ...overrides,
       },
     },
@@ -58,6 +60,20 @@ function config(overrides: Record<string, unknown> = {}): BrainConfig {
 
 function points(ids: string[], vector = [1, 0]) {
   return ids.map(id => ({ id, payload: { type: 'episodic', retention_tier: 'T2' }, vector }));
+}
+
+// bound-corpus-scale-workflows task 1.2: distillation clustering now pages
+// through Qdrant via `scrollCollectionPages` instead of buffering a whole
+// collection via `scrollCollection` — this mock yields the same points as
+// one page, keeping every test's fixture data unchanged.
+function pagedQdrant(pts: ReturnType<typeof points>) {
+  return {
+    scrollCollectionPages: vi.fn(async function* () {
+      if (pts.length > 0) {
+        yield { points: pts, cursor: null, done: true, cancelled: false };
+      }
+    }),
+  };
 }
 
 describe('DistillationService', () => {
@@ -79,7 +95,7 @@ describe('DistillationService', () => {
     for (const id of ['a', 'b', 'c']) sqlite.insertMemory(baseMemory(id) as never);
     sqlite.flushIfDirty();
 
-    const qdrant = { scrollCollection: vi.fn(async () => points(['a', 'b', 'c'])) };
+    const qdrant = pagedQdrant(points(['a', 'b', 'c']));
     const storage = {
       sqlite,
       qdrant,
@@ -118,7 +134,7 @@ describe('DistillationService', () => {
     for (const id of ['a', 'b', 'c']) sqlite.insertMemory(baseMemory(id) as never);
     sqlite.flushIfDirty();
 
-    const qdrant = { scrollCollection: vi.fn(async () => points(['a', 'b', 'c'])) };
+    const qdrant = pagedQdrant(points(['a', 'b', 'c']));
     const storage = { sqlite, qdrant, deleteMemories: vi.fn(), logAudit: vi.fn() } as unknown as StorageManager;
     const llmClient = { distill: vi.fn() } as unknown as DistillationLLMClient;
     const pipeline = { process: vi.fn() } as unknown as WritePipeline;
@@ -138,7 +154,7 @@ describe('DistillationService', () => {
     for (const id of ['a', 'b', 'c']) sqlite.insertMemory(baseMemory(id) as never);
     sqlite.flushIfDirty();
 
-    const qdrant = { scrollCollection: vi.fn(async () => points(['a', 'b', 'c'])) };
+    const qdrant = pagedQdrant(points(['a', 'b', 'c']));
     const storage = { sqlite, qdrant, deleteMemories: vi.fn(), logAudit: vi.fn() } as unknown as StorageManager;
     const llmClient = {
       distill: vi.fn(async () => { throw new DistillationLLMError('missing key', 'no_key'); }),
@@ -157,7 +173,7 @@ describe('DistillationService', () => {
     for (const id of ['a', 'b', 'c']) sqlite.insertMemory(baseMemory(id) as never);
     sqlite.flushIfDirty();
 
-    const qdrant = { scrollCollection: vi.fn(async () => points(['a', 'b', 'c'])) };
+    const qdrant = pagedQdrant(points(['a', 'b', 'c']));
     const storage = { sqlite, qdrant, deleteMemories: vi.fn(), logAudit: vi.fn() } as unknown as StorageManager;
     const llmClient = {
       distill: vi.fn(async () => { throw new DistillationLLMError('API 500', 'llm_error'); }),
@@ -174,7 +190,7 @@ describe('DistillationService', () => {
     for (const id of ['a', 'b', 'c']) sqlite.insertMemory(baseMemory(id) as never);
     sqlite.flushIfDirty();
 
-    const qdrant = { scrollCollection: vi.fn(async () => points(['a', 'b', 'c'])) };
+    const qdrant = pagedQdrant(points(['a', 'b', 'c']));
     const storage = {
       sqlite,
       qdrant,
@@ -201,7 +217,7 @@ describe('DistillationService', () => {
     for (const id of ['a', 'b']) sqlite.insertMemory(baseMemory(id) as never);
     sqlite.flushIfDirty();
 
-    const qdrant = { scrollCollection: vi.fn(async () => points(['a', 'b'])) };
+    const qdrant = pagedQdrant(points(['a', 'b']));
     const storage = { sqlite, qdrant, deleteMemories: vi.fn(), logAudit: vi.fn() } as unknown as StorageManager;
     const llmClient = { distill: vi.fn() } as unknown as DistillationLLMClient;
     const pipeline = { process: vi.fn() } as unknown as WritePipeline;
@@ -211,5 +227,36 @@ describe('DistillationService', () => {
 
     expect(result.clustersFound).toBe(0);
     expect(llmClient.distill).not.toHaveBeenCalled();
+  });
+
+  // bound-corpus-scale-workflows task 2.1
+  it('caps candidates per collection and deterministically rotates the window across runs', async () => {
+    for (const id of ['a', 'b', 'c', 'd']) sqlite.insertMemory(baseMemory(id) as never);
+    sqlite.flushIfDirty();
+
+    const qdrant = pagedQdrant(points(['a', 'b', 'c', 'd']));
+    const storage = { sqlite, qdrant, deleteMemories: vi.fn(), logAudit: vi.fn() } as unknown as StorageManager;
+    const llmClient = { distill: vi.fn() } as unknown as DistillationLLMClient;
+    const pipeline = { process: vi.fn() } as unknown as WritePipeline;
+    const metrics = { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector;
+
+    const cfg = config({ max_candidates_per_collection: 2, min_cluster_size: 2 });
+    const service = new DistillationService(cfg, storage, pipeline, llmClient, { info: vi.fn(), warn: vi.fn() }, metrics);
+
+    // First run: candidates sorted by id ('a','b','c','d'); cursor starts at
+    // 0, so the window is the first two.
+    const first = await service.runOnce({ dryRun: true });
+    expect(first.candidatesSkipped).toBe(2);
+    expect(first.candidates).toHaveLength(1);
+    expect([...first.candidates[0]!.ids].sort()).toEqual(['a', 'b']);
+    expect(metrics.incCounter).toHaveBeenCalledWith(
+      'bhgbrain_distill_candidates_skipped_total', 2, { namespace: 'global', collection: 'general' },
+    );
+
+    // Second run: the persisted cursor advanced past the first window, so
+    // this run's window covers the next slice instead of reprocessing 'a'/'b'.
+    const second = await service.runOnce({ dryRun: true });
+    expect(second.candidatesSkipped).toBe(2);
+    expect([...second.candidates[0]!.ids].sort()).toEqual(['c', 'd']);
   });
 });

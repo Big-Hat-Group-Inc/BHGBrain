@@ -17,6 +17,7 @@ type MockClient = {
   createPayloadIndex?: Mock<QdrantClient['createPayloadIndex']>;
   upsert?: Mock<QdrantClient['upsert']>;
   deleteCollection?: Mock<QdrantClient['deleteCollection']>;
+  scroll?: Mock<QdrantClient['scroll']>;
 };
 
 function createStore(
@@ -887,5 +888,134 @@ describe('QdrantStore.healthCheck', () => {
     const store = createStore(client);
 
     await expect(store.healthCheck()).resolves.toBe(true);
+  });
+});
+
+// bound-corpus-scale-workflows task 1.1: paged iterator with payload
+// projection, optional vectors, stable cursors, and cancellation.
+describe('QdrantStore.scrollAllPages', () => {
+  function makeScrollMock(pages: Array<{ points: Array<{ id: string; payload?: Record<string, unknown> }>; next?: string }>) {
+    let call = 0;
+    return vi.fn<QdrantClient['scroll']>(async () => {
+      const page = pages[call]!;
+      call++;
+      return {
+        points: page.points.map(p => ({ id: p.id, payload: p.payload ?? {}, version: 0 })),
+        next_page_offset: page.next,
+      } as never;
+    });
+  }
+
+  it('requests only the projected payload fields when payloadFields is given, and the full payload when omitted', async () => {
+    const scroll = makeScrollMock([{ points: [{ id: 'p1' }] }]);
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query: vi.fn<QdrantClient['query']>(), scroll };
+    const store = createStore(client);
+
+    for await (const _page of store.scrollAllPages('bhgbrain_global_general', { payloadFields: ['checksum', 'device_id'] })) { /* drain */ }
+
+    expect(scroll.mock.calls[0]![1]).toEqual(expect.objectContaining({ with_payload: ['checksum', 'device_id'] }));
+  });
+
+  it('requests the full payload (with_payload: true) when no projection is given', async () => {
+    const scroll = makeScrollMock([{ points: [{ id: 'p1' }] }]);
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query: vi.fn<QdrantClient['query']>(), scroll };
+    const store = createStore(client);
+
+    for await (const _page of store.scrollAllPages('bhgbrain_global_general')) { /* drain */ }
+
+    expect(scroll.mock.calls[0]![1]).toEqual(expect.objectContaining({ with_payload: true }));
+  });
+
+  it('yields one page at a time (never accumulates the whole collection) and threads next_page_offset as the resumption cursor', async () => {
+    const scroll = makeScrollMock([
+      { points: [{ id: 'p1' }, { id: 'p2' }], next: 'cursor-1' },
+      { points: [{ id: 'p3' }], next: undefined },
+    ]);
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query: vi.fn<QdrantClient['query']>(), scroll };
+    const store = createStore(client);
+
+    const pages: Array<{ points: unknown[]; cursor: string | number | null; done: boolean }> = [];
+    for await (const page of store.scrollAllPages('bhgbrain_global_general', { batchSize: 2 })) {
+      pages.push(page);
+    }
+
+    expect(pages).toHaveLength(2);
+    // First page carries only its own 2 points -- peak retained data per
+    // yield stays bounded near one page, not the whole (3-point) collection.
+    expect(pages[0]!.points).toHaveLength(2);
+    expect(pages[0]!.cursor).toBe('cursor-1');
+    expect(pages[0]!.done).toBe(false);
+    expect(pages[1]!.points).toHaveLength(1);
+    expect(pages[1]!.cursor).toBeNull();
+    expect(pages[1]!.done).toBe(true);
+    // The second server call resumed from the first call's cursor.
+    expect(scroll.mock.calls[1]![1]).toEqual(expect.objectContaining({ offset: 'cursor-1' }));
+  });
+
+  it('resumes from an explicit starting cursor when one is passed in', async () => {
+    const scroll = makeScrollMock([{ points: [{ id: 'p3' }] }]);
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query: vi.fn<QdrantClient['query']>(), scroll };
+    const store = createStore(client);
+
+    for await (const _page of store.scrollAllPages('bhgbrain_global_general', { cursor: 'cursor-1' })) { /* drain */ }
+
+    expect(scroll.mock.calls[0]![1]).toEqual(expect.objectContaining({ offset: 'cursor-1' }));
+  });
+
+  it('stops paging once isCancelled reports true, without requesting a further page', async () => {
+    const scroll = makeScrollMock([
+      { points: [{ id: 'p1' }], next: 'cursor-1' },
+      { points: [{ id: 'p2' }], next: 'cursor-2' },
+      { points: [{ id: 'p3' }], next: undefined },
+    ]);
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query: vi.fn<QdrantClient['query']>(), scroll };
+    const store = createStore(client);
+
+    let calls = 0;
+    const pages: Array<{ points: unknown[]; cancelled: boolean; done: boolean }> = [];
+    for await (const page of store.scrollAllPages('bhgbrain_global_general', { isCancelled: () => calls >= 1 })) {
+      calls++;
+      pages.push(page);
+    }
+
+    // First page fetched normally; isCancelled trips before a second server call.
+    expect(scroll).toHaveBeenCalledTimes(1);
+    expect(pages).toHaveLength(2);
+    expect(pages[0]!.cancelled).toBe(false);
+    expect(pages[1]!).toEqual({ points: [], cursor: 'cursor-1', done: false, cancelled: true });
+  });
+
+  it('scrollCollectionPages resolves the namespace/collection to the internal name and yields nothing for a never-written collection', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      scroll: vi.fn<QdrantClient['scroll']>(async () => {
+        const err = new Error('Collection `bhgbrain_global_work` doesn\'t exist!') as Error & { status?: number };
+        err.status = 404;
+        throw err;
+      }),
+    };
+    const store = createStore(client);
+
+    const pages: unknown[] = [];
+    for await (const page of store.scrollCollectionPages('global', 'work')) {
+      pages.push(page);
+    }
+
+    expect(pages).toEqual([]);
+  });
+
+  it('scrollCollectionPages propagates a genuine transport failure instead of silently yielding nothing', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      scroll: vi.fn<QdrantClient['scroll']>(async () => { throw new Error('transport failure'); }),
+    };
+    const store = createStore(client);
+
+    const drain = async () => {
+      for await (const _page of store.scrollCollectionPages('global', 'work')) { /* drain */ }
+    };
+    await expect(drain()).rejects.toThrow('transport failure');
   });
 });

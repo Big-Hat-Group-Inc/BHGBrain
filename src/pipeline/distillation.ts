@@ -24,6 +24,12 @@ export interface DistillationResult {
   // distilled write itself is never rolled back (see design.md Decision #4).
   degraded: boolean;
   candidates: DistillationCandidateCluster[];
+  // Eligible T2/T3 episodic candidates left out of this run's clustering
+  // pass because a collection's candidate count exceeded
+  // `retention.distillation.max_candidates_per_collection` — never silently
+  // dropped, and rotated into a future run's window (see `findClusters`'s
+  // deterministic cursor). See bound-corpus-scale-workflows task 2.1.
+  candidatesSkipped: number;
 }
 
 interface InternalCluster {
@@ -60,7 +66,7 @@ export class DistillationService {
     const start = Date.now();
     const cfg = this.config.retention.distillation;
 
-    const { clusters, clustersFound } = await this.findClusters();
+    const { clusters, clustersFound, candidatesSkipped } = await this.findClusters();
 
     const candidates: DistillationCandidateCluster[] = [];
     const skippedByReason = new Map<DistillationSkipReason, number>();
@@ -182,9 +188,10 @@ export class DistillationService {
       archived,
       degraded,
       duration_ms: durationMs,
+      candidates_skipped: candidatesSkipped,
     });
 
-    return { clustersFound, distilled, skipped, archived, degraded, candidates };
+    return { clustersFound, distilled, skipped, archived, degraded, candidates, candidatesSkipped };
   }
 
   /**
@@ -193,24 +200,57 @@ export class DistillationService {
    * design.md Decision #3), then merges and globally caps the result to
    * `max_clusters_per_run` — largest clusters first — so the run-wide LLM
    * call budget is respected regardless of how many collections qualify.
+   *
+   * Each collection is scanned page-by-page via `scrollCollectionPages`
+   * (bound-corpus-scale-workflows task 1.2) with a payload projection
+   * limited to the two fields this scan actually inspects (`type`,
+   * `retention_tier`) rather than every stored field, and clustering itself
+   * is bounded per collection to at most `max_candidates_per_collection`
+   * candidates (task 2.1) — pairwise similarity is O(n^2), so an unbounded
+   * candidate set would make one run's compute cost scale quadratically with
+   * corpus size. When a collection has more eligible candidates than the
+   * cap, a deterministic (sorted-by-id) window starting at that collection's
+   * persisted rotation cursor is clustered, the rest are counted and
+   * reported as skipped (never silently dropped), and the cursor advances
+   * so a later run's window covers the next slice — eventually rotating
+   * through the whole candidate pool instead of only ever reprocessing the
+   * same prefix.
    */
-  private async findClusters(): Promise<{ clusters: InternalCluster[]; clustersFound: number }> {
+  private async findClusters(): Promise<{
+    clusters: InternalCluster[];
+    clustersFound: number;
+    candidatesSkipped: number;
+  }> {
     const cfg = this.config.retention.distillation;
     const pairs = this.storage.sqlite.listDistillationCollections();
 
     const perCollection: InternalCluster[] = [];
+    let candidatesSkipped = 0;
     for (const { namespace, collection } of pairs) {
-      const points = await this.storage.qdrant.scrollCollection(namespace, collection, 100, true);
       const candidates: ClusterCandidate[] = [];
-      for (const point of points) {
-        const type = point.payload.type;
-        const tier = point.payload.retention_tier;
-        if (type !== 'episodic' || (tier !== 'T2' && tier !== 'T3')) continue;
-        if (!point.vector) continue;
-        candidates.push({ id: point.id, vector: point.vector });
+      for await (const page of this.storage.qdrant.scrollCollectionPages(namespace, collection, {
+        batchSize: 100,
+        withVector: true,
+        payloadFields: ['type', 'retention_tier'],
+      })) {
+        for (const point of page.points) {
+          const type = point.payload.type;
+          const tier = point.payload.retention_tier;
+          if (type !== 'episodic' || (tier !== 'T2' && tier !== 'T3')) continue;
+          if (!point.vector) continue;
+          candidates.push({ id: point.id, vector: point.vector });
+        }
       }
 
-      const clusters = clusterEpisodicMemories(candidates, {
+      // Deterministic order (independent of Qdrant's internal scroll
+      // ordering) so the cap window below, and the cursor it advances, are
+      // reproducible across runs.
+      candidates.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
+      const windowed = this.applyCandidateCap(namespace, collection, candidates, cfg.max_candidates_per_collection);
+      candidatesSkipped += candidates.length - windowed.length;
+
+      const clusters = await clusterEpisodicMemories(windowed, {
         similarityThreshold: cfg.similarity_threshold,
         minClusterSize: cfg.min_cluster_size,
         maxClusterSize: cfg.max_cluster_size,
@@ -225,7 +265,53 @@ export class DistillationService {
     }
 
     perCollection.sort((a, b) => b.ids.length - a.ids.length);
-    return { clusters: perCollection.slice(0, cfg.max_clusters_per_run), clustersFound: perCollection.length };
+    return {
+      clusters: perCollection.slice(0, cfg.max_clusters_per_run),
+      clustersFound: perCollection.length,
+      candidatesSkipped,
+    };
+  }
+
+  /**
+   * Bounds one collection's candidate set to `cap` before pairwise
+   * similarity ever runs (design.md Decision #2), selecting a deterministic
+   * circular window starting at the collection's persisted rotation cursor
+   * and advancing that cursor for the next run. A collection at or under
+   * the cap resets its cursor to 0 rather than leaving it stale, so a later
+   * regrowth starts rotating from the top instead of resuming mid-pool at
+   * an offset that may no longer even be in range.
+   */
+  private applyCandidateCap(
+    namespace: string,
+    collection: string,
+    candidates: ClusterCandidate[],
+    cap: number,
+  ): ClusterCandidate[] {
+    if (candidates.length <= cap) {
+      this.storage.sqlite.setDistillationCursor(namespace, collection, 0);
+      return candidates;
+    }
+
+    const offset = this.storage.sqlite.getDistillationCursor(namespace, collection) % candidates.length;
+    const windowed: ClusterCandidate[] = [];
+    for (let i = 0; i < cap; i++) {
+      windowed.push(candidates[(offset + i) % candidates.length]!);
+    }
+    const skipped = candidates.length - windowed.length;
+
+    this.metrics?.incCounter('bhgbrain_distill_candidates_skipped_total', skipped, { namespace, collection });
+    this.logger?.warn?.({
+      event: 'distillation_candidates_capped',
+      namespace,
+      collection,
+      total_candidates: candidates.length,
+      window_size: windowed.length,
+      skipped,
+      cursor_offset: offset,
+    });
+    this.storage.sqlite.setDistillationCursor(namespace, collection, (offset + cap) % candidates.length);
+
+    return windowed;
   }
 
   /**

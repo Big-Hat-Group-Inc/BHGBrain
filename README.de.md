@@ -3151,7 +3151,8 @@ Die relevantesten Erinnerungen für eine Abfrage mithilfe semantischer (Vektor-)
       "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
       "confidence": 1.0
     }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
@@ -3168,6 +3169,16 @@ Platzhalter, kein Relevanzscore — dieselbe Konvention wie bei `include_archive
 `search`) sowie `linked_from` (die ID des Basisergebnisses), `link_relation` und
 `link_direction` (`"outgoing"`, wenn das Basisergebnis die Quelle der Kante ist,
 `"incoming"`, wenn es das Ziel ist). Ein bereits archivierter Nachbar wird übersprungen.
+
+`results` wird innerhalb von `defaults.max_response_chars` (Standard `50000`)
+zusammengestellt: umfangreiche Ergebnisse (lange `content`-Felder, ein hohes `limit`)
+werden nacheinander bis zu diesem Zeichenbudget aufgenommen, und `truncated: true`
+kennzeichnet eine Antwort, bei der nachfolgende Ergebnisse weggelassen werden mussten,
+um innerhalb des Budgets zu bleiben — `results.length` kann dann kleiner als `limit`
+sein, obwohl mehr Treffer existierten. Dies unterscheidet sich von der
+`min_score`/Filter-Einschränkung, die `recall` nicht von einer tatsächlich kleinen
+Ergebnismenge unterscheiden kann; ein Aufrufer, der trotz eines großen Budgets jeden
+Treffer benötigt, sollte stattdessen die Abfrage eingrenzen oder `limit` senken.
 
 ---
 
@@ -3211,7 +3222,7 @@ Erinnerungen mithilfe semantischer, Volltext- oder Hybrid-Modi durchsuchen. Biet
 | `after` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at >= after` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Vektor-/Volltextspeicher hinuntergereicht — der erste hinuntergereichte Filter von `search`. |
 | `before` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at <= before` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Vektor-/Volltextspeicher hinuntergereicht. |
 
-**Ausgabe:** Gleiche Struktur wie `recall` — `{ "results": [...] }` — aber ohne den `min_score`-Filter und mit Unterstützung von bis zu 50 Ergebnissen. Archivtreffer (bei `include_archived: true`) tragen `archived: true`, verwenden die gespeicherte Zusammenfassung als `content` und haben keinen aussagekräftigen `score` (es sind Metadaten-Texttreffer, keine gerankten Ergebnisse).
+**Ausgabe:** Gleiche Struktur wie `recall` — `{ "results": [...], "truncated": false }` — aber ohne den `min_score`-Filter, mit Unterstützung von bis zu 50 Ergebnissen und einem zusätzlichen `degraded`-Feld (`true`, wenn der Hybrid-Modus auf reine Volltextsuche zurückgefallen ist). Archivtreffer (bei `include_archived: true`) tragen `archived: true`, verwenden die gespeicherte Zusammenfassung als `content` und haben keinen aussagekräftigen `score` (es sind Metadaten-Texttreffer, keine gerankten Ergebnisse). `results` unterliegt demselben `defaults.max_response_chars`-Budget und derselben `truncated`-Semantik, die oben unter `recall` beschrieben ist.
 
 ---
 
@@ -3463,6 +3474,10 @@ Importiert ein strukturiertes Profil- oder Freiform-Dokument in einem Schritt al
 - `dry_run: true` gibt Erinnerungsvorschauen ohne Schreibvorgänge zurück.
 - Überschriften, die außerhalb der 10 speicher-zugeordneten Abschnitte nummeriert sind (z. B. ein Dokument, das gegen eine ältere 12-Abschnitte-Vorlage geschrieben wurde), werden nicht stillschweigend verworfen — ihre Nummern werden in `sections_ignored` gemeldet, damit Sie wissen, dass Inhalt übersprungen wurde, statt ihn unbemerkt zu verlieren.
 - Wenn [`remember`](#remember--erinnerung-speichern) Ihren Inhalt wegen Überschreitung von `pipeline.long_content_threshold_chars` abgelehnt hat, verwenden Sie stattdessen `import` mit `format: "freeform"` — es teilt das Dokument nach Überschriften-/Absatzgrenzen und bettet jeden Abschnitt einzeln ein, wodurch das Problem eines einzelnen Matsch-Vektors vermieden wird, vor dem der Schwellenwert von `remember` schützt.
+- Ein geparster Abschnitt, der länger als `import.max_chunk_chars` (Standard `8000`) ist, wird deterministisch in Stücke dieser Zeichenzahl aufgeteilt, statt als ein überlanger Abschnitt eingebettet oder ganz abgelehnt zu werden — jedes Stück wird weiterhin zu einem eigenen Erinnerungskandidaten.
+- Überschreitet die resultierende Abschnittsanzahl (nach eventueller Aufteilung) `import.max_chunks` (Standard `500`), wird der gesamte Aufruf — Dry-Run oder nicht — mit `INVALID_INPUT` abgelehnt, das die beobachtete Anzahl und das konfigurierte Maximum nennt, bevor irgendein Aufruf des Embedding-Anbieters erfolgt.
+- Einbettungen für die geparsten Abschnitte werden in Stapeln von `import.embedding_batch_size` (Standard `100`) beim Anbieter angefragt statt eine Anfrage pro Abschnitt, sodass ausgehende Anbieteraufrufe mit Abschnittsanzahl/Stapelgröße skalieren. Schlägt eine ganze Stapel-Einbettungsanfrage fehl, gehen diese Abschnitte nicht verloren — jeder fällt auf individuelles Einbetten über den normalen Schreibpfad zurück.
+- Ein Abschnitt, dessen Schreibvorgang vollständig fehlschlägt (jeder Extraktionskandidat dafür abgelehnt), bricht den Rest des Imports nicht ab: Er wird in einem `failed`-Feld gezählt und in einem `failures`-Array detailliert (`[{ "chunk_index": 4, "error": "..." }]`), beide nur vorhanden, wenn mindestens ein Abschnitt fehlgeschlagen ist.
 
 ---
 
@@ -3826,6 +3841,16 @@ Findet und führt nahezu doppelte, bereits vorhandene Erinnerungen zusammen — 
 ```
 
 Erinnerungen werden zu einem Cluster gruppiert, wenn sie innerhalb der gescannten Seite durch eine Ähnlichkeitskante bei oder über `consolidation.similarity_threshold` (Standard `0.9` — bewusst unterhalb der schreibzeitigen UPDATE-Schwellenwerte der Duplikaterkennung, sodass `list` Kandidaten aufzeigt, die die Duplikaterkennung selbst nicht automatisch zusammengeführt hätte) verbunden sind. `suggested_target` ist **nur ein Hinweis**: das Mitglied mit der höchsten `importance` (bei Gleichstand entscheidet `access_count`, dann die zuletzt aktualisierte `updated_at`). `merge` leitet `target_id` niemals daraus ab — ein Aufrufer muss sie explizit benennen. `cursor` ist `null`, sobald die gescannte Seite kleiner als `consolidation.max_scan_per_call` ist; zum Fortsetzen des Scans über mehrere Aufrufe hinweg zurückgeben.
+
+Die Nachbarschaftsabfragen, die eine gescannte Seite benötigt, laufen mit höchstens
+`consolidation.neighbor_discovery_concurrency` (Standard `8`) gleichzeitig — begrenzt,
+damit eine große Seite weder eine Abfrage nach der anderen seriell abarbeitet noch alle
+Abfragen der Seite gleichzeitig auslöst. Läuft der Fan-out noch, wenn
+`consolidation.neighbor_discovery_deadline_ms` (Standard `10000`) abgelaufen ist, kehrt
+`list` vorzeitig mit einem nicht-null `cursor` zurück, der direkt nach dem letzten
+Mitglied fortsetzt, dessen Nachbarn aufgelöst wurden — ein Mitglied, das die Frist vorher
+abgeschnitten hat, wird in diesem Aufruf keinem Cluster zugeordnet und beim nächsten
+`list`-Aufruf mit diesem Cursor (mit neuer Nachbarschaftssuche) erneut aufgegriffen.
 
 **Ausgabe (`action: "merge"`):**
 

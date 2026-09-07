@@ -18,7 +18,10 @@ describe('import tool', () => {
     pipelineProcess = vi.fn(async () => [{ id: 'mem-1', summary: 'test', type: 'semantic', operation: 'ADD', created_at: '2026-01-01' }]);
 
     ctx = {
-      config: { device: { id: 'dev-1' } } as ToolContext['config'],
+      config: {
+        device: { id: 'dev-1' },
+        import: { max_chunks: 500, max_chunk_chars: 8000, embedding_batch_size: 100 },
+      } as ToolContext['config'],
       storage: {
         sqlite: {
           countMemories: vi.fn(() => 10),
@@ -160,6 +163,101 @@ Jane Doe, CTO at Acme Corp.`;
     const firstCall = pipelineProcess.mock.calls[0]![0];
     expect(firstCall.namespace).toBe('custom-ns');
   });
+
+  // bound-corpus-scale-workflows task 3.1
+  describe('import chunk-count and per-chunk size bounds', () => {
+    it('rejects with INVALID_INPUT before any pipeline call when parsing would exceed max_chunks', async () => {
+      (ctx.config as unknown as { import: { max_chunks: number } }).import.max_chunks = 3;
+      // 5 short freeform paragraphs -> 5 chunks, over the max_chunks: 3 cap.
+      const content = ['p1', 'p2', 'p3', 'p4', 'p5'].join('\n\n');
+
+      const result = await handleTool(ctx, 'import', { format: 'freeform', content }) as Record<string, unknown>;
+
+      expect((result.error as Record<string, unknown> | undefined)?.code).toBe('INVALID_INPUT');
+      expect((result.error as { message: string }).message).toContain('5');
+      expect((result.error as { message: string }).message).toContain('3');
+      expect(pipelineProcess).not.toHaveBeenCalled();
+    });
+
+    it('applies the same max_chunks rejection to a dry run instead of only surfacing it on a real import', async () => {
+      (ctx.config as unknown as { import: { max_chunks: number } }).import.max_chunks = 1;
+      const content = ['p1', 'p2'].join('\n\n');
+
+      const result = await handleTool(ctx, 'import', { format: 'freeform', content, dry_run: true }) as Record<string, unknown>;
+
+      expect((result.error as Record<string, unknown> | undefined)?.code).toBe('INVALID_INPUT');
+    });
+
+    it('deterministically hard-splits an oversized chunk into max_chunk_chars-sized pieces instead of rejecting or embedding one oversized chunk', async () => {
+      (ctx.config as unknown as { import: { max_chunk_chars: number; max_chunks: number } }).import.max_chunk_chars = 10;
+      (ctx.config as unknown as { import: { max_chunk_chars: number; max_chunks: number } }).import.max_chunks = 100;
+      const content = 'a'.repeat(25); // freeform single paragraph, 25 chars -> 3 pieces of <=10
+
+      const result = await handleTool(ctx, 'import', { format: 'freeform', content }) as Record<string, unknown>;
+
+      expect(result.memories_created).toBe(3);
+      expect(pipelineProcess).toHaveBeenCalledTimes(3);
+      const contents = pipelineProcess.mock.calls.map(c => (c[0] as { content: string }).content);
+      expect(contents).toEqual(['a'.repeat(10), 'a'.repeat(10), 'a'.repeat(5)]);
+    });
+  });
+
+  // bound-corpus-scale-workflows task 3.2
+  describe('import batched embedding', () => {
+    it('requests embeddings in batches sized by import.embedding_batch_size rather than one call per chunk', async () => {
+      (ctx.config as unknown as { import: { embedding_batch_size: number } }).import.embedding_batch_size = 2;
+      const embedBatch = vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2]));
+      ctx.embedding = { model: 'm', dimensions: 2, embedBatch } as unknown as EmbeddingProvider;
+      // 5 freeform paragraphs, batch size 2 -> ceil(5/2) = 3 embedBatch calls.
+      const content = ['p1', 'p2', 'p3', 'p4', 'p5'].join('\n\n');
+
+      await handleTool(ctx, 'import', { format: 'freeform', content });
+
+      expect(embedBatch).toHaveBeenCalledTimes(3);
+      expect(embedBatch.mock.calls[0]![0]).toHaveLength(2);
+      expect(embedBatch.mock.calls[2]![0]).toHaveLength(1);
+      expect(pipelineProcess).toHaveBeenCalledTimes(5);
+      // Each pipeline call receives that chunk's precomputed vector.
+      for (const call of pipelineProcess.mock.calls) {
+        expect((call[0] as { precomputedEmbedding: number[] }).precomputedEmbedding).toEqual([0.1, 0.2]);
+      }
+    });
+
+    it('continues processing remaining chunks when one chunk fails entirely, reporting it instead of aborting the import', async () => {
+      let callCount = 0;
+      pipelineProcess.mockImplementation(async () => {
+        callCount++;
+        if (callCount === 2) {
+          throw new Error('simulated total pipeline failure');
+        }
+        return [{ id: `mem-${callCount}`, summary: 'new', type: 'semantic', operation: 'ADD', created_at: '2026-01-01' }];
+      });
+      const content = ['p1', 'p2', 'p3'].join('\n\n');
+
+      const result = await handleTool(ctx, 'import', { format: 'freeform', content }) as Record<string, unknown>;
+
+      expect(pipelineProcess).toHaveBeenCalledTimes(3);
+      expect(result.memories_created).toBe(2);
+      expect(result.failed).toBe(1);
+      expect((result.failures as Array<{ chunk_index: number; error: string }>)[0]).toMatchObject({
+        chunk_index: 1, error: 'simulated total pipeline failure',
+      });
+    });
+
+    it('falls back to per-item processing without failing the import when the whole embedding batch call rejects', async () => {
+      ctx.embedding = {
+        model: 'm', dimensions: 2,
+        embedBatch: vi.fn(async () => { throw new Error('provider outage'); }),
+      } as unknown as EmbeddingProvider;
+      const content = `## 1. Identity & Role\n\nJane Doe.`;
+
+      const result = await handleTool(ctx, 'import', { format: 'profile', content }) as Record<string, unknown>;
+
+      expect(result.memories_created).toBe(1);
+      expect(result.failed).toBeUndefined();
+      expect((pipelineProcess.mock.calls[0]![0] as { precomputedEmbedding?: number[] }).precomputedEmbedding).toBeUndefined();
+    });
+  });
 });
 
 // add-auto-tagging (3.3): `handleImport` routes every memory through
@@ -181,6 +279,7 @@ describe('import tool auto-tagging (add-auto-tagging)', () => {
         default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
       },
       device: { id: 'dev-1' },
+      import: { max_chunks: 500, max_chunk_chars: 8000, embedding_batch_size: 100 },
     } as unknown as ToolContext['config'];
 
     const embedding = {

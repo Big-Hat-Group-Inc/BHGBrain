@@ -547,6 +547,7 @@ describe('consolidate tool', () => {
       config: {
         consolidation: {
           enabled: true, similarity_threshold: 0.9, neighbor_top_k: 20, max_scan_per_call: 500,
+          neighbor_discovery_concurrency: 8, neighbor_discovery_deadline_ms: 10_000,
           ...config,
         },
       } as unknown as ToolContext['config'],
@@ -631,6 +632,58 @@ describe('consolidate tool', () => {
 
     const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as { cursor: string | null };
     expect(result.cursor).toBeNull();
+  });
+
+  // bound-corpus-scale-workflows task 2.5
+  describe('list neighbor-discovery bounded concurrency and deadline', () => {
+    it('never runs more findNeighborsById calls concurrently than neighbor_discovery_concurrency', async () => {
+      const { ctx, storage } = createCtx({ neighbor_discovery_concurrency: 2, max_scan_per_call: 500 });
+      const members = Array.from({ length: 6 }, (_, i) => baseMemory({ id: `m-${i}`, created_at: `2026-01-0${i + 1}T00:00:00.000Z` }));
+      (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue(members);
+
+      let inFlight = 0;
+      let maxInFlight = 0;
+      (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise(resolve => setTimeout(resolve, 5));
+        inFlight--;
+        return [];
+      });
+
+      await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1');
+
+      expect(maxInFlight).toBeLessThanOrEqual(2);
+      expect(storage.qdrant.findNeighborsById).toHaveBeenCalledTimes(6);
+    });
+
+    it('stops the fan-out at the deadline and returns a cursor resuming after the last resolved member, excluding unresolved members from clusters', async () => {
+      const { ctx, storage } = createCtx({
+        neighbor_discovery_concurrency: 1,
+        neighbor_discovery_deadline_ms: 12,
+        max_scan_per_call: 500,
+      });
+      const m1 = baseMemory({ id: T, created_at: '2026-01-01T00:00:00.000Z' });
+      const m2 = baseMemory({ id: S1, created_at: '2026-01-02T00:00:00.000Z' });
+      const m3 = baseMemory({ id: S2, created_at: '2026-01-03T00:00:00.000Z' });
+      (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1, m2, m3]);
+
+      // Each call is slow enough that the second batch's pre-check trips the
+      // deadline after the first (concurrency 1) member resolves.
+      (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        await new Promise(resolve => setTimeout(resolve, 15));
+        return [];
+      });
+
+      const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as {
+        clusters: Array<{ members: Array<{ id: string }> }>; cursor: string | null;
+      };
+
+      // Only the first member's neighbors were resolved before the deadline cut
+      // the fan-out short.
+      expect(storage.qdrant.findNeighborsById).toHaveBeenCalledTimes(1);
+      expect(result.cursor).toBe('2026-01-01T00:00:00.000Z|' + T);
+    });
   });
 
   it('merge happy path: unions tags, maxes importance, sets merged_from, archives sources, and audits consolidate', async () => {
@@ -786,18 +839,40 @@ type RepairResult = {
 };
 
 describe('repair device filtering', () => {
+  // bound-corpus-scale-workflows task 1.3: repair now pages through Qdrant
+  // via `scrollAllPages` and routes recovered points through the same
+  // canonical `hydrateBatch` mapper `bootstrapFromQdrant` uses, instead of a
+  // bespoke per-point `insertMemory` reconstruction — these mocks exercise
+  // that path directly rather than asserting on the old `insertMemory` calls.
   function createRepairCtx(points: Array<{ id: string; payload: Record<string, unknown> }>) {
+    const existingIds = new Set<string>();
+    const hydrated: Array<{ id: string; payload: Record<string, unknown> }> = [];
     const qdrant = {
       listAllCollections: vi.fn(async () => ['bhgbrain_global_general']),
-      scrollAll: vi.fn(async () => points),
+      scrollAllPages: vi.fn(async function* () {
+        if (points.length > 0) {
+          yield { points, cursor: null, done: true, cancelled: false };
+        }
+      }),
     };
     const sqlite = {
-      getMemoryById: vi.fn(() => null),
-      getCollection: vi.fn(() => ({ name: 'general' })),
-      createCollection: vi.fn(),
-      insertMemory: vi.fn(),
+      listMemoryIds: vi.fn(() => existingIds),
+      hydrateBatch: vi.fn((
+        pts: Array<{ id: string; payload: Record<string, unknown> }>,
+        ids: Set<string>,
+      ) => {
+        let count = 0;
+        const failures: Array<{ id: string; error: string }> = [];
+        for (const point of pts) {
+          if (ids.has(point.id)) continue;
+          hydrated.push(point);
+          ids.add(point.id);
+          count++;
+        }
+        return { hydrated: count, failures };
+      }),
       flushIfDirty: vi.fn(),
-      countMemories: vi.fn(() => 0),
+      countMemories: vi.fn(() => hydrated.length),
     };
     const storage = { qdrant, sqlite } as unknown as StorageManager;
     const ctx: ToolContext = {
@@ -811,7 +886,7 @@ describe('repair device filtering', () => {
       metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
     };
-    return { ctx, sqlite };
+    return { ctx, sqlite, hydrated };
   }
 
   const twoDevicePoints = [
@@ -820,47 +895,52 @@ describe('repair device filtering', () => {
   ];
 
   it('recovers only the requested device when device_id is provided', async () => {
-    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+    const { ctx, hydrated } = createRepairCtx(twoDevicePoints);
 
     const result = await handleTool(ctx, 'repair', { device_id: 'device-a' }, 'c1') as RepairResult;
 
     expect(result.recovered).toBe(1);
     expect(result.device_id_filter).toBe('device-a');
     expect(result.all_devices).toBe(false);
-    expect(sqlite.insertMemory).toHaveBeenCalledTimes(1);
-    expect(sqlite.insertMemory).toHaveBeenCalledWith(expect.objectContaining({ id: 'p-a', device_id: 'device-a' }));
+    expect(hydrated).toHaveLength(1);
+    expect(hydrated[0]).toMatchObject({ id: 'p-a', payload: expect.objectContaining({ device_id: 'device-a' }) });
   });
 
   it('recovers points from every device when all_devices is explicitly true', async () => {
-    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+    const { ctx, hydrated } = createRepairCtx(twoDevicePoints);
 
     const result = await handleTool(ctx, 'repair', { all_devices: true }, 'c1') as RepairResult;
 
     expect(result.recovered).toBe(2);
     expect(result.all_devices).toBe(true);
     expect(result.device_id_filter).toBeNull();
-    expect(sqlite.insertMemory).toHaveBeenCalledTimes(2);
+    expect(hydrated).toHaveLength(2);
   });
 
   it('recovers points from every device when neither filter is provided (backward-compatible default)', async () => {
-    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+    const { ctx, hydrated } = createRepairCtx(twoDevicePoints);
 
     const result = await handleTool(ctx, 'repair', {}, 'c1') as RepairResult;
 
     expect(result.recovered).toBe(2);
     expect(result.all_devices).toBe(true);
-    expect(sqlite.insertMemory).toHaveBeenCalledTimes(2);
+    expect(hydrated).toHaveLength(2);
   });
 
-  it('sets the local device_id on a recovered record whose original payload has none', async () => {
-    const { ctx, sqlite } = createRepairCtx([
+  it('routes a legacy point (no device_id on the payload) through hydration and recovers it', async () => {
+    // The canonical `hydrateBatch` mapper (shared with `bootstrapFromQdrant`)
+    // leaves `device_id` null for a payload that predates device stamping —
+    // it does not stamp the local device id, unlike the old bespoke
+    // reconstruction this replaced. See `insertMemoryFromPayloadAtomic`.
+    const { ctx, hydrated } = createRepairCtx([
       { id: 'p-legacy', payload: { content: 'pre-migration memory', namespace: 'global', collection: 'general' } },
     ]);
 
     const result = await handleTool(ctx, 'repair', {}, 'c1') as RepairResult;
 
     expect(result.recovered).toBe(1);
-    expect(sqlite.insertMemory).toHaveBeenCalledWith(expect.objectContaining({ id: 'p-legacy', device_id: 'local-device' }));
+    expect(hydrated).toHaveLength(1);
+    expect(hydrated[0]).toMatchObject({ id: 'p-legacy' });
   });
 
   it('rejects device_id and all_devices together as mutually exclusive', async () => {
@@ -869,6 +949,29 @@ describe('repair device filtering', () => {
     const result = await handleTool(ctx, 'repair', { device_id: 'device-a', all_devices: true }, 'c1') as BrainErrorEnvelope;
 
     expect(result.error.code).toBe('INVALID_INPUT');
+  });
+
+  it('skips a point already present in SQLite and reports it separately from recovered', async () => {
+    const { ctx, hydrated } = createRepairCtx(twoDevicePoints);
+    (ctx.storage.sqlite.listMemoryIds as ReturnType<typeof vi.fn>).mockReturnValue(new Set(['p-a']));
+
+    const result = await handleTool(ctx, 'repair', { all_devices: true }, 'c1') as RepairResult & { already_in_sqlite: number };
+
+    expect(result.recovered).toBe(1);
+    expect(result.already_in_sqlite).toBe(1);
+    expect(hydrated).toHaveLength(1);
+    expect(hydrated[0]).toMatchObject({ id: 'p-b' });
+  });
+
+  it('dry_run reports what would be recovered without calling hydrateBatch', async () => {
+    const { ctx, sqlite, hydrated } = createRepairCtx(twoDevicePoints);
+
+    const result = await handleTool(ctx, 'repair', { all_devices: true, dry_run: true }, 'c1') as RepairResult;
+
+    expect(result.dry_run).toBe(true);
+    expect(result.recovered).toBe(2);
+    expect(hydrated).toHaveLength(0);
+    expect(sqlite.hydrateBatch).not.toHaveBeenCalled();
   });
 });
 
@@ -1520,6 +1623,105 @@ describe('handleSearch after/before pushdown (add-time-scoped-recall)', () => {
     await handleTool(ctx, 'search', { query: 'q', after: '2026-01-01T00:00:00Z' }, 'c1');
 
     expect(ctx.metrics.incCounter).not.toHaveBeenCalledWith('search_zero_after_filter');
+  });
+});
+
+// bound-corpus-scale-workflows task 3.3: recall/search results are assembled
+// within `defaults.max_response_chars` via the shared response-budget
+// assembler, reporting `truncated` rather than silently returning fewer
+// results than a caller would otherwise expect.
+describe('handleRecall/handleSearch response budget (bound-corpus-scale-workflows task 3.3)', () => {
+  function makeResult(overrides: Partial<SearchResult> & { id: string }): SearchResult {
+    return {
+      content: 'x'.repeat(2000),
+      summary: 'summary',
+      type: 'semantic',
+      tags: [],
+      score: 0.9,
+      semantic_score: 0.9,
+      retention_tier: 'T2',
+      expires_at: null,
+      expiring_soon: false,
+      device_id: null,
+      created_at: '2026-03-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+      ...overrides,
+    };
+  }
+
+  function createCtx(maxResponseChars: number, searchMock: ReturnType<typeof vi.fn>): ToolContext {
+    return {
+      config: {
+        defaults: { max_response_chars: maxResponseChars },
+        search: { mmr: { enabled: false }, rerank: { enabled: false, candidate_pool: 20 } },
+      } as unknown as ToolContext['config'],
+      storage: { sqlite: { listMemoryLinks: vi.fn(() => []) } } as unknown as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: { search: searchMock } as unknown as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('recall reports truncated: false and keeps every result when the response comfortably fits the budget', async () => {
+    const matches = Array.from({ length: 5 }, (_, i) => makeResult({ id: `m${i}`, content: 'short' }));
+    const ctx = createCtx(50_000, vi.fn(async () => matches));
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5 }, 'c1') as { results: SearchResult[]; truncated: boolean };
+
+    expect(result.results).toHaveLength(5);
+    expect(result.truncated).toBe(false);
+  });
+
+  it('recall drops trailing results and reports truncated: true once large results would exceed max_response_chars', async () => {
+    // 5 results at ~2000 chars of content each -> comfortably exceeds a
+    // 3000-char budget, so not all 5 can fit.
+    const matches = Array.from({ length: 5 }, (_, i) => makeResult({ id: `m${i}` }));
+    const ctx = createCtx(3_000, vi.fn(async () => matches));
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5 }, 'c1') as { results: SearchResult[]; truncated: boolean };
+
+    expect(result.truncated).toBe(true);
+    expect(result.results.length).toBeLessThan(5);
+    // The response, once serialized, actually stays near the configured budget.
+    expect(JSON.stringify(result.results).length).toBeLessThanOrEqual(3_000);
+  });
+
+  it('search drops trailing results and reports truncated: true once large results would exceed max_response_chars', async () => {
+    const matches = Array.from({ length: 5 }, (_, i) => makeResult({ id: `m${i}` }));
+    const ctx = createCtx(3_000, vi.fn(async () => matches));
+
+    const result = await handleTool(ctx, 'search', { query: 'q', limit: 5 }, 'c1') as { results: SearchResult[]; truncated: boolean };
+
+    expect(result.truncated).toBe(true);
+    expect(result.results.length).toBeLessThan(5);
+    expect(JSON.stringify(result.results).length).toBeLessThanOrEqual(3_000);
+  });
+
+  it('recall with follow_links still honors the budget across the combined base+neighbor result set', async () => {
+    const base = makeResult({ id: 'base-1', content: 'short' });
+    const ctx = createCtx(3_000, vi.fn(async () => [base]));
+    (ctx.storage.sqlite.listMemoryLinks as ReturnType<typeof vi.fn>).mockReturnValue(
+      Array.from({ length: 5 }, (_, i) => ({ direction: 'outgoing', to_id: `neighbor-${i}`, relation: 'related' })),
+    );
+    ctx.storage.sqlite.getMemoryById = vi.fn((id: string) => ({
+      id, namespace: 'global', collection: 'general', type: 'semantic', category: null,
+      content: 'x'.repeat(2000), summary: 'summary', tags: [], source: 'cli', checksum: 'c',
+      importance: 0.5, retention_tier: 'T2', expires_at: null, decay_eligible: true, review_due: null,
+      access_count: 0, last_operation: 'ADD', merged_from: null, archived: false, vector_synced: true,
+      pinned: false, device_id: null, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+    } as never));
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5, follow_links: true }, 'c1') as {
+      results: SearchResult[]; truncated: boolean;
+    };
+
+    expect(result.truncated).toBe(true);
+    expect(JSON.stringify(result.results).length).toBeLessThanOrEqual(3_000);
   });
 });
 

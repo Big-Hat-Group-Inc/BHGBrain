@@ -3157,7 +3157,8 @@ Récupère les souvenirs les plus pertinents pour une requête en utilisant la r
       "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
       "confidence": 1.0
     }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
@@ -3174,6 +3175,16 @@ et plafonnés à `limit` entrées ajoutées au total. Les entrées ajoutées por
 `include_archived` de `search`) ainsi que `linked_from` (l'id du résultat de base),
 `link_relation` et `link_direction` (`"outgoing"` si le résultat de base est la source
 de l'arête, `"incoming"` s'il en est la cible). Un voisin déjà archivé est ignoré.
+
+`results` est assemblé dans la limite de `defaults.max_response_chars` (par défaut
+`50000`) : les résultats volumineux (champs `content` longs, `limit` élevé) sont
+inclus un par un jusqu'à ce budget de caractères, et `truncated: true` marque une
+réponse ayant dû omettre des résultats en fin de liste pour rester dans cette limite —
+`results.length` peut alors être inférieur à `limit` même si davantage de résultats
+existaient. Ceci est distinct du filtrage par `min_score`/filtres, que `recall` ne
+peut pas distinguer d'un ensemble de résultats véritablement restreint ; un appelant
+ayant besoin de chaque résultat malgré un budget important devrait plutôt restreindre
+la requête ou réduire `limit`.
 
 ---
 
@@ -3217,7 +3228,7 @@ Recherche des souvenirs en utilisant les modes sémantique, plein texte ou hybri
 | `after` | `string (date-heure ISO 8601)` | Non | - | N'inclut que les souvenirs avec `created_at >= after` (inclusif). Filtre sur la date de création, pas `updated_at`. Propagé jusque dans le magasin vectoriel/plein texte — le premier filtre propagé de `search`. |
 | `before` | `string (date-heure ISO 8601)` | Non | - | N'inclut que les souvenirs avec `created_at <= before` (inclusif). Filtre sur la date de création, pas `updated_at`. Propagé jusque dans le magasin vectoriel/plein texte. |
 
-**Sortie :** Même structure que `recall` — `{ "results": [...] }` — mais sans le filtre `min_score` et supportant jusqu'à 50 résultats. Les correspondances archivées (quand `include_archived: true`) portent `archived: true`, utilisent le résumé conservé comme `content`, et n'ont pas de `score` significatif (ce sont des correspondances de termes sur les métadonnées, pas des résultats classés).
+**Sortie :** Même structure que `recall` — `{ "results": [...], "truncated": false }` — mais sans le filtre `min_score`, supportant jusqu'à 50 résultats, et avec un champ supplémentaire `degraded` (`true` quand le mode hybride est retombé sur la recherche plein texte seule). Les correspondances archivées (quand `include_archived: true`) portent `archived: true`, utilisent le résumé conservé comme `content`, et n'ont pas de `score` significatif (ce sont des correspondances de termes sur les métadonnées, pas des résultats classés). `results` est soumis au même budget `defaults.max_response_chars` et à la même sémantique `truncated` documentés ci-dessus sous `recall`.
 
 ---
 
@@ -3469,6 +3480,10 @@ Importe un profil structuré ou un document libre sous forme de souvenirs distin
 - `dry_run: true` renvoie des aperçus de souvenirs sans aucune écriture.
 - Les titres numérotés en dehors des 10 sections mappées au stockage (par exemple un document rédigé selon un ancien modèle à 12 sections) ne sont pas ignorés silencieusement — leurs numéros sont signalés dans `sections_ignored` afin que vous sachiez qu'un contenu a été sauté plutôt que de le perdre sans avertissement.
 - Si [`remember`](#remember--stocker-un-souvenir) a rejeté votre contenu pour dépassement de `pipeline.long_content_threshold_chars`, utilisez ici `import` avec `format: "freeform"` à la place — il découpe le document selon les limites de titres/paragraphes et embedde chaque fragment indépendamment, évitant le problème du vecteur unique bouillie contre lequel le seuil de `remember` protège.
+- Un fragment analysé plus long que `import.max_chunk_chars` (par défaut `8000`) est découpé de façon déterministe en morceaux de cette taille en caractères, plutôt qu'embeddé comme un seul fragment surdimensionné ou rejeté d'emblée — chaque morceau devient tout de même son propre candidat souvenir.
+- Si le nombre de fragments résultant (après un éventuel découpage) dépasse `import.max_chunks` (par défaut `500`), l'appel entier — dry run ou non — est rejeté avec `INVALID_INPUT` indiquant le nombre observé et le maximum configuré, avant tout appel au fournisseur d'embedding.
+- Les embeddings des fragments analysés sont demandés au fournisseur par lots de `import.embedding_batch_size` (par défaut `100`) plutôt qu'une requête par fragment, de sorte que les appels sortants au fournisseur passent à l'échelle avec le nombre de fragments/la taille de lot. Si l'appel d'embedding d'un lot entier échoue, ces fragments ne sont pas perdus — chacun retombe sur un embedding individuel via le chemin normal du pipeline d'écriture.
+- Un fragment dont l'écriture échoue complètement (chaque candidat d'extraction pour lui a été rejeté) n'interrompt pas le reste de l'import : il est compté dans un champ `failed` et détaillé dans un tableau `failures` (`[{ "chunk_index": 4, "error": "..." }]`), tous deux présents uniquement si au moins un fragment a échoué.
 
 ---
 
@@ -3833,6 +3848,16 @@ Découvre et fusionne des souvenirs *existants* quasi doublons — comble la lac
 ```
 
 Les souvenirs sont regroupés en un cluster lorsqu'ils sont reliés, au sein de la page explorée, par une arête de similarité au moins égale à `consolidation.similarity_threshold` (par défaut `0.9` — délibérément en dessous des seuils UPDATE de la déduplication à l'écriture, afin que `list` fasse apparaître des candidats que la déduplication elle-même n'aurait pas fusionnés automatiquement). `suggested_target` n'est **qu'une suggestion** : le membre avec la plus haute `importance` (les égalités sont départagées par `access_count`, puis par le `updated_at` le plus récent). `merge` n'en déduit jamais `target_id` — l'appelant doit le nommer explicitement. `cursor` est `null` dès que la page explorée est plus petite que `consolidation.max_scan_per_call` ; le renvoyer permet de poursuivre l'exploration sur plusieurs appels.
+
+Les recherches de voisins que nécessite une page explorée s'exécutent avec au plus
+`consolidation.neighbor_discovery_concurrency` (par défaut `8`) en cours simultanément —
+borné pour qu'une grande page ne sérialise pas les recherches une par une, ni ne les
+déclenche toutes en même temps. Si le traitement est encore en cours une fois
+`consolidation.neighbor_discovery_deadline_ms` (par défaut `10000`) écoulé, `list`
+revient plus tôt avec un `cursor` non nul reprenant juste après le dernier membre dont
+les voisins ont été résolus — un membre que l'échéance a laissé de côté n'est inclus
+dans aucun cluster lors de cet appel, et est repris (avec une nouvelle recherche de
+voisins) lors du prochain appel à `list` avec ce curseur.
 
 **Sortie (`action: "merge"`) :**
 

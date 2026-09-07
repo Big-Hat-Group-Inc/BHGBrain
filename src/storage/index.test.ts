@@ -132,8 +132,7 @@ function createMockSqlite(): MockSqliteStore {
 }
 
 function createMockQdrant(shouldFail = false): MockQdrantStore {
-  const scrollAll = vi.fn(async (_name: string) => [] as Array<{ id: string; payload: Record<string, unknown> }>);
-  return {
+  const store: MockQdrantStore = {
     upsert: shouldFail
       ? vi.fn(async () => { throw new Error('Qdrant unavailable'); })
       : vi.fn(async () => {}),
@@ -142,15 +141,19 @@ function createMockQdrant(shouldFail = false): MockQdrantStore {
     deleteCollection: vi.fn(async () => {}),
     clearManagedCollections: vi.fn(async () => 0),
     listAllCollections: vi.fn(async () => []),
-    scrollAll,
-    // Delegates to whatever `scrollAll` is mocked to return, yielded as one
-    // page — keeps every existing `scrollAll.mockResolvedValue(...)` test
-    // setup working against the streaming reconciliation path unchanged.
+    scrollAll: vi.fn(async (_name: string) => [] as Array<{ id: string; payload: Record<string, unknown> }>),
+    // Delegates to whatever `store.scrollAll` currently resolves to (looked
+    // up live, not closed over, so a test that replaces the whole
+    // `scrollAll` property — not just its resolved value — is still
+    // honored), yielded as one page — keeps every existing
+    // `scrollAll.mockResolvedValue(...)`/`scrollAll = vi.fn(...)` test setup
+    // working against the streaming reconciliation/bootstrap paths unchanged.
     scrollAllPages: vi.fn(async function* (name: string) {
-      const points = await scrollAll(name);
-      if (points.length > 0) yield points;
+      const points = await store.scrollAll(name);
+      if (points.length > 0) yield { points, cursor: null, done: true, cancelled: false };
     }),
   } as unknown as MockQdrantStore;
+  return store;
 }
 
 function createMockEmbedding(): EmbeddingProvider {

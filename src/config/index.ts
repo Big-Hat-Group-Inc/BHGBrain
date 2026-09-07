@@ -223,6 +223,17 @@ const ConfigSchema = z.object({
       // Upper bound on clusters distilled (i.e. LLM calls made) per
       // scheduled tick, bounding worst-case cost/latency per run.
       max_clusters_per_run: z.number().int().positive().default(10),
+      // Upper bound on episodic T2/T3 candidates clustered per
+      // namespace/collection per run — clustering is O(n^2) pairwise
+      // comparisons, so an unbounded candidate set makes one run's compute
+      // cost scale quadratically with corpus size. When a collection has
+      // more eligible candidates than this, a deterministic
+      // `max_candidates_per_collection`-sized window is selected (see
+      // `distillation_collection_state`'s cursor) and the rest are skipped
+      // for this run, not silently dropped — the cursor advances so a later
+      // run's window covers the next slice, eventually rotating through the
+      // whole candidate pool. See bound-corpus-scale-workflows task 2.1.
+      max_candidates_per_collection: z.number().int().positive().default(500),
     }).prefault({}),
   }).prefault({}),
   deduplication: z.object({
@@ -261,6 +272,18 @@ const ConfigSchema = z.object({
     // Upper bound on memories scanned per `list` call, regardless of how
     // large the namespace/collection is — see design.md "Bounded scan cost".
     max_scan_per_call: z.number().int().positive().default(500),
+    // How many `findNeighborsById` ANN queries `consolidate list` runs
+    // concurrently while fanning out over the scanned page — bounded so a
+    // large page neither serializes one Qdrant round trip at a time (slow)
+    // nor fires the whole page's worth of requests at once (unbounded
+    // fan-out). See bound-corpus-scale-workflows task 2.5.
+    neighbor_discovery_concurrency: z.number().int().positive().default(8),
+    // Wall-clock budget for one `list` call's whole neighbor-discovery fan-out
+    // (not one individual Qdrant call). Once reached, discovery stops after
+    // the in-flight batch completes and the call returns a continuation
+    // cursor covering the unscanned remainder instead of blocking until the
+    // full page's neighbors are all resolved.
+    neighbor_discovery_deadline_ms: z.number().int().positive().default(10_000),
   }).prefault({}),
   resilience: z.object({
     circuit_breaker: z.object({
@@ -454,6 +477,35 @@ const ConfigSchema = z.object({
       agent: z.number().min(0).max(1).default(0.7),
       import: z.number().min(0).max(1).default(0.5),
     }).prefault({}),
+  }).prefault({}),
+  // Bounds on the `import` tool's output amplification (bound-corpus-scale-
+  // workflows task 3.1/3.2): a parsed document can otherwise turn into an
+  // unbounded number of embed/write calls (many tiny paragraphs) or a
+  // too-large single chunk (one huge unsplit section) that degrades into a
+  // permanently unsyncable row. See design.md Decision #5.
+  import: z.object({
+    // Upper bound on memories one `import` call may create (after any
+    // oversized-chunk splitting below has already run — it is the resulting
+    // chunk count that bounds outbound provider calls, not the
+    // pre-split parse). Exceeded -> rejected up front with the observed
+    // count and this maximum, before any provider call is made.
+    max_chunks: z.number().int().positive().default(500),
+    // A parsed chunk longer than this is deterministically hard-split into
+    // max_chunk_chars-sized pieces (last piece shorter) rather than embedded
+    // as one oversized "mush vector" or rejected outright — every piece
+    // still gets a chance to become a memory. Matches
+    // `pipeline.long_content_threshold_chars`'s default so a `remember` call
+    // and an `import` chunk hit the same practical size ceiling.
+    max_chunk_chars: z.number().int().positive().default(8000),
+    // How many chunks' embeddings `import` requests from the embedding
+    // provider in one `embedBatch` call, so outbound request count scales
+    // with chunk-count/batch-size rather than 1:1 with chunk count. Capped
+    // in practice by `embedding.max_batch_inputs` (the provider's own
+    // per-request cap) — import does not validate this against that field
+    // directly since a value above it still works, just via more retries at
+    // the request layer; operators tuning both together should keep this at
+    // or below it.
+    embedding_batch_size: z.number().int().positive().default(100),
   }).prefault({}),
   // Controls whether summarization quality tiers (extractive, or LLM when
   // `pipeline.summarization_enabled`) apply. `true` (default): tiered

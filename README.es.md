@@ -3147,7 +3147,8 @@ Recupera las memorias más relevantes para una consulta usando búsqueda de simi
       "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
       "confidence": 1.0
     }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
@@ -3164,6 +3165,16 @@ posición, no una puntuación de relevancia — la misma convención que usa
 `include_archived` de `search`) además de `linked_from` (el id del resultado base),
 `link_relation` y `link_direction` (`"outgoing"` si el resultado base es el origen del
 borde, `"incoming"` si es el destino). Un vecino ya archivado se omite.
+
+`results` se ensambla dentro de `defaults.max_response_chars` (predeterminado
+`50000`): los resultados grandes (campos `content` largos, un `limit` alto) se
+incluyen uno a uno hasta ese presupuesto de caracteres, y `truncated: true` marca una
+respuesta que tuvo que dejar fuera resultados finales para mantenerse dentro de él —
+`results.length` puede entonces ser menor que `limit` aunque existieran más
+coincidencias. Esto es distinto del filtrado por `min_score`/filtros, que `recall` no
+puede distinguir de un conjunto de resultados genuinamente pequeño; un llamador que
+necesite cada coincidencia a pesar de un presupuesto amplio debería en su lugar
+acotar la consulta o reducir `limit`.
 
 ---
 
@@ -3207,7 +3218,7 @@ Busca memorias usando modos semántico, de texto completo o híbrido. Ofrece má
 | `after` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at >= after` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén vectorial/de texto completo — el primer filtro empujado hacia el almacén en `search`. |
 | `before` | `string (fecha-hora ISO 8601)` | No | - | Solo incluye memorias con `created_at <= before` (inclusivo). Filtra por tiempo de creación, no por `updated_at`. Se empuja hacia el almacén vectorial/de texto completo. |
 
-**Salida:** Misma estructura que `recall` — `{ "results": [...] }` — pero sin la compuerta `min_score` y admitiendo hasta 50 resultados. Las coincidencias archivadas (cuando `include_archived: true`) llevan `archived: true`, usan el resumen conservado como `content` y no tienen un `score` significativo (son coincidencias de términos en metadatos, no resultados clasificados).
+**Salida:** Misma estructura que `recall` — `{ "results": [...], "truncated": false }` — pero sin la compuerta `min_score`, admitiendo hasta 50 resultados, y con un campo adicional `degraded` (`true` cuando el modo híbrido recurrió solo a texto completo). Las coincidencias archivadas (cuando `include_archived: true`) llevan `archived: true`, usan el resumen conservado como `content` y no tienen un `score` significativo (son coincidencias de términos en metadatos, no resultados clasificados). `results` está sujeto al mismo presupuesto `defaults.max_response_chars` y a la misma semántica de `truncated` documentada arriba en `recall`.
 
 ---
 
@@ -3459,6 +3470,10 @@ Importa un perfil estructurado o un documento de formato libre como memorias dis
 - `dry_run: true` devuelve vistas previas de memorias sin ninguna escritura.
 - Los encabezados numerados fuera de las 10 secciones mapeadas al almacenamiento (p. ej. un documento escrito contra una plantilla de 12 secciones más antigua) no se descartan silenciosamente — sus números se reportan en `sections_ignored` para que sepas que se omitió contenido en lugar de perderlo sin aviso.
 - Si [`remember`](#remember--almacenar-una-memoria) rechazó tu contenido por exceder `pipeline.long_content_threshold_chars`, usa `import` con `format: "freeform"` aquí en su lugar — divide el documento por límites de encabezado/párrafo e incrusta cada fragmento de forma independiente, evitando el problema del vector único y mezclado contra el que protege el umbral de `remember`.
+- Un fragmento analizado más largo que `import.max_chunk_chars` (predeterminado `8000`) se divide determinísticamente en piezas de ese tamaño en caracteres, en lugar de incrustarse como un fragmento sobredimensionado o rechazarse por completo — cada pieza sigue convirtiéndose en su propio candidato a memoria.
+- Si el recuento de fragmentos resultante (tras cualquier división) supera `import.max_chunks` (predeterminado `500`), toda la llamada — sea dry run o no — se rechaza con `INVALID_INPUT`, indicando el recuento observado y el máximo configurado, antes de realizar ninguna llamada al proveedor de incrustación.
+- Las incrustaciones de los fragmentos analizados se solicitan al proveedor en lotes de `import.embedding_batch_size` (predeterminado `100`) en lugar de una solicitud por fragmento, de modo que las llamadas salientes al proveedor escalan según el recuento de fragmentos/tamaño de lote. Si falla la llamada de incrustación de todo un lote, esos fragmentos no se pierden — cada uno recurre a incrustarse individualmente a través de la ruta normal del pipeline de escritura.
+- Un fragmento cuya escritura falla por completo (cada candidato de extracción para él fue rechazado) no aborta el resto de la importación: se cuenta en un campo `failed` y se detalla en un array `failures` (`[{ "chunk_index": 4, "error": "..." }]`), ambos presentes solo cuando al menos un fragmento falló.
 
 ---
 
@@ -3821,6 +3836,16 @@ Descubre y fusiona memorias *existentes* casi duplicadas — cierra la brecha de
 ```
 
 Las memorias se agrupan en un clúster cuando están conectadas, dentro de la página explorada, por una arista de similitud igual o superior a `consolidation.similarity_threshold` (por defecto `0.9` — deliberadamente por debajo de los umbrales de UPDATE de la deduplicación en tiempo de escritura, de modo que `list` muestra candidatos que la propia deduplicación no habría fusionado automáticamente). `suggested_target` es **solo una sugerencia**: el miembro con mayor `importance` (los empates se resuelven por `access_count`, y luego por el `updated_at` más reciente). `merge` nunca infiere `target_id` a partir de ella — quien llama debe indicarla explícitamente. `cursor` es `null` en cuanto la página explorada es menor que `consolidation.max_scan_per_call`; devuélvelo para continuar la exploración a través de varias llamadas.
+
+Las búsquedas de vecinos que requiere una página explorada se ejecutan con como máximo
+`consolidation.neighbor_discovery_concurrency` (por defecto `8`) en curso a la vez —
+acotado para que una página grande ni serialice una búsqueda a la vez ni dispare todas
+las de la página a la vez. Si el reparto sigue en curso una vez transcurrido
+`consolidation.neighbor_discovery_deadline_ms` (por defecto `10000`), `list` regresa
+antes de tiempo con un `cursor` no nulo que retoma justo después del último miembro
+cuyos vecinos se resolvieron — un miembro que la fecha límite dejó fuera no se incluye
+en ningún clúster en esa llamada, y se retoma (con una búsqueda de vecinos nueva) en la
+siguiente llamada a `list` usando ese cursor.
 
 **Salida (`action: "merge"`):**
 

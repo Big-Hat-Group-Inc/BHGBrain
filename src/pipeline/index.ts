@@ -84,6 +84,20 @@ export class WritePipeline {
     // leaving this parameter's behavior a no-op for them. See
     // add-memory-distillation.
     derived_from?: string[] | null;
+    // Reuses an already-computed embedding instead of calling
+    // `embedding.embed()` again — the batched-import path (`handleImport`,
+    // bound-corpus-scale-workflows task 3.2) embeds a whole chunk batch in
+    // one `embedBatch` round trip up front, then feeds each chunk's vector
+    // in here so `decide()`'s own embed call is skipped. Only honored when
+    // extraction resolves to exactly the single, unmodified `content` this
+    // vector was computed from (see below) — multi-candidate extraction (or
+    // any candidate whose content extraction rewrote) still embeds fresh,
+    // since the precomputed vector would no longer describe that candidate's
+    // actual text. A checksum-exact-duplicate candidate (Step 1 of
+    // `decide()`) never reaches the embedding step regardless, so this is
+    // simply unused (not wasted work beyond the one batched API call) on a
+    // NOOP outcome — see `decide()`'s dedup-before-embed ordering.
+    precomputedEmbedding?: number[];
   }): Promise<WriteResult[]> {
     const normalized = normalizeContent(input.content);
 
@@ -103,7 +117,15 @@ export class WritePipeline {
     for (const [index, candidate] of candidates.entries()) {
       attempted += 1;
       try {
-        const result = await this.decide(candidate, input);
+        // Safe to reuse the precomputed vector only when extraction left
+        // exactly one candidate whose content is byte-identical to what the
+        // vector was computed from — otherwise it describes different text.
+        const embeddingForCandidate = input.precomputedEmbedding !== undefined
+          && candidates.length === 1
+          && candidate.content === normalized
+          ? input.precomputedEmbedding
+          : undefined;
+        const result = await this.decide(candidate, input, embeddingForCandidate);
         results.push(result);
       } catch (err) {
         lastError = err;
@@ -195,6 +217,7 @@ export class WritePipeline {
       confidence?: number;
       derived_from?: string[] | null;
     },
+    precomputedEmbedding?: number[],
   ): Promise<WriteResult> {
     const checksum = computeChecksum(candidate.content);
     const now = new Date().toISOString();
@@ -237,7 +260,7 @@ export class WritePipeline {
     // `summarizeContent` itself never rejects (it catches internally and
     // falls back to the extractive tier).
     const [embedResult, summaryResult] = await Promise.allSettled([
-      this.embedding.embed(candidate.content),
+      precomputedEmbedding !== undefined ? Promise.resolve(precomputedEmbedding) : this.embedding.embed(candidate.content),
       summarizeContent(candidate.content, this.config, this.summarizer, this.logger),
     ]);
 

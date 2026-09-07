@@ -19,12 +19,19 @@ import type {
   WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter,
 } from '../domain/types.js';
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
-import { computeChecksum } from '../domain/normalize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
+import { assembleWithinCharBudget } from '../domain/response-budget.js';
 import { buildRestoredMemoryFromArchive } from '../domain/archive-restore.js';
 import { handleImport } from './import.js';
 import { handleBootstrap } from './bootstrap.js';
 import { ZodError } from 'zod';
+
+// Fixed slack reserved out of `defaults.max_response_chars` for a result
+// object's own envelope — the `results`/`truncated`/`degraded` keys, array
+// brackets, and surrounding braces — so the *whole* returned object stays
+// within budget, not just its `results` array in isolation. Comfortably
+// covers the handful of short scalar fields these tools wrap `results` in.
+const RESPONSE_BUDGET_RESERVED_CHARS = 200;
 
 export interface ToolContext {
   config: BrainConfig;
@@ -213,7 +220,7 @@ async function handleRemember(
 
 async function handleRecall(
   ctx: ToolContext, args: unknown, logCtx: ToolLogContext,
-): Promise<{ results: SearchResult[] }> {
+): Promise<{ results: SearchResult[]; truncated: boolean }> {
   const input = parseInput(RecallInputSchema, args);
   logCtx.namespace = input.namespace;
   const lifecycle = new MemoryLifecycleService(ctx.config);
@@ -307,7 +314,13 @@ async function handleRecall(
   const sliced = filtered.slice(0, input.limit);
 
   if (!input.follow_links) {
-    return { results: sliced };
+    // Response budget (bound-corpus-scale-workflows task 3.3): assembled
+    // BEFORE serialization, one candidate at a time, rather than truncating
+    // the final JSON string (which risks invalid/ambiguous output — see
+    // design.md Decision #6). `RESPONSE_BUDGET_RESERVED_CHARS` covers this
+    // object's own envelope (the `results`/`truncated` keys and brackets).
+    const budgeted = assembleWithinCharBudget(sliced, ctx.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY, RESPONSE_BUDGET_RESERVED_CHARS);
+    return { results: budgeted.items, truncated: budgeted.truncated };
   }
 
   // One-hop neighbor expansion (add-memory-links): runs on the final,
@@ -352,7 +365,10 @@ async function handleRecall(
     }
   }
 
-  return { results: [...sliced, ...neighbors] };
+  const budgeted = assembleWithinCharBudget(
+    [...sliced, ...neighbors], ctx.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY, RESPONSE_BUDGET_RESERVED_CHARS,
+  );
+  return { results: budgeted.items, truncated: budgeted.truncated };
 }
 
 async function handleForget(
@@ -374,7 +390,7 @@ async function handleForget(
 
 async function handleSearch(
   ctx: ToolContext, args: unknown, logCtx: ToolLogContext,
-): Promise<{ results: SearchResult[]; degraded: boolean }> {
+): Promise<{ results: SearchResult[]; degraded: boolean; truncated: boolean }> {
   const input = parseInput(SearchInputSchema, args);
   logCtx.namespace = input.namespace;
   const signal: { degraded?: boolean } = {};
@@ -421,7 +437,12 @@ async function handleSearch(
 
   // `degraded` is true when hybrid mode fell back to fulltext-only (embedding /
   // vector store unavailable), so callers can tell it from a healthy result.
-  return { results: filtered.slice(0, input.limit), degraded: signal.degraded ?? false };
+  // Response budget (bound-corpus-scale-workflows task 3.3): see
+  // `handleRecall`'s matching comment.
+  const budgeted = assembleWithinCharBudget(
+    filtered.slice(0, input.limit), ctx.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY, RESPONSE_BUDGET_RESERVED_CHARS,
+  );
+  return { results: budgeted.items, degraded: signal.degraded ?? false, truncated: budgeted.truncated };
 }
 
 async function handleTag(
@@ -833,25 +854,54 @@ async function handleConsolidateList(
     if (ra !== rb) parent.set(ra, rb);
   };
 
-  for (const m of page) {
-    const neighbors = await ctx.storage.qdrant.findNeighborsById(
-      namespace, collection, m.id,
-      ctx.config.consolidation.neighbor_top_k,
-      ctx.config.consolidation.similarity_threshold,
-    );
-    for (const n of neighbors) {
-      // Only edges between memories both present in this scanned page can be
-      // clustered — metadata for the suggested-target tie-break is only
-      // available for page members (design.md: "union-find over the page's
-      // neighbor edges").
-      if (byId.has(n.id)) {
-        union(m.id, n.id);
-      }
+  // Bounded-concurrency, deadline-aware fan-out (bound-corpus-scale-workflows
+  // task 2.5): the page's `findNeighborsById` ANN calls run in batches of at
+  // most `neighbor_discovery_concurrency` in flight at once — neither
+  // strictly serial (one Qdrant round trip at a time, as this loop used to
+  // be) nor unbounded (the whole page fired concurrently). The deadline is
+  // checked between batches, so at most one batch's worth of calls can run
+  // past it; `processed` then names exactly how many leading page members
+  // (in scan order) got their neighbors resolved, letting `cursor` below
+  // resume precisely after them rather than either re-scanning already-
+  // resolved members or skipping ones that were never reached.
+  const startedAt = Date.now();
+  const concurrency = Math.max(1, ctx.config.consolidation.neighbor_discovery_concurrency);
+  const deadlineMs = ctx.config.consolidation.neighbor_discovery_deadline_ms;
+  let processed = 0;
+  let deadlineReached = false;
+  for (let i = 0; i < page.length; i += concurrency) {
+    if (Date.now() - startedAt >= deadlineMs) {
+      deadlineReached = true;
+      break;
     }
+    const batch = page.slice(i, i + concurrency);
+    await Promise.all(batch.map(async m => {
+      const neighbors = await ctx.storage.qdrant.findNeighborsById(
+        namespace, collection, m.id,
+        ctx.config.consolidation.neighbor_top_k,
+        ctx.config.consolidation.similarity_threshold,
+      );
+      for (const n of neighbors) {
+        // Only edges between memories both present in this scanned page can be
+        // clustered — metadata for the suggested-target tie-break is only
+        // available for page members (design.md: "union-find over the page's
+        // neighbor edges").
+        if (byId.has(n.id)) {
+          union(m.id, n.id);
+        }
+      }
+    }));
+    processed += batch.length;
   }
 
+  // Only members whose neighbors were actually resolved this call can be
+  // safely clustered — an unresolved member (deadline cut the fan-out short
+  // before reaching it) has no discovered edges yet and would otherwise
+  // surface as a false singleton instead of being deferred to the next call.
+  const resolvedIds = new Set(page.slice(0, processed).map(m => m.id));
   const groups = new Map<string, string[]>();
   for (const m of page) {
+    if (!resolvedIds.has(m.id)) continue;
     const root = find(m.id);
     const arr = groups.get(root) ?? [];
     arr.push(m.id);
@@ -876,10 +926,19 @@ async function handleConsolidateList(
     });
   }
 
-  const last = page[page.length - 1];
-  const cursor = page.length === maxScan && last
-    ? `${last.created_at}|${last.id}`
-    : null;
+  let cursor: string | null = null;
+  if (deadlineReached && processed > 0) {
+    const lastResolved = page[processed - 1]!;
+    cursor = `${lastResolved.created_at}|${lastResolved.id}`;
+  } else if (!deadlineReached) {
+    const last = page[page.length - 1];
+    cursor = page.length === maxScan && last ? `${last.created_at}|${last.id}` : null;
+  } else {
+    // deadlineReached but processed === 0: the very first batch alone
+    // exceeded the deadline. Resume from the same input cursor (no progress
+    // to advance past) rather than fabricating one from an empty result.
+    cursor = input.cursor ?? null;
+  }
 
   return { clusters, cursor };
 }
@@ -1119,9 +1178,14 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
   // schema); omitting both is the documented, backward-compatible
   // all-devices default, same as passing `all_devices: true` explicitly.
   const filterDeviceId = input.all_devices ? undefined : input.device_id;
-  const localDeviceId = ctx.config.device.id ?? null;
 
   const collections = await ctx.storage.qdrant.listAllCollections();
+  // Preloaded once for the whole repair run, same rationale as
+  // `bootstrapFromQdrant` (trim-sqlite-query-and-health-overhead task 2.3):
+  // a Set lookup per point instead of a `getMemoryById` query, mutated in
+  // place by `hydrateBatch` as it inserts so a later page/collection in this
+  // same run sees an id inserted earlier as already present.
+  const existingIds = ctx.storage.sqlite.listMemoryIds();
   let scannedPoints = 0;
   let recoveredCount = 0;
   let skippedNoContent = 0;
@@ -1130,119 +1194,75 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
   const errors: string[] = [];
 
   for (const collectionName of collections) {
-    let points: Array<{ id: string; payload: Record<string, unknown> }>;
+    let pageIndex = 0;
     try {
-      points = await ctx.storage.qdrant.scrollAll(collectionName);
+      // Paged (bound-corpus-scale-workflows tasks 1.1/1.3) rather than
+      // buffering the whole collection before processing any of it, and
+      // routed through the same canonical payload mapper and transactional,
+      // per-page-committed hydration `bootstrapFromQdrant` uses
+      // (`SqliteStore.hydrateBatch`) instead of a bespoke field-by-field
+      // reconstruction — the prior hand-rolled mapping here silently
+      // dropped `expires_at`, `review_due`, `access_count`, `last_operation`,
+      // and `derived_from` on every recovered record, and inserted each
+      // point in its own autocommit transaction (blocking, and able to
+      // split `memories`/`memories_fts` state on a crash mid-collection).
+      // Because each page's `hydrateBatch` call commits before the next
+      // page is requested, a process interrupted partway through a
+      // collection leaves every already-hydrated page's rows valid and
+      // searchable, and a later `repair` invocation simply skips them via
+      // `existingIds` rather than duplicating or corrupting them.
+      for await (const page of ctx.storage.qdrant.scrollAllPages(collectionName)) {
+        pageIndex++;
+        scannedPoints += page.points.length;
+
+        const toHydrate: Array<{ id: string; payload: Record<string, unknown> }> = [];
+        for (const point of page.points) {
+          const content = point.payload.content as string | undefined;
+          if (!content) {
+            skippedNoContent++;
+            continue;
+          }
+
+          const pointDeviceId = (point.payload.device_id as string) ?? null;
+          if (filterDeviceId && pointDeviceId !== filterDeviceId) {
+            skippedDeviceFilter++;
+            continue;
+          }
+
+          if (existingIds.has(point.id)) {
+            alreadyInSqlite++;
+            continue;
+          }
+
+          toHydrate.push(point);
+        }
+
+        if (dryRun) {
+          recoveredCount += toHydrate.length;
+        } else if (toHydrate.length > 0) {
+          const { hydrated, failures } = ctx.storage.sqlite.hydrateBatch(toHydrate, existingIds);
+          recoveredCount += hydrated;
+          for (const failure of failures) {
+            errors.push(`Failed to insert ${failure.id}: ${failure.error}`);
+          }
+          ctx.storage.sqlite.flushIfDirty();
+        }
+
+        ctx.logger.info({
+          event: 'repair_progress',
+          collection: collectionName,
+          page: pageIndex,
+          recovered_so_far: recoveredCount,
+          done: page.done,
+        });
+      }
     } catch (err) {
       errors.push(`Failed to scroll ${collectionName}: ${(err as Error).message}`);
       continue;
     }
-
-    scannedPoints += points.length;
-
-    for (const point of points) {
-      const payload = point.payload;
-      const content = payload.content as string | undefined;
-
-      if (!content) {
-        skippedNoContent++;
-        continue;
-      }
-
-      // Filter by device_id if specified
-      const pointDeviceId = (payload.device_id as string) ?? null;
-      if (filterDeviceId && pointDeviceId !== filterDeviceId) {
-        skippedDeviceFilter++;
-        continue;
-      }
-
-      // Check if already in SQLite
-      const existing = ctx.storage.sqlite.getMemoryById(point.id);
-      if (existing) {
-        alreadyInSqlite++;
-        continue;
-      }
-
-      if (dryRun) {
-        recoveredCount++;
-        continue;
-      }
-
-      // Reconstruct and insert into SQLite
-      const now = new Date().toISOString();
-      const namespace = (payload.namespace as string) ?? 'global';
-      const collection = (payload.collection as string) ?? 'general';
-
-      // Ensure the collection exists in SQLite
-      const colRecord = ctx.storage.sqlite.getCollection(namespace, collection);
-      if (!colRecord) {
-        ctx.storage.sqlite.createCollection(
-          namespace, collection,
-          ctx.embedding.model, ctx.embedding.dimensions,
-        );
-      }
-
-      // Use original device_id from payload, or fall back to local device_id
-      const recoveredDeviceId = pointDeviceId ?? localDeviceId;
-
-      const mem: Omit<MemoryRecord, 'embedding'> = {
-        id: point.id,
-        namespace,
-        collection,
-        type: (payload.type as MemoryRecord['type']) ?? 'semantic',
-        category: (payload.category as string) ?? null,
-        content,
-        summary: (payload.summary as string) ?? '',
-        tags: Array.isArray(payload.tags) ? payload.tags as string[] : [],
-        source: (payload.source as MemoryRecord['source']) ?? 'import',
-        checksum: computeChecksum(content),
-        importance: (payload.importance as number) ?? 0.5,
-        retention_tier: (payload.retention_tier as MemoryRecord['retention_tier']) ?? 'T2',
-        expires_at: null,
-        decay_eligible: (payload.decay_eligible as boolean) ?? true,
-        review_due: null,
-        access_count: 0,
-        last_operation: 'ADD',
-        merged_from: null,
-        archived: false,
-        vector_synced: true,
-        // Restore pin state from the recovered Qdrant payload rather than
-        // defaulting it to false, so `repair --mode from-qdrant` preserves
-        // it. See add-inject-pinning.
-        pinned: typeof payload.pinned === 'boolean' ? payload.pinned : false,
-        device_id: recoveredDeviceId,
-        // Carry forward whatever identity the recovered vector was already
-        // stamped with — this reconstructs a SQLite row from an existing
-        // Qdrant point, not a new embedding, so it must not claim the active
-        // configuration's identity. Missing on the payload means the point
-        // predates provenance stamping and stays "unknown" (null).
-        embedding_model: typeof payload.embedding_model === 'string' ? payload.embedding_model : null,
-        // Same recovery posture as `embedding_model` above: carry forward
-        // whatever content provenance the payload already carries rather
-        // than inventing new provenance for a reconstructed row. A missing
-        // or malformed field narrows to "unknown" (null / 1.0), mirroring
-        // `SqliteStore.upsertMemoryFromPayload`. See
-        // add-memory-provenance-metadata.
-        origin: payload.origin !== null && typeof payload.origin === 'object' && !Array.isArray(payload.origin)
-          ? payload.origin as MemoryRecord['origin']
-          : null,
-        confidence: typeof payload.confidence === 'number' ? payload.confidence : 1.0,
-        created_at: (payload.created_at as string) ?? now,
-        updated_at: now,
-        last_accessed: now,
-      };
-
-      try {
-        ctx.storage.sqlite.insertMemory(mem);
-        recoveredCount++;
-      } catch (err) {
-        errors.push(`Failed to insert ${point.id}: ${(err as Error).message}`);
-      }
-    }
   }
 
   if (recoveredCount > 0 && !dryRun) {
-    ctx.storage.sqlite.flushIfDirty();
     ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
   }
 

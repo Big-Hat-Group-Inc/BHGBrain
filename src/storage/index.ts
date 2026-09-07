@@ -647,30 +647,50 @@ export class StorageManager {
 
     let total = 0;
     for (const collectionName of collections) {
-      const points = await this.qdrant.scrollAll(collectionName);
-      const filteredPoints = deviceFilter
-        ? points.filter(point => {
-            const pointDeviceId = typeof point.payload.device_id === 'string' ? point.payload.device_id : null;
-            return pointDeviceId === deviceFilter;
-          })
-        : points;
+      let collectionHydrated = 0;
+      let pageIndex = 0;
+      // Paged (bound-corpus-scale-workflows task 1.2) rather than buffering
+      // the whole collection's points before hydrating any of them — each
+      // page is hydrated (and its transaction committed, via `hydrateBatch`)
+      // as soon as it arrives, so peak retained scan data stays bounded near
+      // one page regardless of collection size, and progress is reported
+      // incrementally instead of only once the entire collection has been
+      // scrolled. Full payload is requested (no `payloadFields` projection):
+      // hydration reconstructs a whole memory record, so every field is
+      // required, unlike drift detection's four-field projection.
+      for await (const page of this.qdrant.scrollAllPages(collectionName)) {
+        pageIndex++;
+        const filteredPoints = deviceFilter
+          ? page.points.filter(point => {
+              const pointDeviceId = typeof point.payload.device_id === 'string' ? point.payload.device_id : null;
+              return pointDeviceId === deviceFilter;
+            })
+          : page.points;
 
-      // Hydration is best-effort across the whole scan: one point that fails a
-      // SQLite constraint (fails loudly, atomically — see hydrateBatch) must not
-      // silently succeed, but it also must not abort the remaining points in this
-      // collection or in later collections. One BEGIN/COMMIT per collection (task
-      // 2.4) instead of one per point, with a SAVEPOINT per point preserving that
-      // same per-point atomicity/isolation.
-      const { hydrated, failures } = this.sqlite.hydrateBatch(filteredPoints, existingIds);
-      for (const failure of failures) {
-        logFailure(`[bootstrap] failed to hydrate point ${failure.id} in ${collectionName}: ${failure.error}`, {
+        // Hydration is best-effort across the whole scan: one point that fails a
+        // SQLite constraint (fails loudly, atomically — see hydrateBatch) must not
+        // silently succeed, but it also must not abort the remaining points in this
+        // page or in later pages/collections. One BEGIN/COMMIT per page, with a
+        // SAVEPOINT per point preserving that same per-point atomicity/isolation.
+        const { hydrated, failures } = this.sqlite.hydrateBatch(filteredPoints, existingIds);
+        for (const failure of failures) {
+          logFailure(`[bootstrap] failed to hydrate point ${failure.id} in ${collectionName}: ${failure.error}`, {
+            collection: collectionName,
+            point_id: failure.id,
+          });
+        }
+        this.sqlite.flushIfDirty();
+        collectionHydrated += hydrated;
+        log(`[bootstrap] collection ${collectionName}: page ${pageIndex} hydrated ${hydrated} (running total ${collectionHydrated})`, {
           collection: collectionName,
-          point_id: failure.id,
+          page: pageIndex,
+          hydrated,
+          running_total: collectionHydrated,
+          done: page.done,
         });
       }
-      this.sqlite.flushIfDirty();
-      log(`[bootstrap] collection ${collectionName}: ${hydrated} points hydrated`, { collection: collectionName, hydrated });
-      total += hydrated;
+      log(`[bootstrap] collection ${collectionName}: ${collectionHydrated} points hydrated`, { collection: collectionName, hydrated: collectionHydrated });
+      total += collectionHydrated;
     }
 
     log(`[bootstrap] complete: ${total} total memories hydrated`, { total });
@@ -698,7 +718,10 @@ export class StorageManager {
    *    cross-device search fallback (device-namespace-partitioning) and is
    *    never touched here, restore or not.
    *
-   * See make-backup-restore-transactional task 3.1.
+   * See make-backup-restore-transactional task 3.1 and
+   * bound-corpus-scale-workflows task 1.2 (paged with a server-side payload
+   * projection — drift detection only ever inspects these four fields, so
+   * the full record is never requested or held in memory per page).
    */
   private async computeVectorReconciliationDiff(
     sqliteChecksums: Map<string, string>,
@@ -710,8 +733,10 @@ export class StorageManager {
     const surplus: Array<{ namespace: string; collection: string; id: string }> = [];
 
     for (const name of collections) {
-      for await (const page of this.qdrant.scrollAllPages(name)) {
-        for (const point of page) {
+      for await (const page of this.qdrant.scrollAllPages(name, {
+        payloadFields: ['checksum', 'device_id', 'namespace', 'collection'],
+      })) {
+        for (const point of page.points) {
           const expectedChecksum = sqliteChecksums.get(point.id);
           if (expectedChecksum !== undefined) {
             const actualChecksum = point.payload.checksum;

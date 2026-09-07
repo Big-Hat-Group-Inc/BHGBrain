@@ -3123,7 +3123,8 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
       "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
       "confidence": 1.0
     }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
@@ -3139,6 +3140,14 @@ convention `search`'s `include_archived` uses) plus `linked_from` (the base resu
 id), `link_relation`, and `link_direction` (`"outgoing"` if the base result is the
 edge's source, `"incoming"` if it is the target). A neighbor that is itself archived
 is skipped.
+
+`results` is assembled within `defaults.max_response_chars` (default `50000`): large
+results (long `content` fields, a high `limit`) are included one at a time up to that
+character budget, and `truncated: true` marks a response that had to leave trailing
+results out to stay within it — `results.length` can then be smaller than `limit` even
+when more matches existed. This is distinct from `min_score`/filter narrowing, which
+`recall` cannot tell apart from a genuinely small result set; a caller that needs every
+match despite a large budget should narrow the query or lower `limit` instead.
 
 ---
 
@@ -3182,7 +3191,7 @@ Search memories using semantic, fulltext, or hybrid modes. Offers more control t
 | `after` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at >= after` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the vector/fulltext store so `limit` counts matching memories - `search`'s first pushed-down filter. |
 | `before` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at <= before` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the vector/fulltext store so `limit` counts matching memories. |
 
-**Output:** Same structure as `recall` - `{ "results": [...] }` - but without the `min_score` gate and supporting up to 50 results. Archived matches (when `include_archived: true`) carry `archived: true`, use the retained summary as `content`, and have no meaningful `score` (they're metadata-term matches, not ranked).
+**Output:** Same structure as `recall` - `{ "results": [...], "truncated": false }` - but without the `min_score` gate, supporting up to 50 results, and an additional `degraded` field (`true` when hybrid mode fell back to fulltext-only). Archived matches (when `include_archived: true`) carry `archived: true`, use the retained summary as `content`, and have no meaningful `score` (they're metadata-term matches, not ranked). `results` is subject to the same `defaults.max_response_chars` budget and `truncated` semantics documented under `recall` above.
 
 ---
 
@@ -3434,6 +3443,10 @@ Import a structured profile or freeform document as discrete memories in one sho
 - `dry_run: true` returns memory previews with zero writes.
 - Headings numbered outside the 10 storage-mapped sections (e.g. a document written against an older 12-section template) are not silently dropped — their numbers are reported in `sections_ignored` so you know content was skipped instead of losing it without notice.
 - If [`remember`](#remember---store-a-memory) rejected your content for exceeding `pipeline.long_content_threshold_chars`, use `import` with `format: "freeform"` here instead — it splits the document by heading/paragraph boundaries and embeds each chunk independently, avoiding the single mush-vector problem `remember`'s threshold guards against.
+- A parsed chunk longer than `import.max_chunk_chars` (default `8000`) is deterministically hard-split into that many characters per piece instead of being embedded as one oversized chunk or rejected outright — every piece still becomes its own memory candidate.
+- If the resulting chunk count (after any hard-splitting) exceeds `import.max_chunks` (default `500`), the whole call — dry run or not — is rejected with `INVALID_INPUT` naming the observed count and the configured maximum, before any embedding provider call is made.
+- Embeddings for the parsed chunks are requested from the provider in batches of `import.embedding_batch_size` (default `100`) rather than one request per chunk, so outbound provider calls scale with chunk-count/batch-size. A whole batch's embedding call failing does not lose those chunks — each falls back to being embedded individually through the normal write-pipeline path.
+- A chunk whose write fails outright (every extraction candidate for it rejected) does not abort the rest of the import: it is counted in a `failed` field and detailed in a `failures` array (`[{ "chunk_index": 4, "error": "..." }]`), both present only when at least one chunk failed.
 
 ---
 
@@ -3834,6 +3847,16 @@ most-recently `updated_at`). `merge` never infers `target_id` from it — a call
 name it explicitly. `cursor` is `null` once the scanned page is smaller than
 `consolidation.max_scan_per_call`; pass it back to continue scanning a larger
 namespace/collection across multiple calls.
+
+The per-point neighbor lookups a scanned page requires run with at most
+`consolidation.neighbor_discovery_concurrency` (default `8`) in flight at once —
+bounded so a large page neither serializes one lookup at a time nor fires the whole
+page's worth of requests concurrently. If the fan-out is still running once
+`consolidation.neighbor_discovery_deadline_ms` (default `10000`) elapses, `list`
+returns early with a non-null `cursor` resuming right after the last member whose
+neighbors were resolved — a member the deadline cut off before reaching is never
+included in a cluster that call, and is picked back up (with fresh neighbor discovery)
+on the next `list` call using that cursor.
 
 **Output (`action: "merge"`):**
 

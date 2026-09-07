@@ -2987,7 +2987,8 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
       "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
       "confidence": 1.0
     }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
@@ -3001,6 +3002,13 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 `include_archived` 采用相同约定），以及 `linked_from`（基础结果的 id）、
 `link_relation` 和 `link_direction`（若基础结果是该边的源端则为 `"outgoing"`，若是
 目标端则为 `"incoming"`）。已归档的关联记忆会被跳过。
+
+`results` 的组装会控制在 `defaults.max_response_chars`（默认 `50000`）字符预算内：
+体积较大的结果（较长的 `content` 字段、较高的 `limit`）会逐条纳入，直到达到该字符
+预算为止；`truncated: true` 表示为了保持在预算内而省略了末尾的结果——此时即便存在
+更多匹配项，`results.length` 也可能小于 `limit`。这与 `min_score`/过滤条件收窄不
+同，`recall` 无法将二者与结果本身就很少的情况区分开；如果调用方即便预算充足也需要
+获取全部匹配项，应改为收窄查询或降低 `limit`。
 
 ---
 
@@ -3044,7 +3052,7 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `after` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at >= after`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到向量/全文存储层——这是 `search` 的第一个下推过滤条件。 |
 | `before` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at <= before`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到向量/全文存储层。 |
 
-**输出：** 与 `recall` 相同的结构——`{ "results": [...] }`——但没有 `min_score` 关卡，支持最多 50 条结果。归档命中（当 `include_archived: true` 时）带有 `archived: true`，使用保留的摘要作为 `content`，且没有有意义的 `score`（它们是元数据词条匹配，而非排序结果）。
+**输出：** 与 `recall` 相同的结构——`{ "results": [...], "truncated": false }`——但没有 `min_score` 关卡，支持最多 50 条结果，并多一个 `degraded` 字段（混合模式回退为纯全文搜索时为 `true`）。归档命中（当 `include_archived: true` 时）带有 `archived: true`，使用保留的摘要作为 `content`，且没有有意义的 `score`（它们是元数据词条匹配，而非排序结果）。`results` 遵循与上文 `recall` 相同的 `defaults.max_response_chars` 预算及 `truncated` 语义。
 
 ---
 
@@ -3296,6 +3304,10 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 - `dry_run: true` 返回记忆预览且不产生任何写入。
 - 编号超出 10 个存储映射节范围的标题（例如按旧的 12 节模板编写的文档）不会被静默丢弃——其编号会记录在 `sections_ignored` 中，让你知道内容被跳过而不是在毫无提示的情况下丢失。
 - 如果 [`remember`](#remember存储记忆) 因内容超过 `pipeline.long_content_threshold_chars` 而拒绝了你的内容，改用 `format: "freeform"` 的 `import`——它会按标题/段落边界拆分文档并独立嵌入每个片段，从而避开 `remember` 的阈值所防范的单一混合向量问题。
+- 解析出的片段若长于 `import.max_chunk_chars`（默认 `8000`），会被确定性地按该字符数硬拆分为多块，而不是作为一个超长片段被嵌入或被直接拒绝——每一块仍会成为独立的记忆候选项。
+- 若拆分后的片段总数超过 `import.max_chunks`（默认 `500`），整次调用——无论是否为 dry run——都会在发起任何嵌入服务调用之前，以 `INVALID_INPUT` 被拒绝，并说明实际片段数与配置的上限。
+- 解析出的片段会按 `import.embedding_batch_size`（默认 `100`）分批向嵌入服务商请求向量，而不是每个片段单独请求一次，因此出站请求数会随片段数/批大小扩展，而非片段数本身。若整批嵌入请求失败，这些片段并不会因此丢失——每个片段会回退为通过正常写入流程单独嵌入。
+- 若某个片段彻底写入失败（其每个提取候选都被拒绝），不会中止本次导入的其余部分：该片段会计入 `failed` 字段，并在 `failures` 数组中列出详情（`[{ "chunk_index": 4, "error": "..." }]`），两者仅在至少有一个片段失败时才会出现。
 
 ---
 
@@ -3643,6 +3655,13 @@ SQLite 数据库——用于多设备设置、数据丢失恢复或新设备接�
 ```
 
 在被扫描的这一页内，只要两条记忆之间的相似度边达到或超过 `consolidation.similarity_threshold`（默认 `0.9`——刻意低于写入时去重的 UPDATE 阈值，因此 `list` 会呈现出那些去重机制本身不会自动合并的候选项），就会被归入同一个簇。`suggested_target` **仅是提示**：取 `importance` 最高的成员（若相同则比较 `access_count`，再相同则取 `updated_at` 最新的一个）。`merge` 从不据此自动推断 `target_id`——调用方必须显式指定。当被扫描的这一页小于 `consolidation.max_scan_per_call` 时，`cursor` 为 `null`；否则将其传回以便跨多次调用继续扫描。
+
+扫描到的一页所需的近邻查询，最多以 `consolidation.neighbor_discovery_concurrency`
+（默认 `8`）个并发执行——加以限制，使一大页既不会逐个串行查询，也不会一次性并发触发整页
+的查询。若 `consolidation.neighbor_discovery_deadline_ms`（默认 `10000`）已过而扇出仍
+未完成，`list` 会提前返回一个非空的 `cursor`，从最后一个已解析近邻的成员之后继续——被
+截止时间挡在外面的成员本次调用不会被归入任何簇，会在下一次使用该 cursor 调用 `list`
+时（重新进行近邻查询）被继续处理。
 
 **输出（`action: "merge"`）：**
 
