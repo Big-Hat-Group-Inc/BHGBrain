@@ -4,6 +4,13 @@ import type { MetricsCollector } from '../health/metrics.js';
 import type { CircuitBreaker } from '../resilience/index.js';
 import type { MemoryType } from '../domain/types.js';
 import { MemoryTypeSchema } from '../domain/schemas.js';
+import {
+  executeLlmRequest,
+  extractChatMessageContent,
+  resolveApiKey,
+  resolveLlmBaseUrl,
+  resolveLlmRetryConfig,
+} from '../llm/client.js';
 
 /**
  * A single atomic fact split out of raw input by the extraction LLM.
@@ -67,7 +74,8 @@ export class LlmExtractionProvider implements ExtractionProvider {
   private readonly model: string;
   private readonly maxCandidates: number;
   private readonly timeoutMs: number;
-  private baseUrl = 'https://api.openai.com/v1';
+  private readonly baseUrl: string;
+  private readonly retry: ReturnType<typeof resolveLlmRetryConfig>;
 
   constructor(
     config: BrainConfig,
@@ -80,6 +88,8 @@ export class LlmExtractionProvider implements ExtractionProvider {
     this.model = config.pipeline.extraction_model;
     this.maxCandidates = config.pipeline.extraction_max_candidates;
     this.timeoutMs = config.pipeline.extraction_timeout_ms;
+    this.baseUrl = resolveLlmBaseUrl(config.llm?.base_url);
+    this.retry = resolveLlmRetryConfig(config.llm?.retry);
   }
 
   async extractCandidates(content: string): Promise<RawCandidate[] | null> {
@@ -144,48 +154,37 @@ export class LlmExtractionProvider implements ExtractionProvider {
     return result.data.candidates;
   }
 
+  // unify-llm-client-boundaries task 2.3: routed through the shared
+  // OpenAI-compatible request executor (`src/llm/client.ts`) so base URL,
+  // deadline-through-body-parse coverage, HTTP/network classification, and
+  // capped-jitter retry are identical to every other migrated chat feature.
+  // The breaker now wraps the whole retry loop (one outcome per call) rather
+  // than a single bare fetch. Schema validation of the inner JSON stays in
+  // `parseAndValidate`, called after this resolves, exactly as before this
+  // migration — a malformed/off-schema response still falls back to `null`
+  // rather than throwing.
   private async callChatCompletion(content: string): Promise<string> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-
-    const executeFetch = () => fetch(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
+    return executeLlmRequest({
+      url: `${this.baseUrl}/chat/completions`,
       headers: {
         'Authorization': `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
+      body: {
         model: this.model,
         response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
           { role: 'user', content },
         ],
-      }),
-      signal: controller.signal,
+      },
+      timeoutMs: this.timeoutMs,
+      retry: this.retry,
+      breaker: this.breaker,
+      useBreaker: this.breaker !== undefined,
+      errorPrefix: 'Extraction',
+      parseResponse: async response => extractChatMessageContent(response, 'Extraction'),
     });
-
-    try {
-      const response = this.breaker
-        ? await this.breaker.execute(executeFetch)
-        : await executeFetch();
-
-      if (!response.ok) {
-        const body = await response.text().catch(() => '');
-        throw new Error(`Extraction API error ${response.status}: ${body.slice(0, 200)}`);
-      }
-
-      const data = await response.json() as {
-        choices: Array<{ message: { content: string } }>;
-      };
-      const message = data.choices[0]?.message.content;
-      if (!message) {
-        throw new Error('Extraction API response had no message content');
-      }
-      return message;
-    } finally {
-      clearTimeout(timer);
-    }
   }
 }
 
@@ -206,7 +205,7 @@ export class NoopExtractionProvider implements ExtractionProvider {
  * `extraction_model_env` var, falling back to `OPENAI_API_KEY` when unset.
  */
 function resolveExtractionApiKey(config: BrainConfig): string | undefined {
-  return process.env[config.pipeline.extraction_model_env] ?? process.env.OPENAI_API_KEY;
+  return resolveApiKey(config.pipeline.extraction_model_env, { fallbackToOpenAI: true });
 }
 
 export function createExtractionProvider(

@@ -8,10 +8,11 @@ import { normalizeContent, computeChecksum, generateSummary, containsSecret, det
 import { extractAutoTags } from '../domain/auto-tag.js';
 import { summarizeContent } from '../domain/summarize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
-import { invalidInput, internal } from '../errors/index.js';
+import { invalidInput, internal, BrainError } from '../errors/index.js';
 import { checkEntailment } from './entailment.js';
 import { NoopExtractionProvider, type ExtractionProvider } from './extraction.js';
 import type { SummarizationProvider } from '../summarization/index.js';
+import type { CircuitBreaker } from '../resilience/index.js';
 
 interface MemoryCandidate {
   content: string;
@@ -50,6 +51,14 @@ export class WritePipeline {
     extraction?: ExtractionProvider,
     private metrics?: MetricsCollector,
     private summarizer?: SummarizationProvider,
+    // unify-llm-client-boundaries task 2.1: entailment now goes through the
+    // shared request executor's breaker integration like every other
+    // migrated chat feature. Optional/trailing so every existing call site
+    // that omits it keeps working with entailment behaving exactly as
+    // before (unbreakered — a failing entailment call still fails the
+    // individual `checkContradiction` call and open-fails, it just never
+    // trips a breaker).
+    private entailmentBreaker?: CircuitBreaker,
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
     this.extraction = extraction ?? new NoopExtractionProvider();
@@ -536,13 +545,30 @@ export class WritePipeline {
     }
 
     try {
-      const label = await checkEntailment(existing.content, candidateContent, this.config);
+      const label = await checkEntailment(
+        existing.content,
+        candidateContent,
+        this.config,
+        this.entailmentBreaker,
+        this.metrics,
+        this.logger,
+      );
       return label === 'contradict';
     } catch (err) {
+      // unify-llm-client-boundaries: `checkEntailment` now preserves the
+      // original classified failure's code/retryability on the thrown
+      // BrainError (design.md Decision #6) — surface both here so the
+      // fail-open telemetry retains the real cause, not just a message
+      // string (task 2.1: "verify fail-open behavior retains cause
+      // telemetry").
+      const code = err instanceof BrainError ? err.code : undefined;
+      const retryable = err instanceof BrainError ? err.retryable : undefined;
       this.logger?.warn({
         event: 'contradiction_check_degraded',
         namespace,
         collection,
+        code,
+        retryable,
         error: (err as Error).message,
       });
       return false;

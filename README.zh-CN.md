@@ -242,6 +242,22 @@ BHGBrain 从以下位置加载配置文件：
     "id": null
   },
 
+  // 共享的、兼容 OpenAI 的聊天/嵌入请求边界：每个已迁移的功能（抽取、重排序、
+  // 摘要、查询扩展、矛盾检测、蒸馏，以及 OpenAI 嵌入——Azure 嵌入仍保留其
+  // 派生的按资源端点）都通过同一个基础 URL 和重试策略解析请求，而不是各自
+  // 硬编码 "https://api.openai.com/v1" 并各自实现重试逻辑。将 base_url 指向
+  // 一个经过校验的、兼容 OpenAI 的网关，即可一次性将上述所有功能路由过去。
+  // 参见下文的“Outbound AI Request Policy”。
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 200,
+      // 同时限制指数退避的上限和提供商 Retry-After 建议的上限。
+      "max_backoff_ms": 2000
+    }
+  },
+
   // 嵌入提供商配置
   "embedding": {
     // 提供商："openai" 或 "azure-foundry"
@@ -256,12 +272,16 @@ BHGBrain 从以下位置加载配置文件：
     "dimensions": 1536,
     // 请求超时时间（毫秒）
     "request_timeout_ms": 30000,
-    // 单次嵌入请求的最大输入数量（分块阈值）
+    // 单次嵌入请求的最大输入数量（分块阈值）。两个提供商均遵守此项——
+    // 每次嵌入请求（包括 OpenAI）都会被拆分为不超过此大小的批次，并按
+    // 原始顺序重新组装结果。
     "max_batch_inputs": 2048,
     // 瞬时故障的重试配置
     "retry": {
       "max_attempts": 3,
-      "backoff_ms": 1000
+      "backoff_ms": 1000,
+      // 限制指数退避的上限，作用与上文的 llm.retry.max_backoff_ms 相同。
+      "max_backoff_ms": 10000
     },
     // 每个向量在写入时都会打上带提供方限定的身份标记
     // （`<provider>/<model>@<dimensions>`）。如果存储层记录的期望身份
@@ -466,7 +486,14 @@ BHGBrain 从以下位置加载配置文件：
       "max_cluster_size": 20,
 
       // 每次定时运行最多蒸馏（即调用 LLM）的簇数上限。
-      "max_clusters_per_run": 10
+      "max_clusters_per_run": 10,
+
+      // 每个簇的蒸馏 LLM 调用超时时间，通过共享请求执行器的 AbortController
+      // 强制执行（参见下文的“Outbound AI Request Policy”）。高于廉价模型的
+      // 默认值（pipeline.extraction_timeout_ms / summarization_timeout_ms），
+      // 因为蒸馏提示词会将整个簇的内容打包在一起。限制了一次定时运行中
+      // 各簇调用的最坏情况延迟。
+      "llm_timeout_ms": 10000
     }
   },
 
@@ -651,7 +678,8 @@ BHGBrain 从以下位置加载配置文件：
     "summarization_model": "gpt-4o-mini",
     // 摘要模型 API key 的环境变量名称。默认与 extraction_model_env 相同
     // （两者都是针对同一 OpenAI 账户的低成本写入路径模型调用）——如需使用
-    // 独立的 key，可指向另一个变量。
+    // 独立的 key，可指向另一个变量。与 extraction_model_env 一样，未设置时
+    // 会回退到 OPENAI_API_KEY。
     "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
     // 摘要请求超时（毫秒），通过 AbortController 强制执行
     "summarization_timeout_ms": 3000,
@@ -684,7 +712,7 @@ BHGBrain 从以下位置加载配置文件：
 | `BHGBRAIN_TOKEN` | 非回环 HTTP 时必需 | — | HTTP 认证的 Bearer token。若主机地址为非回环且此变量未设置，服务器**拒绝启动**（除非 `allow_unauthenticated_http: true`）。 |
 | `QDRANT_API_KEY` | Qdrant Cloud 时必需 | — | 在配置中将 `qdrant.api_key_env` 设置为此变量名称。默认配置字段名为 `QDRANT_API_KEY`。 |
 | `BHGBRAIN_DEVICE_ID` | 否 | 从主机名自动生成 | 覆盖多设备设置的设备标识符。参见[设备身份解析](#设备身份解析)。 |
-| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key，在 `pipeline.extraction_enabled` 为 `true` 时使用。也是 `pipeline.summarization_model_env` 的默认值（在 `pipeline.summarization_enabled` 为 `true` 时使用）——如需为摘要使用独立的 key，可将该字段指向其他变量。多查询扩展的 LLM 改写/HyDE 阶段（`search.query_expansion.llm_paraphrase.enabled`，详见[多查询扩展](#多查询扩展)）也会读取此变量，其解析方式与此相同：先读取 `pipeline.extraction_model_env`，未设置时回退到 `OPENAI_API_KEY`。 |
+| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key，在 `pipeline.extraction_enabled` 为 `true` 时使用。也是 `pipeline.summarization_model_env` 的默认值（在 `pipeline.summarization_enabled` 为 `true` 时使用）——如需为摘要使用独立的 key，可将该字段指向其他变量；无论 `summarization_model_env` 指向哪个变量，它都会像 `extraction_model_env` 一样回退到 `OPENAI_API_KEY`。多查询扩展的 LLM 改写/HyDE 阶段（`search.query_expansion.llm_paraphrase.enabled`，详见[多查询扩展](#多查询扩展)）以及矛盾检测（`pipeline.contradiction_detection.enabled`，详见[去重](#去重)）也会读取此变量，二者的解析方式与此相同：先读取 `pipeline.extraction_model_env`，未设置时回退到 `OPENAI_API_KEY`。 |
 | `BHGBRAIN_RERANK_API_KEY` | 否 | 无（**不会**回退到 `OPENAI_API_KEY`） | 可选的 `recall` 重排序阶段使用的 API key，在 `search.rerank.enabled` 为 `true` 时使用。与 `BHGBRAIN_EXTRACTION_API_KEY` 不同，它没有隐式回退——启用重排序是一次刻意的、使用独立 key 的选择，绝不会悄悄消耗嵌入或提取的 key/预算。详见[重排序](#重排序)。 |
 
 生成安全的 Bearer token：
@@ -2414,6 +2442,41 @@ scroll/列出/删除 —— 都受 `qdrant.operation_timeout_ms` 约束（默认
 `limit`。截断情况通过 `bhgbrain_qdrant_fanout_width` 仪表和
 `bhgbrain_qdrant_fanout_truncated_total` 计数器（参见[指标](#指标)）以及一条
 `qdrant_fanout_truncated` 日志行暴露，而不会出现在 `search`/`recall` 响应体本身中。
+
+### Outbound AI Request Policy
+
+每一个兼容 OpenAI 的功能——嵌入（OpenAI 提供商；Azure 保留其自身派生的按资源端点）、
+多候选提取、可选的重排序、LLM 摘要、多查询扩展的 LLM 改写/HyDE 阶段、矛盾检测，以及
+定时蒸馏——都通过同一个共享请求边界发出其聊天/嵌入请求，而不是各功能各自独立构造
+`fetch` 调用。该边界提供：
+
+- **共享的基础 URL**（`llm.base_url`，默认 `https://api.openai.com/v1`）：将其指向一个
+  经过校验的、兼容 OpenAI 的网关，即可一次性将上述所有功能路由过去。各功能自身的模型
+  名称、凭据和超时设置（`pipeline.extraction_timeout_ms`、`search.rerank.timeout_ms`
+  等）不受影响——只有端点和重试策略是共享的。
+- **覆盖整个响应过程的超时**，而不仅是初始连接：所配置的超时会在接收响应头、读取响应
+  体、JSON 解析以及该功能自身的响应校验期间持续生效。一个返回成功响应头之后却在响应体
+  中途卡住的提供商，仍会在超时到达时中止——如果该功能受断路器保护，这会被记为一次
+  断路器失败，而不是静默的成功。
+- **统一的 HTTP/网络故障分类**：`429` 和 `408` 始终可重试；`500`/`502`/`503`/`504`
+  可重试（其他 5xx 状态码以及任何其他 4xx 状态码都被视为永久性故障——重试无法修复
+  错误的凭据或格式错误的载荷）；网络错误和超时可重试。`429`/`5xx` 响应中有效的
+  `Retry-After` 头会将下一次尝试的延迟提升到至少该值，并受 `llm.retry.max_backoff_ms`
+  上限约束。
+- **带上限和抖动的重试**（`llm.retry.max_attempts`/`backoff_ms`/`max_backoff_ms`，默认
+  `3`/`200`/`2000`）：一次逻辑调用的整个重试循环——包括每一次内部尝试——最多只记录一次
+  断路器结果，因此第二次尝试就成功的瞬时故障绝不会触发一个健康提供商本不会触发的断路器。
+  嵌入请求使用自己等价的 `embedding.retry` 策略（同样包含 `max_backoff_ms`）而不是
+  `llm.retry`，因为嵌入本身已经有自己的批量拆分需求（`max_batch_inputs`）。
+- **在信任任何提供商输出之前先做响应校验**：每一次嵌入请求（无论 OpenAI 还是 Azure，
+  均按 `embedding.max_batch_inputs` 分块）都会校验返回的数组中恰好包含与请求输入数量
+  相同的向量数，且每个向量都与配置的 `embedding.dimensions` 一致，然后才会按输入顺序
+  重新组装结果——过短或格式错误的批次会使整次调用失败，而不是悄悄地将向量与错误的
+  记忆关联起来。
+
+语义搜索会保留嵌入提供商原始的、已分类的错误（其代码以及是否可重试），而不是总用一个
+通用信息替换它；混合搜索退化为纯全文检索的路径也会记录并度量同样的分类信息，并连同
+`fulltext_only` 回退一起上报，使运维人员在两种模式下都能区分瞬时限流与永久性认证失败。
 
 ### MCP 会话生命周期
 

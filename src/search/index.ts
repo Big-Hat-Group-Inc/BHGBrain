@@ -6,7 +6,7 @@ import type { AccessUpdate } from '../storage/sqlite.js';
 import { mapQdrantPayloadToMemoryFields } from '../storage/payload-mapper.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
-import { embeddingUnavailable, internal } from '../errors/index.js';
+import { BrainError, embeddingUnavailable, internal } from '../errors/index.js';
 import { cosineSimilarity } from './similarity.js';
 import { buildVariants, type QueryExpansionProvider } from './query-expansion.js';
 import type { RerankProvider } from '../rerank/index.js';
@@ -311,7 +311,24 @@ export class SearchService {
     let variantCount: number;
     try {
       ({ vectors, variantCount } = await this.embedQueryVariants(query));
-    } catch {
+    } catch (err) {
+      // unify-llm-client-boundaries task 2.4 / design.md Decision #6:
+      // preserve the embedding provider's original classified error (code +
+      // retryability — e.g. a non-retryable 401 vs. a retryable rate limit)
+      // instead of always replacing it with a generic retryable
+      // EMBEDDING_UNAVAILABLE. Metered/logged here so the cause is visible
+      // even though semantic mode's contract is still to raise, not degrade.
+      if (err instanceof BrainError) {
+        this.metrics?.incCounter('search_embedding_degraded', 1, { namespace, mode: 'semantic' });
+        this.logger?.warn({
+          event: 'embedding_degraded',
+          mode: 'semantic',
+          code: err.code,
+          retryable: err.retryable,
+          message: err.message,
+        });
+        throw err;
+      }
       throw embeddingUnavailable('Cannot perform semantic search: embedding provider unavailable');
     }
 
@@ -420,10 +437,16 @@ export class SearchService {
       // degradation observable instead of silent (dependency outages are signal in
       // this project). Semantic mode raises EMBEDDING_UNAVAILABLE; hybrid stays
       // graceful but emits a metric + warning so operators can see it.
+      // unify-llm-client-boundaries task 2.4: surface the original classified
+      // code/retryability (when available) alongside the message, so a
+      // degraded-fulltext-only search's telemetry still distinguishes e.g. a
+      // non-retryable auth failure from a transient rate limit.
       this.metrics?.incCounter('search_embedding_degraded', 1, { namespace });
       this.logger?.warn({
         event: 'embedding_degraded',
         degraded: 'fulltext_only',
+        code: err instanceof BrainError ? err.code : undefined,
+        retryable: err instanceof BrainError ? err.retryable : undefined,
         message: (err as Error).message,
       });
       if (signal) signal.degraded = true;

@@ -50,6 +50,11 @@ const ConfigSchema = z.object({
     retry: z.object({
       max_attempts: z.number().int().min(1).max(5).default(3),
       backoff_ms: z.number().int().positive().default(1000),
+      // unify-llm-client-boundaries: embedding requests now retry through
+      // the same capped-jitter backoff primitive every migrated chat
+      // feature uses (`src/llm/client.ts`), which requires an explicit cap
+      // on the exponential envelope in addition to `backoff_ms`.
+      max_backoff_ms: z.number().int().positive().default(10_000),
     }).prefault({}),
     azure: AzureEmbeddingSchema.optional(),
     // Guards against silently mixing embedding spaces: when the store's
@@ -94,6 +99,29 @@ const ConfigSchema = z.object({
         path: ['dimensions'],
       });
     }
+  }).prefault({}),
+  // Shared OpenAI-compatible chat/embedding request boundary
+  // (unify-llm-client-boundaries): one base URL and retry envelope every
+  // migrated feature (extraction, reranking, summarization, query expansion,
+  // entailment, distillation, and OpenAI embeddings — Azure embeddings keep
+  // their derived per-resource endpoint) resolves through, instead of each
+  // hardcoding `https://api.openai.com/v1` and its own retry logic. Feature
+  // credentials, models, and timeouts remain feature-specific config (see
+  // `pipeline.extraction_model_env`, `search.rerank.model_env`, etc.) — this
+  // section covers only what genuinely needs to be uniform. See
+  // `openspec/changes/unify-llm-client-boundaries` and `src/llm/client.ts`.
+  llm: z.object({
+    // Validated as a URL so a typo'd endpoint fails fast at config-load time
+    // rather than as an opaque fetch failure on the first request.
+    base_url: z.string().url().default('https://api.openai.com/v1'),
+    retry: z.object({
+      max_attempts: z.number().int().min(1).max(5).default(3),
+      backoff_ms: z.number().int().positive().default(200),
+      // Caps both the exponential backoff envelope and a provider's
+      // Retry-After guidance, bounding worst-case retry latency inside a
+      // feature's own request deadline.
+      max_backoff_ms: z.number().int().positive().default(2000),
+    }).prefault({}),
   }).prefault({}),
   qdrant: z.object({
     mode: z.enum(['embedded', 'external']).default('embedded'),
@@ -289,6 +317,17 @@ const ConfigSchema = z.object({
       // run's window covers the next slice, eventually rotating through the
       // whole candidate pool. See bound-corpus-scale-workflows task 2.1.
       max_candidates_per_collection: z.number().int().positive().default(500),
+      // unify-llm-client-boundaries task 2.2: the distillation LLM call
+      // (`DistillationLLMClient.distill`) previously had no timeout at all —
+      // a hung provider request blocked `DistillationScheduler.runOnce`
+      // forever, which in turn meant `scheduleNext()` (called only after
+      // `runOnce` resolves) never ran again, silently ending every future
+      // scheduled tick. Enforced via the shared request executor's
+      // `AbortController` deadline, covering body read/parse the same as
+      // every other migrated feature. Higher than the cheap-model defaults
+      // (`extraction_timeout_ms`/`summarization_timeout_ms`) since a
+      // distillation prompt bundles a whole cluster's memory contents.
+      llm_timeout_ms: z.number().int().positive().default(10_000),
     }).prefault({}),
   }).prefault({}),
   deduplication: z.object({

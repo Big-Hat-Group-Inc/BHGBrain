@@ -145,7 +145,7 @@ describe('OpenAIEmbeddingProvider', () => {
     // behavior, not the retry loop (covered separately below).
     config.embedding.retry.max_attempts = 1;
     const provider = new OpenAIEmbeddingProvider(config);
-    await expect(provider.embed('hello')).rejects.toThrow('Embedding provider unreachable: network down');
+    await expect(provider.embed('hello')).rejects.toThrow('Embedding provider unreachable: OpenAI request failed: network down');
   });
 
   it('includes HTTP status code in non-retryable embedding API failures', async () => {
@@ -181,7 +181,7 @@ describe('OpenAIEmbeddingProvider', () => {
     const provider = new OpenAIEmbeddingProvider(config);
     await expect(provider.embed('hello')).rejects.toMatchObject({
       code: 'EMBEDDING_UNAVAILABLE',
-      message: 'Embedding provider unreachable: Request timed out',
+      message: 'Embedding provider unreachable: OpenAI request timed out after 10ms',
       retryable: true,
     });
   });
@@ -357,6 +357,97 @@ describe('OpenAIEmbeddingProvider', () => {
     warnIfEmbeddingDegraded(provider, config, logger);
 
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  // unify-llm-client-boundaries task 2.5: OpenAI embeddings now honor
+  // max_batch_inputs (previously only the Azure provider chunked at all) and
+  // reassemble results across chunks in input order.
+  it('chunks embedBatch requests larger than max_batch_inputs and reassembles results in order', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    const fetchMock = vi.fn(async (_url: string, options: RequestInit) => {
+      const body = JSON.parse(options.body as string) as { input: string[] };
+      return new Response(JSON.stringify({
+        data: body.input.map((_text, i) => ({ index: i, embedding: [0.1, 0.2, 0.3] })),
+      }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const config = createConfig();
+    config.embedding.max_batch_inputs = 2;
+    const provider = new OpenAIEmbeddingProvider(config);
+    const results = await provider.embedBatch(['a', 'b', 'c', 'd', 'e']);
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(results).toHaveLength(5);
+  });
+
+  // task 2.5 / spec "Embedding gateway returns a short result array": a
+  // response with fewer embeddings than requested inputs must fail the
+  // whole batch rather than silently misassociating vectors.
+  it('rejects a response with fewer embeddings than requested inputs', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
+    }), { status: 200 })));
+
+    const provider = new OpenAIEmbeddingProvider(createConfig());
+    await expect(provider.embedBatch(['a', 'b'])).rejects.toMatchObject({
+      code: 'EMBEDDING_UNAVAILABLE',
+      retryable: false,
+    });
+  });
+
+  it('rejects a response whose vector dimensions do not match the configured dimensions', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      data: [{ index: 0, embedding: [0.1, 0.2] }], // config dimensions is 3
+    }), { status: 200 })));
+
+    const provider = new OpenAIEmbeddingProvider(createConfig());
+    await expect(provider.embed('hello')).rejects.toMatchObject({
+      code: 'EMBEDDING_UNAVAILABLE',
+      retryable: false,
+    });
+  });
+
+  // task 2.4: the deadline (and, when a breaker is supplied, the breaker)
+  // now covers body read/parse — a provider that returns 2xx headers and
+  // then stalls mid-body must still abort at request_timeout_ms and record
+  // a breaker failure, not a silent success.
+  it('bounds a post-header stall through body read and trips the breaker as a failure', async () => {
+    process.env.OPENAI_API_KEY = 'test-key';
+    let bodySignal: AbortSignal | undefined;
+    vi.stubGlobal('fetch', vi.fn((_url: string, init?: RequestInit) => {
+      bodySignal = init?.signal ?? undefined;
+      // Headers resolve immediately; the body stream never delivers until
+      // the abort signal fires, mirroring how an aborted real fetch's
+      // in-flight body read rejects.
+      return new Promise<Response>(resolve => {
+        const stream = new ReadableStream({
+          start(controller) {
+            init?.signal?.addEventListener('abort', () => {
+              const err = new Error('aborted');
+              err.name = 'AbortError';
+              controller.error(err);
+            });
+          },
+        });
+        resolve(new Response(stream, { status: 200 }));
+      });
+    }));
+
+    const breaker = {
+      execute: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
+    } as unknown as CircuitBreaker;
+
+    const config = createConfig();
+    config.embedding.request_timeout_ms = 20;
+    config.embedding.retry.max_attempts = 1;
+    const provider = new OpenAIEmbeddingProvider(config, breaker);
+
+    await expect(provider.embed('hello')).rejects.toMatchObject({ code: 'EMBEDDING_UNAVAILABLE', retryable: true });
+    expect(breaker.execute).toHaveBeenCalledTimes(1);
+    expect(bodySignal?.aborted).toBe(true);
   });
 
   it('throws when createEmbeddingProvider receives an unknown provider', () => {

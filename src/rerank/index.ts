@@ -2,6 +2,13 @@ import { z } from 'zod';
 import type { BrainConfig } from '../config/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { CircuitBreaker } from '../resilience/index.js';
+import {
+  executeLlmRequest,
+  extractChatMessageContent,
+  requireApiKey,
+  resolveLlmBaseUrl,
+  resolveLlmRetryConfig,
+} from '../llm/client.js';
 
 // A single recall candidate as offered to the rerank provider: only the
 // fields the LLM needs to judge relevance, never the full SearchResult (no
@@ -67,7 +74,8 @@ export class OpenAiRerankProvider implements RerankProvider {
   private readonly apiKey: string;
   private readonly model: string;
   private readonly timeoutMs: number;
-  private baseUrl = 'https://api.openai.com/v1';
+  private readonly baseUrl: string;
+  private readonly retry: ReturnType<typeof resolveLlmRetryConfig>;
 
   constructor(
     config: BrainConfig,
@@ -76,11 +84,12 @@ export class OpenAiRerankProvider implements RerankProvider {
   ) {
     this.model = config.search.rerank.model;
     this.timeoutMs = config.search.rerank.timeout_ms;
-    const key = process.env[config.search.rerank.model_env];
-    if (!key) {
-      throw new Error(`Missing environment variable: ${config.search.rerank.model_env}`);
-    }
-    this.apiKey = key;
+    // No OPENAI_API_KEY fallback — documented, deliberate: reranking is a
+    // separately-keyed opt-in that never silently consumes the embedding or
+    // extraction key/budget (README.md "Environment Variables").
+    this.apiKey = requireApiKey(config.search.rerank.model_env);
+    this.baseUrl = resolveLlmBaseUrl(config.llm?.base_url);
+    this.retry = resolveLlmRetryConfig(config.llm?.retry);
   }
 
   async score(query: string, candidates: RerankCandidate[]): Promise<Map<string, number>> {
@@ -93,48 +102,35 @@ export class OpenAiRerankProvider implements RerankProvider {
     }
   }
 
+  // unify-llm-client-boundaries task 2.3: routed through the shared
+  // OpenAI-compatible request executor — same base URL resolution,
+  // deadline-through-body-parse coverage, HTTP/network classification, and
+  // capped-jitter retry as every other migrated chat feature. The breaker
+  // now wraps the whole retry loop (one outcome per `score()` call).
+  // `parseAndValidate`'s own JSON.parse + schema check of the inner content
+  // is unchanged from before this migration.
   private async callChatCompletion(query: string, candidates: RerankCandidate[]): Promise<string> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-
-    const executeFetch = () => fetch(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
+    return executeLlmRequest({
+      url: `${this.baseUrl}/chat/completions`,
       headers: {
         'Authorization': `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
+      body: {
         model: this.model,
         response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: RERANK_SYSTEM_PROMPT },
           { role: 'user', content: JSON.stringify({ query, candidates }) },
         ],
-      }),
-      signal: controller.signal,
+      },
+      timeoutMs: this.timeoutMs,
+      retry: this.retry,
+      breaker: this.breaker,
+      useBreaker: this.breaker !== undefined,
+      errorPrefix: 'Rerank',
+      parseResponse: async response => extractChatMessageContent(response, 'Rerank'),
     });
-
-    try {
-      const response = this.breaker
-        ? await this.breaker.execute(executeFetch)
-        : await executeFetch();
-
-      if (!response.ok) {
-        const body = await response.text().catch(() => '');
-        throw new Error(`Rerank API error ${response.status}: ${body.slice(0, 200)}`);
-      }
-
-      const data = await response.json() as {
-        choices: Array<{ message: { content: string } }>;
-      };
-      const message = data.choices[0]?.message.content;
-      if (!message) {
-        throw new Error('Rerank API response had no message content');
-      }
-      return message;
-    } finally {
-      clearTimeout(timer);
-    }
   }
 
   // Parses/validates the raw chat-completions message content and narrows it

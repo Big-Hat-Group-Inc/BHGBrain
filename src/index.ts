@@ -9,6 +9,7 @@ import { StorageManager } from './storage/index.js';
 import { createEmbeddingProvider, getEmbeddingBreakerKey, warnIfEmbeddingDegraded } from './embedding/index.js';
 import { WritePipeline } from './pipeline/index.js';
 import { createExtractionProvider, warnIfExtractionDegraded } from './pipeline/extraction.js';
+import { warnIfEntailmentDegraded } from './pipeline/entailment.js';
 import { createSummarizationProvider, warnIfSummarizationDegraded } from './summarization/index.js';
 import { SearchService } from './search/index.js';
 import { createQueryExpansionProvider, warnIfQueryExpansionDegraded } from './search/query-expansion.js';
@@ -17,7 +18,7 @@ import { BackupService } from './backup/index.js';
 import { RetentionService } from './backup/retention.js';
 import { CleanupScheduler, DistillationScheduler } from './backup/scheduler.js';
 import { DistillationService } from './pipeline/distillation.js';
-import { DistillationLLMClient } from './pipeline/distillation-llm.js';
+import { DistillationLLMClient, warnIfDistillationDegraded } from './pipeline/distillation-llm.js';
 import { HealthService } from './health/index.js';
 import { MetricsCollector } from './health/metrics.js';
 import { createLogger } from './health/logger.js';
@@ -153,6 +154,14 @@ async function main() {
   // but a failing paraphrase/HyDE call must not trip the breaker guarding the
   // write-pipeline's extraction call, or vice versa.
   const queryExpansionBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
+  // Same rationale/independent-instance pattern as `queryExpansionBreaker`
+  // (unify-llm-client-boundaries task 2.1): contradiction detection reuses
+  // `pipeline.extraction_model`/`extraction_model_env` credentials, so it
+  // shares the `extraction` label for reporting, but a failing entailment
+  // call must not trip the breaker guarding multi-candidate extraction, or
+  // vice versa. Not included in `healthBreakers` below — same best-effort/
+  // fail-open rationale as extraction/summarization/query expansion.
+  const entailmentBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
   // Always constructed (cheap, stateless until used) so it exists regardless
   // of `search.rerank.enabled`, mirroring `embeddingBreaker`/`qdrantBreaker`
   // (add-opt-in-rerank-stage design.md "Bootstrap wiring"). Only added to
@@ -188,6 +197,7 @@ async function main() {
   // aggregate health status.
   const queryExpansion = createQueryExpansionProvider(config, { breaker: queryExpansionBreaker, metrics, logger });
   warnIfQueryExpansionDegraded(queryExpansion, config, logger);
+  warnIfEntailmentDegraded(config, logger);
   // Only instantiated when reranking is opted in (add-opt-in-rerank-stage):
   // stock installs never construct a `RerankProvider`, so `SearchService`
   // gets `undefined` and `recall` stays byte-for-byte unchanged. Enabling it
@@ -233,7 +243,7 @@ async function main() {
   }
 
   // Initialize services
-  const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics, summarization);
+  const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics, summarization, entailmentBreaker);
   const searchService = new SearchService(config, storage, embedding, metrics, logger, queryExpansion, rerank);
   const backupService = new BackupService(config, storage, logger);
   const healthBreakers: Record<string, CircuitBreaker> = {
@@ -263,6 +273,7 @@ async function main() {
   const distillationService = new DistillationService(config, storage, pipeline, distillationLlmClient, logger, metrics);
   const distillationScheduler = new DistillationScheduler(config, distillationService, logger);
   distillationScheduler.start();
+  warnIfDistillationDegraded(config, logger);
 
   const healthService = new HealthService(
     storage, embedding, config, healthBreakers, logger,

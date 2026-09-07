@@ -2,6 +2,13 @@ import { z } from 'zod';
 import type { BrainConfig } from '../config/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { CircuitBreaker } from '../resilience/index.js';
+import {
+  executeLlmRequest,
+  extractChatMessageContent,
+  resolveApiKey,
+  resolveLlmBaseUrl,
+  resolveLlmRetryConfig,
+} from '../llm/client.js';
 
 // Small, fixed, deterministic English stopword set (add-multi-query-expansion
 // Phase 1). No configurability beyond `keyword_stripped: boolean` to disable
@@ -130,7 +137,7 @@ function systemPromptFor(mode: QueryExpansionMode, count: number): string {
  * extraction hook") rather than adding a parallel model/credential config.
  */
 function resolveQueryExpansionApiKey(config: BrainConfig): string | undefined {
-  return process.env[config.pipeline.extraction_model_env] ?? process.env.OPENAI_API_KEY;
+  return resolveApiKey(config.pipeline.extraction_model_env, { fallbackToOpenAI: true });
 }
 
 /**
@@ -146,7 +153,8 @@ export class LLMQueryExpansionProvider implements QueryExpansionProvider {
   readonly configured: boolean;
   private readonly apiKey: string | undefined;
   private readonly model: string;
-  private baseUrl = 'https://api.openai.com/v1';
+  private readonly baseUrl: string;
+  private readonly retry: ReturnType<typeof resolveLlmRetryConfig>;
 
   constructor(
     config: BrainConfig,
@@ -157,6 +165,8 @@ export class LLMQueryExpansionProvider implements QueryExpansionProvider {
     this.model = config.pipeline.extraction_model;
     this.apiKey = resolveQueryExpansionApiKey(config);
     this.configured = this.apiKey !== undefined;
+    this.baseUrl = resolveLlmBaseUrl(config.llm?.base_url);
+    this.retry = resolveLlmRetryConfig(config.llm?.retry);
   }
 
   async generateVariants(
@@ -202,6 +212,13 @@ export class LLMQueryExpansionProvider implements QueryExpansionProvider {
     return result.data.variants;
   }
 
+  // unify-llm-client-boundaries task 2.3: routed through the shared
+  // OpenAI-compatible request executor — same base URL resolution,
+  // deadline-through-body-parse coverage, HTTP/network classification, and
+  // capped-jitter retry as every other migrated chat feature. The breaker
+  // now wraps the whole retry loop (one outcome per `generateVariants()`
+  // call). `parseAndValidate`'s own JSON.parse + schema check of the inner
+  // content is unchanged from before this migration.
   private async callChatCompletion(
     query: string,
     mode: QueryExpansionMode,
@@ -209,47 +226,27 @@ export class LLMQueryExpansionProvider implements QueryExpansionProvider {
     timeoutMs: number,
     apiKey: string,
   ): Promise<string> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    const executeFetch = () => fetch(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
+    return executeLlmRequest({
+      url: `${this.baseUrl}/chat/completions`,
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
+      body: {
         model: this.model,
         response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: systemPromptFor(mode, count) },
           { role: 'user', content: query },
         ],
-      }),
-      signal: controller.signal,
+      },
+      timeoutMs,
+      retry: this.retry,
+      breaker: this.breaker,
+      useBreaker: this.breaker !== undefined,
+      errorPrefix: 'Query expansion',
+      parseResponse: async response => extractChatMessageContent(response, 'Query expansion'),
     });
-
-    try {
-      const response = this.breaker
-        ? await this.breaker.execute(executeFetch)
-        : await executeFetch();
-
-      if (!response.ok) {
-        const body = await response.text().catch(() => '');
-        throw new Error(`Query expansion API error ${response.status}: ${body.slice(0, 200)}`);
-      }
-
-      const data = await response.json() as {
-        choices: Array<{ message: { content: string } }>;
-      };
-      const message = data.choices[0]?.message.content;
-      if (!message) {
-        throw new Error('Query expansion API response had no message content');
-      }
-      return message;
-    } finally {
-      clearTimeout(timer);
-    }
   }
 }
 

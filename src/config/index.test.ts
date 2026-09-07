@@ -163,6 +163,89 @@ describe('loadConfig Azure embedding validation', () => {
   });
 });
 
+describe('llm config (unify-llm-client-boundaries)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    tempDirs.push(dir);
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify(raw));
+    return configPath;
+  }
+
+  it('defaults base_url and retry when omitted', () => {
+    const config = loadConfig(writeConfig({}));
+
+    expect(config.llm.base_url).toBe('https://api.openai.com/v1');
+    expect(config.llm.retry).toEqual({ max_attempts: 3, backoff_ms: 200, max_backoff_ms: 2000 });
+  });
+
+  it('accepts a validated custom OpenAI-compatible base URL and retry overrides', () => {
+    const config = loadConfig(writeConfig({
+      llm: {
+        base_url: 'https://gateway.internal.example.com/v1',
+        retry: { max_attempts: 5, backoff_ms: 50, max_backoff_ms: 1000 },
+      },
+    }));
+
+    expect(config.llm.base_url).toBe('https://gateway.internal.example.com/v1');
+    expect(config.llm.retry).toEqual({ max_attempts: 5, backoff_ms: 50, max_backoff_ms: 1000 });
+  });
+
+  it('rejects a malformed base_url', () => {
+    expect(() => loadConfig(writeConfig({ llm: { base_url: 'not-a-url' } }))).toThrow();
+  });
+
+  it('rejects a retry.max_attempts above the documented cap', () => {
+    expect(() => loadConfig(writeConfig({ llm: { retry: { max_attempts: 6 } } }))).toThrow();
+  });
+});
+
+describe('retention.distillation.llm_timeout_ms config', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    tempDirs.push(dir);
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify(raw));
+    return configPath;
+  }
+
+  it('defaults to 10000ms when omitted', () => {
+    const config = loadConfig(writeConfig({}));
+    expect(config.retention.distillation.llm_timeout_ms).toBe(10_000);
+  });
+
+  it('accepts an explicit override', () => {
+    const config = loadConfig(writeConfig({ retention: { distillation: { llm_timeout_ms: 20_000 } } }));
+    expect(config.retention.distillation.llm_timeout_ms).toBe(20_000);
+  });
+
+  it('rejects a non-positive value', () => {
+    expect(() => loadConfig(writeConfig({ retention: { distillation: { llm_timeout_ms: 0 } } }))).toThrow();
+  });
+});
+
 describe('pipeline.contradiction_detection config', () => {
   const tempDirs: string[] = [];
 

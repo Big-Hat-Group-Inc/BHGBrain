@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { SearchService } from './index.js';
+import { BrainError } from '../errors/index.js';
 import type { BrainConfig } from '../config/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
@@ -683,6 +684,28 @@ describe('SearchService', () => {
     await expect(
       service.search('hello', 'global', undefined, 'semantic', 10),
     ).rejects.toThrow('vector store unavailable');
+  });
+
+  // unify-llm-client-boundaries task 2.4 / design.md Decision #6: a
+  // classified embedding failure (e.g. a non-retryable auth error) is
+  // rethrown as-is from semantic search rather than always replaced with a
+  // generic retryable EMBEDDING_UNAVAILABLE.
+  it('preserves the original classified error code/retryability in semantic search', async () => {
+    const { service, embedding, metrics, logger } = createSearchService();
+    const authError = new BrainError('EMBEDDING_UNAVAILABLE', 'OpenAI embeddings request rejected (HTTP 401)', false);
+    (embedding.embed as ReturnType<typeof vi.fn>).mockRejectedValue(authError);
+
+    await expect(
+      service.search('hello', 'global', undefined, 'semantic', 10),
+    ).rejects.toMatchObject({ code: 'EMBEDDING_UNAVAILABLE', retryable: false, message: 'OpenAI embeddings request rejected (HTTP 401)' });
+
+    expect(metrics.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { namespace: 'global', mode: 'semantic' });
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'embedding_degraded',
+      mode: 'semantic',
+      code: 'EMBEDDING_UNAVAILABLE',
+      retryable: false,
+    }));
   });
 
   // cut-embedding-and-qdrant-round-trips

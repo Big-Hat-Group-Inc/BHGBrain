@@ -154,6 +154,25 @@ describe('OpenAiRerankProvider', () => {
     await expect(provider.score('q', CANDIDATES)).rejects.toThrow('Rerank API response failed schema validation');
   });
 
+  // unify-llm-client-boundaries task 2.3: an HTTP failure now records exactly
+  // one breaker outcome for the whole `score()` call, including every
+  // internal retry attempt, since it now routes through the shared request
+  // executor instead of a bare un-retried fetch.
+  it('records a single breaker failure across a whole retried HTTP-error call', async () => {
+    process.env.BHGBRAIN_RERANK_API_KEY = 'test-key';
+    const fetchMock = vi.fn(async () => chatResponse({ error: 'boom' }, 500));
+    vi.stubGlobal('fetch', fetchMock);
+    const breaker = {
+      execute: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
+    } as unknown as CircuitBreaker;
+
+    const provider = new OpenAiRerankProvider(createConfig(), breaker);
+    await expect(provider.score('q', CANDIDATES)).rejects.toThrow(/Rerank API error 500/);
+
+    expect(breaker.execute).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+  });
+
   it('records the search_rerank_ms histogram', async () => {
     process.env.BHGBRAIN_RERANK_API_KEY = 'test-key';
     vi.stubGlobal('fetch', vi.fn(async () => chatResponse(withScores([{ id: 'a', score: 0.5 }]))));

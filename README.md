@@ -253,6 +253,25 @@ The file is created automatically on first run with all defaults applied. Edit i
     "id": null
   },
 
+  // Shared OpenAI-compatible chat/embedding request boundary: one base URL
+  // and retry envelope every migrated feature (extraction, reranking,
+  // summarization, query expansion, contradiction detection, distillation,
+  // and OpenAI embeddings — Azure embeddings keep their derived per-resource
+  // endpoint) resolves through, instead of each hardcoding
+  // "https://api.openai.com/v1" and its own retry logic. Point base_url at
+  // a validated OpenAI-compatible gateway to route every one of those
+  // features through it at once. See "Outbound AI Request Policy" below.
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 200,
+      // Caps both the exponential backoff envelope and a provider's
+      // Retry-After guidance.
+      "max_backoff_ms": 2000
+    }
+  },
+
   // Embedding provider configuration
   "embedding": {
     // Provider: "openai" or "azure-foundry"
@@ -267,12 +286,16 @@ The file is created automatically on first run with all defaults applied. Edit i
     "dimensions": 1536,
     // Request timeout in milliseconds
     "request_timeout_ms": 30000,
-    // Maximum inputs per embedding request (chunking threshold)
+    // Maximum inputs per embedding request (chunking threshold). Honored by
+    // both providers — every embedding request (OpenAI included) is split
+    // into batches of at most this many inputs and reassembled in order.
     "max_batch_inputs": 2048,
     // Retry configuration for transient failures
     "retry": {
       "max_attempts": 3,
-      "backoff_ms": 1000
+      "backoff_ms": 1000,
+      // Caps the exponential backoff envelope, same role as llm.retry.max_backoff_ms above.
+      "max_backoff_ms": 10000
     },
     // Every vector is stamped with a provider-qualified identity
     // (`<provider>/<model>@<dimensions>`) at write time. If the store's
@@ -489,7 +512,15 @@ The file is created automatically on first run with all defaults applied. Edit i
       "max_cluster_size": 20,
 
       // Upper bound on clusters distilled (LLM calls made) per scheduled tick.
-      "max_clusters_per_run": 10
+      "max_clusters_per_run": 10,
+
+      // Timeout for the per-cluster distillation LLM call, enforced via the
+      // shared request executor's AbortController (see "Outbound AI Request
+      // Policy" below). Higher than the cheap-model defaults
+      // (pipeline.extraction_timeout_ms/summarization_timeout_ms) since a
+      // distillation prompt bundles a whole cluster's memory contents.
+      // Bounds worst-case latency of one scheduled tick's per-cluster calls.
+      "llm_timeout_ms": 10000
     }
   },
 
@@ -704,7 +735,9 @@ The file is created automatically on first run with all defaults applied. Edit i
     "summarization_model": "gpt-4o-mini",
     // Env var name for the summarization model API key. Defaults to the same
     // variable as extraction_model_env (both are cheap-model write-path calls
-    // against the same OpenAI account) — point it elsewhere for a separate key.
+    // against the same OpenAI account) — point it elsewhere for a separate
+    // key. Like extraction_model_env, falls back to OPENAI_API_KEY when
+    // unset.
     "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
     // Summarization request timeout in milliseconds, enforced via AbortController
     "summarization_timeout_ms": 3000,
@@ -743,7 +776,7 @@ The file is created automatically on first run with all defaults applied. Edit i
 | `BHGBRAIN_TOKEN` | Required for non-loopback HTTP | — | Bearer token for HTTP authentication. Server **refuses to start** if the host is non-loopback and this is unset (unless `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Required for Qdrant Cloud | — | Set `qdrant.api_key_env` in config to the name of this variable. The default config field name is `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generated from hostname | Override the device identifier for multi-device setups. See [Device Identity Resolution](#device-identity-resolution). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model, used when `pipeline.extraction_enabled` is `true`. Also the default value of `pipeline.summarization_model_env` (used when `pipeline.summarization_enabled` is `true`) — point that field at a different variable if you want a separate key for summarization. Also read by multi-query expansion's LLM paraphrase/HyDE phase (`search.query_expansion.llm_paraphrase.enabled`, see [Multi-Query Expansion](#multi-query-expansion)), which resolves the key from `pipeline.extraction_model_env` the same way, falling back to `OPENAI_API_KEY` when unset. |
+| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model, used when `pipeline.extraction_enabled` is `true`. Also the default value of `pipeline.summarization_model_env` (used when `pipeline.summarization_enabled` is `true`) — point that field at a different variable if you want a separate key for summarization; whichever variable `summarization_model_env` names, it falls back to `OPENAI_API_KEY` the same way `extraction_model_env` does. Also read by multi-query expansion's LLM paraphrase/HyDE phase (`search.query_expansion.llm_paraphrase.enabled`, see [Multi-Query Expansion](#multi-query-expansion)) and contradiction detection (`pipeline.contradiction_detection.enabled`, see [Deduplication](#deduplication)), both of which resolve the key from `pipeline.extraction_model_env` the same way, falling back to `OPENAI_API_KEY` when unset. |
 | `BHGBRAIN_RERANK_API_KEY` | No | — (**no** fallback to `OPENAI_API_KEY`) | API key for the opt-in `recall` rerank stage, used when `search.rerank.enabled` is `true`. Unlike `BHGBRAIN_EXTRACTION_API_KEY`, this has no implicit fallback — enabling reranking is a deliberate, separately-keyed opt-in that never silently consumes the embedding or extraction key/budget. See [Rerank](#rerank). |
 
 Generate a secure bearer token:
@@ -2532,6 +2565,50 @@ the caller's full `limit` unclamped. Truncation is surfaced via
 the `bhgbrain_qdrant_fanout_width` gauge and `bhgbrain_qdrant_fanout_truncated_total`
 counter (see [Metrics](#metrics)) and a `qdrant_fanout_truncated` log line, not in the
 `search`/`recall` response body itself.
+
+### Outbound AI Request Policy
+
+Every OpenAI-compatible feature — embedding (OpenAI provider; Azure keeps its own
+derived per-resource endpoint), multi-candidate extraction, opt-in reranking,
+LLM-backed summarization, multi-query expansion's LLM paraphrase/HyDE phase,
+contradiction detection, and scheduled distillation — issues its chat/embedding
+requests through one shared request boundary instead of each feature independently
+constructing a `fetch` call. That boundary provides:
+
+- **A shared base URL** (`llm.base_url`, default `https://api.openai.com/v1`): point it
+  at a validated OpenAI-compatible gateway to route every one of those features through
+  it at once. Feature-specific model names, credentials, and per-feature timeouts
+  (`pipeline.extraction_timeout_ms`, `search.rerank.timeout_ms`, etc.) are unaffected —
+  only the endpoint and retry envelope are shared.
+- **A deadline that covers the whole response**, not just the initial connection: the
+  configured timeout stays active through header receipt, body read, JSON parsing, and
+  the feature's own response validation. A provider that returns successful headers and
+  then stalls mid-body still aborts at the deadline and — when the feature is
+  breaker-guarded — records a breaker failure, not a silent success.
+- **Uniform HTTP/network failure classification**: `429` and `408` are always retryable;
+  `500`/`502`/`503`/`504` are retryable (other 5xx and every other 4xx are treated as
+  permanent — retrying cannot fix bad credentials or a malformed payload); network
+  errors and timeouts are retryable. A `Retry-After` header on a `429`/`5xx` response
+  raises the next attempt's delay to at least that value, capped by `llm.retry.max_backoff_ms`.
+- **Capped, jittered retry** (`llm.retry.max_attempts`/`backoff_ms`/`max_backoff_ms`,
+  defaults `3`/`200`/`2000`): the whole retry loop for one logical call — including every
+  internal attempt — records at most one circuit-breaker outcome, so a transient failure
+  that succeeds on the second attempt never trips a breaker a healthy provider wouldn't.
+  Embedding requests use their own equivalent `embedding.retry` envelope (including
+  `max_backoff_ms`) rather than `llm.retry`, since embedding already has its own
+  `max_batch_inputs` batching concern.
+- **Response validation before any provider output is trusted**: every embedding request
+  (OpenAI and Azure alike, chunked to `embedding.max_batch_inputs`) verifies the returned
+  array has exactly one vector per requested input and that every vector matches the
+  configured `embedding.dimensions` before reassembling results in input order — a short
+  or malformed batch fails the whole call rather than silently misassociating vectors
+  with the wrong memories.
+
+Semantic search preserves the embedding provider's original classified error (its code
+and whether it's retryable) rather than always replacing it with a generic message;
+hybrid search's fulltext-only degradation path logs and meters that same classification
+alongside the `fulltext_only` fallback, so an operator can tell a transient rate limit
+apart from a permanent auth failure in either mode.
 
 ### MCP Session Lifecycle
 

@@ -242,6 +242,26 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     "id": null
   },
 
+  // Frontière partagée de requêtes chat/embedding compatibles OpenAI : une URL
+  // de base et un schéma de nouvelles tentatives que chaque fonctionnalité
+  // migrée (extraction, reranking, résumé, expansion de requêtes, détection
+  // de contradictions, distillation et embeddings OpenAI — les embeddings
+  // Azure conservent leur point de terminaison dérivé par ressource) utilise,
+  // plutôt que chacune codant en dur "https://api.openai.com/v1" et sa propre
+  // logique de nouvelles tentatives. Pointez base_url vers une passerelle
+  // compatible OpenAI validée pour acheminer toutes ces fonctionnalités à la
+  // fois. Voir « Outbound AI Request Policy » plus bas.
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 200,
+      // Plafonne à la fois l'enveloppe de backoff exponentiel et l'indication
+      // Retry-After d'un fournisseur.
+      "max_backoff_ms": 2000
+    }
+  },
+
   // Configuration du fournisseur d'embeddings
   "embedding": {
     // Fournisseur : "openai" ou "azure-foundry"
@@ -259,12 +279,17 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     "dimensions": 1536,
     // Délai d'expiration des requêtes en millisecondes
     "request_timeout_ms": 30000,
-    // Nombre maximal d'entrées par requête d'embedding (seuil de découpage en blocs)
+    // Nombre maximal d'entrées par requête d'embedding (seuil de découpage en
+    // blocs). S'applique aux deux fournisseurs — chaque requête d'embedding
+    // (y compris OpenAI) est découpée en lots d'au plus cette taille et
+    // réassemblée dans l'ordre.
     "max_batch_inputs": 2048,
     // Configuration des nouvelles tentatives pour les échecs transitoires
     "retry": {
       "max_attempts": 3,
-      "backoff_ms": 1000
+      "backoff_ms": 1000,
+      // Plafonne l'enveloppe de backoff exponentiel, même rôle que llm.retry.max_backoff_ms ci-dessus.
+      "max_backoff_ms": 10000
     },
     // Chaque vecteur est estampillé à l'écriture avec une identité qualifiée par
     // fournisseur (`<provider>/<model>@<dimensions>`). Si l'identité attendue
@@ -488,7 +513,17 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
       "max_cluster_size": 20,
 
       // Limite supérieure de clusters distillés (appels LLM) par exécution planifiée.
-      "max_clusters_per_run": 10
+      "max_clusters_per_run": 10,
+
+      // Délai d'expiration pour l'appel LLM de distillation par cluster,
+      // appliqué via l'AbortController de l'exécuteur de requêtes partagé
+      // (voir « Outbound AI Request Policy » plus bas). Plus élevé que les
+      // valeurs par défaut des modèles économiques
+      // (pipeline.extraction_timeout_ms/summarization_timeout_ms), car un
+      // prompt de distillation regroupe le contenu de tout un cluster.
+      // Plafonne la latence dans le pire cas des appels par cluster d'une
+      // exécution planifiée.
+      "llm_timeout_ms": 10000
     }
   },
 
@@ -705,7 +740,8 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     // Nom de la variable d'env pour la clé API du modèle de résumé. Par défaut
     // la même variable que extraction_model_env (les deux sont des appels de
     // modèle peu coûteux sur le chemin d'écriture contre le même compte
-    // OpenAI) — pointez-la ailleurs pour une clé séparée.
+    // OpenAI) — pointez-la ailleurs pour une clé séparée. Se rabat sur
+    // OPENAI_API_KEY si non définie, comme extraction_model_env.
     "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
     // Délai d'expiration de la requête de résumé en millisecondes, appliqué via AbortController
     "summarization_timeout_ms": 3000,
@@ -747,7 +783,7 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
 | `BHGBRAIN_TOKEN` | Obligatoire pour HTTP non-loopback | — | Token Bearer pour l'authentification HTTP. Le serveur **refuse de démarrer** si l'hôte est non-loopback et que ce token n'est pas défini (sauf si `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Obligatoire pour Qdrant Cloud | — | Définissez `qdrant.api_key_env` dans la configuration sur le nom de cette variable. Le nom de champ de configuration par défaut est `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | Non | Auto-généré à partir du hostname | Remplace l'identifiant de l'appareil pour les configurations multi-appareils. Voir [Résolution de l'identité de l'appareil](#résolution-de-lidentité-de-lappareil). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | Non | Se rabat sur `OPENAI_API_KEY` | Clé API pour le modèle d'extraction LLM, utilisée quand `pipeline.extraction_enabled` vaut `true`. Également la valeur par défaut de `pipeline.summarization_model_env` (utilisée quand `pipeline.summarization_enabled` vaut `true`) — pointez ce champ vers une autre variable si vous voulez une clé séparée pour le résumé. Également lue par la phase de paraphrase/HyDE LLM de l'expansion multi-requête (`search.query_expansion.llm_paraphrase.enabled`, voir [Expansion multi-requête](#expansion-multi-requête)), qui résout la clé de la même façon depuis `pipeline.extraction_model_env`, avec repli sur `OPENAI_API_KEY` si non définie. |
+| `BHGBRAIN_EXTRACTION_API_KEY` | Non | Se rabat sur `OPENAI_API_KEY` | Clé API pour le modèle d'extraction LLM, utilisée quand `pipeline.extraction_enabled` vaut `true`. Également la valeur par défaut de `pipeline.summarization_model_env` (utilisée quand `pipeline.summarization_enabled` vaut `true`) — pointez ce champ vers une autre variable si vous voulez une clé séparée pour le résumé ; quelle que soit la variable que nomme `summarization_model_env`, elle se rabat sur `OPENAI_API_KEY` de la même façon que `extraction_model_env`. Également lue par la phase de paraphrase/HyDE LLM de l'expansion multi-requête (`search.query_expansion.llm_paraphrase.enabled`, voir [Expansion multi-requête](#expansion-multi-requête)) et par la détection de contradictions (`pipeline.contradiction_detection.enabled`, voir [Déduplication](#déduplication)), qui résolvent toutes deux la clé de la même façon depuis `pipeline.extraction_model_env`, avec repli sur `OPENAI_API_KEY` si non définie. |
 | `BHGBRAIN_RERANK_API_KEY` | Non | — (**aucun** repli sur `OPENAI_API_KEY`) | Clé API pour l'étape de rerank optionnelle de `recall`, utilisée quand `search.rerank.enabled` vaut `true`. Contrairement à `BHGBRAIN_EXTRACTION_API_KEY`, il n'y a pas de repli implicite — activer le rerank est un opt-in délibéré, avec sa propre clé, qui ne consomme jamais silencieusement la clé/le budget d'embedding ou d'extraction. Voir [Rerank](#rerank). |
 
 Générez un token Bearer sécurisé :
@@ -2564,6 +2600,62 @@ jauge `bhgbrain_qdrant_fanout_width` et le compteur
 `bhgbrain_qdrant_fanout_truncated_total` (voir [Métriques](#métriques)) ainsi qu'une
 ligne de log `qdrant_fanout_truncated`, pas dans le corps de la réponse
 `search`/`recall` elle-même.
+
+### Outbound AI Request Policy
+
+Chaque fonctionnalité compatible OpenAI — embeddings (fournisseur OpenAI ; Azure
+conserve son propre point de terminaison dérivé par ressource), extraction
+multi-candidats, reranking optionnel, résumé assisté par LLM, la phase de
+paraphrase/HyDE LLM de l'expansion multi-requête, la détection de contradictions et la
+distillation planifiée — envoie ses requêtes chat/embedding via une frontière de
+requêtes partagée unique, plutôt que chaque fonctionnalité construisant indépendamment
+son propre appel `fetch`. Cette frontière fournit :
+
+- **Une URL de base partagée** (`llm.base_url`, par défaut `https://api.openai.com/v1`) :
+  pointez-la vers une passerelle compatible OpenAI validée pour acheminer toutes ces
+  fonctionnalités à la fois. Les noms de modèle, identifiants et délais d'expiration
+  propres à chaque fonctionnalité (`pipeline.extraction_timeout_ms`,
+  `search.rerank.timeout_ms`, etc.) ne sont pas affectés — seuls le point de terminaison
+  et le schéma de nouvelles tentatives sont partagés.
+- **Un délai qui couvre l'intégralité de la réponse**, pas seulement la connexion
+  initiale : le délai d'expiration configuré reste actif pendant la réception des
+  en-têtes, la lecture du corps, l'analyse JSON et la propre validation de réponse de
+  la fonctionnalité. Un fournisseur qui renvoie des en-têtes réussis puis se bloque au
+  milieu du corps continue d'abandonner à l'échéance et — quand la fonctionnalité est
+  protégée par un circuit breaker — cela est enregistré comme un échec du breaker, pas
+  comme un succès silencieux.
+- **Classification uniforme des échecs HTTP/réseau** : `429` et `408` sont toujours
+  susceptibles de nouvelles tentatives ; `500`/`502`/`503`/`504` le sont aussi (les
+  autres codes 5xx et tout code 4xx sont traités comme permanents — une nouvelle
+  tentative ne peut pas corriger des identifiants invalides ou une charge utile
+  malformée) ; les erreurs réseau et les délais d'expiration sont susceptibles de
+  nouvelles tentatives. Un en-tête `Retry-After` sur une réponse `429`/`5xx` relève le
+  délai de la prochaine tentative à au moins cette valeur, plafonné par
+  `llm.retry.max_backoff_ms`.
+- **Nouvelles tentatives plafonnées et avec gigue** (`llm.retry.max_attempts`/
+  `backoff_ms`/`max_backoff_ms`, par défaut `3`/`200`/`2000`) : toute la boucle de
+  nouvelles tentatives d'un appel logique — y compris chaque tentative interne —
+  n'enregistre qu'un seul résultat de circuit breaker au maximum, de sorte qu'un échec
+  transitoire réussissant à la deuxième tentative ne déclenche jamais un breaker qu'un
+  fournisseur sain ne déclencherait pas. Les requêtes d'embedding utilisent leur propre
+  schéma équivalent `embedding.retry` (y compris `max_backoff_ms`) plutôt que
+  `llm.retry`, car les embeddings ont déjà leur propre problématique de découpage en
+  lots (`max_batch_inputs`).
+- **Validation de la réponse avant de faire confiance à toute sortie du fournisseur** :
+  chaque requête d'embedding (OpenAI et Azure de la même façon, découpée selon
+  `embedding.max_batch_inputs`) vérifie que le tableau renvoyé contient exactement un
+  vecteur par entrée demandée et que chaque vecteur correspond aux
+  `embedding.dimensions` configurées avant de réassembler les résultats dans l'ordre
+  des entrées — un lot court ou malformé fait échouer tout l'appel plutôt que
+  d'associer silencieusement des vecteurs aux mauvaises mémoires.
+
+La recherche sémantique préserve l'erreur classifiée d'origine du fournisseur
+d'embedding (son code et si elle est susceptible de nouvelle tentative) plutôt que de
+toujours la remplacer par un message générique ; le chemin de dégradation vers le
+texte intégral seul de la recherche hybride enregistre et mesure cette même
+classification aux côtés du repli `fulltext_only`, afin qu'un opérateur puisse
+distinguer une limitation de débit transitoire d'un échec d'authentification permanent
+dans les deux modes.
 
 ### Cycle de vie des sessions MCP
 

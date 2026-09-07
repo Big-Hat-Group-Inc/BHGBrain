@@ -87,6 +87,23 @@ describe('OpenAISummarizationProvider', () => {
 
     expect(breaker.execute).toHaveBeenCalledTimes(1);
   });
+
+  // unify-llm-client-boundaries task 2.3: an HTTP failure now records
+  // exactly one breaker outcome for the whole `summarize()` call, including
+  // every internal retry attempt.
+  it('records a single breaker failure across a whole retried HTTP-error call', async () => {
+    const fetchMock = vi.fn(async () => new Response('server error', { status: 500 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const breaker = {
+      execute: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
+    } as unknown as CircuitBreaker;
+
+    const provider = new OpenAISummarizationProvider(createConfig(), 'test-key', breaker);
+    await expect(provider.summarize('some content', 120)).rejects.toThrow('Summarization API error 500');
+
+    expect(breaker.execute).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+  });
 });
 
 describe('DegradedSummarizationProvider', () => {
@@ -121,6 +138,18 @@ describe('createSummarizationProvider', () => {
     process.env.BHGBRAIN_EXTRACTION_API_KEY = 'key';
     const provider = createSummarizationProvider(createConfig({ summarization_enabled: true }));
     expect(provider).toBeInstanceOf(OpenAISummarizationProvider);
+  });
+
+  // unify-llm-client-boundaries task 1.2 / spec "Only the common API key is
+  // set": summarization now falls back to OPENAI_API_KEY like every sibling
+  // feature (extraction, query expansion, entailment, distillation), instead
+  // of requiring summarization_model_env specifically.
+  it('falls back to OPENAI_API_KEY when summarization_model_env is unset', () => {
+    delete process.env.BHGBRAIN_EXTRACTION_API_KEY;
+    process.env.OPENAI_API_KEY = 'fallback-key';
+    const provider = createSummarizationProvider(createConfig({ summarization_enabled: true }));
+    expect(provider).toBeInstanceOf(OpenAISummarizationProvider);
+    delete process.env.OPENAI_API_KEY;
   });
 });
 

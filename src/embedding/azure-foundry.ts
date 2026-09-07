@@ -1,30 +1,18 @@
 import type { BrainConfig } from '../config/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { CircuitBreaker } from '../resilience/index.js';
-import { BrainError, embeddingUnavailable } from '../errors/index.js';
-import { formatEmbeddingIdentity, type EmbeddingProvider } from './index.js';
-import { executeSingleEmbeddingRequest, requestEmbeddingsWithRetry } from './request.js';
+import { formatEmbeddingIdentity, chunkInputs, classifyEmbeddingError, parseAndValidateEmbeddingsResponse, type EmbeddingProvider } from './index.js';
+import { executeLlmRequest, executeSingleLlmRequest, requireApiKey, type LlmRetryConfig } from '../llm/client.js';
+import { embeddingUnavailable } from '../errors/index.js';
 
 function shouldIncludeDimensions(model: string): boolean {
   return model === 'text-embedding-3-small' || model === 'text-embedding-3-large';
-}
-
-function chunkInputs<T>(items: T[], chunkSize: number): T[][] {
-  const chunks: T[][] = [];
-  for (let i = 0; i < items.length; i += chunkSize) {
-    chunks.push(items.slice(i, i + chunkSize));
-  }
-  return chunks;
 }
 
 interface AzureEmbeddingsRequestBody {
   model: string;
   input: string[];
   dimensions?: number;
-}
-
-function getErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : 'Unknown error';
 }
 
 export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
@@ -36,8 +24,7 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
   private readonly apiKey: string;
   private readonly requestTimeoutMs: number;
   private readonly maxBatchInputs: number;
-  private readonly retryMaxAttempts: number;
-  private readonly retryBackoffMs: number;
+  private readonly retry: LlmRetryConfig;
   private readonly breaker?: CircuitBreaker;
   private readonly metrics?: MetricsCollector;
 
@@ -51,8 +38,11 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
     this.identity = formatEmbeddingIdentity(this.provider, this.model, this.dimensions);
     this.requestTimeoutMs = config.embedding.request_timeout_ms;
     this.maxBatchInputs = config.embedding.max_batch_inputs;
-    this.retryMaxAttempts = config.embedding.retry.max_attempts;
-    this.retryBackoffMs = config.embedding.retry.backoff_ms;
+    this.retry = {
+      maxAttempts: config.embedding.retry.max_attempts,
+      backoffMs: config.embedding.retry.backoff_ms,
+      maxBackoffMs: config.embedding.retry.max_backoff_ms ?? 10_000,
+    };
 
     if (!config.embedding.azure) {
       throw new Error('embedding.azure configuration is required for Azure provider');
@@ -62,12 +52,12 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
     const resourceName = azureConfig.resource_name;
     this.baseUrl = `https://${resourceName}.openai.azure.com/openai/v1`;
 
-    const keyEnv = azureConfig.api_key_env;
-    const key = process.env[keyEnv];
-    if (!key) {
-      throw new Error(`Missing environment variable: ${keyEnv}`);
-    }
-    this.apiKey = key;
+    // Azure retains its derived per-resource endpoint (never the shared
+    // `llm.base_url`) — see design.md Decision #3 — but credential
+    // resolution goes through the same shared helper as every other
+    // feature, no OPENAI_API_KEY fallback (Azure and OpenAI keys are never
+    // interchangeable).
+    this.apiKey = requireApiKey(azureConfig.api_key_env);
 
     this.breaker = breaker;
     this.metrics = metrics;
@@ -85,17 +75,12 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
       const results: number[][] = [];
 
       for (const chunk of chunks) {
-        const response = await this.requestWithRetry(chunk, true);
-        const embeddings = await this.parseEmbeddingsResponse(response);
-        results.push(...embeddings);
+        results.push(...await this.requestWithRetry(chunk, true));
       }
 
       return results;
     } catch (err) {
-      if (err instanceof BrainError) {
-        throw err;
-      }
-      throw embeddingUnavailable(`Azure embedding provider unreachable: ${getErrorMessage(err)}`);
+      throw classifyEmbeddingError(err, { errorPrefix: 'Azure', genericPrefix: 'Azure embedding provider unreachable' });
     } finally {
       this.metrics?.recordHistogram('embedding_embed_batch_ms', Date.now() - start);
     }
@@ -104,11 +89,15 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
   async healthCheck(): Promise<boolean> {
     try {
       // Single-shot, bounded probe (respects requestTimeoutMs via the abort
-      // controller in executeSingleRequest) — no retry/backoff loop, mirroring
+      // controller in executeSingleLlmRequest) — no retry/backoff loop, mirroring
       // OpenAIEmbeddingProvider.healthCheck(). Bypasses the breaker entirely,
       // same as requestWithRetry(..., false).
       const response = await this.executeSingleRequest(['health check']);
-      await this.parseEmbeddingsResponse(response);
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        throw embeddingUnavailable(`Azure embedding API error ${response.status}: ${body.slice(0, 200)}`);
+      }
+      await parseAndValidateEmbeddingsResponse(response, 1, this.dimensions, 'Azure');
       return true;
     } catch {
       return false;
@@ -136,42 +125,29 @@ export class AzureFoundryEmbeddingProvider implements EmbeddingProvider {
   // Wraps the whole logical operation (all retry attempts) in a single breaker
   // call so one `embedBatch` records at most one breaker failure, regardless of
   // how many attempts `retry.max_attempts` allows internally. Delegates the
-  // timeout/retry/classification machinery to the shared helper (see
-  // ./request.ts) so it is identical to the OpenAI provider's.
-  private async requestWithRetry(texts: string[], useBreaker: boolean): Promise<Response> {
-    return requestEmbeddingsWithRetry({
+  // timeout/retry/classification/response-validation machinery to the shared
+  // request executor (`src/llm/client.ts`) so it is identical to the OpenAI
+  // provider's (unify-llm-client-boundaries task 2.4/2.5).
+  private async requestWithRetry(texts: string[], useBreaker: boolean): Promise<number[][]> {
+    return executeLlmRequest({
       url: `${this.baseUrl}/embeddings`,
       headers: this.requestHeaders(),
       body: this.buildRequestBody(texts),
       timeoutMs: this.requestTimeoutMs,
-      retry: { max_attempts: this.retryMaxAttempts, backoff_ms: this.retryBackoffMs },
+      retry: this.retry,
       breaker: this.breaker,
       useBreaker,
       errorPrefix: 'Azure',
+      parseResponse: async response => parseAndValidateEmbeddingsResponse(response, texts.length, this.dimensions, 'Azure'),
     });
   }
 
   private async executeSingleRequest(texts: string[]): Promise<Response> {
-    return executeSingleEmbeddingRequest({
+    return executeSingleLlmRequest({
       url: `${this.baseUrl}/embeddings`,
       headers: this.requestHeaders(),
       body: this.buildRequestBody(texts),
       timeoutMs: this.requestTimeoutMs,
     });
-  }
-
-  private async parseEmbeddingsResponse(response: Response): Promise<number[][]> {
-    if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw embeddingUnavailable(`Azure embedding API error ${response.status}: ${body.slice(0, 200)}`);
-    }
-
-    const data = await response.json() as {
-      data: Array<{ embedding: number[]; index: number }>;
-    };
-
-    return data.data
-      .sort((a, b) => a.index - b.index)
-      .map(d => d.embedding);
   }
 }
