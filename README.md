@@ -139,10 +139,14 @@ BHGBrain **requires an external Qdrant instance**. Even in the default `embedded
 ### Option A: Docker (recommended)
 
 ```bash
+# Loopback-only publish: Qdrant has no authentication of its own, so binding
+# to every interface (-p 6333:6333) would serve your stored vectors/payloads
+# to the whole LAN. Widen only behind your own authenticated reverse
+# proxy/firewall.
 docker run -d \
   --name qdrant \
   --restart unless-stopped \
-  -p 6333:6333 \
+  -p 127.0.0.1:6333:6333 \
   -v qdrant_storage:/qdrant/storage \
   qdrant/qdrant
 ```
@@ -161,8 +165,11 @@ services:
   qdrant:
     image: qdrant/qdrant
     restart: unless-stopped
+    # Loopback-only: Qdrant has no authentication of its own, so binding to
+    # every interface would serve your stored vectors/payloads to the whole
+    # LAN. Widen only behind your own authenticated reverse proxy/firewall.
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
 
@@ -3015,8 +3022,9 @@ The `bootstrap` MCP tool drives a stateful 10-section interview directly within 
 // Check progress
 { "name": "bootstrap", "arguments": { "action": "status" } }
 
-// Re-do a section
-{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+// Re-do a section — reset is destructive (permanently deletes the section's
+// memories) and requires an exact confirmation value
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3, "confirm": "RESET" } }
 ```
 
 The tool returns the next section's questions after each submission, so the agent can drive the conversation naturally. Sessions persist in SQLite — you can close your client and pick up where you left off.
@@ -3591,13 +3599,14 @@ Drive a stateful 10-section interview to build your work profile. Supports pause
 | `section` | `integer (1-10)` | For submit/reset | - | Section number to submit answers for or reset. |
 | `answers` | `string` | For submit | - | Your answers for the section. Max 500,000 characters. |
 | `namespace` | `string` | No | `"profile"` | Namespace scope. |
+| `confirm` | `string` | For reset | - | Must be exactly `"RESET"`. Omitted or wrong values leave storage unchanged. |
 
 **Actions:**
 
 - **`start`** — Creates a new session or resumes an existing one. Returns the first incomplete section's title, questions, and instructions.
 - **`submit`** — Stores answers as discrete memories for the given section, marks it complete, and returns the next section.
 - **`status`** — Returns progress overview: which sections are complete, memory counts, last updated.
-- **`reset`** — Deletes all memories for a section and marks it as pending for re-collection.
+- **`reset`** — **Destructive.** Permanently deletes all memories for a section and marks it as pending for re-collection. Requires `confirm: "RESET"`; an omitted or wrong value is rejected and nothing is deleted.
 
 **Output (start):**
 
@@ -4125,12 +4134,12 @@ The container binds the API to `0.0.0.0` so the published port is reachable, and
 is **authenticated by default**:
 
 - If `BHGBRAIN_TOKEN` is unset, the entrypoint **generates a bearer token** on
-  first run, persists it to `/data/bhgbrain-token`, and prints it to the logs.
-  Retrieve it with:
+  first run and persists it to `/data/bhgbrain-token` (owner-only file mode).
+  The token value itself is never printed to container logs — only the path
+  it was saved to — so `docker compose logs` alone can never leak a working
+  credential. Retrieve it with:
 
   ```bash
-  docker compose logs bhgbrain | grep token
-  # or
   docker compose exec bhgbrain cat /data/bhgbrain-token
   ```
 
@@ -4143,6 +4152,12 @@ is **authenticated by default**:
 - The published port maps to host loopback (`127.0.0.1:3721:3721`), so the API is
   not LAN-reachable by default. Change the mapping in `docker-compose.yml` to
   expose it externally.
+
+- The `self-hosted` profile's Qdrant sidecar is loopback-only for the same
+  reason (`127.0.0.1:6333:6333`) — Qdrant has no authentication configured in
+  this stack, so every stored vector/payload would otherwise be reachable to
+  anyone on the LAN. Only widen its port mapping behind your own authenticated
+  reverse proxy or firewall.
 
 - To intentionally run **without** authentication, set
   `BHGBRAIN_ALLOW_UNAUTHENTICATED=true` (the server logs a warning; not

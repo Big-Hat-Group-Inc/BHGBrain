@@ -139,10 +139,13 @@ BHGBrain **需要一个外部 Qdrant 实例**。即使在默认的 `embedded` �
 ### 方案 A：Docker（推荐）
 
 ```bash
+# 仅回环地址：Qdrant 本身没有身份验证，因此绑定到所有网络接口（-p 6333:6333）
+# 会让局域网内的任何人都能访问你存储的向量/负载数据。仅在你自己的认证反向代理/
+# 防火墙之后才扩大暴露范围。
 docker run -d \
   --name qdrant \
   --restart unless-stopped \
-  -p 6333:6333 \
+  -p 127.0.0.1:6333:6333 \
   -v qdrant_storage:/qdrant/storage \
   qdrant/qdrant
 ```
@@ -161,8 +164,11 @@ services:
   qdrant:
     image: qdrant/qdrant
     restart: unless-stopped
+    # 仅回环地址：Qdrant 本身没有身份验证，因此绑定到所有网络接口会让局域网内
+    # 的任何人都能访问你存储的向量/负载数据。仅在你自己的认证反向代理/防火墙
+    # 之后才扩大暴露范围。
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
 
@@ -2866,8 +2872,8 @@ BHGBrain 提供三种构建你的工作档案的方式，从全程引导到批�
 // 查看进度
 { "name": "bootstrap", "arguments": { "action": "status" } }
 
-// 重做某一节
-{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+// 重做某一节——reset 是破坏性操作（会永久删除该节的记忆），需要提供精确的确认值
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3, "confirm": "RESET" } }
 ```
 
 每次提交后，该工具会返回下一节的问题，方便智能体自然地推进对话。会话持久化在 SQLite 中——你可以关闭客户端，之后从中断处继续。
@@ -3423,13 +3429,14 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `section` | `integer (1-10)` | submit/reset 时需要 | - | 要提交答案或重置的节号。 |
 | `answers` | `string` | submit 时需要 | - | 该节的答案。最多 500,000 个字符。 |
 | `namespace` | `string` | 否 | `"profile"` | 命名空间范围。 |
+| `confirm` | `string` | reset 时需要 | - | 必须精确等于 `"RESET"`。缺失或错误的值不会改变任何存储数据。 |
 
 **动作：**
 
 - **`start`** —— 创建新会话或恢复现有会话。返回第一个未完成节的标题、问题和说明。
 - **`submit`** —— 将答案作为离散记忆存储到给定节，将其标记为已完成，并返回下一节。
 - **`status`** —— 返回进度概览：哪些节已完成、记忆数量、最后更新时间。
-- **`reset`** —— 删除某一节的所有记忆，并将其标记为待重新采集。
+- **`reset`** —— **破坏性操作。** 永久删除某一节的所有记忆，并将其标记为待重新采集。需要提供 `confirm: "RESET"`；缺失或错误的值会被拒绝，且不会删除任何数据。
 
 **输出（start）：**
 
@@ -3884,11 +3891,9 @@ curl http://localhost:3721/health/live
 
 容器将 API 绑定到 `0.0.0.0` 以便发布的端口可访问，并且**默认启用认证**：
 
-- 如果未设置 `BHGBRAIN_TOKEN`，入口脚本会在首次运行时**生成一个 Bearer token**，将其持久化到 `/data/bhgbrain-token`，并打印到日志中。可通过以下方式获取：
+- 如果未设置 `BHGBRAIN_TOKEN`，入口脚本会在首次运行时**生成一个 Bearer token**，并将其持久化到 `/data/bhgbrain-token`（文件权限仅限属主访问）。token 的值本身永远不会写入容器日志——只会记录它保存的路径——因此仅凭 `docker compose logs` 永远无法泄露有效凭据。可通过以下方式获取：
 
   ```bash
-  docker compose logs bhgbrain | grep token
-  # 或
   docker compose exec bhgbrain cat /data/bhgbrain-token
   ```
 
@@ -3899,6 +3904,8 @@ curl http://localhost:3721/health/live
   ```
 
 - 发布的端口映射到宿主机回环地址（`127.0.0.1:3721:3721`），因此默认情况下 API 无法从局域网访问。要对外暴露，请修改 `docker-compose.yml` 中的映射。
+
+- `self-hosted` profile 中的 Qdrant sidecar 出于同样的原因也仅绑定到回环地址（`127.0.0.1:6333:6333`）——该技术栈中 Qdrant 没有配置任何身份验证，否则局域网内的任何人都能访问每一个存储的向量/负载数据。仅在你自己的认证反向代理/防火墙之后才扩大其端口映射。
 
 - 若要刻意在**不启用认证**的情况下运行，设置 `BHGBRAIN_ALLOW_UNAUTHENTICATED=true`（服务器会记录警告；不建议用于非回环绑定）。
 

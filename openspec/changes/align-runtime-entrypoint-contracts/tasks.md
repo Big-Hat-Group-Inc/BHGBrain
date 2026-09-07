@@ -3,14 +3,14 @@
 - [x] 1.1 Make root and nested configuration schemas strict and add URL, port, boolean, and cron validation; verify unknown/invalid values report file and field paths.
 - [x] 1.2 Separate raw file configuration from runtime environment overlays and revalidate the final object; verify temporary security overrides and credential-bearing URLs are never persisted.
 - [x] 1.3 Persist config/device changes atomically with restrictive modes and verify interrupted writes preserve the previous readable file.
-- [ ] 1.4 Bind the bundled vector service to loopback, stop printing generated bearer tokens, and align README commands; verify the default compose configuration exposes neither vector data nor token values externally.
+- [x] 1.4 Bind the bundled vector service to loopback, stop printing generated bearer tokens, and align README commands; verify the default compose configuration exposes neither vector data nor token values externally.
 
 ## 2. Unified Context and Error Contracts
 
 - [ ] 2.1 Extract one tool-context factory used by server and CLI with explicit optional capability checks and verify equivalent tools receive equivalent provider, breaker, logger, and lifecycle dependencies.
 - [ ] 2.2 Export one strict error-envelope predicate and native REST/MCP/CLI adapters and verify identical classified failures map to HTTP status, MCP error state, and non-zero CLI exit.
 - [ ] 2.3 Convert resource errors into MCP errors and validate REST tool names before dispatch; verify unknown tools/resources never appear as successful content.
-- [ ] 2.4 Mark bootstrap as destructive and require an exact reset confirmation value; verify omitted or wrong confirmation leaves storage unchanged.
+- [x] 2.4 Mark bootstrap as destructive and require an exact reset confirmation value; verify omitted or wrong confirmation leaves storage unchanged.
 
 ## 3. Startup, Hydration, and Shutdown
 

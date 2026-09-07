@@ -32,8 +32,11 @@ if [ -z "${BHGBRAIN_TOKEN}" ] && [ "${BHGBRAIN_ALLOW_UNAUTHENTICATED}" != "true"
     echo "============================================================" >&2
     echo "BHGBrain: no BHGBRAIN_TOKEN provided — generated a bearer token" >&2
     echo "so the externally-reachable HTTP API is authenticated by default." >&2
-    echo "  token: ${BHGBRAIN_TOKEN}" >&2
+    # The token value itself is never logged (align-runtime-entrypoint-contracts
+    # task 1.4) — only where to find it, so container logs alone never
+    # disclose a working credential.
     echo "  saved: ${SAVED}" >&2
+    echo "  retrieve it with: docker compose exec bhgbrain cat ${TOKEN_FILE}" >&2
     echo "Provide BHGBRAIN_TOKEN yourself for a stable credential, or set" >&2
     echo "BHGBRAIN_ALLOW_UNAUTHENTICATED=true to intentionally run open." >&2
     echo "============================================================" >&2

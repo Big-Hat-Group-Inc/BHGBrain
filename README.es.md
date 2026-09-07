@@ -139,10 +139,14 @@ BHGBrain **requiere una instancia externa de Qdrant**. Incluso en el modo `embed
 ### Opción A: Docker (recomendado)
 
 ```bash
+# Solo loopback: Qdrant no tiene autenticación propia, por lo que enlazar a
+# todas las interfaces (-p 6333:6333) expondría sus vectores/payloads
+# almacenados a toda la LAN. Amplíe solo detrás de su propio proxy inverso o
+# firewall autenticado.
 docker run -d \
   --name qdrant \
   --restart unless-stopped \
-  -p 6333:6333 \
+  -p 127.0.0.1:6333:6333 \
   -v qdrant_storage:/qdrant/storage \
   qdrant/qdrant
 ```
@@ -161,8 +165,12 @@ services:
   qdrant:
     image: qdrant/qdrant
     restart: unless-stopped
+    # Solo loopback: Qdrant no tiene autenticación propia, por lo que enlazar a
+    # todas las interfaces expondría sus vectores/payloads almacenados a toda
+    # la LAN. Amplíe solo detrás de su propio proxy inverso o firewall
+    # autenticado.
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
 
@@ -3068,8 +3076,9 @@ La herramienta MCP `bootstrap` conduce una entrevista con estado de 10 secciones
 // Consultar el progreso
 { "name": "bootstrap", "arguments": { "action": "status" } }
 
-// Rehacer una sección
-{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+// Rehacer una sección — reset es destructivo (elimina permanentemente las
+// memorias de la sección) y requiere un valor de confirmación exacto
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3, "confirm": "RESET" } }
 ```
 
 La herramienta devuelve las preguntas de la siguiente sección después de cada envío, para que el agente pueda conducir la conversación de forma natural. Las sesiones persisten en SQLite — puedes cerrar tu cliente y retomar donde lo dejaste.
@@ -3646,13 +3655,14 @@ Conduce una entrevista con estado de 10 secciones para construir tu perfil de tr
 | `section` | `integer (1-10)` | Para submit/reset | - | Número de sección para enviar respuestas o reiniciar. |
 | `answers` | `string` | Para submit | - | Tus respuestas para la sección. Máx. 500,000 caracteres. |
 | `namespace` | `string` | No | `"profile"` | Ámbito de namespace. |
+| `confirm` | `string` | Para reset | - | Debe ser exactamente `"RESET"`. Un valor omitido o incorrecto deja el almacenamiento sin cambios. |
 
 **Acciones:**
 
 - **`start`** — Crea una nueva sesión o reanuda una existente. Devuelve el título, las preguntas y las instrucciones de la primera sección incompleta.
 - **`submit`** — Almacena las respuestas como memorias discretas para la sección dada, la marca como completa, y devuelve la siguiente sección.
 - **`status`** — Devuelve una visión general del progreso: qué secciones están completas, recuentos de memorias, última actualización.
-- **`reset`** — Elimina todas las memorias de una sección y la marca como pendiente para volver a recolectarla.
+- **`reset`** — **Destructivo.** Elimina permanentemente todas las memorias de una sección y la marca como pendiente para volver a recolectarla. Requiere `confirm: "RESET"`; un valor omitido o incorrecto es rechazado y no se elimina nada.
 
 **Salida (`start`):**
 
@@ -4129,12 +4139,12 @@ El contenedor vincula la API a `0.0.0.0` para que el puerto publicado sea alcanz
 está **autenticado por defecto**:
 
 - Si `BHGBRAIN_TOKEN` no está definido, el entrypoint **genera un token bearer** en
-  el primer inicio, lo persiste en `/data/bhgbrain-token`, y lo imprime en los logs.
-  Recupéralo con:
+  el primer inicio y lo persiste en `/data/bhgbrain-token` (modo de archivo solo para
+  el propietario). El valor del token nunca se escribe en los logs del contenedor —
+  solo la ruta donde se guardó —, de modo que `docker compose logs` por sí solo nunca
+  puede filtrar una credencial válida. Recupéralo con:
 
   ```bash
-  docker compose logs bhgbrain | grep token
-  # o
   docker compose exec bhgbrain cat /data/bhgbrain-token
   ```
 
@@ -4147,6 +4157,12 @@ está **autenticado por defecto**:
 - El puerto publicado se mapea al loopback del host (`127.0.0.1:3721:3721`), por lo que la API
   no es alcanzable por LAN de forma predeterminada. Cambia el mapeo en `docker-compose.yml` para
   exponerla externamente.
+
+- El sidecar de Qdrant del perfil `self-hosted` es solo loopback por la misma razón
+  (`127.0.0.1:6333:6333`) — Qdrant no tiene autenticación propia configurada en este
+  stack, por lo que de lo contrario cada vector/payload almacenado sería alcanzable
+  para cualquiera en la LAN. Amplía su mapeo de puerto solo detrás de tu propio proxy
+  inverso o firewall autenticado.
 
 - Para ejecutar intencionalmente **sin** autenticación, configura
   `BHGBRAIN_ALLOW_UNAUTHENTICATED=true` (el servidor registra una advertencia; no
