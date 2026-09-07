@@ -1118,10 +1118,42 @@ describe('tool-handler latency recording (record-tool-latency-on-all-paths)', ()
     const result = await handleTool(ctx, 'unknown_tool', {}, 'c1') as BrainErrorEnvelope;
 
     expect(result.error.code).toBe('INVALID_INPUT');
+    // strengthen-operational-observability task 2.1: an unrecognized tool
+    // name is normalized to the fixed 'invalid_tool' metric label rather
+    // than allocating its own permanent series — the real (unbounded) name
+    // still appears in the thrown error message and structured logs.
     expect(ctx.metrics.recordHistogram).toHaveBeenCalledWith(
       'bhgbrain_tool_handler_ms',
       expect.any(Number),
-      { tool: 'unknown_tool', status: 'error' },
+      { tool: 'invalid_tool', status: 'error' },
+    );
+  });
+
+  it('never allocates a metric series named after an arbitrary/unbounded tool string (task 2.1)', async () => {
+    const ctx = createCtx();
+
+    for (let i = 0; i < 50; i += 1) {
+      await handleTool(ctx, `probe-${i}`, {}, 'c1');
+    }
+
+    const recordHistogram = ctx.metrics.recordHistogram as ReturnType<typeof vi.fn>;
+    const distinctToolLabels = new Set(
+      recordHistogram.mock.calls
+        .filter(call => call[0] === 'bhgbrain_tool_handler_ms')
+        .map(call => (call[2] as { tool: string }).tool),
+    );
+    expect(distinctToolLabels).toEqual(new Set(['invalid_tool']));
+  });
+
+  it('increments the monotonic bhgbrain_tool_calls_total counter with the tool/status labels (task 2.3)', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: { listCategories: () => [] } } as unknown as Partial<StorageManager>,
+    });
+
+    await handleTool(ctx, 'category', { action: 'list' }, 'c1');
+
+    expect(ctx.metrics.incCounter).toHaveBeenCalledWith(
+      'bhgbrain_tool_calls_total', 1, { tool: 'category', status: 'ok' },
     );
   });
 

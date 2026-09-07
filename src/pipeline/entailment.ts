@@ -119,7 +119,7 @@ export async function checkEntailment(
         code: err.code,
         retryable: err.retryable,
         status: err.status,
-        error: err.message,
+        err,
       });
       throw new BrainError('INTERNAL', `Entailment check failed: ${err.message}`, err.retryable);
     }

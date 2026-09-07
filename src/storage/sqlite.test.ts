@@ -1356,6 +1356,32 @@ describe('SqliteStore embedding provenance', () => {
     expect(store.getExpectedEmbeddingIdentity()).toBe('azure-foundry/other@1536');
   });
 
+  it('a fresh store has no vector-drift cause on record (task 3.3)', () => {
+    expect(store.getVectorDriftState()).toEqual({ cause: null, message: null, updated_at: null });
+  });
+
+  it('setVectorDriftState persists and round-trips a drift cause with its message', () => {
+    store.setVectorDriftState('full-rebuild', 'embedding model changed since backup');
+    const state = store.getVectorDriftState();
+    expect(state.cause).toBe('full-rebuild');
+    expect(state.message).toBe('embedding model changed since backup');
+    expect(state.updated_at).toEqual(expect.any(String));
+  });
+
+  it('setVectorDriftState(null) clears a previously recorded cause', () => {
+    store.setVectorDriftState('inspection-failed', 'Qdrant unreachable during restore');
+    expect(store.getVectorDriftState().cause).toBe('inspection-failed');
+
+    store.setVectorDriftState(null);
+    expect(store.getVectorDriftState()).toMatchObject({ cause: null, message: null });
+  });
+
+  it('setVectorDriftState overwrites a prior cause rather than accumulating rows', () => {
+    store.setVectorDriftState('partial-drift', 'first pass');
+    store.setVectorDriftState('full-rebuild', 'second pass');
+    expect(store.getVectorDriftState()).toMatchObject({ cause: 'full-rebuild', message: 'second pass' });
+  });
+
   it('stores and round-trips a null embedding_model for a row that never specifies one', () => {
     store.insertMemory(sampleMemory());
     const mem = store.getMemoryById('550e8400-e29b-41d4-a716-446655440000');

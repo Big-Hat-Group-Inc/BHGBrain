@@ -1,4 +1,4 @@
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual, randomUUID } from 'node:crypto';
 import type { Request, Response, NextFunction } from 'express';
 import type { BrainConfig } from '../config/index.js';
 import { redactToken } from '../health/logger.js';
@@ -26,6 +26,20 @@ export function createAuthMiddleware(config: BrainConfig, logger: pino.Logger) {
   const tokenEnv = config.transport.http.bearer_token_env;
   const expectedToken = process.env[tokenEnv];
 
+  // strengthen-operational-observability task 1.6: whether a bearer token is
+  // configured is fixed for the lifetime of this middleware instance (it is
+  // read from the environment once, above, not re-read per request) — a
+  // process-lifetime condition, not a per-request event. Logging it here,
+  // once, at middleware construction, instead of inside the request handler
+  // below (as it previously did, on every single unauthenticated request)
+  // is what the spec's "Default unauthenticated loopback mode serves
+  // traffic ... condition is logged once at startup rather than on every
+  // request" scenario requires — a busy loopback deployment no longer drowns
+  // its warn-level logs in one `auth_skip` line per call.
+  if (!expectedToken) {
+    logger.warn({ event: 'auth_skip', reason: `No token set in env ${tokenEnv}` });
+  }
+
   return (req: Request, res: Response, next: NextFunction): void => {
     // bound-qdrant-http-runtime task 2.1: `/health/live` is registered ahead
     // of this middleware entirely (src/transport/http.ts), so it never
@@ -41,7 +55,6 @@ export function createAuthMiddleware(config: BrainConfig, logger: pino.Logger) {
     }
 
     if (!expectedToken) {
-      logger.warn({ event: 'auth_skip', reason: `No token set in env ${tokenEnv}` });
       next();
       return;
     }
@@ -65,6 +78,62 @@ export function createAuthMiddleware(config: BrainConfig, logger: pino.Logger) {
 
     next();
   };
+}
+
+// -- Request context: correlation id + child logger --
+
+const REQUEST_ID_HEADER = 'x-request-id';
+
+export interface RequestContext {
+  requestId: string;
+  /** Child logger pre-bound with `request_id` and (when derivable) `client_id`. */
+  log: pino.Logger;
+}
+
+// strengthen-operational-observability task 1.5: keyed on the `Request`
+// object itself (never serialized, never leaked to another request) rather
+// than a header/query param the handler has to keep threading through every
+// call — any downstream code holding the same `req` can recover this
+// request's correlation id/child logger via `getRequestContext`.
+const REQUEST_CONTEXTS = new WeakMap<Request, RequestContext>();
+
+/**
+ * Assigns a per-request correlation id — reusing an inbound `X-Request-Id`
+ * header when the caller (or a fronting reverse proxy) already generated
+ * one, so a request can be traced across systems, and generating a fresh
+ * UUID otherwise — and a child logger pre-bound with that id plus the
+ * trusted client identity. Every downstream log for this request (the tool
+ * call itself, the terminal error handler) can then share one identifier a
+ * concurrent request never collides with (spec: "Request activity SHALL be
+ * correlatable end to end").
+ *
+ * Registered as the very first middleware in `createHttpServer` — ahead of
+ * auth, rate limiting, and every route — so even a 401/429/413 rejection
+ * carries a correlation id in its response header and log line.
+ */
+export function createRequestContextMiddleware(logger: pino.Logger) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const inbound = req.headers[REQUEST_ID_HEADER];
+    const requestId = typeof inbound === 'string' && inbound.length > 0 ? inbound : randomUUID();
+    const trustedClientId = deriveTrustedClientId(req);
+    const log = logger.child({
+      request_id: requestId,
+      ...(trustedClientId ? { client_id: trustedClientId } : {}),
+    });
+    REQUEST_CONTEXTS.set(req, { requestId, log });
+    res.setHeader('X-Request-Id', requestId);
+    next();
+  };
+}
+
+/** The current request's correlation id + child logger, if the context middleware ran for it. */
+export function getRequestContext(req: Request): RequestContext | undefined {
+  return REQUEST_CONTEXTS.get(req);
+}
+
+/** `getRequestContext(req)?.log`, falling back to `fallback` for a request the context middleware never saw (e.g. a unit test driving a route handler directly). */
+export function requestLogger(req: Request, fallback: pino.Logger): pino.Logger {
+  return REQUEST_CONTEXTS.get(req)?.log ?? fallback;
 }
 
 // -- Rate limiting middleware --

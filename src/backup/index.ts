@@ -5,7 +5,7 @@ import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import { atomicWriteStreamAsync, writeChunk } from '../storage/sqlite.js';
 import type { LifecycleOperationToken } from '../storage/sqlite.js';
-import type { BackupInfo, RestoreResult, VectorReconciliationStatus } from '../domain/types.js';
+import type { BackupInfo, RestoreResult, VectorReconciliationStatus, VectorDriftCause } from '../domain/types.js';
 import { BrainError, invalidInput, internal } from '../errors/index.js';
 import type pino from 'pino';
 
@@ -153,7 +153,7 @@ export class BackupService {
       try {
         this.pruneRetention();
       } catch (err) {
-        this.logger?.warn?.({ event: 'backup_retention_pass_failed', error: (err as Error).message });
+        this.logger?.warn?.({ event: 'backup_retention_pass_failed', err });
       }
 
       return {
@@ -244,7 +244,7 @@ export class BackupService {
         this.logger?.warn?.({
           event: 'backup_retention_delete_failed',
           path: backup.path,
-          error: (err as Error).message,
+          err,
         });
         // File delete failed: leave the metadata row in place so this
         // backup is retried (not silently dropped) on the next prune pass.
@@ -525,20 +525,16 @@ export class BackupService {
     // restored source of truth (SQLite) has no record of it.
     if (outcome.driftedCount === 0 && surplusRemaining === 0) {
       this.logger?.info({ event: 'backup_restore_vector_no_drift', mode: outcome.mode });
+      // strengthen-operational-observability task 3.3: clears any cause
+      // left over from a prior restore/reconcile — this restore found
+      // nothing to reconcile, so a later health poll must not keep
+      // reporting a stale cause from before this restore ran.
+      this.storage.sqlite.setVectorDriftState(null);
       return {
         status: 'healthy',
         state: 'reconciled',
         unsynced_vectors: 0,
       };
-    }
-
-    if (outcome.driftedCount > 0) {
-      this.logger?.info({
-        event: 'backup_restore_vector_drift_detected',
-        mode: outcome.mode,
-        drifted_count: outcome.driftedCount,
-      });
-      this.scheduleBackgroundReconciliation();
     }
 
     // Task 3.3: `mode` names three genuinely different causes, and the
@@ -557,6 +553,19 @@ export class BackupService {
     const orphanMessage = surplusRemaining > 0
       ? `${surplusRemaining} vector-only orphan point(s) from a previous state could not be pruned and remain retryable work`
       : null;
+
+    if (outcome.driftedCount > 0) {
+      this.logger?.info({
+        event: 'backup_restore_vector_drift_detected',
+        mode: outcome.mode,
+        drifted_count: outcome.driftedCount,
+      });
+      // Persisted past this synchronous response (task 3.3) — `outcome.mode`
+      // here is never 'no-drift' (that case returned above), so it is
+      // always one of the three real VectorDriftCause values.
+      this.storage.sqlite.setVectorDriftState(outcome.mode as VectorDriftCause, driftMessage);
+      this.scheduleBackgroundReconciliation();
+    }
 
     return {
       status: 'degraded',
@@ -601,11 +610,17 @@ export class BackupService {
         this.retryOrGiveUp(attempt);
       } else {
         this.storage.setBackgroundReconciliationActive(false);
+        // strengthen-operational-observability task 3.3: background
+        // reconciliation has now fully caught up — the drift cause recorded
+        // when this restore first detected it (see
+        // `restoreVectorStateAfterActivation`) is resolved, so later health
+        // polls should stop attributing degraded state to it.
+        this.storage.sqlite.setVectorDriftState(null);
       }
     } catch (err) {
       this.logger?.warn?.({
         event: 'backup_restore_background_reconcile_failed',
-        error: (err as Error).message,
+        err,
         attempt,
       });
       this.retryOrGiveUp(attempt);

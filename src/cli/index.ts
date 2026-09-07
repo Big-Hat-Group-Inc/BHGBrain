@@ -41,7 +41,13 @@ async function createContext(): Promise<ToolContext> {
   const fileConfig = loadFileConfig();
   ensureDataDir(fileConfig);
   const config = deriveRuntimeConfig(fileConfig);
-  const logger = createLogger(config);
+  // strengthen-operational-observability task 1.3: every CLI command prints
+  // its actual result as JSON on stdout (see `printToolResult` above) so a
+  // calling script can pipe/parse it — structured log lines interleaved on
+  // the same stream would corrupt that output. Routed to stderr, mirroring
+  // src/index.ts's stdio-transport branch, which reserves stdout for MCP
+  // JSON-RPC for the identical reason.
+  const logger = createLogger(config, process.stderr);
 
   // Built through the same composition root the MCP server uses
   // (align-runtime-entrypoint-contracts task 2.1) — see src/context.ts.

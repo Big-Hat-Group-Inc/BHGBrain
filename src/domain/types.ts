@@ -17,7 +17,23 @@ export type RetentionTier = 'T0' | 'T1' | 'T2' | 'T3';
 
 export type HealthStatus = 'healthy' | 'degraded' | 'unhealthy';
 
-export type VectorReconciliationState = 'reconciled' | 'reconciling' | 'pending';
+// strengthen-operational-observability task 3.2: 'surplus_suspected' is a
+// distinct terminal state from 'pending' (SQLite has unsynced metadata
+// waiting on a vector) — it means the *opposite* direction of drift, where
+// the vector store holds more managed points than SQLite has authoritative
+// rows for (orphaned/vector-only points), which `pending`'s "still needs
+// reconciliation" framing does not describe.
+export type VectorReconciliationState = 'reconciled' | 'reconciling' | 'pending' | 'surplus_suspected';
+
+// strengthen-operational-observability task 3.3: the same three causes
+// `StorageManager.detectAndMarkVectorDrift` already distinguishes during a
+// restore (`VectorDriftReconciliationOutcome['mode']`, minus 'no-drift')
+// persisted so a LATER health poll — after the restore's own one-shot
+// response has already been returned to its caller — can still tell "the
+// embedding model changed" from "a transient read failure" from "an
+// ordinary checksum mismatch", instead of collapsing all three into one
+// generic "reconciling" message once the moment of restore has passed.
+export type VectorDriftCause = 'full-rebuild' | 'inspection-failed' | 'partial-drift';
 
 /**
  * Type/tags/time predicate pushed down into the vector and fulltext stores so a
@@ -213,6 +229,40 @@ export interface ComponentHealth {
 export interface VectorReconciliationStatus extends ComponentHealth {
   state: VectorReconciliationState;
   unsynced_vectors: number;
+  // strengthen-operational-observability task 3.3: the persisted cause of
+  // the most recent restore/reconcile drift, when one is on record — see
+  // `VectorDriftCause`. `null`/absent when no drift cause is on record
+  // (a fresh install, or the last one fully resolved).
+  drift_cause?: VectorDriftCause | null;
+  // strengthen-operational-observability task 3.2: the cached bidirectional
+  // signal — total points Qdrant reports across this store's managed
+  // collections vs. SQLite's authoritative memory count, plus when that
+  // comparison was last actually performed (design.md risk mitigation:
+  // "report staleness timestamp" for a check that is cached, not live, on
+  // every poll).
+  qdrant_points_total?: number;
+  sqlite_memory_count?: number;
+  checked_at?: string;
+}
+
+/**
+ * strengthen-operational-observability task 3.1: reports how close the
+ * store is to its configured `retention.max_db_size_gb`/`max_memories` hard
+ * caps, in both directions of "how far" — a raw byte/count figure alone
+ * forces every consumer to re-derive the percentage against config it may
+ * not have; publishing the percentage directly keeps that arithmetic in one
+ * place. `status` degrades at `retention.warn_at_percent` (before the hard
+ * cap in `over_capacity`/`checkRetention`'s existing capacity gate is ever
+ * reached), so an operator has advance warning instead of learning about
+ * capacity only once writes start failing.
+ */
+export interface CapacityHealth extends ComponentHealth {
+  db_size_bytes: number;
+  db_size_limit_bytes: number;
+  db_size_percent: number;
+  memory_count: number;
+  memory_count_limit: number;
+  memory_count_percent: number;
 }
 
 export interface RestoreResult {
@@ -229,6 +279,10 @@ export interface HealthSnapshot {
     embedding: ComponentHealth;
     vector_reconciliation: VectorReconciliationStatus;
     retention?: ComponentHealth;
+    // strengthen-operational-observability task 3.1: byte/count capacity
+    // thresholds — a sibling to `retention` above (which reports scheduled
+    // *cleanup* health), not a replacement for it.
+    capacity?: CapacityHealth;
     schedulers?: ComponentHealth;
     // Reports 'degraded' while any Qdrant collection is recorded 'failed' in
     // bootstrap_hydration_state — i.e. this device's vector-to-SQLite

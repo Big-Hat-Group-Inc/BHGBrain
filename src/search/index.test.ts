@@ -562,8 +562,12 @@ describe('SearchService', () => {
     // Hybrid degrades to fulltext-only rather than throwing...
     const results = await service.search('hello', 'global', undefined, 'hybrid', 10);
     expect(results.length).toBeGreaterThan(0);
-    // ...but the degradation is observable.
-    expect(metrics.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { namespace: 'global' });
+    // ...but the degradation is observable. `namespace` is deliberately NOT
+    // a metric label (strengthen-operational-observability task 2.1 /
+    // design.md decision 2: an unbounded, caller-controlled string must
+    // never grow the metrics registry) — only the fixed `mode` enum is.
+    // Namespace is still available on the paired log event below.
+    expect(metrics.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { mode: 'hybrid' });
     expect(logger.warn).toHaveBeenCalledWith(
       expect.objectContaining({ event: 'embedding_degraded', degraded: 'fulltext_only' }),
     );
@@ -571,16 +575,18 @@ describe('SearchService', () => {
     expect(storage.qdrant.search).not.toHaveBeenCalled();
   });
 
-  it('accumulates search_embedding_degraded independently per namespace (add-retrieval-quality-metrics 3.3)', async () => {
+  it('accumulates search_embedding_degraded into one bounded series regardless of namespace (strengthen-operational-observability task 2.1)', async () => {
     const { service: serviceA, embedding: embeddingA, metrics: metricsA } = createSearchService();
     (embeddingA.embed as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('embeddings down'));
     await serviceA.search('hello', 'team-a', undefined, 'hybrid', 10);
-    expect(metricsA.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { namespace: 'team-a' });
+    expect(metricsA.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { mode: 'hybrid' });
 
     const { service: serviceB, embedding: embeddingB, metrics: metricsB } = createSearchService();
     (embeddingB.embed as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('embeddings down'));
     await serviceB.search('hello', 'team-b', undefined, 'hybrid', 10);
-    expect(metricsB.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { namespace: 'team-b' });
+    // Different namespace, same bounded label set — a namespace never
+    // allocates its own series.
+    expect(metricsB.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { mode: 'hybrid' });
   });
 
   describe('retrieval quality metrics (add-retrieval-quality-metrics)', () => {
@@ -699,7 +705,7 @@ describe('SearchService', () => {
       service.search('hello', 'global', undefined, 'semantic', 10),
     ).rejects.toMatchObject({ code: 'EMBEDDING_UNAVAILABLE', retryable: false, message: 'OpenAI embeddings request rejected (HTTP 401)' });
 
-    expect(metrics.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { namespace: 'global', mode: 'semantic' });
+    expect(metrics.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { mode: 'semantic' });
     expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
       event: 'embedding_degraded',
       mode: 'semantic',
@@ -750,7 +756,7 @@ describe('SearchService', () => {
         await new Promise(resolve => setImmediate(resolve));
 
         expect(results.length).toBeGreaterThan(0);
-        expect(metrics.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { namespace: 'global' });
+        expect(metrics.incCounter).toHaveBeenCalledWith('search_embedding_degraded', 1, { mode: 'hybrid' });
         expect(logger.warn).toHaveBeenCalledWith(
           expect.objectContaining({ event: 'embedding_degraded', degraded: 'fulltext_only' }),
         );

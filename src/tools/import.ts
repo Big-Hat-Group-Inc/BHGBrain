@@ -181,7 +181,7 @@ async function processMemories(
         event: 'import_batch_embed_failed',
         batch_start: batchStart,
         batch_size: batch.length,
-        error: (err as Error).message,
+        err,
       });
     }
 
@@ -219,7 +219,7 @@ async function processMemories(
           event: 'import_chunk_failed',
           chunk_index: chunkIndex,
           collection: mem.collection,
-          error: (err as Error).message,
+          err,
         });
       }
     }

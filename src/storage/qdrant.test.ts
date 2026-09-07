@@ -489,7 +489,7 @@ describe('QdrantStore.searchSimilar', () => {
       event: 'similarity_search_failed',
       namespace: 'global',
       collection: 'work',
-      error: 'transport failure',
+      err: expect.objectContaining({ message: 'transport failure' }),
     }));
   });
 
@@ -1254,6 +1254,46 @@ describe('QdrantStore operational breaker coverage (bound-qdrant-http-runtime ta
     const failingStore = createStore(failing, { breaker });
     await expect(failingStore.getCollectionInfo('global', 'work')).rejects.toThrow('transport failure');
     expect(breaker.getState()).toBe('open');
+  });
+
+  it('getTotalManagedPointsCount sums points_count across every managed collection (task 3.2)', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(async () => ({
+        collections: [
+          { name: 'bhgbrain_global_general' },
+          { name: 'bhgbrain_global_work' },
+          { name: 'other_namespace_prefix' }, // not bhgbrain_-prefixed — excluded by listAllCollections
+        ],
+      })),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async (name: string) => {
+        const counts: Record<string, number> = { bhgbrain_global_general: 10, bhgbrain_global_work: 25 };
+        return { points_count: counts[name] } as never;
+      }),
+    };
+    const store = createStore(client);
+
+    await expect(store.getTotalManagedPointsCount()).resolves.toBe(35);
+  });
+
+  it('getTotalManagedPointsCount tolerates one collection vanishing mid-count rather than failing the whole sum', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(async () => ({
+        collections: [{ name: 'bhgbrain_global_general' }, { name: 'bhgbrain_global_gone' }],
+      })),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async (name: string) => {
+        if (name === 'bhgbrain_global_gone') {
+          const err = new Error('doesn\'t exist!') as Error & { status?: number };
+          err.status = 404;
+          throw err;
+        }
+        return { points_count: 7 } as never;
+      }),
+    };
+    const store = createStore(client);
+
+    await expect(store.getTotalManagedPointsCount()).resolves.toBe(7);
   });
 
   it('deleteCollection opens the breaker on a genuine failure and short-circuits the next call', async () => {

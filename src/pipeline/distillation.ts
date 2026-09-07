@@ -115,7 +115,7 @@ export class DistillationService {
           collection: cluster.collection,
           reason,
           cluster_size: records.length,
-          error: (err as Error).message,
+          err,
         });
         continue;
       }
@@ -145,7 +145,7 @@ export class DistillationService {
           event: 'distillation_write_failed',
           namespace: cluster.namespace,
           collection: cluster.collection,
-          error: (err as Error).message,
+          err,
         });
         continue;
       }
@@ -299,7 +299,11 @@ export class DistillationService {
     }
     const skipped = candidates.length - windowed.length;
 
-    this.metrics?.incCounter('bhgbrain_distill_candidates_skipped_total', skipped, { namespace, collection });
+    // strengthen-operational-observability task 2.1: namespace/collection
+    // are caller-controlled, effectively unbounded strings — omitted from
+    // the metric label set (see search/index.ts's matching fix) though
+    // still present on the paired log event below.
+    this.metrics?.incCounter('bhgbrain_distill_candidates_skipped_total', skipped);
     this.logger?.warn?.({
       event: 'distillation_candidates_capped',
       namespace,
@@ -347,7 +351,7 @@ export class DistillationService {
         this.logger?.warn?.({
           event: 'distillation_archive_failed',
           memory_id: record.id,
-          error: (err as Error).message,
+          err,
         });
       }
     }
@@ -363,7 +367,7 @@ export class DistillationService {
       this.logger?.warn?.({
         event: 'distillation_delete_failed',
         namespace,
-        error: (err as Error).message,
+        err,
       });
     }
 

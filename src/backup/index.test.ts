@@ -165,7 +165,7 @@ describe('BackupService restore activation', () => {
     const backupPath = makeBackupFile(tempDir, Buffer.from('not-used'), { version: 99 });
     const storage = {
       sqlite: {
-        beginLifecycleOperation: vi.fn(), endLifecycleOperation: vi.fn(),
+        beginLifecycleOperation: vi.fn(), endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
         countMemories: vi.fn(), countUnsyncedVectors: vi.fn(),
       },
       activateSqliteImage: vi.fn(),
@@ -185,7 +185,7 @@ describe('BackupService restore activation', () => {
     const storage = {
       sqlite: {
         beginLifecycleOperation: vi.fn(),
-        endLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 7),
         countUnsyncedVectors: vi.fn(() => 0),
@@ -220,6 +220,9 @@ describe('BackupService restore activation', () => {
       lifecycleToken: undefined,
       deviceId: null,
     });
+    // strengthen-operational-observability task 3.3: no drift found — any
+    // cause left over from a prior restore/reconcile is cleared.
+    expect(storage.sqlite.setVectorDriftState).toHaveBeenCalledWith(null);
     expect(storage.reconcileVectorsFromSqlite).not.toHaveBeenCalled();
     expect(storage.setBackgroundReconciliationActive).not.toHaveBeenCalled();
 
@@ -238,7 +241,7 @@ describe('BackupService restore activation', () => {
     const storage = {
       sqlite: {
         beginLifecycleOperation: vi.fn(),
-        endLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 7),
         countUnsyncedVectors: vi.fn(() => 0),
@@ -274,6 +277,7 @@ describe('BackupService restore activation', () => {
       sqlite: {
         beginLifecycleOperation: vi.fn(),
         endLifecycleOperation: vi.fn(() => { callOrder.push('endLifecycleOperation'); }),
+        setVectorDriftState: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 5),
         countUnsyncedVectors: vi.fn(() => 0),
@@ -331,7 +335,7 @@ describe('BackupService restore activation', () => {
     const storage = {
       sqlite: {
         beginLifecycleOperation: vi.fn(),
-        endLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 3),
         countUnsyncedVectors: vi.fn(() => 3),
@@ -356,6 +360,13 @@ describe('BackupService restore activation', () => {
         '(a transient failure, not a model change), so reconciliation is conservatively re-embedding the ' +
         'corpus in the background.',
     });
+    // strengthen-operational-observability task 3.3: the drift cause is
+    // persisted past this synchronous response so a later health poll can
+    // still tell this apart from a real embedding-model change.
+    expect(storage.sqlite.setVectorDriftState).toHaveBeenCalledWith(
+      'inspection-failed',
+      'the vector store could not be inspected for drift (a transient failure, not a model change), so reconciliation is conservatively re-embedding the corpus in the background',
+    );
 
     await flushMicrotasks();
 
@@ -372,7 +383,7 @@ describe('BackupService restore activation', () => {
     const storage = {
       sqlite: {
         beginLifecycleOperation: vi.fn(),
-        endLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 3),
         countUnsyncedVectors: vi.fn(() => 3),
@@ -401,6 +412,10 @@ describe('BackupService restore activation', () => {
       unsynced_vectors: 3,
       message: 'Restore activated SQLite metadata; the embedding model or dimensions changed since this backup, so vectors are being fully rebuilt in the background.',
     });
+    expect(storage.sqlite.setVectorDriftState).toHaveBeenCalledWith(
+      'full-rebuild',
+      'the embedding model or dimensions changed since this backup, so vectors are being fully rebuilt in the background',
+    );
 
     await flushMicrotasks();
 
@@ -417,7 +432,7 @@ describe('BackupService restore activation', () => {
       const storage = {
         sqlite: {
           beginLifecycleOperation: vi.fn(),
-          endLifecycleOperation: vi.fn(),
+          endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
           getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
           countMemories: vi.fn(() => 4),
           countUnsyncedVectors: vi.fn(() => 4),
@@ -463,7 +478,7 @@ describe('BackupService restore activation', () => {
       const storage = {
         sqlite: {
           beginLifecycleOperation: vi.fn(),
-          endLifecycleOperation: vi.fn(),
+          endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
           getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
           countMemories: vi.fn(() => 4),
           countUnsyncedVectors: vi.fn(() => 4),
@@ -514,7 +529,7 @@ describe('BackupService restore activation', () => {
     const storage = {
       sqlite: {
         beginLifecycleOperation: vi.fn(),
-        endLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 4),
         countUnsyncedVectors: vi.fn(() => 4),
@@ -558,7 +573,7 @@ describe('BackupService restore activation', () => {
     const storage = {
       sqlite: {
         beginLifecycleOperation: vi.fn(),
-        endLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 0),
         countUnsyncedVectors: vi.fn(() => 0),
@@ -598,7 +613,7 @@ describe('BackupService restore activation', () => {
     const storage = {
       sqlite: {
         beginLifecycleOperation: vi.fn(),
-        endLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 0),
         countUnsyncedVectors: vi.fn(() => 0),
@@ -634,7 +649,7 @@ describe('BackupService restore activation', () => {
     const storage = {
       sqlite: {
         beginLifecycleOperation,
-        endLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 2),
         countUnsyncedVectors: vi.fn(() => 0),
@@ -674,7 +689,7 @@ describe('BackupService restore activation', () => {
     const storage = {
       sqlite: {
         beginLifecycleOperation: vi.fn(),
-        endLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 2),
         countUnsyncedVectors: vi.fn(() => 0),
@@ -712,7 +727,7 @@ describe('BackupService restore activation', () => {
     const storage = {
       sqlite: {
         beginLifecycleOperation: vi.fn(),
-        endLifecycleOperation: vi.fn(),
+        endLifecycleOperation: vi.fn(), setVectorDriftState: vi.fn(),
         getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
         countMemories: vi.fn(() => 1),
         countUnsyncedVectors: vi.fn(() => 0),

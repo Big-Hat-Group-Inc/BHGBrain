@@ -2382,7 +2382,26 @@ bhgbrain health
     "sqlite": { "status": "healthy" },
     "qdrant": { "status": "healthy" },
     "embedding": { "status": "healthy" },
+    "vector_reconciliation": {
+      "status": "healthy",
+      "state": "reconciled",
+      "unsynced_vectors": 0,
+      "drift_cause": null,
+      "qdrant_points_total": 1234,
+      "sqlite_memory_count": 1234,
+      "checked_at": "2026-03-01T00:00:00.000Z"
+    },
     "retention": { "status": "healthy" },
+    "capacity": {
+      "status": "healthy",
+      "db_size_bytes": 8388608,
+      "db_size_limit_bytes": 2147483648,
+      "db_size_percent": 0.4,
+      "memory_count": 1234,
+      "memory_count_limit": 500000,
+      "memory_count_percent": 0.2
+    },
+    "schedulers": { "status": "healthy" },
     "bootstrap_hydration": { "status": "healthy" }
   },
   "memory_count": 1234,
@@ -2406,13 +2425,17 @@ bhgbrain health
 
 当最近一次 GC 运行（定时或手动）报告部分失败（某个归档或删除步骤失败）时，`components.retention` 也会变为 `"degraded"`（附带说明信息），与层级容量压力无关。下一次干净的 GC 运行会将其恢复为 `"healthy"`。
 
+`components.capacity` 会将 `retention.max_db_size_gb`/`retention.max_memories`（硬性上限）以及 `retention.warn_at_percent`（预警阈值，默认 80%）与存储当前的字节大小和记忆数量进行比对——一旦任意一项越过预警百分比，状态即变为 `"degraded"`，并在消息中区分"接近"上限与真正"已达到"上限，让运维人员在写入受影响之前就能提前获知。无论是否降级，都会始终报告 `db_size_percent`/`memory_count_percent`。
+
+`components.vector_reconciliation.state` 取值之一：`"reconciled"`（健康——SQLite 与向量存储一致）、`"reconciling"`（一次恢复或有边界的后台重新嵌入正在进行）、`"pending"`（SQLite 元数据需要向量，且当前没有任何流程在对齐——自动重试已耗尽，或需要运行一次修复）、或 `"surplus_suspected"`（向量存储报告的受管点数量明显多于 SQLite 具有权威记录的记忆数——很可能是中断的删除操作留下的孤立/仅向量存在的点）。`drift_cause`（非 `null` 时）用于区分 `"reconciling"`/`"pending"` 降级的*具体原因*：`"full-rebuild"`（自上次恢复以来嵌入模型/维度发生了变化）、`"inspection-failed"`（上次恢复期间 Qdrant 读取瞬时失败，出于保守考虑被当作需要重新嵌入处理——**并非**模型变更），或 `"partial-drift"`（普通的内容校验和不匹配）。该值会持久保存，超出发现它的那次恢复调用的生命周期，因此在对齐完成之前，后续的 `/health` 轮询仍能看到它。`qdrant_points_total`/`sqlite_memory_count`/`checked_at` 报告的是用于检测 `"surplus_suspected"` 的缓存双向计数比较（任务 3.2）——缓存 60 秒（这是对所有 Qdrant 集合的扫描，而非廉价的本地读取），因此可能比实时写入滞后长达该时长；若该计算本次瞬时失败，相关字段会被直接省略，而不会导致整个响应失败。
+
 当运行中的 SQLite 编译版本没有 `fts5` 模块时，`components.sqlite` 仍保持 `"healthy"`，但会附带一条 `message`：全文搜索此时运行的是旧版基于 `LIKE` 的匹配器（参见[全文搜索](#全文搜索)），而不是 FTS5/BM25 索引。启动时也会记录一次相应日志（`event: "fts5_unavailable"`）。
 
 当有任意 Qdrant 集合在本设备的 bootstrap hydration 状态中被持久记录为 `"failed"` 时，`components.bootstrap_hydration` 会变为 `"degraded"`（并在 `message` 中指出受影响的集合）——即某次向量到 SQLite 的 hydration 过程对该集合遇到了错误（一次瞬时的网络/Qdrant 故障，而非单点数据问题），且尚未重试成功。一旦之后的某次 hydration（下一次进程启动，或 `bhgbrain repair --from-qdrant`）成功 hydrate 该集合，状态就会恢复为 `"healthy"`。参见[修复与恢复](#修复与恢复)。
 
 **整体状态逻辑：**
 - `unhealthy`——如果 SQLite 或 Qdrant 不健康
-- `degraded`——如果嵌入已降级/不健康，或保留系统已降级（超容量或向量未同步），或某个 bootstrap hydration 集合已降级（hydration 失败，等待重试）
+- `degraded`——如果嵌入已降级/不健康，或保留系统已降级（超容量或向量未同步），或容量越过预警阈值，或向量对齐处于 `reconciling`/`pending`/`surplus_suspected`，或某个调度器失败或未激活，或某个 bootstrap hydration 集合已降级（hydration 失败，等待重试）
 - `healthy`——所有组件均健康
 
 **组件状态：**
@@ -2423,6 +2446,9 @@ bhgbrain health
 | `qdrant` | 有限范围的只读向量查询成功（空结果或尚未创建的集合也视为健康） | — | 向量查询本身失败，即使服务器可达 |
 | `embedding` | 嵌入 API 调用成功 | 缺少凭据或无法访问 | — |
 | `retention` | 所有预算在限制内，无未同步向量 | 预算超出或未同步向量 > 0 | — |
+| `capacity` | 数据库大小与记忆数量均低于其配置上限的 `warn_at_percent` | 任一项越过 `warn_at_percent`，或达到其硬性上限 | — |
+| `vector_reconciliation` | SQLite 与 Qdrant 一致（无未同步元数据，无可疑盈余） | 正在对齐、待处理、或存在可疑的向量盈余 | — |
+| `schedulers` | 每个已配置的定时任务（清理、蒸馏）均已激活且无记录失败 | 某个已配置任务上次运行失败，或未激活 | — |
 | `bootstrap_hydration` | 每个已发现的 Qdrant 集合都已 hydrate（或尚不存在任何集合） | 至少一个集合 hydration 失败，正等待重试 | — |
 
 **HTTP 状态码（`GET /health`）：**
@@ -2512,36 +2538,42 @@ scroll/列出/删除 —— 都受 `qdrant.operation_timeout_ms` 约束（默认
 
 ### 指标
 
-如果 `observability.metrics_enabled: true`，则可访问指标端点：
-
 ```bash
 GET /metrics
 ```
 
-以 Prometheus 文本暴露格式返回指标：每个指标名称输出一行 `# TYPE <name>
-<counter|gauge|histogram>`，随后是 `name{label="value",...} value` 形式的行（对于没有标签的指标，会省略
-`{...}` 部分，从而保持与之前无标签格式的向后兼容）。
+当 `observability.metrics_enabled: true`（默认 `false`）时，此端点以 Prometheus 文本暴露格式返回
+指标：每个指标名称输出一行 `# TYPE <name> <counter|gauge|histogram>`，随后是
+`name{label="value",...} value` 形式的行（对于没有标签的指标，会省略 `{...}` 部分）。
+
+当指标被禁用时，该路由依然存在——它会返回 `503` 并附带明确说明
+（`{"metrics_enabled": false, "message": "..."}`），而不是 Express 通用的"路由未找到" `404`，服务器
+还会在启动时记录一次 `metrics_disabled` 事件，因此无论通过探测还是查看日志，"`/metrics` 是被禁用了，
+还是这个构建版本压根没有它"都不会产生歧义。
 
 | 指标 | 类型 | 说明 |
 |---|---|---|
-| `bhgbrain_tool_calls_total` | counter | 工具调用总次数 |
-| `bhgbrain_tool_handler_ms_avg` | histogram | 工具处理程序的平均延迟（毫秒），带有 `tool`（工具名称）和 `status`（`ok`/`error`）标签。每次调用都会记录，包括失败的调用。 |
+| `bhgbrain_tool_calls_total` | counter | 工具调用完成的单调计数，带有 `tool`（取自固定的调度集合——无法识别的名称会被报告为 `invalid_tool`，永远不会分配自己的序列）和 `status`（`ok`/`error`）标签。与下面的滚动延迟直方图不同，该计数器永不重置窗口，因此仅凭它计算的 `error / total` 能一直保持有意义，而不仅限于最近 1,000 次调用。 |
+| `bhgbrain_tool_handler_ms_avg` | histogram | 工具处理程序的平均延迟（毫秒），带有 `tool` 和 `status` 标签。每次调用都会记录，包括失败的调用。 |
 | `bhgbrain_tool_handler_ms_p50` | histogram | 工具处理程序延迟的第 50 百分位，带有 `tool` 和 `status` 标签 |
 | `bhgbrain_tool_handler_ms_p95` | histogram | 工具处理程序延迟的第 95 百分位，带有 `tool` 和 `status` 标签 |
 | `bhgbrain_tool_handler_ms_p99` | histogram | 工具处理程序延迟的第 99 百分位，带有 `tool` 和 `status` 标签 |
-| `bhgbrain_tool_handler_ms_count` | counter | 工具处理程序延迟样本数量，带有 `tool` 和 `status` 标签 |
+| `bhgbrain_tool_handler_ms_sample_count` | gauge | 该 `tool`/`status` 组合滚动窗口的当前占用量（0-1000）——**非**单调，因为旧样本会随着新样本进入而移出窗口 |
+| `bhgbrain_tool_handler_ms_observations_total` | counter | 该 `tool`/`status` 组合有史以来记录的每一个工具处理程序延迟样本的真实单调总数，不受滚动窗口淘汰的影响 |
 | `embedding_embed_batch_ms_p95` | histogram | 嵌入批处理延迟的第 95 百分位 |
 | `search_total_ms_p95` | histogram | 端到端搜索延迟的第 95 百分位 |
 | `search_result_count_avg` | histogram | 每次 `search`/`recall` 调用返回结果数量的平均值，按 `mode`（`semantic`/`fulltext`/`hybrid`）分类。仅统计模式特定的结果——`include_archived` 附加的已归档匹配项不计入。 |
 | `search_result_count_p50` | histogram | 结果数量的第 50 百分位，按 `mode` 分类 |
 | `search_result_count_p95` | histogram | 结果数量的第 95 百分位，按 `mode` 分类 |
 | `search_result_count_p99` | histogram | 结果数量的第 99 百分位，按 `mode` 分类 |
-| `search_result_count_count` | counter | `search_result_count` 样本数量，按 `mode` 分类 |
+| `search_result_count_sample_count` | gauge | 滚动窗口的当前占用量，按 `mode` 分类 |
+| `search_result_count_observations_total` | counter | `search_result_count` 样本的真实单调总数，按 `mode` 分类 |
 | `search_result_score_avg` | histogram | 每次 `search`/`recall` 调用结果综合得分的平均值，按 `mode` 分类。每个结果一个样本；已归档匹配项因携带占位得分（而非相关性得分）而被排除。 |
 | `search_result_score_p50` | histogram | 结果综合得分的第 50 百分位，按 `mode` 分类 |
 | `search_result_score_p95` | histogram | 结果综合得分的第 95 百分位，按 `mode` 分类 |
 | `search_result_score_p99` | histogram | 结果综合得分的第 99 百分位，按 `mode` 分类 |
-| `search_result_score_count` | counter | `search_result_score` 样本数量，按 `mode` 分类 |
+| `search_result_score_sample_count` | gauge | 滚动窗口的当前占用量，按 `mode` 分类 |
+| `search_result_score_observations_total` | counter | `search_result_score` 样本的真实单调总数，按 `mode` 分类 |
 | `bhgbrain_memory_count` | gauge | 当前总记忆数量（写入/删除时更新） |
 | `bhgbrain_rate_limit_buckets` | gauge | 活跃的速率限制追踪桶 |
 | `bhgbrain_rate_limited_total` | counter | 被速率限制的请求总数 |
@@ -2552,7 +2584,9 @@ GET /metrics
 | `bhgbrain_mcp_sessions_evicted_total` | counter | 会话管理器关闭的 MCP HTTP 会话总数，带 `reason` 标签（`idle` 或 `capacity`） |
 | `recall_zero_after_filter` | counter | 当 `recall` 检索后的类型/标签/`after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
 | `search_zero_after_filter` | counter | 当 `search` 检索后的 `after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
-| `search_embedding_degraded` | counter | 当 `hybrid` 模式搜索因嵌入提供方或向量存储不可用而降级为仅全文搜索时递增，按 `namespace` 分类 |
+| `search_embedding_degraded` | counter | 当搜索因嵌入提供方或向量存储不可用而从语义评分降级时递增，按 `mode`（`semantic`/`hybrid`）分类。**不**按 `namespace` 分类——无界的、由调用方控制的值永远不会成为指标标签（见下文）。 |
+| `bhgbrain_metrics_dropped_series_total` | counter | 注册表因已达到其固定上限而拒绝分配的新指标序列的累计计数。从首次抓取起即存在（值为 `0`），因此无需自身分配序列即可观察到饱和情况。 |
+| `bhgbrain_metrics_registry_size` | gauge | 进程内注册表当前持有的不同序列（计数器 + 直方图族）总数 |
 
 例如：
 
@@ -2563,9 +2597,42 @@ bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
 ```
 
 直方图对**每种标签组合**使用最后 1,000 个样本的有界循环缓冲区（即每个 工具/状态 组合都拥有自己的
-1,000 个样本窗口）。指标仅在进程内——不进行外部推送。由于失败现在也会计入
+1,000 个样本窗口）——该滚动窗口自身的占用量以 `_sample_count` gauge 的形式暴露，而不是
+`_count`-后缀的 counter，这样抓取端就不会将其误认为单调值；旁边的 `_observations_total` counter
+才是真正的单调数值。指标仅在进程内——不进行外部推送。由于失败现在也会计入
 `bhgbrain_tool_handler_ms`，其 p95/p99 会反映缓慢的失败尾部（超时、熔断器打开等），因此可能比该指标
 开始记录失败之前更高。
+
+**有界基数：** 整个进程内注册表（所有计数器与直方图族合计）被限制在一个固定的序列总数上限内。原本
+可能无界的标签值——例如 REST 调用方探测任意 `/tool/:name` 路径产生的未知工具名、命名空间、
+collection——要么在用作标签之前被归一化为一个较小的固定词表（未知工具名归一化为
+`invalid_tool`），要么被完全从标签集合中省略（命名空间/collection），因此无论调用方控制的输入如何
+组合，都无法让注册表无限增长。一旦达到上限，一个真正全新的序列会被拒绝而不是被分配（可通过上方的
+`bhgbrain_metrics_dropped_series_total`/`bhgbrain_metrics_registry_size` 观察到）；已被追踪的既有
+序列永远不受影响。
+
+### 请求关联与结构化日志
+
+每个 HTTP 响应都携带一个 `X-Request-Id` 响应头——如果请求中已带有 `X-Request-Id` 请求头，则复用它
+（以便请求经过前置代理后仍可追踪），否则重新生成一个——而服务器在处理该请求期间产生的每一行日志
+（工具调用本身，以及失败时的终端错误处理器）都包含相同的 `request_id` 字段，若可推导还会附带
+`client_id`。在 MCP 中，对应的标识符是 `session_id`（每个 Streamable HTTP 会话一个，在其生命周期内
+保持不变）和 `call_id`（该会话内每次工具调用一个，或在 stdio 上每次调用一个）。这使得运维人员可以从
+一个繁忙、并发的服务器中精确提取某一个失败请求的每一行日志——通过对客户端可见的 `request_id`/
+`session_id`（来自响应头或错误信息）执行 grep，而不是依赖一个多个并发调用都可能落入的时间窗口。
+
+每一行日志还携带固定的 `service`/`version` 基础字段，且任何异常都会记录在同一个 `err` 字段下
+（类型、消息、堆栈，以及——当底层 `Error` 是以 `{ cause }` 构造时——被折叠进同一条 message/stack 的
+成因链），而不是每个调用点各自命名不一致、被拍平的 `error`/`message`/`stack` 字段集合。`BrainError`
+自身的 `code`/`retryable` 也会被带入同一个 `err` 对象。
+
+CLI（`bhgbrain ...`）始终将自己的结构化日志写入 **stderr**，将 **stdout** 保留给脚本在管道化该命令
+输出时期望能干净解析的 JSON 结果（这与现有 stdio MCP 传输的 stdout/stderr 划分保持一致——参见
+[stdio 模式](#stdio-模式通过-stdinstdout-的-mcp)）。
+
+一个在进程整个生命周期内都成立的状态（例如"未配置 Bearer 令牌，因此该服务器提供未经身份验证的
+流量"）只会在每次服务器启动时记录一次，而不是每个请求都记录一次——一个处理数千个请求的回环部署
+不会因为同一行日志重复数千次而淹没其 warn 级别日志。
 
 ---
 

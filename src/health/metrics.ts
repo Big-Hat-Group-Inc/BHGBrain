@@ -55,6 +55,15 @@ interface HistogramFamily {
   name: string;
   labels?: Record<string, string>;
   buffer: BoundedBuffer;
+  // strengthen-operational-observability task 2.3: the buffer above only
+  // ever holds the most recent `HISTOGRAM_CAPACITY` samples, so its own
+  // `.length` cannot answer "how many observations has this family EVER
+  // recorded" once more than that many calls have been made — an operator
+  // computing an error rate as (error observations / total observations)
+  // needs a true monotonic denominator that keeps growing after the buffer
+  // has wrapped, not one that resets to the window size. Tracked
+  // independently of the buffer so it is never affected by eviction.
+  totalObservations: number;
 }
 
 /** Stable composite key so identical label sets (regardless of key order) share a buffer. */
@@ -75,37 +84,93 @@ interface CounterEntry {
   value: number;
 }
 
+// strengthen-operational-observability task 2.1: the whole point of a
+// registry cap is that it is a genuinely fixed ceiling — callers cannot
+// raise it via configuration, since a value read from config could itself
+// be pushed arbitrarily high by whatever already controls the attacker-
+// influenced label values (tool/namespace/etc.) this cap defends against.
+const MAX_TOTAL_SERIES = 2000;
+
+// A label value is truncated (not rejected outright) at this length so one
+// pathologically long value can never itself become an unbounded-memory
+// attack independent of the series cap above.
+const MAX_LABEL_VALUE_LENGTH = 128;
+
+const DROPPED_SERIES_METRIC = 'bhgbrain_metrics_dropped_series_total';
+const REGISTRY_SIZE_METRIC = 'bhgbrain_metrics_registry_size';
+
+function sanitizeLabels(labels?: Record<string, string>): Record<string, string> | undefined {
+  if (!labels) return undefined;
+  const entries = Object.entries(labels).map(([k, v]) => {
+    const value = typeof v === 'string' ? v : String(v);
+    return [k, value.length > MAX_LABEL_VALUE_LENGTH ? value.slice(0, MAX_LABEL_VALUE_LENGTH) : value] as const;
+  });
+  return Object.fromEntries(entries);
+}
+
 export class MetricsCollector {
   private enabled: boolean;
   private counters = new Map<string, CounterEntry>();
   private histograms = new Map<string, HistogramFamily>();
   private gauges = new Map<string, number>();
+  // strengthen-operational-observability task 2.2: counted independently of
+  // `counters`/`histograms` (never itself subject to the cap it reports on)
+  // so saturation stays visible via `getMetrics()` even once the registry
+  // is completely full and refusing every new series.
+  private droppedSeries = 0;
   private static readonly HISTOGRAM_CAPACITY = 1000;
 
   constructor(config: BrainConfig) {
     this.enabled = config.observability.metrics_enabled;
   }
 
+  /** Total distinct series currently held (counters + histogram families). */
+  private seriesCount(): number {
+    return this.counters.size + this.histograms.size;
+  }
+
+  /**
+   * Returns true when `key` may allocate a new series in `existing` — either
+   * because it already exists (incrementing/observing an existing series
+   * never counts against the cap) or because the registry has room for one
+   * more. A rejected allocation increments `droppedSeries` so operators can
+   * see saturation (task 2.1/2.2's "unknown tool/namespace inputs cannot
+   * grow the registry ... registry remains within its configured cap").
+   */
+  private admit(key: string, existing: Map<string, unknown>): boolean {
+    if (existing.has(key)) return true;
+    if (this.seriesCount() >= MAX_TOTAL_SERIES) {
+      this.droppedSeries += 1;
+      return false;
+    }
+    return true;
+  }
+
   incCounter(name: string, amount = 1, labels?: Record<string, string>): void {
     if (!this.enabled) return;
-    const key = histogramKey(name, labels);
+    const cleanLabels = sanitizeLabels(labels);
+    const key = histogramKey(name, cleanLabels);
+    if (!this.admit(key, this.counters)) return;
     const current = this.counters.get(key);
     if (current) {
       current.value += amount;
     } else {
-      this.counters.set(key, { name, labels, value: amount });
+      this.counters.set(key, { name, labels: cleanLabels, value: amount });
     }
   }
 
   recordHistogram(name: string, value: number, labels?: Record<string, string>): void {
     if (!this.enabled) return;
-    const key = histogramKey(name, labels);
+    const cleanLabels = sanitizeLabels(labels);
+    const key = histogramKey(name, cleanLabels);
+    if (!this.admit(key, this.histograms)) return;
     let family = this.histograms.get(key);
     if (!family) {
-      family = { name, labels, buffer: new BoundedBuffer(MetricsCollector.HISTOGRAM_CAPACITY) };
+      family = { name, labels: cleanLabels, buffer: new BoundedBuffer(MetricsCollector.HISTOGRAM_CAPACITY), totalObservations: 0 };
       this.histograms.set(key, family);
     }
     family.buffer.push(value);
+    family.totalObservations += 1;
   }
 
   setGauge(name: string, value: number): void {
@@ -131,14 +196,30 @@ export class MetricsCollector {
       entries.push({ name: `${name}_p50`, type: 'histogram', value: computePercentile(sortedValues, 50), labels });
       entries.push({ name: `${name}_p95`, type: 'histogram', value: computePercentile(sortedValues, 95), labels });
       entries.push({ name: `${name}_p99`, type: 'histogram', value: computePercentile(sortedValues, 99), labels });
-      // The rolling sample count is a simple cumulative counter, not a percentile
-      // value, so it is tagged 'counter' (not 'histogram') even though it belongs
-      // to the same histogram family and carries the same labels.
-      entries.push({ name: `${name}_count`, type: 'counter', value: count, labels });
+      // strengthen-operational-observability task 2.3 / design.md decision
+      // 3: the rolling window's current occupancy is NOT a cumulative
+      // count — it goes back down implicitly (stays at capacity) as old
+      // samples are evicted, so a monitoring system reading it as monotonic
+      // (as the prior `_count`-suffixed, 'counter'-typed field invited)
+      // would derive a nonsensical rate. Tagged 'gauge' and suffixed
+      // `_sample_count` instead of `_count` to make that explicit.
+      entries.push({ name: `${name}_sample_count`, type: 'gauge', value: count, labels });
+      // The true monotonic total — keeps growing after the buffer above has
+      // wrapped, so an error-rate query (errors / total) built from two
+      // `_observations_total` counters stays meaningful past 1,000 samples,
+      // where the rolling buffer alone would silently cap the denominator.
+      entries.push({ name: `${name}_observations_total`, type: 'counter', value: family.totalObservations, labels });
     }
     for (const [name, value] of this.gauges) {
       entries.push({ name, type: 'gauge', value });
     }
+
+    // strengthen-operational-observability task 2.2: always present (even
+    // at zero) once metrics are enabled, so "saturation is visible without
+    // allocating new series" holds from the very first scrape rather than
+    // only once the registry has actually dropped something.
+    entries.push({ name: DROPPED_SERIES_METRIC, type: 'counter', value: this.droppedSeries });
+    entries.push({ name: REGISTRY_SIZE_METRIC, type: 'gauge', value: this.seriesCount() });
 
     return entries;
   }

@@ -8,6 +8,8 @@
  * transport connection. See `openspec/changes/adopt-streamable-http-mcp-transport`.
  */
 
+import { randomUUID } from 'node:crypto';
+import type pino from 'pino';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import {
   CallToolRequestSchema,
@@ -81,13 +83,35 @@ function normalizeRememberResult(toolName: string, result: unknown): unknown {
 }
 
 /**
+ * Options threading request/session correlation into a built `Server`
+ * (strengthen-operational-observability task 1.5/design.md decision 1:
+ * "MCP uses session ID plus a per-call ID; trusted client identity is
+ * passed into `buildMcpServer` and child loggers").
+ */
+export interface BuildMcpServerOptions {
+  /**
+   * Base logger for this server instance — a session-scoped child logger
+   * (carrying `session_id`/`client_id`) for the Streamable HTTP transport
+   * (see `src/transport/mcp-http.ts`'s `createSession`), or the process-wide
+   * logger for stdio, where there is exactly one long-lived connection per
+   * process. Defaults to `ctx.logger`.
+   */
+  logger?: pino.Logger;
+  /** Trusted client identity (HTTP: the derived socket/forwarded IP; stdio: unknown — a single local client). Defaults to 'unknown'. */
+  clientId?: string;
+}
+
+/**
  * Constructs a new MCP `Server` with the ListTools/CallTool/ListResources/
  * ListResourceTemplates/ReadResource handlers registered against the given
  * `ctx`/`resources`. Callers connect the returned server to whichever
  * `Transport` is appropriate (stdio, or a per-session
  * `StreamableHTTPServerTransport`).
  */
-export function buildMcpServer(ctx: ToolContext, resources: ResourceHandler): Server {
+export function buildMcpServer(ctx: ToolContext, resources: ResourceHandler, options?: BuildMcpServerOptions): Server {
+  const baseLogger = options?.logger ?? ctx.logger;
+  const clientId = options?.clientId ?? 'unknown';
+
   const server = new Server(
     { name: 'bhgbrain', version: MCP_SERVER_VERSION },
     { capabilities: { tools: {}, resources: { listChanged: true }, prompts: {} } },
@@ -105,7 +129,16 @@ export function buildMcpServer(ctx: ToolContext, resources: ResourceHandler): Se
     if (!MCP_TOOL_NAMES.has(name)) {
       throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
     }
-    const result = await handleTool(ctx, name, toolArgs);
+    // strengthen-operational-observability task 1.5: a per-call id on top of
+    // the session-scoped base logger, so two concurrent calls on the same
+    // MCP session (or the same stdio connection) still produce
+    // distinguishable `tool_call`/`tool_error` log lines. `baseLogger` is
+    // optional-chained rather than assumed present so a caller that omits
+    // `ctx.logger` entirely (a bare test double) still gets a well-defined
+    // `undefined` — `handleTool` itself falls back to `ctx.logger` in that
+    // case, exactly as it did before this call ever passed a logger through.
+    const callLogger = baseLogger?.child({ call_id: randomUUID() });
+    const result = await handleTool(ctx, name, toolArgs, clientId, callLogger);
     return buildToolCallResponse(normalizeRememberResult(name, result));
   });
 

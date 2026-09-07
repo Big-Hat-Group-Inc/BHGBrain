@@ -4,6 +4,7 @@ import type { ArchiveRecord, MemoryRecord, RetentionTier } from '../domain/types
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { buildRestoredMemoryFromArchive } from '../domain/archive-restore.js';
 import type { MetricsCollector } from '../health/metrics.js';
+import { toLogError } from '../health/logger.js';
 
 type CleanupPageSqlite = {
   listExpiredMemoriesPage?: (
@@ -190,7 +191,7 @@ export class RetentionService {
           this.warn({
             event: 'retention_gc_archive_failed',
             memory_id: memory.id,
-            error: (err as Error).message,
+            err,
           });
         }
       }
@@ -199,7 +200,7 @@ export class RetentionService {
       try {
         deleteResult = await this.storage.deleteMemories(archivedOk, { flush: false, lifecycleToken });
       } catch (err) {
-        this.warn({ event: 'retention_gc_delete_failed', error: (err as Error).message });
+        this.warn({ event: 'retention_gc_delete_failed', err });
         deleteResult = { deleted: 0, unreconciled: archivedOk.map(m => m.id), degraded: true };
       }
 
@@ -297,14 +298,14 @@ export class RetentionService {
       } catch (stateError) {
         this.error({
           event: 'retention_gc_state_record_failed',
-          error: (stateError as Error).message,
-          original_error: (err as Error).message,
+          err: stateError,
+          original_error: toLogError(err).message,
         });
       }
       this.warn({
         event: 'retention_gc',
         outcome: 'degraded',
-        error: (err as Error).message,
+        err,
         scanned: deletable.length,
         remaining: remainingAfterPass(),
         continuation: true,
@@ -367,7 +368,7 @@ export class RetentionService {
           event: 'retention_gc_collection_info_failed',
           namespace,
           collection,
-          error: (err as Error).message,
+          err,
         });
         continue;
       }

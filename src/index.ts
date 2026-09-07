@@ -6,7 +6,7 @@ import { loadFileConfig, deriveRuntimeConfig, ensureDataDir } from './config/ind
 import type { SqliteStore } from './storage/sqlite.js';
 import type { CleanupScheduler, DistillationScheduler } from './backup/scheduler.js';
 import type { BackupService } from './backup/index.js';
-import { createLogger } from './health/logger.js';
+import { createLogger, toLogError } from './health/logger.js';
 import { createHttpServer, applyHttpServerTimeouts, listenAsync } from './transport/http.js';
 import { buildMcpServer } from './transport/mcp-server.js';
 import { buildToolContext } from './context.js';
@@ -70,7 +70,7 @@ function createShutdown(deps: ShutdownDeps): (signal: string, opts?: { fatal?: b
         deps.sqlite.cancelDeferredFlush();
         deps.sqlite.flushIfDirty();
       } catch (err) {
-        deps.logger.error({ event: 'shutdown_timeout_flush_failed', error: (err as Error).message });
+        deps.logger.error({ event: 'shutdown_timeout_flush_failed', err: toLogError(err) });
       }
       process.exit(1);
     }, SHUTDOWN_DEADLINE_MS);
@@ -79,14 +79,14 @@ function createShutdown(deps: ShutdownDeps): (signal: string, opts?: { fatal?: b
     try {
       deps.sqlite.flushIfDirty();
     } catch (err) {
-      deps.logger.error({ event: 'shutdown_flush_failed', error: (err as Error).message });
+      deps.logger.error({ event: 'shutdown_flush_failed', err: toLogError(err) });
     }
 
     void (async () => {
       try {
         await deps.drain();
       } catch (err) {
-        deps.logger.error({ event: 'shutdown_drain_failed', error: (err as Error).message });
+        deps.logger.error({ event: 'shutdown_drain_failed', err: toLogError(err) });
       } finally {
         deps.cleanupScheduler.stop();
         deps.distillationScheduler.stop();
@@ -94,7 +94,7 @@ function createShutdown(deps: ShutdownDeps): (signal: string, opts?: { fatal?: b
         try {
           deps.sqlite.close();
         } catch (err) {
-          deps.logger.error({ event: 'shutdown_close_failed', error: (err as Error).message });
+          deps.logger.error({ event: 'shutdown_close_failed', err: toLogError(err) });
         }
         clearTimeout(deadline);
         deps.logger.info({ event: 'shutdown_complete', signal, transport: deps.transport, exit_code: exitCode });
@@ -139,11 +139,11 @@ function installFatalProcessHandlers(logger: pino.Logger, shutdown: (signal: str
   process.removeAllListeners('uncaughtException');
   process.on('unhandledRejection', (reason) => {
     const err = reason instanceof Error ? reason : new Error(String(reason));
-    logger.error({ event: 'unhandled_rejection', error: err.message, stack: err.stack });
+    logger.error({ event: 'unhandled_rejection', err });
     shutdown('unhandledRejection', { fatal: true });
   });
   process.on('uncaughtException', (err) => {
-    logger.error({ event: 'uncaught_exception', error: err.message, stack: err.stack });
+    logger.error({ event: 'uncaught_exception', err });
     shutdown('uncaughtException', { fatal: true });
   });
 }
@@ -186,7 +186,7 @@ async function main() {
     // that triggered it, since the underlying mutation already succeeded.
     ctx.notifyResourceListChanged = () => {
       server.sendResourceListChanged().catch((err: unknown) => {
-        logger.debug({ event: 'resource_list_changed_notify_failed', error: (err as Error).message });
+        logger.debug({ event: 'resource_list_changed_notify_failed', err: toLogError(err) });
       });
     };
 
@@ -241,12 +241,12 @@ async function main() {
       const nodeErr = err as NodeJS.ErrnoException;
       logger.error({
         event: 'listen_failed', transport: 'http', host, port,
-        error: nodeErr.message, code: nodeErr.code,
+        err: nodeErr, code: nodeErr.code,
       });
       try {
         sqlite.close();
       } catch (closeErr) {
-        logger.error({ event: 'listen_failed_close_failed', error: (closeErr as Error).message });
+        logger.error({ event: 'listen_failed_close_failed', err: toLogError(closeErr) });
       }
       process.exit(1);
       return;
@@ -285,7 +285,7 @@ async function main() {
     // error" the spec requires structured, bounded handling for — routed
     // through the same fatal shutdown path (task 3.2).
     httpServer.on('error', (err: NodeJS.ErrnoException) => {
-      logger.error({ event: 'http_listener_error', error: err.message, code: err.code });
+      logger.error({ event: 'http_listener_error', err, code: err.code });
       shutdown('http_listener_error', { fatal: true });
     });
     process.on('SIGINT', () => shutdown('SIGINT'));

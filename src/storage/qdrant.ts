@@ -491,7 +491,7 @@ export class QdrantStore {
         event: 'similarity_search_failed',
         namespace,
         collection,
-        error: (err as Error).message,
+        err,
       });
       throw err;
     }
@@ -540,7 +540,7 @@ export class QdrantStore {
         namespace,
         collection,
         point_id: pointId,
-        error: (err as Error).message,
+        err,
       });
       throw err;
     }
@@ -651,6 +651,32 @@ export class QdrantStore {
         throw err;
       }
     });
+  }
+
+  /**
+   * strengthen-operational-observability task 3.2: total point count across
+   * every collection this store manages (`bhgbrain_*`, per `listAllCollections`
+   * — itself already short-TTL cached), for the bidirectional "does Qdrant
+   * hold more points than SQLite has authoritative rows for" health signal.
+   * A single missing collection (raced a concurrent delete between the list
+   * and this call) contributes 0 rather than failing the whole count — the
+   * signal is meant to be a cheap, best-effort cross-check, not a strict
+   * transactional read.
+   */
+  async getTotalManagedPointsCount(): Promise<number> {
+    const names = await this.listAllCollections();
+    const counts = await Promise.all(names.map(async name => this.executeWithBreaker(async () => {
+      try {
+        const info = await this.client.getCollection(name);
+        return info.points_count ?? 0;
+      } catch (err) {
+        if (this.isNotFoundError(err)) {
+          return 0;
+        }
+        throw err;
+      }
+    })));
+    return counts.reduce((sum, count) => sum + count, 0);
   }
 
   async listAllCollections(): Promise<string[]> {

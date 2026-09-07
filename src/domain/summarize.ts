@@ -131,7 +131,7 @@ export async function summarizeContent(
     } catch (err) {
       logger?.warn({
         event: 'summarization_degraded',
-        error: (err as Error).message,
+        err,
       });
     }
   }

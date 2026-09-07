@@ -127,10 +127,15 @@ describe('createHttpServer', () => {
     handleToolMock.mockClear();
 
     const { createHttpServer } = await import('./http.js');
-    const logger = {
+    const logger: { warn: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn>; child: ReturnType<typeof vi.fn> } = {
       warn: vi.fn(),
       info: vi.fn(),
       error: vi.fn(),
+      // strengthen-operational-observability task 1.5: the request-context
+      // and MCP-session middleware both derive a child logger via
+      // `.child(...)` — self-referential so `logger.warn`/etc. assertions
+      // below still see calls made through a derived child.
+      child: vi.fn(() => logger),
     };
 
     const defaultMetrics = {
@@ -335,12 +340,17 @@ describe('createHttpServer', () => {
     expect(res.body).toMatchObject({ error: { code: 'NOT_FOUND' } });
   });
 
-  it('serves metrics only when enabled', async () => {
+  it('serves metrics when enabled, or an explicit disabled explanation (not an unexplained 404) otherwise (task 2.4)', async () => {
     const disabled = await buildApp(createConfig(false, true));
     const disabledResponse = await request(disabled.app)
       .get('/metrics')
       .set('Authorization', 'Bearer secret-token');
-    expect(disabledResponse.status).toBe(404);
+    // The route is registered either way — a disabled install answers 503
+    // with the reason, never the generic "route not found" 404 a caller
+    // cannot distinguish from a typo'd path.
+    expect(disabledResponse.status).toBe(503);
+    expect(disabledResponse.body).toMatchObject({ metrics_enabled: false });
+    expect(disabledResponse.body.message).toMatch(/metrics_enabled/);
 
     const enabled = await buildApp(createConfig(true, true), {
       metrics: {

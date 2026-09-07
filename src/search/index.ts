@@ -319,7 +319,13 @@ export class SearchService {
       // EMBEDDING_UNAVAILABLE. Metered/logged here so the cause is visible
       // even though semantic mode's contract is still to raise, not degrade.
       if (err instanceof BrainError) {
-        this.metrics?.incCounter('search_embedding_degraded', 1, { namespace, mode: 'semantic' });
+        // strengthen-operational-observability task 2.1: `namespace` is a
+        // caller-controlled, effectively unbounded string — attaching it as
+        // a metric label would let repeated calls from distinct namespaces
+        // permanently grow the metrics registry. `mode` alone (a fixed
+        // enum) is kept; namespace stays available in the paired log event
+        // below, where cardinality is not a concern.
+        this.metrics?.incCounter('search_embedding_degraded', 1, { mode: 'semantic' });
         this.logger?.warn({
           event: 'embedding_degraded',
           mode: 'semantic',
@@ -441,7 +447,9 @@ export class SearchService {
       // code/retryability (when available) alongside the message, so a
       // degraded-fulltext-only search's telemetry still distinguishes e.g. a
       // non-retryable auth failure from a transient rate limit.
-      this.metrics?.incCounter('search_embedding_degraded', 1, { namespace });
+      // strengthen-operational-observability task 2.1: no namespace label —
+      // see the matching comment on the semantic-mode call site above.
+      this.metrics?.incCounter('search_embedding_degraded', 1, { mode: 'hybrid' });
       this.logger?.warn({
         event: 'embedding_degraded',
         degraded: 'fulltext_only',
