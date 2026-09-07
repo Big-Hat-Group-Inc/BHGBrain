@@ -23,6 +23,30 @@ interface SchedulerHealthState {
   failure: string | null;
 }
 
+/**
+ * bound-qdrant-http-runtime task 2.1: the terse public `/health/live`
+ * response — process responsiveness only, no dependency I/O at all.
+ */
+export interface LivenessSnapshot {
+  status: 'ok';
+  uptime_seconds: number;
+}
+
+/**
+ * bound-qdrant-http-runtime task 2.1: the public `/health/ready` response —
+ * required storage dependencies only (SQLite + Qdrant), with the Qdrant probe
+ * cached (see `checkQdrant`'s `cachedQdrantHealth`) so repeated unauthenticated
+ * probes cannot each start a fresh, uncached Qdrant request. `ready: false`
+ * maps to HTTP 503 at the transport layer.
+ */
+export interface ReadinessSnapshot {
+  ready: boolean;
+  components: {
+    sqlite: ComponentHealth;
+    qdrant: ComponentHealth;
+  };
+}
+
 export class HealthService {
   private cachedEmbeddingHealth: ComponentHealth | null = null;
   private cachedEmbeddingAt = 0;
@@ -40,6 +64,17 @@ export class HealthService {
   private cachedSqliteStatsAt = 0;
   private static readonly SQLITE_STATS_CACHE_MS = 5_000; // cache for 5s
 
+  // bound-qdrant-http-runtime task 2.1/2.2: `checkQdrant()` is a live network
+  // call with no cache of its own. Both the authenticated diagnostic
+  // `/health` route and the public, rate-limited `/health/ready` route call
+  // it — without a cache, a burst of unauthenticated readiness probes would
+  // each start a fresh, uncached Qdrant request (the exact amplification the
+  // "Health SHALL distinguish liveness, readiness, and diagnostics"
+  // requirement rules out). Mirrors `cachedEmbeddingHealth`'s pattern above.
+  private cachedQdrantHealth: ComponentHealth | null = null;
+  private cachedQdrantAt = 0;
+  private static readonly QDRANT_HEALTH_CACHE_MS = 5_000; // cache for 5s
+
   constructor(
     private storage: StorageManager,
     private embedding: EmbeddingProvider,
@@ -48,6 +83,37 @@ export class HealthService {
     private logger?: pino.Logger,
     private schedulerStates?: () => SchedulerHealthState[],
   ) {}
+
+  /**
+   * bound-qdrant-http-runtime task 2.1: the public `/health/live` response.
+   * Deliberately synchronous and dependency-free — no SQLite read, no Qdrant
+   * call, no cache lookup even — so it stays cheap under any probe rate and
+   * reflects only "the process is alive and its event loop is responsive
+   * enough to answer this request", matching the "terse unauthenticated
+   * liveness response SHALL avoid expensive dependency work" requirement.
+   */
+  checkLiveness(): LivenessSnapshot {
+    return { status: 'ok', uptime_seconds: Math.floor((Date.now() - startTime) / 1000) };
+  }
+
+  /**
+   * bound-qdrant-http-runtime task 2.1/2.2: the public `/health/ready`
+   * response. Checks only the two storage dependencies a request cannot
+   * function without (SQLite, Qdrant) — not embedding, retention, or
+   * scheduler state, which degrade the server's *quality* rather than its
+   * ability to serve requests at all — and both underlying checks are
+   * cheap/cached (`checkSqlite` is a local `SELECT 1`; `checkQdrant` is
+   * cached for `QDRANT_HEALTH_CACHE_MS`), so a burst of public probes never
+   * translates into a burst of fresh dependency calls.
+   */
+  async checkReadiness(): Promise<ReadinessSnapshot> {
+    const [sqlite, qdrant] = await Promise.all([
+      Promise.resolve(this.checkSqlite()),
+      this.checkQdrant(),
+    ]);
+    const ready = sqlite.status !== 'unhealthy' && qdrant.status !== 'unhealthy';
+    return { ready, components: { sqlite, qdrant } };
+  }
 
   async check(): Promise<HealthSnapshot> {
     const [sqliteOk, qdrantOk, embeddingOk] = await Promise.all([
@@ -161,9 +227,13 @@ export class HealthService {
   }
 
   private async checkQdrant(): Promise<ComponentHealth> {
+    const now = Date.now();
+    if (this.cachedQdrantHealth && (now - this.cachedQdrantAt) < HealthService.QDRANT_HEALTH_CACHE_MS) {
+      return this.cachedQdrantHealth;
+    }
     try {
       const ok = await this.storage.qdrant.healthCheck();
-      return ok
+      this.cachedQdrantHealth = ok
         ? { status: 'healthy' }
         : { status: 'unhealthy', message: 'Qdrant unreachable' };
     } catch (err) {
@@ -173,8 +243,10 @@ export class HealthService {
       // function") from a plain connectivity failure (e.g. ECONNREFUSED),
       // not just an operator polling /health and reading the message field.
       this.logger?.warn({ event: 'qdrant_health_check_failed', message });
-      return { status: 'unhealthy', message };
+      this.cachedQdrantHealth = { status: 'unhealthy', message };
     }
+    this.cachedQdrantAt = now;
+    return this.cachedQdrantHealth;
   }
 
   private async checkEmbedding(): Promise<ComponentHealth> {

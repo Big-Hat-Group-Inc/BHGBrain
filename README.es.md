@@ -295,7 +295,30 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     // URL externa de Qdrant (se usa cuando mode = "external")
     "external_url": null,
     // Nombre de la variable de entorno que contiene la clave API de Qdrant (se usa cuando mode = "external")
-    "api_key_env": null
+    "api_key_env": null,
+    // Plazo del lado del cliente (basado en AbortController) para cada
+    // operación de Qdrant en la ruta de solicitud, de limpieza, de escaneo y
+    // administrativa — todas enrutadas a través del circuit breaker
+    // compartido. El propio valor por defecto del cliente subyacente es de
+    // 300000 ms.
+    "operation_timeout_ms": 10000,
+    // Plazo separado, deliberadamente más corto, usado solo por la sonda de
+    // salud (su propia instancia de cliente dedicada, nunca enrutada a
+    // través del circuit breaker). No debe superar operation_timeout_ms.
+    "health_timeout_ms": 3000,
+    // Límites para el fan-out de una consulta search/recall sin colección
+    // (a nivel de namespace) sobre todas las colecciones del namespace.
+    "fanout": {
+      // Las colecciones objetivo por encima de este número se truncan de
+      // forma determinista.
+      "max_collections": 25,
+      // Cuántas de esas colecciones objetivo se consultan simultáneamente.
+      "concurrency": 5,
+      // Límite de resultados por colección aplicado solo mientras se abre
+      // realmente en abanico (más de un objetivo); una búsqueda con
+      // `collection` explícita siempre usa el `limit` completo del llamante.
+      "per_target_limit": 50
+    }
   },
 
   // Configuración de transporte
@@ -321,7 +344,18 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
       // Tiempo permitido para recibir completamente una solicitud; no limita las
       // respuestas SSE de larga duración en GET /mcp, que solo reciben una
       // solicitud, no envían una.
-      "request_timeout_ms": 300000
+      "request_timeout_ms": 300000,
+      // Acota el registro en memoria de sesiones MCP HTTP (ver "Ciclo de Vida
+      // de las Sesiones MCP" bajo Salud y Métricas).
+      "mcp_session": {
+        // Una sesión sin solicitudes durante este tiempo se cierra automáticamente.
+        "idle_timeout_ms": 1800000,
+        // Tope máximo de sesiones residentes; una nueva sesión al llegar a la
+        // capacidad desaloja la menos recientemente activa para hacer espacio.
+        "max_sessions": 1000,
+        // Con qué frecuencia se ejecuta el barrido independiente de sesiones inactivas.
+        "sweep_interval_ms": 60000
+      }
     },
     "stdio": {
       // Habilitar transporte MCP stdio
@@ -581,11 +615,17 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
     "log_redaction": true,
     // Número máximo de solicitudes por minuto por IP de cliente para transporte HTTP
     "rate_limit_rpm": 100,
+    // Capacidad máxima estricta del mapa de cubos del limitador de tasa (ver Límite de Tasa).
+    "rate_limit_max_buckets": 10000,
     // Tamaño máximo del cuerpo de solicitudes HTTP en bytes
     "max_request_size_bytes": 1048576,
     // Configuración "trust proxy" de Express. false (predeterminado) = req.ip es el
-    // peer de socket directo (preciso para loopback); true = respeta X-Forwarded-For
-    // del proxy inverso frente al servidor. Actívalo solo detrás de un proxy confiable.
+    // peer de socket directo (preciso para loopback). Un entero positivo = confiar en
+    // exactamente esa cantidad de saltos de proxy inverso (req.ip respeta
+    // X-Forwarded-For desde la entrada más a la derecha no confiable). Un array de
+    // strings = confiar solo en saltos que coincidan con esas IPs/subredes. El
+    // booleano heredado true ("confiar en cada salto") ya no se acepta — ver
+    // Confianza de Proxy.
     "trust_proxy": false
   },
 
@@ -755,7 +795,9 @@ El servidor escucha en `http://127.0.0.1:3721` por defecto. Endpoints HTTP dispo
 
 | Endpoint | Auth Requerida | Descripción |
 |---|---|---|
-| `GET /health` | No | Verificación de salud (sin autenticación para compatibilidad con sondas) |
+| `GET /health/live` | No | Liveness: escueto, sin E/S de dependencias — se puede sondear a cualquier frecuencia |
+| `GET /health/ready` | No | Readiness: comprobación cacheada de SQLite/Qdrant; 503 si una dependencia requerida está degradada |
+| `GET /health` | Sí | Instantánea diagnóstica completa (embedding, retención, planificadores, circuit breakers, etc.) |
 | `POST /mcp` | Sí | MCP Streamable HTTP: solicitudes JSON-RPC; una solicitud `initialize` crea una nueva sesión |
 | `GET /mcp` | Sí | MCP Streamable HTTP: canal SSE independiente para una sesión existente |
 | `DELETE /mcp` | Sí | MCP Streamable HTTP: termina una sesión |
@@ -766,12 +808,17 @@ El servidor escucha en `http://127.0.0.1:3721` por defecto. Endpoints HTTP dispo
 Cada sesión `/mcp` es un servidor MCP nuevo, en memoria, que comparte el mismo
 almacenamiento subyacente que cualquier otra sesión y los endpoints REST — reiniciar el
 proceso elimina todas las sesiones, y los clientes conformes con la especificación se
-reinicializan automáticamente.
+reinicializan automáticamente. Una sesión inactiva más tiempo que
+`transport.http.mcp_session.idle_timeout_ms` se cierra automáticamente; ver
+[Salud y Métricas](#salud-y-métricas) para el ciclo de vida completo de las sesiones y
+el desglose de endpoints.
 
-Ejemplo de verificación de salud:
+Ejemplos de verificación de salud:
 
 ```bash
-curl http://127.0.0.1:3721/health
+curl http://127.0.0.1:3721/health/live
+curl http://127.0.0.1:3721/health/ready
+curl -H "Authorization: Bearer <your-token>" http://127.0.0.1:3721/health
 ```
 
 Ejemplo de llamada a herramienta vía HTTP:
@@ -1966,7 +2013,7 @@ La búsqueda de texto completo usa un índice FTS5 real de SQLite para encontrar
 5. Las memorias archivadas se excluyen (la tabla FTS se mantiene sincronizada con la tabla principal de memorias — las filas archivadas se eliminan de FTS).
 6. Los metadatos de acceso se actualizan para los resultados devueltos.
 
-**Alternativa (fallback):** si la compilación de SQLite en ejecución no tiene el módulo `fts5` compilado (verificado mediante una prueba de capacidad al inicio, no asumido), la búsqueda de texto completo recurre a un comparador `LIKE '%term%'` heredado con un rango de frecuencia de términos hecho a mano en lugar de fallar. Esto es visible, no silencioso: el componente `sqlite` de `health://status` lleva un `message`, y se registra una advertencia `fts5_unavailable` una vez al inicio. Ver [Endpoint de Salud](#endpoint-de-salud).
+**Alternativa (fallback):** si la compilación de SQLite en ejecución no tiene el módulo `fts5` compilado (verificado mediante una prueba de capacidad al inicio, no asumido), la búsqueda de texto completo recurre a un comparador `LIKE '%term%'` heredado con un rango de frecuencia de términos hecho a mano en lugar de fallar. Esto es visible, no silencioso: el componente `sqlite` de `health://status` lleva un `message`, y se registra una advertencia `fts5_unavailable` una vez al inicio. Ver [Endpoints de Salud](#endpoints-de-salud).
 
 **Cuándo usar:** Búsquedas exactas de palabras clave, búsqueda de identificadores específicos (IDs de memoria, nombres de proyectos, nombres de sistemas), cuando conoces la terminología exacta utilizada.
 
@@ -2387,15 +2434,40 @@ Devuelve:
 
 ## Salud y Métricas
 
-### Endpoint de Salud
+### Endpoints de Salud
+
+La salud HTTP se divide en tres para que una sonda de liveness barata y de alta
+frecuencia, una comprobación de readiness acotada, y la instantánea diagnóstica
+completa autenticada tengan cada una el coste y el modelo de control de acceso
+adecuados (bound-qdrant-http-runtime):
 
 ```bash
-GET /health        # HTTP
-# o vía CLI:
+GET /health/live   # sin autenticación, sin E/S de dependencias — decisiones de reinicio/liveness
+GET /health/ready   # sin autenticación, comprobación de dependencias cacheada — 503 si no está listo
+GET /health          # autenticado, instantánea diagnóstica completa
+# o vía CLI (instantánea diagnóstica completa, igual que GET /health):
 bhgbrain health
 ```
 
-Devuelve un `HealthSnapshot`:
+- **`GET /health/live`** — `{ "status": "ok", "uptime_seconds": 86400 }`. Síncrono, no
+  toca ninguna dependencia (ni siquiera SQLite), por lo que se mantiene barato a
+  cualquier frecuencia de sondeo. Siempre `200`. Úsalo para decisiones de reinicio del
+  orquestador (es lo que sondea el propio `HEALTHCHECK` de la imagen Docker — ver
+  [Docker](#docker)).
+- **`GET /health/ready`** — comprueba solo las dos dependencias sin las que una
+  solicitud no puede funcionar: SQLite (un `SELECT 1` local) y Qdrant (una sonda
+  vectorial acotada y cacheada — ver abajo). Devuelve `{ "ready": true|false,
+  "components": { "sqlite": {...}, "qdrant": {...} } }`, `200` cuando está listo y
+  `503` cuando alguna de las dos está no saludable. A diferencia de `/health/live`, se
+  registra *después* del limitador de tasa, y la sonda de Qdrant en sí está cacheada,
+  de modo que una ráfaga de sondeos de readiness sin autenticar no se convierte en una
+  ráfaga de solicitudes nuevas a Qdrant.
+- **`GET /health`** — la instantánea diagnóstica completa (embedding, retención,
+  planificadores, circuit breakers, conteos por nivel, etc.), que ahora requiere la
+  misma autenticación Bearer que cualquier otra ruta. Comparte la misma sonda cacheada
+  de Qdrant que `/health/ready`.
+
+Devuelve un `HealthSnapshot` desde `GET /health`:
 
 ```json
 {
@@ -2443,11 +2515,72 @@ Devuelve un `HealthSnapshot`:
 | `embedding` | La llamada a la API de embed tiene éxito | Credenciales faltantes o no accesible | — |
 | `retention` | Todos los presupuestos dentro de los límites, sin vectores no sincronizados | Presupuesto excedido O vectores no sincronizados > 0 | — |
 
-**Códigos de estado HTTP:**
+**Códigos de estado HTTP (`GET /health`):**
 - `200` tanto para `healthy` como para `degraded`
 - `503` para `unhealthy`
 
-El estado de salud del embedding se almacena en caché durante 30 segundos para evitar llamadas a la API de OpenAI por sonda.
+(`GET /health/ready` usa su propio mapeo `ready`/`503` — ver arriba — independiente
+del campo de estado `healthy`/`degraded`/`unhealthy` de `GET /health`.)
+
+El estado de salud del embedding se almacena en caché durante 30 segundos para evitar
+llamadas a la API de OpenAI por sonda. La sonda de salud de Qdrant (compartida por
+`/health` y `/health/ready`) se cachea durante 5 segundos por la misma razón, y usa su
+propio timeout corto e independiente del lado del cliente
+(`qdrant.health_timeout_ms`, por defecto 3000) en lugar del más largo
+`qdrant.operation_timeout_ms` usado por las llamadas a Qdrant en la ruta de solicitud
+— un Qdrant estancado degrada la salud rápidamente sin que los llamantes tengan que
+esperar el plazo operativo completo. Ver
+[Referencia Completa de Configuración](#referencia-completa-de-configuración).
+
+### Timeouts de Dependencias, Fan-Out Acotado y Cobertura del Circuit Breaker
+
+Cada operación de Qdrant que emite el servidor — escrituras, lecturas,
+limpieza/compactación, creación de snapshots, scroll/listado/eliminación de
+colecciones — está acotada por `qdrant.operation_timeout_ms` (por defecto 10000,
+basado en `AbortController` del lado del cliente) y se enruta a través del circuit
+breaker compartido de Qdrant (`resilience.circuit_breaker`), de modo que un endpoint
+de Qdrant bloqueado falla rápido en todas las rutas de código, no solo en algunas. La
+sonda de salud usa deliberadamente su propio cliente y timeout separados
+(`qdrant.health_timeout_ms`) y nunca toca el circuit breaker (ver arriba).
+
+Una llamada a `recall`/`search` sin `collection` específica se abre en abanico sobre
+todas las colecciones del namespace. Ese fan-out está acotado por `qdrant.fanout`:
+`max_collections` (por defecto 25) limita a cuántas colecciones apunta como máximo una
+llamada — más allá de eso la lista de objetivos se trunca de forma determinista — y
+`concurrency` (por defecto 5) limita cuántas de ellas se ejecutan a la vez (en lotes de
+tamaño fijo), y `per_target_limit` (por defecto 50) acota el `limit` propio de cada
+objetivo mientras se abre realmente en abanico (más de un objetivo) — una búsqueda con
+`collection` explícita siempre usa el `limit` completo y sin acotar del llamante. El
+truncamiento se expone mediante el gauge `bhgbrain_qdrant_fanout_width`
+y el contador `bhgbrain_qdrant_fanout_truncated_total` (ver [Métricas](#métricas)) y una
+línea de log `qdrant_fanout_truncated`, no en el cuerpo de la respuesta de
+`search`/`recall` en sí.
+
+### Ciclo de Vida de las Sesiones MCP
+
+Cada llamada `POST /mcp initialize` abre una sesión mantenida en memoria durante la
+vida del proceso. `transport.http.mcp_session` acota ese registro para que un cliente
+MCP HTTP que se desconecta sin enviar nunca `DELETE /mcp` (el caso común ante una
+caída del cliente o corte de red ordinarios) no pueda filtrar sesiones para siempre:
+
+- `idle_timeout_ms` (por defecto 1.800.000 = 30 minutos) — una sesión sin solicitudes
+  durante este tiempo se cierra mediante un barrido independiente y `unref`
+  (`sweep_interval_ms`, por defecto 60000). Cualquier solicitud a través de una sesión
+  refresca su actividad, posponiendo la expiración.
+- `max_sessions` (por defecto 1000) — un tope máximo de sesiones residentes. Un nuevo
+  `initialize` al llegar a la capacidad desaloja la sesión menos recientemente activa
+  para hacer espacio; si el registro ya está vacío y aun así "en capacidad" (solo
+  posible con una mala configuración `max_sessions: 0`), la solicitud falla de forma
+  cerrada con `503`.
+- Reutilizar un id tras cualquiera de las dos vías de desalojo obtiene la misma
+  respuesta `404 Session not found` que ya producía `DELETE /mcp` — no hay una forma
+  de error separada que manejar.
+
+Los conteos de sesiones actuales y desalojadas se publican como el gauge
+`bhgbrain_mcp_sessions_active` y el contador
+`bhgbrain_mcp_sessions_evicted_total{reason="idle"|"capacity"}` (ver
+[Métricas](#métricas)). `closeAll()` (apagado del proceso) detiene el temporizador de
+barrido y cierra el transporte de cada sesión activa.
 
 ### Métricas
 
@@ -2485,6 +2618,11 @@ con el formato anterior sin etiquetas).
 | `bhgbrain_memory_count` | medidor | Recuento total de memorias actual (actualizado en escritura/eliminación) |
 | `bhgbrain_rate_limit_buckets` | medidor | Cubos de seguimiento de límite de tasa activos |
 | `bhgbrain_rate_limited_total` | contador | Total de solicitudes con límite de tasa excedido |
+| `bhgbrain_rate_limit_capacity_rejected_total` | contador | Total de solicitudes rechazadas con 429 porque el mapa de cubos de límite de tasa estaba al límite `security.rate_limit_max_buckets` para una identidad de cliente genuinamente nueva |
+| `bhgbrain_qdrant_fanout_width` | medidor | Número de colecciones a las que se abrió en abanico la consulta `search`/`recall` sin colección más reciente, tras cualquier truncamiento por `qdrant.fanout.max_collections` |
+| `bhgbrain_qdrant_fanout_truncated_total` | contador | Se incrementa cada vez que se trunca la lista de colecciones objetivo de una consulta sin colección a `qdrant.fanout.max_collections` |
+| `bhgbrain_mcp_sessions_active` | medidor | Número actual de sesiones MCP HTTP residentes |
+| `bhgbrain_mcp_sessions_evicted_total` | contador | Total de sesiones MCP HTTP cerradas por el gestor de sesiones, etiquetado con `reason` (`idle` o `capacity`) |
 | `recall_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva de tipo/etiquetas/`after`/`before` posterior a la recuperación de `recall` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
 | `search_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva `after`/`before` posterior a la recuperación de `search` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
 | `search_embedding_degraded` | contador | Se incrementa cuando una búsqueda en modo `hybrid` recae en solo texto completo porque el proveedor de embeddings o el almacén de vectores no está disponible, etiquetado con `namespace` |
@@ -2510,7 +2648,10 @@ métrica registrara fallos.
 
 ### Autenticación HTTP
 
-Al ejecutarse en modo HTTP, las solicitudes a todos los endpoints excepto `/health` requieren un token `Bearer`:
+Al ejecutarse en modo HTTP, las solicitudes a todos los endpoints excepto
+`/health/live` y `/health/ready` requieren un token `Bearer` — la instantánea
+diagnóstica completa `/health` está autenticada como cualquier otra ruta (ver
+[Salud y Métricas](#salud-y-métricas)):
 
 ```
 Authorization: Bearer <your-token>
@@ -2553,14 +2694,21 @@ Asegúrate de que `BHGBRAIN_TOKEN` esté configurado en esta configuración.
 
 ### Confianza de Proxy
 
-`security.trust_proxy` (predeterminado `false`) se pasa directamente a `app.set('trust proxy', ...)` de Express, lo que controla cómo se deriva `req.ip` y, por lo tanto, qué identidad usa el limitador de tasa:
+`security.trust_proxy` (predeterminado `false`) se pasa directamente a `app.set('trust proxy', ...)` de Express, lo que controla cómo se deriva `req.ip` y, por lo tanto, qué identidad usa el limitador de tasa. Acepta `false`, un número de saltos positivo, o un array de IPs/subredes de proxy confiables — **el booleano heredado `true` ("confiar en cada salto") ya no se acepta** y falla la validación de configuración con orientación de migración, porque permite que una entrada *más a la izquierda* de `X-Forwarded-For` suministrada por el llamador elija su propia identidad de cliente incluso a través de exactamente un salto de proxy inverso real:
 
-- **Deshabilitado (predeterminado):** `req.ip` es el peer de socket directo. Esto es preciso para el despliegue solo-loopback documentado. Si de todos modos hay un proxy inverso delante, todos los clientes proxied colapsan en la única IP del proxy, y los encabezados `X-Forwarded-For` suministrados por el llamador se ignoran (por lo que no pueden falsificarse para dividir o evadir límites de tasa).
-- **Habilitado:** `req.ip` respeta `X-Forwarded-For` establecido por el peer inmediato. Habilítalo solo detrás de un proxy inverso en el que confíes para establecer ese encabezado correctamente — habilitarlo sin un proxy confiable delante permite que cualquier cliente falsifique su identidad de límite de tasa.
+- **Deshabilitado (predeterminado, `false`):** `req.ip` es el peer de socket directo. Esto es preciso para el despliegue solo-loopback documentado. Si de todos modos hay un proxy inverso delante, todos los clientes proxied colapsan en la única IP del proxy, y los encabezados `X-Forwarded-For` suministrados por el llamador se ignoran (por lo que no pueden falsificarse para dividir o evadir límites de tasa).
+- **Número de saltos (un entero positivo):** confía en exactamente esa cantidad de saltos de proxy inverso más cercanos al servidor. Con `1` detrás de un proxy inverso confiable, `req.ip` se resuelve a la entrada más a la derecha (más cercana al servidor) de `X-Forwarded-For` — la que realmente estableció tu proxy —, no a un prefijo izquierdo arbitrario suministrado por el llamador.
+- **Lista de subredes/direcciones (un array de strings):** confía solo en los saltos cuya dirección coincida con una de las IPs o subredes CIDR dadas (p. ej. `["10.0.0.0/8"]`), el formato estándar de Express/`proxy-addr`.
 
 ```json
-{ "security": { "trust_proxy": true } }
+{ "security": { "trust_proxy": 1 } }
 ```
+
+```json
+{ "security": { "trust_proxy": ["10.0.0.0/8"] } }
+```
+
+Migrando desde un `"trust_proxy": true` preexistente: reemplázalo por el número de saltos de tu cadena real de proxies inversos (normalmente `1` para un único balanceador de carga o ingress delante del servidor) o la(s) subred(es) confiable(s) en la que se ejecuta.
 
 ### Límite de Tasa
 
@@ -2571,7 +2719,7 @@ Las solicitudes HTTP tienen límite de tasa por dirección IP de cliente:
 - Los clientes que exceden el límite reciben HTTP 429 con `{ error: { code: "RATE_LIMITED", retryable: true } }`
 - Las solicitudes sin IP de cliente derivable fallan de forma cerrada con HTTP 400 (`INVALID_INPUT`) en lugar de compartir un único cubo de reserva
 - Los encabezados de respuesta incluyen `X-RateLimit-Limit` y `X-RateLimit-Remaining`
-- Los cubos de límite de tasa expirados se barren cada 30 segundos
+- El mapa de cubos tiene una capacidad máxima estricta, `security.rate_limit_max_buckets` (predeterminado 10.000). Los cubos expirados se barren de forma independiente cada 30 segundos mediante un temporizador `unref` (no ligado oportunistamente a la llegada de solicitudes, por lo que la limpieza ocurre incluso cuando el tráfico se detiene por completo). Al llegar a la capacidad, se ejecuta un último barrido antes de rechazar con HTTP 429 (`{ error: { code: "RATE_LIMITED", retryable: true } }`) a una identidad de cliente genuinamente nueva, en lugar de seguir haciendo crecer el mapa — un cliente ya registrado nunca se ve afectado por esto.
 - El estado del límite de tasa está delimitado por instancia de servidor/middleware, de modo que instancias independientes (p. ej. en pruebas) nunca comparten cubos
 
 ### Límite de Tamaño de Solicitud
@@ -3880,8 +4028,12 @@ El servidor está disponible en `http://localhost:3721` (publicado solo en el
 loopback del host por defecto). Verifica la salud con:
 
 ```bash
-curl http://localhost:3721/health
+curl http://localhost:3721/health/live
 ```
+
+El propio `HEALTHCHECK` del contenedor sondea `/health/live` por la misma razón: se
+ejecuta sin credenciales, y la instantánea diagnóstica completa `/health` requiere
+autenticación Bearer (ver [Salud y Métricas](#salud-y-métricas)).
 
 ### Valores de Seguridad por Defecto
 
@@ -4088,7 +4240,7 @@ Una vez que termina la comprobación de drift/excedente, se libera el bloqueo �
 
 ### Fortalecimiento HTTP
 
-- `/health` es intencionalmente sin autenticación para compatibilidad con sondas.
+- `/health/live` y `/health/ready` son intencionalmente sin autenticación para compatibilidad con sondas; la instantánea diagnóstica completa `/health` requiere la misma autenticación Bearer que cualquier otra ruta. Ver [Salud y Métricas](#salud-y-métricas).
 - El límite de tasa se basa en la identidad de solicitud confiable (IP) e ignora `x-client-id` para su aplicación.
 - El `client_id` de los logs de auditoría/solicitud también se deriva de la identidad de solicitud confiable (`req.ip`), nunca del encabezado `x-client-id` proporcionado por el llamante; ese encabezado solo se acepta como una pista de depuración no autoritativa y nunca se confía en él para el registro de auditoría.
 - `memory://list` aplica límites de `limit` de `1..100`; los valores inválidos devuelven `INVALID_INPUT`.

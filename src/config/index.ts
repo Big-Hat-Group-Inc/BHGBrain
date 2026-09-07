@@ -100,6 +100,48 @@ const ConfigSchema = z.object({
     embedded_path: z.string().default('./qdrant'),
     external_url: z.string().nullable().default(null),
     api_key_env: z.string().nullable().default(null),
+    // bound-qdrant-http-runtime task 1.1: the @qdrant/js-client-rest client
+    // inherits a 300s default request timeout (client-side, AbortSignal-based)
+    // — far longer than any deadline this service otherwise offers, so a
+    // black-holed Qdrant endpoint could hold a request (and, pre-breaker-
+    // coverage, the whole HTTP request) open for minutes. `operation_timeout_ms`
+    // bounds every request-path/administrative call made through the main
+    // client (routed through the shared circuit breaker — see
+    // QdrantStore.executeWithBreaker); `health_timeout_ms` is a separate,
+    // intentionally shorter deadline used only by the independent health probe
+    // (QdrantStore's dedicated `healthClient`), which deliberately bypasses the
+    // breaker so a stalled dependency degrades health quickly without waiting
+    // out the full operational deadline.
+    operation_timeout_ms: z.number().int().positive().default(10_000),
+    health_timeout_ms: z.number().int().positive().default(3_000),
+    fanout: z.object({
+      // Upper bound on how many collections one collectionless (namespace-wide)
+      // query fans out to; beyond this the target list is deterministically
+      // truncated rather than firing an unbounded number of concurrent Qdrant
+      // requests. See bound-qdrant-http-runtime task 1.4.
+      max_collections: z.number().int().positive().default(25),
+      // How many of those target collections are queried concurrently (in
+      // fixed-size batches — see QdrantStore.search).
+      concurrency: z.number().int().positive().default(5),
+      // Per-collection result cap applied only while actually fanning out
+      // (more than one target collection) — bounds how much work/payload one
+      // target contributes independent of a caller-supplied `limit`, so a
+      // large `limit` times a wide fan-out cannot multiply into an
+      // unbounded amount of per-target work before the top-K merge trims it
+      // back down. A single explicit `collection` search is unaffected and
+      // keeps using the caller's `limit` directly.
+      per_target_limit: z.number().int().positive().default(50),
+    }).prefault({}),
+  }).superRefine((value, ctx) => {
+    if (value.health_timeout_ms > value.operation_timeout_ms) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `qdrant.health_timeout_ms (${value.health_timeout_ms}) should not exceed ` +
+          `qdrant.operation_timeout_ms (${value.operation_timeout_ms}) — the health probe is meant to ` +
+          'fail faster than an operational call, not slower.',
+        path: ['health_timeout_ms'],
+      });
+    }
   }).prefault({}),
   storage: z.object({
     // A bounded wait lets short-lived CLI/server writer overlap settle without
@@ -133,6 +175,19 @@ const ConfigSchema = z.object({
       keep_alive_timeout_ms: z.number().int().positive().default(65000),
       headers_timeout_ms: z.number().int().positive().default(66000),
       request_timeout_ms: z.number().int().positive().default(300000),
+      // bound-qdrant-http-runtime task 3.1-3.3: per-session state for the
+      // Streamable HTTP MCP transport (src/transport/mcp-http.ts) is otherwise
+      // unbounded — a client that abandons a session without sending DELETE
+      // (the common case; see design.md decision 3) leaks its transport
+      // forever. `idle_timeout_ms` is how long a session may go without
+      // activity before an unref'd sweep closes it; `max_sessions` is a hard
+      // capacity enforced at session creation (oldest-idle eviction, or 503 if
+      // none is safely evictable); `sweep_interval_ms` paces that sweep.
+      mcp_session: z.object({
+        idle_timeout_ms: z.number().int().positive().default(30 * 60_000),
+        max_sessions: z.number().int().positive().default(1000),
+        sweep_interval_ms: z.number().int().positive().default(60_000),
+      }).prefault({}),
     }).superRefine((value, ctx) => {
       if (value.headers_timeout_ms <= value.keep_alive_timeout_ms) {
         ctx.addIssue({
@@ -376,11 +431,42 @@ const ConfigSchema = z.object({
     allow_unauthenticated_http: z.boolean().default(false),
     log_redaction: z.boolean().default(true),
     rate_limit_rpm: z.number().int().positive().default(100),
+    // bound-qdrant-http-runtime task 2.4: hard capacity on the rate limiter's
+    // client-bucket map (src/transport/middleware.ts). Without this, a caller
+    // that rotates its identity (spoofed X-Forwarded-For under a trust-all
+    // proxy setting, or simply many distinct real clients) grows the bucket
+    // map without bound. At capacity, a final expired-bucket sweep runs and a
+    // genuinely new key is rejected (429) rather than stored — see
+    // createRateLimitMiddleware's fail-closed capacity policy.
+    rate_limit_max_buckets: z.number().int().positive().default(10_000),
     max_request_size_bytes: z.number().int().positive().default(1048576),
     // Passed directly to Express `app.set('trust proxy', ...)`. Default `false`
-    // means `req.ip` is the direct socket peer (loopback-accurate); enable only
-    // behind a trusted reverse proxy that sets `X-Forwarded-For` correctly.
-    trust_proxy: z.boolean().default(false),
+    // means `req.ip` is the direct socket peer (loopback-accurate). `true`
+    // ("trust every hop") is no longer accepted — it lets a caller-supplied
+    // left-most X-Forwarded-For entry choose its own client identity even
+    // through exactly one real reverse proxy hop (bound-qdrant-http-runtime
+    // task 2.3). Use a positive hop count (the number of trusted reverse
+    // proxies between the client and this process) or an explicit array of
+    // trusted proxy IPs/subnets instead — both are passed straight through to
+    // Express/`proxy-addr`, which resolves `req.ip` to the right-most
+    // untrusted address rather than the caller-controlled left-most one.
+    trust_proxy: z.preprocess((val, ctx) => {
+      if (val === true) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'security.trust_proxy: boolean `true` (trust every hop) is no longer supported — it lets ' +
+            'a caller-supplied X-Forwarded-For value choose its own client identity. Set it to a positive hop ' +
+            'count (e.g. 1 for exactly one trusted reverse proxy) or an array of trusted proxy IPs/subnets ' +
+            '(e.g. ["10.0.0.0/8"]) instead.',
+        });
+        return z.NEVER;
+      }
+      return val;
+    }, z.union([
+      z.literal(false),
+      z.number().int().positive(),
+      z.array(z.string().min(1)).min(1),
+    ])).default(false),
   }).prefault({}),
   auto_inject: z.object({
     max_chars: z.number().int().positive().default(30000),

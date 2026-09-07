@@ -41,8 +41,16 @@ USER node
 VOLUME ["/data"]
 EXPOSE 3721
 
+# bound-qdrant-http-runtime task 3.4: `/health` (the full diagnostic
+# snapshot) now requires Bearer auth like every other route, and this
+# HEALTHCHECK has no way to supply one — using it here would make every
+# container report unhealthy (401) regardless of actual process state.
+# `/health/live` is the terse, unauthenticated, dependency-free probe meant
+# exactly for a restart-decision healthcheck like this one; use
+# `/health/ready` instead if you want Docker to also restart the container
+# on a degraded Qdrant/SQLite dependency rather than only a wedged process.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD node -e "fetch('http://localhost:3721/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://localhost:3721/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 # The entrypoint provisions a bearer token before launch so the externally-bound
 # API is authenticated by default (see docker-entrypoint.sh).

@@ -167,7 +167,7 @@ async function main() {
   // server's aggregate health status. See add-memory-distillation.
   const distillationBreaker = new CircuitBreaker({ ...breakerOptions, key: 'distillation', logger });
   const metrics = new MetricsCollector(config);
-  const qdrant = new QdrantStore(config, qdrantBreaker, logger);
+  const qdrant = new QdrantStore(config, qdrantBreaker, logger, metrics);
   const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
   warnIfEmbeddingDegraded(embedding, config, logger);
   const extraction = createExtractionProvider(config, { breaker: extractionBreaker, metrics, logger });

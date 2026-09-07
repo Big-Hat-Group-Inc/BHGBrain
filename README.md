@@ -305,7 +305,27 @@ The file is created automatically on first run with all defaults applied. Edit i
     // External Qdrant URL (used when mode = "external")
     "external_url": null,
     // Env var name containing the Qdrant API key (used when mode = "external")
-    "api_key_env": null
+    "api_key_env": null,
+    // Client-side (AbortController-based) deadline for every request-path,
+    // cleanup, scan, and administrative Qdrant call — all routed through the
+    // shared circuit breaker. The upstream client's own default is 300000ms.
+    "operation_timeout_ms": 10000,
+    // Separate, intentionally shorter deadline used only by the health probe
+    // (its own dedicated client instance, never routed through the breaker).
+    // Must not exceed operation_timeout_ms.
+    "health_timeout_ms": 3000,
+    // Bounds for a collectionless (namespace-wide) search/recall query's
+    // fan-out across every collection in the namespace.
+    "fanout": {
+      // Target collections beyond this count are deterministically truncated.
+      "max_collections": 25,
+      // How many of those target collections are queried concurrently.
+      "concurrency": 5,
+      // Per-collection result cap applied only while genuinely fanning out
+      // (more than one target); a single explicit `collection` search always
+      // uses the caller's full `limit`.
+      "per_target_limit": 50
+    }
   },
 
   // Transport configuration
@@ -329,7 +349,18 @@ The file is created automatically on first run with all defaults applied. Edit i
       "headers_timeout_ms": 66000,
       // Time allowed to fully receive a request; does not bound long-lived
       // SSE responses on GET /mcp, which only receive a request, not send one.
-      "request_timeout_ms": 300000
+      "request_timeout_ms": 300000,
+      // Bounds the in-memory MCP HTTP session registry (see "MCP Session
+      // Lifecycle" under Health & Metrics).
+      "mcp_session": {
+        // A session with no request this long is closed automatically.
+        "idle_timeout_ms": 1800000,
+        // Hard cap on resident sessions; a new session at capacity evicts
+        // the least-recently-active one to make room.
+        "max_sessions": 1000,
+        // How often the independent idle-session sweep runs.
+        "sweep_interval_ms": 60000
+      }
     },
     "stdio": {
       // Enable MCP stdio transport
@@ -588,11 +619,16 @@ The file is created automatically on first run with all defaults applied. Edit i
     "log_redaction": true,
     // Max requests per minute per client IP for HTTP transport
     "rate_limit_rpm": 100,
+    // Hard cap on the rate limiter's client-bucket map (see Rate Limiting).
+    "rate_limit_max_buckets": 10000,
     // Maximum HTTP request body size in bytes
     "max_request_size_bytes": 1048576,
     // Express "trust proxy" setting. false (default) = req.ip is the direct
-    // socket peer (loopback-accurate); true = honor X-Forwarded-For from the
-    // reverse proxy in front of the server. Only enable behind a trusted proxy.
+    // socket peer (loopback-accurate). A positive integer = trust exactly
+    // that many reverse-proxy hops (req.ip honors X-Forwarded-For from the
+    // right-most untrusted entry). An array of strings = trust only hops
+    // matching those IPs/subnets. The legacy boolean true ("trust every
+    // hop") is no longer accepted — see Proxy Trust.
     "trust_proxy": false
   },
 
@@ -760,7 +796,9 @@ The server listens at `http://127.0.0.1:3721` by default. Available HTTP endpoin
 
 | Endpoint | Auth Required | Description |
 |---|---|---|
-| `GET /health` | No | Health check (unauthenticated for probe compatibility) |
+| `GET /health/live` | No | Liveness: terse, no dependency I/O — safe to poll at any rate |
+| `GET /health/ready` | No | Readiness: cached SQLite/Qdrant check; 503 when a required dependency is degraded |
+| `GET /health` | Yes | Full diagnostic snapshot (embedding, retention, schedulers, circuit breakers, etc.) |
 | `POST /mcp` | Yes | MCP Streamable HTTP: JSON-RPC requests; an `initialize` request creates a new session |
 | `GET /mcp` | Yes | MCP Streamable HTTP: standalone SSE channel for an existing session |
 | `DELETE /mcp` | Yes | MCP Streamable HTTP: terminates a session |
@@ -770,12 +808,17 @@ The server listens at `http://127.0.0.1:3721` by default. Available HTTP endpoin
 
 Every `/mcp` session is a fresh, in-memory MCP server sharing the same underlying
 storage as every other session and the REST endpoints — restarting the process drops
-all sessions, and spec-conformant clients re-initialize automatically.
+all sessions, and spec-conformant clients re-initialize automatically. A session idle
+longer than `transport.http.mcp_session.idle_timeout_ms` is closed automatically; see
+[Health & Metrics](#health--metrics) for the full session-lifecycle and endpoint-split
+details.
 
-Health check example:
+Health check examples:
 
 ```bash
-curl http://127.0.0.1:3721/health
+curl http://127.0.0.1:3721/health/live
+curl http://127.0.0.1:3721/health/ready
+curl -H "Authorization: Bearer <your-token>" http://127.0.0.1:3721/health
 ```
 
 Tool call example over HTTP:
@@ -1949,7 +1992,7 @@ Fulltext search uses a real SQLite FTS5 index to find memories containing specif
 5. Archived memories are excluded (the FTS table is kept in sync with the main memories table - archived rows are removed from FTS).
 6. Access metadata is updated for returned results.
 
-**Fallback:** if the running SQLite build has no `fts5` module compiled in (verified via a startup capability probe, not assumed), fulltext search degrades to a legacy `LIKE '%term%'` matcher with a hand-rolled term-frequency rank instead of erroring. This is visible, not silent: `health://status`'s `sqlite` component carries a `message`, and a `fts5_unavailable` warning is logged once at startup. See [Health Endpoint](#health-endpoint).
+**Fallback:** if the running SQLite build has no `fts5` module compiled in (verified via a startup capability probe, not assumed), fulltext search degrades to a legacy `LIKE '%term%'` matcher with a hand-rolled term-frequency rank instead of erroring. This is visible, not silent: `health://status`'s `sqlite` component carries a `message`, and a `fts5_unavailable` warning is logged once at startup. See [Health Endpoints](#health-endpoints).
 
 **When to use:** Exact keyword searches, searching for specific identifiers (memory IDs, project names, system names), when you know the exact terminology used.
 
@@ -2370,15 +2413,36 @@ Returns:
 
 ## Health & Metrics
 
-### Health Endpoint
+### Health Endpoints
+
+HTTP health is split three ways so a cheap, high-frequency liveness probe, a bounded
+readiness check, and the full authenticated diagnostic snapshot each have the right
+cost and access-control shape (bound-qdrant-http-runtime):
 
 ```bash
-GET /health        # HTTP
-# or via CLI:
+GET /health/live   # unauthenticated, no dependency I/O — restart/liveness decisions
+GET /health/ready   # unauthenticated, cached dependency check — 503 when not ready
+GET /health          # authenticated, full diagnostic snapshot
+# or via CLI (full diagnostic snapshot, same as GET /health):
 bhgbrain health
 ```
 
-Returns a `HealthSnapshot`:
+- **`GET /health/live`** — `{ "status": "ok", "uptime_seconds": 86400 }`. Synchronous,
+  touches no dependency at all (not even SQLite), so it stays cheap under any probe
+  rate. Always `200`. Use this for orchestrator restart decisions (it is what the
+  Docker image's own `HEALTHCHECK` polls — see [Docker](#docker)).
+- **`GET /health/ready`** — checks only the two dependencies a request cannot function
+  without: SQLite (a local `SELECT 1`) and Qdrant (a bounded, cached vector-query
+  probe — see below). Returns `{ "ready": true|false, "components": { "sqlite": {...},
+  "qdrant": {...} } }`, `200` when ready and `503` when either is unhealthy. Registered
+  *after* rate limiting (unlike `/health/live`), and the Qdrant probe itself is cached,
+  so a burst of unauthenticated readiness polling cannot turn into a burst of fresh
+  Qdrant requests.
+- **`GET /health`** — the full diagnostic snapshot (embedding, retention, schedulers,
+  circuit breakers, per-tier counts, etc.), now requiring the same Bearer auth as every
+  other route. Shares the same cached Qdrant probe as `/health/ready`.
+
+Returns a `HealthSnapshot` from `GET /health`:
 
 ```json
 {
@@ -2432,11 +2496,64 @@ Returns a `HealthSnapshot`:
 
 **Circuit breakers:** The `circuitBreakers` object reports the state of each external dependency breaker (`closed`, `open`, or `half-open`). When a breaker is `open`, requests to that dependency are short-circuited with a `CircuitOpenError` until the open window elapses and a half-open probe succeeds. Configure thresholds in `resilience.circuit_breaker` (see [Configuration](#configuration)).
 
-**HTTP status codes:**
+**HTTP status codes (`GET /health`):**
 - `200` for both `healthy` and `degraded`
 - `503` for `unhealthy`
 
-Embedding health is cached for 30 seconds to avoid per-probe API calls to OpenAI.
+(`GET /health/ready` uses its own `ready`/`503` mapping — see above — independent of
+`GET /health`'s `healthy`/`degraded`/`unhealthy` status field.)
+
+Embedding health is cached for 30 seconds to avoid per-probe API calls to OpenAI. The
+Qdrant health probe (shared by `/health` and `/health/ready`) is cached for 5 seconds
+for the same reason, and itself uses a short, independent client-side timeout
+(`qdrant.health_timeout_ms`, default 3000) rather than the longer
+`qdrant.operation_timeout_ms` used by request-path Qdrant calls — a stalled Qdrant
+degrades health quickly without making callers wait out the full operational deadline.
+See [Full Configuration Reference](#full-configuration-reference).
+
+### Dependency Timeouts, Bounded Fan-Out, and Circuit Breaker Coverage
+
+Every Qdrant operation the server issues — writes, reads, cleanup/compaction, snapshot
+creation, collection scroll/list/delete — is bounded by `qdrant.operation_timeout_ms`
+(default 10000, client-side `AbortController`-based) and routed through the shared
+Qdrant circuit breaker (`resilience.circuit_breaker`), so a black-holed Qdrant endpoint
+fails fast on every code path instead of only some. The health probe deliberately uses
+its own separate client and timeout (`qdrant.health_timeout_ms`) and never touches the
+breaker (see above).
+
+A `recall`/`search` call made without a specific `collection` fans out across every
+collection in the namespace. That fan-out is bounded by `qdrant.fanout`:
+`max_collections` (default 25) caps how many collections one call ever targets — beyond
+that the target list is deterministically truncated; `concurrency` (default 5)
+caps how many of those run at once (in fixed-size batches); and `per_target_limit`
+(default 50) clamps each target's own per-collection query `limit` while genuinely
+fanning out (more than one target) — a single explicit `collection` search always uses
+the caller's full `limit` unclamped. Truncation is surfaced via
+the `bhgbrain_qdrant_fanout_width` gauge and `bhgbrain_qdrant_fanout_truncated_total`
+counter (see [Metrics](#metrics)) and a `qdrant_fanout_truncated` log line, not in the
+`search`/`recall` response body itself.
+
+### MCP Session Lifecycle
+
+Each `POST /mcp initialize` call opens a session held in memory for the life of the
+process. `transport.http.mcp_session` bounds that registry so an HTTP MCP client that
+disconnects without ever sending `DELETE /mcp` (the common case for an ordinary client
+crash or network drop) cannot leak sessions forever:
+
+- `idle_timeout_ms` (default 1,800,000 = 30 minutes) — a session with no request in this
+  long is closed by an independent, unref'd sweep (`sweep_interval_ms`, default 60000).
+  Any request through a session refreshes its activity, postponing expiry.
+- `max_sessions` (default 1000) — a hard cap on resident sessions. A new `initialize`
+  once at capacity evicts the single least-recently-active session to make room; if the
+  registry is somehow already empty and still "at capacity" (only possible with a
+  `max_sessions: 0` misconfiguration), the request fails closed with `503`.
+- Reusing an id after either eviction path gets the same `404 Session not found`
+  response as `DELETE /mcp` already produced — no separate error shape to handle.
+
+Current and evicted session counts are published as the `bhgbrain_mcp_sessions_active`
+gauge and `bhgbrain_mcp_sessions_evicted_total{reason="idle"|"capacity"}` counter (see
+[Metrics](#metrics)). `closeAll()` (process shutdown) stops the sweep timer and closes
+every live session's transport.
 
 ### Metrics
 
@@ -2474,6 +2591,11 @@ label-less format).
 | `bhgbrain_memory_count` | gauge | Current total memory count (updated on write/delete) |
 | `bhgbrain_rate_limit_buckets` | gauge | Active rate limit tracking buckets |
 | `bhgbrain_rate_limited_total` | counter | Total rate-limited requests |
+| `bhgbrain_rate_limit_capacity_rejected_total` | counter | Total requests rejected with 429 because the rate-limit bucket map was at `security.rate_limit_max_buckets` capacity for a genuinely new client identity |
+| `bhgbrain_qdrant_fanout_width` | gauge | Number of collections the most recent collectionless `search`/`recall` query fanned out to, after any `qdrant.fanout.max_collections` truncation |
+| `bhgbrain_qdrant_fanout_truncated_total` | counter | Incremented whenever a collectionless query's target-collection list was truncated to `qdrant.fanout.max_collections` |
+| `bhgbrain_mcp_sessions_active` | gauge | Current resident MCP HTTP session count |
+| `bhgbrain_mcp_sessions_evicted_total` | counter | Total MCP HTTP sessions closed by the session manager, labeled `reason` (`idle` or `capacity`) |
 | `recall_zero_after_filter` | counter | Incremented when `recall`'s defensive post-retrieval type/tags/`after`/`before` re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
 | `search_zero_after_filter` | counter | Incremented when `search`'s defensive post-retrieval `after`/`before` re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
 | `search_embedding_degraded` | counter | Incremented when `hybrid`-mode search falls back to fulltext-only because the embedding provider or vector store is unavailable, labeled `namespace` |
@@ -2497,7 +2619,9 @@ Because failures are now included in `bhgbrain_tool_handler_ms`, its p95/p99 ref
 
 ### HTTP Authentication
 
-When running in HTTP mode, requests to all endpoints except `/health` require a `Bearer` token:
+When running in HTTP mode, requests to all endpoints except `/health/live` and
+`/health/ready` require a `Bearer` token — the full diagnostic `/health` snapshot is
+authenticated like every other route (see [Health & Metrics](#health--metrics)):
 
 ```
 Authorization: Bearer <your-token>
@@ -2540,14 +2664,21 @@ Make sure `BHGBRAIN_TOKEN` is set in this configuration.
 
 ### Proxy Trust
 
-`security.trust_proxy` (default `false`) is passed directly to Express's `app.set('trust proxy', ...)`, which controls how `req.ip` is derived and therefore which identity the rate limiter keys on:
+`security.trust_proxy` (default `false`) is passed directly to Express's `app.set('trust proxy', ...)`, which controls how `req.ip` is derived and therefore which identity the rate limiter keys on. It accepts `false`, a positive hop count, or an array of trusted proxy IPs/subnets — **the legacy boolean `true` ("trust every hop") is no longer accepted** and fails config validation with migration guidance, because it lets a caller-supplied *left-most* `X-Forwarded-For` entry choose its own client identity even through exactly one real reverse-proxy hop:
 
-- **Disabled (default):** `req.ip` is the direct socket peer. This is accurate for the documented loopback-only deployment. If a reverse proxy sits in front of the server anyway, every proxied client collapses into the proxy's single IP and caller-supplied `X-Forwarded-For` headers are ignored (so they cannot be spoofed to split or evade rate limits).
-- **Enabled:** `req.ip` honors `X-Forwarded-For` set by the immediate peer. Only enable this behind a reverse proxy you trust to set that header correctly — enabling it without a trusted proxy in front lets any client spoof its rate-limit identity.
+- **Disabled (default, `false`):** `req.ip` is the direct socket peer. This is accurate for the documented loopback-only deployment. If a reverse proxy sits in front of the server anyway, every proxied client collapses into the proxy's single IP and caller-supplied `X-Forwarded-For` headers are ignored (so they cannot be spoofed to split or evade rate limits).
+- **Hop count (a positive integer):** trusts exactly that many reverse-proxy hops closest to the server. With `1` behind one trusted reverse proxy, `req.ip` resolves to the right-most (nearest-to-server) `X-Forwarded-For` entry — the one your proxy actually set — not an arbitrary caller-supplied left-most prefix.
+- **Subnet/address list (an array of strings):** trusts only hops whose address matches one of the given IPs or CIDR subnets (e.g. `["10.0.0.0/8"]`), Express/`proxy-addr`'s standard shape.
 
 ```json
-{ "security": { "trust_proxy": true } }
+{ "security": { "trust_proxy": 1 } }
 ```
+
+```json
+{ "security": { "trust_proxy": ["10.0.0.0/8"] } }
+```
+
+Migrating from a pre-existing `"trust_proxy": true`: replace it with the hop count of your actual reverse-proxy chain (usually `1` for a single load balancer or ingress in front of the server) or the trusted subnet(s) it runs in.
 
 ### Rate Limiting
 
@@ -2558,7 +2689,7 @@ HTTP requests are rate-limited per client IP address:
 - Exceeded clients receive HTTP 429 with `{ error: { code: "RATE_LIMITED", retryable: true } }`
 - Requests with no derivable client IP fail closed with HTTP 400 (`INVALID_INPUT`) rather than sharing a single fallback bucket
 - Response headers include `X-RateLimit-Limit` and `X-RateLimit-Remaining`
-- Expired rate limit buckets are swept every 30 seconds
+- The client-bucket map has a hard capacity, `security.rate_limit_max_buckets` (default 10,000). Expired buckets are swept independently every 30 seconds via an unref'd timer (not opportunistically tied to request arrival, so cleanup happens even when traffic stops). At capacity, one last sweep runs before a genuinely new client identity is rejected with HTTP 429 (`{ error: { code: "RATE_LIMITED", retryable: true } }`) rather than growing the map further — an already-bucketed client is never affected by this.
 - Rate-limit state is scoped per server/middleware instance, so independent instances (e.g. in tests) never share buckets
 
 ### Request Size Limiting
@@ -3904,8 +4035,12 @@ The server is available at `http://localhost:3721` (published to host loopback
 only by default). Check health with:
 
 ```bash
-curl http://localhost:3721/health
+curl http://localhost:3721/health/live
 ```
+
+The container's own `HEALTHCHECK` polls `/health/live` for the same reason: it runs
+with no credentials, and the full diagnostic `/health` snapshot requires Bearer auth
+(see [Health & Metrics](#health--metrics)).
 
 ### Security defaults
 
@@ -4111,7 +4246,9 @@ Once the drift/surplus check finishes, the guard is released — re-embedding th
 
 ### HTTP Hardening
 
-- `/health` is intentionally unauthenticated for probe compatibility.
+- `/health/live` and `/health/ready` are intentionally unauthenticated for probe
+  compatibility; the full diagnostic `/health` snapshot requires the same Bearer auth
+  as every other route. See [Health & Metrics](#health--metrics).
 - Rate limiting keys on trusted request identity (IP) and ignores `x-client-id` for enforcement.
 - Audit/request-log `client_id` is likewise derived from the trusted request identity (`req.ip`), never from the caller-supplied `x-client-id` header — that header is accepted only as a non-authoritative debug hint and is never trusted for the audit trail.
 - `memory://list` enforces `limit` bounds of `1..100`; invalid values return `INVALID_INPUT`.

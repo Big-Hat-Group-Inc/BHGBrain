@@ -23,9 +23,26 @@ describe('HealthService', () => {
           backoff_ms: 1000,
         },
       },
-      qdrant: { mode: 'embedded', embedded_path: './qdrant', external_url: null, api_key_env: null },
+      qdrant: {
+        mode: 'embedded',
+        embedded_path: './qdrant',
+        external_url: null,
+        api_key_env: null,
+        operation_timeout_ms: 10_000,
+        health_timeout_ms: 3_000,
+        fanout: { max_collections: 25, concurrency: 5, per_target_limit: 50 },
+      },
       transport: {
-        http: { enabled: true, host: '127.0.0.1', port: 3721, bearer_token_env: 'BHGBRAIN_TOKEN' },
+        http: {
+          enabled: true,
+          host: '127.0.0.1',
+          port: 3721,
+          bearer_token_env: 'BHGBRAIN_TOKEN',
+          keep_alive_timeout_ms: 65000,
+          headers_timeout_ms: 66000,
+          request_timeout_ms: 300000,
+          mcp_session: { idle_timeout_ms: 30 * 60_000, max_sessions: 1000, sweep_interval_ms: 60_000 },
+        },
         stdio: { enabled: true },
       },
       defaults: {
@@ -67,7 +84,9 @@ describe('HealthService', () => {
         allow_unauthenticated_http: false,
         log_redaction: true,
         rate_limit_rpm: 100,
+        rate_limit_max_buckets: 10_000,
         max_request_size_bytes: 1048576,
+        trust_proxy: false,
       },
       auto_inject: { max_chars: 30000, max_tokens: null },
       observability: { metrics_enabled: false, structured_logging: true, log_level: 'info' },
@@ -549,5 +568,78 @@ describe('HealthService', () => {
 
     expect(result.status).toBe('degraded');
     expect(result.components.schedulers).toEqual({ status: 'degraded', message: 'timer registration failed' });
+  });
+
+  // bound-qdrant-http-runtime task 2.1: liveness/readiness/diagnostics split.
+  describe('checkLiveness (task 2.1)', () => {
+    it('is synchronous, dependency-free, and always reports ok', () => {
+      const storage = createStorage();
+      // If checkLiveness touched either dependency, these would be invoked;
+      // they aren't spied here on purpose so an accidental call throws.
+      delete (storage.sqlite as unknown as Record<string, unknown>).healthCheck;
+      delete (storage.qdrant as unknown as Record<string, unknown>).healthCheck;
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = health.checkLiveness();
+
+      expect(result.status).toBe('ok');
+      expect(result.uptime_seconds).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe('checkReadiness (task 2.1/2.2)', () => {
+    it('is ready when sqlite and qdrant are both healthy', async () => {
+      const health = new HealthService(createStorage(), createEmbedding(true), createConfig());
+      const result = await health.checkReadiness();
+
+      expect(result.ready).toBe(true);
+      expect(result.components.sqlite.status).toBe('healthy');
+      expect(result.components.qdrant.status).toBe('healthy');
+    });
+
+    it('is not ready when qdrant is unavailable, independent of embedding/retention state', async () => {
+      const storage = createStorage();
+      storage.qdrant.healthCheck = vi.fn(async () => {
+        throw new Error('Qdrant unreachable');
+      });
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.checkReadiness();
+
+      expect(result.ready).toBe(false);
+      expect(result.components.qdrant.status).toBe('unhealthy');
+    });
+
+    it('is not ready when sqlite is unavailable', async () => {
+      const storage = createStorage();
+      storage.sqlite.healthCheck = vi.fn(() => false);
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.checkReadiness();
+
+      expect(result.ready).toBe(false);
+      expect(result.components.sqlite.status).toBe('unhealthy');
+    });
+
+    it('caches the qdrant probe so repeated readiness calls do not each hit qdrant again', async () => {
+      const storage = createStorage();
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+
+      await health.checkReadiness();
+      await health.checkReadiness();
+      await health.checkReadiness();
+
+      expect(storage.qdrant.healthCheck).toHaveBeenCalledTimes(1);
+    });
+
+    it('shares the qdrant health cache with the authenticated diagnostic check()', async () => {
+      const storage = createStorage();
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+
+      await health.checkReadiness();
+      await health.check();
+
+      expect(storage.qdrant.healthCheck).toHaveBeenCalledTimes(1);
+    });
   });
 });

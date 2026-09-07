@@ -292,7 +292,25 @@ BHGBrain 从以下位置加载配置文件：
     // 外部 Qdrant URL（当 mode = "external" 时使用）
     "external_url": null,
     // 包含 Qdrant API key 的环境变量名称（当 mode = "external" 时使用）
-    "api_key_env": null
+    "api_key_env": null,
+    // 每个请求路径、清理、扫描及管理类 Qdrant 调用的客户端（基于
+    // AbortController）超时期限 —— 全部经过共享断路器。底层客户端自身的默
+    // 认值为 300000 毫秒。
+    "operation_timeout_ms": 10000,
+    // 仅供健康探针使用的单独、故意更短的期限（其专属的独立客户端实例，从
+    // 不经过断路器）。不得超过 operation_timeout_ms。
+    "health_timeout_ms": 3000,
+    // 未指定 collection（整个命名空间范围）的 search/recall 查询在命名空间
+    // 内所有集合上扇出时的边界。
+    "fanout": {
+      // 超过此数量的目标集合会被确定性地截断。
+      "max_collections": 25,
+      // 这些目标集合中同时并发查询的数量。
+      "concurrency": 5,
+      // 仅在真正扇出（目标数大于一）时应用的单集合结果上限；显式指定
+      // `collection` 的搜索始终使用调用方完整的 `limit`。
+      "per_target_limit": 50
+    }
   },
 
   // 传输配置
@@ -315,7 +333,18 @@ BHGBrain 从以下位置加载配置文件：
       "headers_timeout_ms": 66000,
       // 完整接收一个请求所允许的时间；不会限制 GET /mcp 上长期存在的 SSE
       // 响应，因为该响应只接收请求，不发送请求。
-      "request_timeout_ms": 300000
+      "request_timeout_ms": 300000,
+      // 为内存中的 MCP HTTP 会话注册表设置边界（参见"健康状态与指标"下的
+      // "MCP 会话生命周期"）。
+      "mcp_session": {
+        // 超过这一时长没有请求的会话会被自动关闭。
+        "idle_timeout_ms": 1800000,
+        // 常驻会话数的硬上限；达到容量上限后的新会话会驱逐最近最少活跃的
+        // 会话以腾出空间。
+        "max_sessions": 1000,
+        // 独立的空闲会话清扫器运行的频率。
+        "sweep_interval_ms": 60000
+      }
     },
     "stdio": {
       // 启用 MCP stdio 传输
@@ -548,10 +577,14 @@ BHGBrain 从以下位置加载配置文件：
     "log_redaction": true,
     // HTTP 传输下每个客户端 IP 每分钟的最大请求数
     "rate_limit_rpm": 100,
+    // 速率限制器桶映射的硬性容量上限（参见速率限制）。
+    "rate_limit_max_buckets": 10000,
     // HTTP 请求体的最大字节数
     "max_request_size_bytes": 1048576,
-    // Express 的 "trust proxy" 设置。false（默认）= req.ip 为直接 socket 对端（回环精确）；
-    // true = 采信前置反向代理设置的 X-Forwarded-For。仅在受信任的代理之后启用。
+    // Express 的 "trust proxy" 设置。false（默认）= req.ip 为直接 socket 对端
+    // （回环精确）。正整数 = 精确信任这么多跳反向代理（req.ip 采信最右侧、
+    // 不受信任条目之前的 X-Forwarded-For）。字符串数组 = 仅信任地址匹配这些
+    // IP/子网的跳点。不再接受旧式布尔值 true（"信任每一跳"）—— 参见代理信任。
     "trust_proxy": false
   },
 
@@ -700,7 +733,9 @@ node dist/index.js
 
 | 端点 | 是否需要认证 | 说明 |
 |---|---|---|
-| `GET /health` | 否 | 健康检查（不需认证，兼容探针） |
+| `GET /health/live` | 否 | 存活检查（liveness）：极简，不涉及任何依赖 I/O —— 可任意频率轮询 |
+| `GET /health/ready` | 否 | 就绪检查（readiness）：带缓存的 SQLite/Qdrant 检查；必需依赖降级时返回 503 |
+| `GET /health` | 是 | 完整诊断快照（embedding、retention、调度器、断路器等） |
 | `POST /mcp` | 是 | MCP Streamable HTTP：JSON-RPC 请求；`initialize` 请求会创建新会话 |
 | `GET /mcp` | 是 | MCP Streamable HTTP：既有会话的独立 SSE 通道 |
 | `DELETE /mcp` | 是 | MCP Streamable HTTP：终止会话 |
@@ -709,12 +744,16 @@ node dist/index.js
 | `GET /metrics` | 是 | Prometheus 格式的指标（需 `metrics_enabled: true`） |
 
 每个 `/mcp` 会话都是一个全新的内存态 MCP 服务器，与其他会话及 REST 端点共享同一底层
-存储 —— 重启进程会丢弃所有会话，符合规范的客户端会自动重新初始化。
+存储 —— 重启进程会丢弃所有会话，符合规范的客户端会自动重新初始化。空闲超过
+`transport.http.mcp_session.idle_timeout_ms` 的会话会被自动关闭；完整的会话生命周期与
+端点划分详见[健康状态与指标](#健康状态与指标)。
 
 健康检查示例：
 
 ```bash
-curl http://127.0.0.1:3721/health
+curl http://127.0.0.1:3721/health/live
+curl http://127.0.0.1:3721/health/ready
+curl -H "Authorization: Bearer <your-token>" http://127.0.0.1:3721/health
 ```
 
 通过 HTTP 调用工具示例：
@@ -2273,13 +2312,32 @@ JSON 头部（格式版本 2）包含：
 
 ### 健康端点
 
+HTTP 健康检查分为三部分，让廉价、高频的存活探针、有边界的就绪检查、以及完整的认证诊断
+快照各自具有恰当的成本与访问控制模型（bound-qdrant-http-runtime）：
+
 ```bash
-GET /health        # HTTP
-# 或通过 CLI：
+GET /health/live   # 无需认证，无依赖 I/O —— 用于重启/存活决策
+GET /health/ready   # 无需认证，带缓存的依赖检查 —— 未就绪时返回 503
+GET /health          # 需认证，完整诊断快照
+# 或通过 CLI（完整诊断快照，等同于 GET /health）：
 bhgbrain health
 ```
 
-返回 `HealthSnapshot`：
+- **`GET /health/live`** —— `{ "status": "ok", "uptime_seconds": 86400 }`。同步执行，
+  不涉及任何依赖（连 SQLite 都不涉及），因此在任何探测频率下都保持廉价。始终返回
+  `200`。用于编排器的重启决策（Docker 镜像自身的 `HEALTHCHECK` 探测的正是它 —— 参见
+  [Docker](#docker)）。
+- **`GET /health/ready`** —— 只检查请求无法离开的两个依赖：SQLite（本地
+  `SELECT 1`）和 Qdrant（有边界、带缓存的向量查询探针 —— 见下文）。返回
+  `{ "ready": true|false, "components": { "sqlite": {...}, "qdrant": {...} } }`，就绪
+  时为 `200`，任一依赖不健康时为 `503`。与 `/health/live` 不同，该端点注册在限流之
+  *后*，且 Qdrant 探针本身带缓存，因此一连串未认证的就绪轮询不会转化为一连串新的
+  Qdrant 请求。
+- **`GET /health`** —— 完整诊断快照（embedding、retention、调度器、断路器、各层计数
+  等），现在要求与其他路由相同的 Bearer 认证。与 `/health/ready` 共享同一个带缓存的
+  Qdrant 探针。
+
+返回 `GET /health` 的 `HealthSnapshot`：
 
 ```json
 {
@@ -2327,11 +2385,55 @@ bhgbrain health
 | `embedding` | 嵌入 API 调用成功 | 缺少凭据或无法访问 | — |
 | `retention` | 所有预算在限制内，无未同步向量 | 预算超出或未同步向量 > 0 | — |
 
-**HTTP 状态码：**
+**HTTP 状态码（`GET /health`）：**
 - `200`——对于 `healthy` 和 `degraded`
 - `503`——对于 `unhealthy`
 
-嵌入健康状态缓存 30 秒，以避免每次探针对 OpenAI 发起 API 调用。
+（`GET /health/ready` 使用自己的 `ready`/`503` 映射 —— 见上文 —— 与 `GET /health` 的
+`healthy`/`degraded`/`unhealthy` 状态字段相互独立。）
+
+嵌入健康状态缓存 30 秒，以避免每次探针对 OpenAI 发起 API 调用。Qdrant 健康探针（由
+`/health` 与 `/health/ready` 共用）出于同样的原因缓存 5 秒，并使用自己独立的短客户端
+超时（`qdrant.health_timeout_ms`，默认 3000），而不是请求路径 Qdrant 调用所用的更长
+的 `qdrant.operation_timeout_ms` —— 卡住的 Qdrant 能快速使健康状态降级，调用方无需
+等待完整的操作期限。参见[完整配置参考](#完整配置参考)。
+
+### 依赖超时、有边界的扇出与断路器覆盖
+
+服务器发出的每一次 Qdrant 操作 —— 写入、读取、清理/压缩、快照创建、集合
+scroll/列出/删除 —— 都受 `qdrant.operation_timeout_ms` 约束（默认 10000，基于客户端
+的 `AbortController`），并统一经过共享的 Qdrant 断路器（`resilience.circuit_breaker`），
+因此被黑洞化的 Qdrant 端点会在每条代码路径上快速失败，而不只是部分路径。健康探针刻意
+使用独立的客户端与超时（`qdrant.health_timeout_ms`），且从不触碰断路器（见上文）。
+
+未指定 `collection` 的 `recall`/`search` 调用会在命名空间内的每个集合上扇出。这一扇出
+受 `qdrant.fanout` 约束：`max_collections`（默认 25）限制一次调用最多面向多少个集合
+—— 超出部分会被确定性地截断 —— `concurrency`（默认 5）限制其中有多少并发执行（以固
+定大小的批次进行），`per_target_limit`（默认 50）则在真正扇出（目标数大于一）时限制
+每个目标自身的 `limit` —— 显式指定 `collection` 的搜索始终使用调用方完整、不受限制的
+`limit`。截断情况通过 `bhgbrain_qdrant_fanout_width` 仪表和
+`bhgbrain_qdrant_fanout_truncated_total` 计数器（参见[指标](#指标)）以及一条
+`qdrant_fanout_truncated` 日志行暴露，而不会出现在 `search`/`recall` 响应体本身中。
+
+### MCP 会话生命周期
+
+每次 `POST /mcp initialize` 调用都会打开一个在进程生命周期内保存在内存中的会话。
+`transport.http.mcp_session` 为这一注册表设置边界，使得一个未发送 `DELETE /mcp` 就断开
+连接的 HTTP MCP 客户端（普通客户端崩溃或网络中断的常见情形）不会无限期泄漏会话：
+
+- `idle_timeout_ms`（默认 1,800,000 = 30 分钟）—— 超过这一时长没有请求的会话会被独立
+  的、`unref` 的清扫器关闭（`sweep_interval_ms`，默认 60000）。通过某个会话发出的任何
+  请求都会刷新其活跃度，从而推迟过期。
+- `max_sessions`（默认 1000）—— 常驻会话数的硬上限。达到容量上限后的新 `initialize`
+  会驱逐最近最少活跃的会话以腾出空间；如果注册表本已为空却仍然“达到容量”（只有在
+  `max_sessions: 0` 这种误配置下才可能发生），请求会以失败关闭（fail closed）的方式返
+  回 `503`。
+- 在任一驱逐路径之后重用某个 ID，会得到与 `DELETE /mcp` 已经产生的相同的
+  `404 Session not found` 响应 —— 无需处理另一套错误形态。
+
+当前及被驱逐的会话数分别以 `bhgbrain_mcp_sessions_active` 仪表和
+`bhgbrain_mcp_sessions_evicted_total{reason="idle"|"capacity"}` 计数器发布（参见
+[指标](#指标)）。`closeAll()`（进程关闭时）会停止清扫定时器并关闭每个存活会话的传输层。
 
 ### 指标
 
@@ -2368,6 +2470,11 @@ GET /metrics
 | `bhgbrain_memory_count` | gauge | 当前总记忆数量（写入/删除时更新） |
 | `bhgbrain_rate_limit_buckets` | gauge | 活跃的速率限制追踪桶 |
 | `bhgbrain_rate_limited_total` | counter | 被速率限制的请求总数 |
+| `bhgbrain_rate_limit_capacity_rejected_total` | counter | 因速率限制桶映射对某个全新客户端身份已达到 `security.rate_limit_max_buckets` 容量上限而以 429 拒绝的请求总数 |
+| `bhgbrain_qdrant_fanout_width` | gauge | 最近一次未指定 collection 的 `search`/`recall` 查询在经过 `qdrant.fanout.max_collections` 截断后实际扇出的集合数 |
+| `bhgbrain_qdrant_fanout_truncated_total` | counter | 每当未指定 collection 的查询的目标集合列表被截断到 `qdrant.fanout.max_collections` 时递增 |
+| `bhgbrain_mcp_sessions_active` | gauge | 当前常驻的 MCP HTTP 会话数 |
+| `bhgbrain_mcp_sessions_evicted_total` | counter | 会话管理器关闭的 MCP HTTP 会话总数，带 `reason` 标签（`idle` 或 `capacity`） |
 | `recall_zero_after_filter` | counter | 当 `recall` 检索后的类型/标签/`after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
 | `search_zero_after_filter` | counter | 当 `search` 检索后的 `after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
 | `search_embedding_degraded` | counter | 当 `hybrid` 模式搜索因嵌入提供方或向量存储不可用而降级为仅全文搜索时递增，按 `namespace` 分类 |
@@ -2391,7 +2498,9 @@ bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
 
 ### HTTP 认证
 
-在 HTTP 模式下运行时，所有端点（`/health` 除外）的请求都需要 `Bearer` token：
+在 HTTP 模式下运行时，除 `/health/live` 与 `/health/ready` 外的所有端点的请求都需要
+`Bearer` token —— 完整诊断快照 `/health` 现在与其他路由一样需要认证（参见
+[健康状态与指标](#健康状态与指标)）：
 
 ```
 Authorization: Bearer <your-token>
@@ -2434,14 +2543,21 @@ SECURITY: HTTP binding to "0.0.0.0" is externally reachable but no bearer token 
 
 ### 代理信任
 
-`security.trust_proxy`（默认 `false`）会直接传给 Express 的 `app.set('trust proxy', ...)`，从而控制 `req.ip` 的推导方式，也就决定了速率限制器所依据的身份：
+`security.trust_proxy`（默认 `false`）会直接传给 Express 的 `app.set('trust proxy', ...)`，从而控制 `req.ip` 的推导方式，也就决定了速率限制器所依据的身份。它接受 `false`、一个正整数跳数，或一个受信任代理 IP/子网数组 —— **不再接受旧式布尔值 `true`（"信任每一跳"）**，配置校验会失败并给出迁移提示，因为它会让调用方提交的、位于 `X-Forwarded-For` *最左侧*的条目自行选择客户端身份，即便只经过恰好一跳真实反向代理：
 
-- **禁用（默认）：** `req.ip` 为直接 socket 对端地址。这对文档中仅回环的部署方式是精确的。如果前面仍然放置了反向代理，所有被代理的客户端都会被合并为代理的单一 IP，并且调用方提交的 `X-Forwarded-For` 头会被忽略（因此无法被伪造来拆分或规避速率限制）。
-- **启用：** `req.ip` 会采信直接对端设置的 `X-Forwarded-For`。仅应在您信任其正确设置该头部的反向代理之后启用——在没有受信任代理的情况下启用会让任何客户端伪造其速率限制身份。
+- **禁用（默认，`false`）：** `req.ip` 为直接 socket 对端地址。这对文档中仅回环的部署方式是精确的。如果前面仍然放置了反向代理，所有被代理的客户端都会被合并为代理的单一 IP，并且调用方提交的 `X-Forwarded-For` 头会被忽略（因此无法被伪造来拆分或规避速率限制）。
+- **跳数（正整数）：** 精确信任离服务器最近的这么多跳反向代理。当设为 `1` 且位于一个受信任的反向代理之后时，`req.ip` 会解析为 `X-Forwarded-For` 中最右侧（离服务器最近）的条目 —— 即代理实际设置的那一项 —— 而不是调用方任意提交的最左侧前缀。
+- **子网/地址列表（字符串数组）：** 只信任地址匹配给定 IP 或 CIDR 子网之一的跳点（例如 `["10.0.0.0/8"]`），即 Express/`proxy-addr` 的标准形式。
 
 ```json
-{ "security": { "trust_proxy": true } }
+{ "security": { "trust_proxy": 1 } }
 ```
+
+```json
+{ "security": { "trust_proxy": ["10.0.0.0/8"] } }
+```
+
+从已有的 `"trust_proxy": true` 迁移：将其替换为您实际反向代理链的跳数（在服务器前只有单一负载均衡器或 ingress 的常见情形下通常为 `1`），或其运行所在的受信任子网。
 
 ### 速率限制
 
@@ -2452,7 +2568,7 @@ HTTP 请求按客户端 IP 地址进行速率限制：
 - 超出限制的客户端收到 HTTP 429 和 `{ error: { code: "RATE_LIMITED", retryable: true } }`
 - 无法推导出客户端 IP 的请求会以 HTTP 400（`INVALID_INPUT`）安全失败关闭，而不是共享单一的兜底桶
 - 响应头包含 `X-RateLimit-Limit` 和 `X-RateLimit-Remaining`
-- 每 30 秒清扫一次过期的速率限制桶
+- 桶映射有一个硬性容量上限 `security.rate_limit_max_buckets`（默认 10,000）。过期的桶通过一个 `unref` 定时器每 30 秒独立清扫一次（不再机会主义地依附于请求到达，因此即使流量完全停止，清理也会继续进行）。达到容量上限时，会先运行最后一次清扫，之后仍会以 HTTP 429（`{ error: { code: "RATE_LIMITED", retryable: true } }`）拒绝一个全新的客户端身份，而不是继续让映射增长 —— 已经存在的客户端永远不会因此受影响。
 - 速率限制状态按服务器/中间件实例隔离，因此独立实例（例如测试中）永远不会共享桶
 
 ### 请求大小限制
@@ -3695,8 +3811,11 @@ docker compose up
 服务器默认监听 `http://localhost:3721`（默认仅发布到宿主机回环地址）。使用以下命令检查健康状态：
 
 ```bash
-curl http://localhost:3721/health
+curl http://localhost:3721/health/live
 ```
+
+容器自身的 `HEALTHCHECK` 出于同样原因探测 `/health/live`：它在没有任何凭据的情况下运
+行，而完整诊断快照 `/health` 需要 Bearer 认证（参见[健康状态与指标](#健康状态与指标)）。
 
 ### 安全默认值
 
@@ -3894,7 +4013,7 @@ bhgbrain backup create
 
 ### HTTP 安全加固
 
-- `/health` 有意设计为无需认证，以兼容探针。
+- `/health/live` 与 `/health/ready` 有意设计为无需认证，以兼容探针；完整诊断快照 `/health` 与其他路由一样需要相同的 Bearer 认证。参见[健康状态与指标](#健康状态与指标)。
 - 速率限制以受信任的请求身份（IP）为键，忽略 `x-client-id` 用于强制执行。
 - 审计/请求日志中的 `client_id` 同样源自受信任的请求身份（`req.ip`），而非调用方提供的 `x-client-id` 头部——该头部仅作为非权威的调试提示接受，绝不用于审计追踪的信任来源。
 - `memory://list` 强制 `limit` 范围为 `1..100`；无效值返回 `INVALID_INPUT`。

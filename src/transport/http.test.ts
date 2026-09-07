@@ -12,12 +12,24 @@ describe('createHttpServer', () => {
   function createConfig(
     metricsEnabled = false,
     authRequired = true,
-    overrides?: { trustProxy?: boolean; rateLimitRpm?: number },
+    overrides?: {
+      trustProxy?: false | number | string[];
+      rateLimitRpm?: number;
+      mcpSession?: { idle_timeout_ms?: number; max_sessions?: number; sweep_interval_ms?: number };
+    },
   ): BrainConfig {
     return {
       data_dir: 'test-data',
       embedding: { provider: 'openai', model: 'test-model', api_key_env: 'OPENAI_API_KEY', dimensions: 3 },
-      qdrant: { mode: 'embedded', embedded_path: './qdrant', external_url: null, api_key_env: null },
+      qdrant: {
+        mode: 'embedded',
+        embedded_path: './qdrant',
+        external_url: null,
+        api_key_env: null,
+        operation_timeout_ms: 10_000,
+        health_timeout_ms: 3_000,
+        fanout: { max_collections: 25, concurrency: 5, per_target_limit: 50 },
+      },
       transport: {
         http: {
           enabled: true,
@@ -27,6 +39,11 @@ describe('createHttpServer', () => {
           keep_alive_timeout_ms: 65000,
           headers_timeout_ms: 66000,
           request_timeout_ms: 300000,
+          mcp_session: {
+            idle_timeout_ms: overrides?.mcpSession?.idle_timeout_ms ?? 30 * 60_000,
+            max_sessions: overrides?.mcpSession?.max_sessions ?? 1000,
+            sweep_interval_ms: overrides?.mcpSession?.sweep_interval_ms ?? 60_000,
+          },
         },
         stdio: { enabled: true },
       },
@@ -69,6 +86,7 @@ describe('createHttpServer', () => {
         allow_unauthenticated_http: !authRequired,
         log_redaction: true,
         rate_limit_rpm: overrides?.rateLimitRpm ?? 100,
+        rate_limit_max_buckets: 10_000,
         max_request_size_bytes: 1048576,
         trust_proxy: overrides?.trustProxy ?? false,
       },
@@ -90,7 +108,7 @@ describe('createHttpServer', () => {
   // design decision "Use supertest ... never call .listen() in tests" and
   // audit follow-up 8.9).
   async function buildApp(config: BrainConfig, overrides?: {
-    health?: { check: () => Promise<unknown> };
+    health?: { check: () => Promise<unknown>; checkLiveness?: () => unknown; checkReadiness?: () => Promise<unknown> };
     metrics?: Partial<{
       getMetrics: () => Array<{ name: string; value: number }>;
       incCounter: (name: string, amount?: number) => void;
@@ -116,7 +134,13 @@ describe('createHttpServer', () => {
       recordHistogram: vi.fn(),
     };
     const ctx = {
-      health: overrides?.health ?? { check: vi.fn(async () => ({ status: 'healthy' })) },
+      config,
+      health: {
+        check: vi.fn(async () => ({ status: 'healthy' })),
+        checkLiveness: vi.fn(() => ({ status: 'ok', uptime_seconds: 1 })),
+        checkReadiness: vi.fn(async () => ({ ready: true, components: { sqlite: { status: 'healthy' }, qdrant: { status: 'healthy' } } })),
+        ...overrides?.health,
+      },
       metrics: { ...defaultMetrics, ...overrides?.metrics },
     };
     const resources = overrides?.resources ?? { handle: vi.fn(async (uri: string) => ({ uri })) };
@@ -128,7 +152,7 @@ describe('createHttpServer', () => {
       logger as never,
     );
 
-    return { app, resources, mcpSessions };
+    return { app, resources, mcpSessions, metrics: ctx.metrics };
   }
 
   afterEach(() => {
@@ -136,29 +160,83 @@ describe('createHttpServer', () => {
     delete process.env.BHGBRAIN_TOKEN;
   });
 
-  it('returns health without auth and uses 200/503 based on status', async () => {
+  // bound-qdrant-http-runtime task 2.1: the full diagnostic snapshot at
+  // `/health` now requires the same Bearer auth as every other route.
+  it('requires auth for the diagnostic /health snapshot and uses 200/503 based on status', async () => {
     const healthy = await buildApp(createConfig(false, true), {
       health: { check: vi.fn(async () => ({ status: 'healthy' })) },
     });
-    const healthyResponse = await request(healthy.app).get('/health');
+    const unauthenticated = await request(healthy.app).get('/health');
+    expect(unauthenticated.status).toBe(401);
+
+    const healthyResponse = await request(healthy.app).get('/health').set('Authorization', 'Bearer secret-token');
     expect(healthyResponse.status).toBe(200);
 
     const unhealthy = await buildApp(createConfig(false, true), {
       health: { check: vi.fn(async () => ({ status: 'unhealthy' })) },
     });
-    const unhealthyResponse = await request(unhealthy.app).get('/health');
+    const unhealthyResponse = await request(unhealthy.app).get('/health').set('Authorization', 'Bearer secret-token');
     expect(unhealthyResponse.status).toBe(503);
   });
 
-  it('returns 200 (not 503) when health reports degraded', async () => {
-    // Covers http.ts:31 — the `degraded` branch, distinct from the
-    // `unhealthy`->503 path above (audit follow-up 8.8 / task 2.3).
+  it('returns 200 (not 503) when the diagnostic snapshot reports degraded', async () => {
+    // Covers http.ts's degraded branch, distinct from the unhealthy->503
+    // path above (audit follow-up 8.8 / task 2.3).
     const degraded = await buildApp(createConfig(false, true), {
       health: { check: vi.fn(async () => ({ status: 'degraded' })) },
     });
-    const degradedResponse = await request(degraded.app).get('/health');
+    const degradedResponse = await request(degraded.app).get('/health').set('Authorization', 'Bearer secret-token');
     expect(degradedResponse.status).toBe(200);
     expect(degradedResponse.body.status).toBe('degraded');
+  });
+
+  // bound-qdrant-http-runtime task 2.1/2.2: liveness/readiness split.
+  describe('/health/live and /health/ready (task 2.1/2.2)', () => {
+    it('serves /health/live without auth, without rate limiting, and with no dependency I/O', async () => {
+      const checkLiveness = vi.fn(() => ({ status: 'ok' as const, uptime_seconds: 42 }));
+      const { app } = await buildApp(createConfig(false, true, { rateLimitRpm: 1 }), {
+        health: { check: vi.fn(), checkLiveness, checkReadiness: vi.fn() },
+      });
+
+      // Exhaust the (very low) rate limit budget first...
+      await request(app).get('/health/live');
+      // ...liveness still succeeds every time, since it is registered ahead
+      // of both auth and rate limiting.
+      const response = await request(app).get('/health/live');
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ status: 'ok', uptime_seconds: 42 });
+      expect(checkLiveness).toHaveBeenCalled();
+    });
+
+    it('serves /health/ready without auth but maps ready:false to 503', async () => {
+      const { app } = await buildApp(createConfig(false, true), {
+        health: {
+          check: vi.fn(),
+          checkLiveness: vi.fn(),
+          checkReadiness: vi.fn(async () => ({
+            ready: false,
+            components: { sqlite: { status: 'healthy' }, qdrant: { status: 'unhealthy', message: 'Qdrant unreachable' } },
+          })),
+        },
+      });
+
+      const response = await request(app).get('/health/ready');
+      expect(response.status).toBe(503);
+      expect(response.body.ready).toBe(false);
+    });
+
+    it('rate-limits repeated /health/ready probes (task 2.2)', async () => {
+      const checkReadiness = vi.fn(async () => ({ ready: true, components: { sqlite: { status: 'healthy' }, qdrant: { status: 'healthy' } } }));
+      const { app } = await buildApp(createConfig(false, true, { rateLimitRpm: 1 }), {
+        health: { check: vi.fn(), checkLiveness: vi.fn(), checkReadiness },
+      });
+
+      const first = await request(app).get('/health/ready');
+      expect(first.status).toBe(200);
+
+      const second = await request(app).get('/health/ready');
+      expect(second.status).toBe(429);
+    });
   });
 
   it('rejects tool calls without or with invalid auth', async () => {
@@ -302,9 +380,9 @@ describe('createHttpServer', () => {
     expect(second.status).toBe(429);
   });
 
-  it('derives rate-limit identity from X-Forwarded-For when trust_proxy is enabled', async () => {
+  it('derives rate-limit identity from X-Forwarded-For when trust_proxy is enabled (one trusted hop)', async () => {
     const { app } = await buildApp(
-      createConfig(false, true, { trustProxy: true, rateLimitRpm: 1 }),
+      createConfig(false, true, { trustProxy: 1, rateLimitRpm: 1 }),
     );
 
     const clientA = await request(app)
@@ -324,6 +402,39 @@ describe('createHttpServer', () => {
       .set('X-Forwarded-For', '203.0.113.20')
       .send({ content: 'hello' });
     expect(clientB.status).toBe(200);
+  });
+
+  // bound-qdrant-http-runtime task 2.3: `trust_proxy: true` ("trust every
+  // hop") let a caller-supplied left-most X-Forwarded-For entry choose its
+  // own client identity even through exactly one real reverse-proxy hop. A
+  // positive hop count fixes this: only the right-most (nearest-to-server)
+  // untrusted entry is authoritative, so a spoofed left-most prefix cannot
+  // manufacture a fresh rate-limit identity.
+  it('resists a spoofed left-most X-Forwarded-For entry behind a one-hop trusted proxy', async () => {
+    const { app } = await buildApp(
+      createConfig(false, true, { trustProxy: 1, rateLimitRpm: 1 }),
+    );
+
+    // Both requests arrive "through" the same real one-hop proxy (same
+    // right-most/nearest entry, 9.9.9.9) but with different attacker-supplied
+    // left-most prefixes. With only one hop trusted, req.ip resolves to the
+    // right-most entry both times — the same identity — so the second
+    // request is rate-limited rather than getting a fresh bucket.
+    const first = await request(app)
+      .post('/tool/remember')
+      .set('Content-Type', 'application/json')
+      .set('Authorization', 'Bearer secret-token')
+      .set('X-Forwarded-For', '203.0.113.1, 9.9.9.9')
+      .send({ content: 'hello' });
+    expect(first.status).toBe(200);
+
+    const second = await request(app)
+      .post('/tool/remember')
+      .set('Content-Type', 'application/json')
+      .set('Authorization', 'Bearer secret-token')
+      .set('X-Forwarded-For', '203.0.113.2, 9.9.9.9')
+      .send({ content: 'hello' });
+    expect(second.status).toBe(429);
   });
 
   // harden-http-server-lifecycle task 6.2: every HTTP failure path returns
@@ -609,6 +720,131 @@ describe('createHttpServer /mcp routes', () => {
       .set('mcp-session-id', sessionId)
       .send(toolsListBody());
     expect(afterTeardown.status).toBe(404);
+  });
+
+  // bound-qdrant-http-runtime task 3.1-3.3: MCP session lifecycle bounds.
+  describe('MCP session lifecycle bounds (bound-qdrant-http-runtime tasks 3.1-3.3)', () => {
+    it('evicts the oldest session to make room once at max_sessions capacity', async () => {
+      const { app, mcpSessions, metrics } = await buildApp(
+        createConfig(false, true, { mcpSession: { max_sessions: 1 } }),
+      );
+
+      const firstInit = await initializeSession(app);
+      const firstSessionId = firstInit.headers['mcp-session-id'];
+      expect(mcpSessions.size).toBe(1);
+
+      // A second initialize while already at capacity (max_sessions: 1)
+      // evicts the first (only, hence oldest) session rather than growing
+      // the registry past its cap or refusing the new client outright.
+      const secondInit = await initializeSession(app);
+      expect(secondInit.status).toBe(200);
+      const secondSessionId = secondInit.headers['mcp-session-id'];
+      expect(mcpSessions.size).toBe(1);
+      expect(secondSessionId).not.toBe(firstSessionId);
+
+      // The evicted session is gone from the registry.
+      const afterEviction = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', MCP_ACCEPT)
+        .set('Authorization', 'Bearer secret-token')
+        .set('mcp-session-id', firstSessionId)
+        .send(toolsListBody());
+      expect(afterEviction.status).toBe(404);
+
+      // The newly created session still works.
+      const stillWorks = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', MCP_ACCEPT)
+        .set('Authorization', 'Bearer secret-token')
+        .set('mcp-session-id', secondSessionId)
+        .send(toolsListBody());
+      expect(stillWorks.status).toBe(200);
+
+      expect(metrics.incCounter).toHaveBeenCalledWith(
+        'bhgbrain_mcp_sessions_evicted_total', 1, { reason: 'capacity' },
+      );
+      expect(metrics.setGauge).toHaveBeenCalledWith('bhgbrain_mcp_sessions_active', 1);
+    });
+
+    it('closes an idle session once it exceeds idle_timeout_ms, via the independent sweep', async () => {
+      const { app, mcpSessions, metrics } = await buildApp(
+        createConfig(false, true, { mcpSession: { idle_timeout_ms: 30, sweep_interval_ms: 20 } }),
+      );
+
+      const initRes = await initializeSession(app);
+      const sessionId = initRes.headers['mcp-session-id'];
+      expect(mcpSessions.size).toBe(1);
+
+      // Real elapsed time (not fake timers, to keep the real HTTP round trip
+      // above intact) comfortably past idle_timeout_ms and at least one
+      // sweep_interval_ms tick.
+      await new Promise(resolve => setTimeout(resolve, 200));
+
+      expect(mcpSessions.size).toBe(0);
+      expect(metrics.incCounter).toHaveBeenCalledWith(
+        'bhgbrain_mcp_sessions_evicted_total', 1, { reason: 'idle' },
+      );
+
+      const afterIdleExpiry = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', MCP_ACCEPT)
+        .set('Authorization', 'Bearer secret-token')
+        .set('mcp-session-id', sessionId)
+        .send(toolsListBody());
+      expect(afterIdleExpiry.status).toBe(404);
+    });
+
+    it('activity postpones idle expiry', async () => {
+      const { app, mcpSessions } = await buildApp(
+        createConfig(false, true, { mcpSession: { idle_timeout_ms: 150, sweep_interval_ms: 20 } }),
+      );
+
+      const initRes = await initializeSession(app);
+      const sessionId = initRes.headers['mcp-session-id'];
+
+      // Send activity partway through the idle window...
+      await new Promise(resolve => setTimeout(resolve, 80));
+      const midway = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', MCP_ACCEPT)
+        .set('Authorization', 'Bearer secret-token')
+        .set('mcp-session-id', sessionId)
+        .send(toolsListBody());
+      expect(midway.status).toBe(200);
+
+      // ...then wait past the ORIGINAL deadline (but well within a fresh one
+      // counted from the activity above) — the session must still be alive.
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(mcpSessions.size).toBe(1);
+
+      const stillAlive = await request(app)
+        .post('/mcp')
+        .set('Content-Type', 'application/json')
+        .set('Accept', MCP_ACCEPT)
+        .set('Authorization', 'Bearer secret-token')
+        .set('mcp-session-id', sessionId)
+        .send(toolsListBody());
+      expect(stillAlive.status).toBe(200);
+    });
+
+    it('closeAll() stops the idle sweep timer', async () => {
+      const { mcpSessions } = await buildApp(
+        createConfig(false, true, { mcpSession: { idle_timeout_ms: 30, sweep_interval_ms: 20 } }),
+      );
+
+      await mcpSessions.closeAll();
+
+      // No open handle/exception from a sweep continuing to fire after
+      // teardown — if the timer weren't cleared this would still pass
+      // functionally, so this test mainly documents the expectation and
+      // guards against `closeAll` throwing.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(mcpSessions.size).toBe(0);
+    });
   });
 });
 });

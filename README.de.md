@@ -295,7 +295,28 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Externe Qdrant-URL (wird verwendet wenn mode = "external")
     "external_url": null,
     // Name der Umgebungsvariable mit dem Qdrant API-Schlüssel (wird verwendet wenn mode = "external")
-    "api_key_env": null
+    "api_key_env": null,
+    // Clientseitige (AbortController-basierte) Frist für jeden Qdrant-Aufruf im
+    // Anfragepfad, für Cleanup, Scans und administrative Aufrufe — alle über
+    // den gemeinsamen Circuit Breaker geleitet. Der Standard des zugrunde
+    // liegenden Clients selbst liegt bei 300000 ms.
+    "operation_timeout_ms": 10000,
+    // Separate, bewusst kürzere Frist, die nur von der Health-Probe verwendet
+    // wird (eigene, dedizierte Client-Instanz, nie über den Breaker geleitet).
+    // Darf operation_timeout_ms nicht überschreiten.
+    "health_timeout_ms": 3000,
+    // Grenzen für den Fan-Out einer collectionslosen (namespace-weiten)
+    // search/recall-Abfrage über jede Collection im Namespace.
+    "fanout": {
+      // Zielcollections über dieser Anzahl werden deterministisch gekürzt.
+      "max_collections": 25,
+      // Wie viele dieser Zielcollections gleichzeitig abgefragt werden.
+      "concurrency": 5,
+      // Pro-Collection-Ergebnisobergrenze, die nur beim tatsächlichen
+      // Fan-Out (mehr als ein Ziel) angewendet wird; eine explizite
+      // Ein-Collection-Suche nutzt immer das volle `limit` des Aufrufers.
+      "per_target_limit": 50
+    }
   },
 
   // Transport-Konfiguration
@@ -320,7 +341,19 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
       // Zeit, die zum vollständigen Empfangen einer Anfrage erlaubt ist; begrenzt
       // nicht lang laufende SSE-Antworten auf GET /mcp, die nur eine Anfrage
       // empfangen, keine senden.
-      "request_timeout_ms": 300000
+      "request_timeout_ms": 300000,
+      // Begrenzt die In-Memory-MCP-HTTP-Sitzungsregistry (siehe
+      // "MCP-Sitzungslebenszyklus" unter Gesundheitszustand & Metriken).
+      "mcp_session": {
+        // Eine Sitzung ohne Anfrage über diese Dauer wird automatisch geschlossen.
+        "idle_timeout_ms": 1800000,
+        // Harte Obergrenze für residente Sitzungen; eine neue Sitzung bei
+        // erreichter Kapazität verdrängt die am längsten inaktive, um Platz
+        // zu schaffen.
+        "max_sessions": 1000,
+        // Wie oft der unabhängige Idle-Sitzungs-Sweep läuft.
+        "sweep_interval_ms": 60000
+      }
     },
     "stdio": {
       // MCP stdio-Transport aktivieren
@@ -578,11 +611,17 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "log_redaction": true,
     // Maximale Anfragen pro Minute pro Client-IP für den HTTP-Transport
     "rate_limit_rpm": 100,
+    // Harte Obergrenze für die Eimer-Map des Rate-Limiters (siehe Rate Limiting).
+    "rate_limit_max_buckets": 10000,
     // Maximale HTTP-Anfrage-Body-Größe in Bytes
     "max_request_size_bytes": 1048576,
     // Express-Einstellung "trust proxy". false (Standard) = req.ip ist der direkte
-    // Socket-Peer (Loopback-genau); true = X-Forwarded-For vom vorgeschalteten
-    // Reverse-Proxy berücksichtigen. Nur hinter einem vertrauenswürdigen Proxy aktivieren.
+    // Socket-Peer (Loopback-genau). Eine positive Ganzzahl = genau so vielen
+    // Reverse-Proxy-Hops vertrauen (req.ip berücksichtigt X-Forwarded-For vom
+    // rechtesten, nicht-vertrauenswürdigen Eintrag). Ein Array von Strings =
+    // nur Hops vertrauen, die diesen IPs/Subnetzen entsprechen. Das alte
+    // boolesche true ("jedem Hop vertrauen") wird nicht mehr akzeptiert —
+    // siehe Proxy-Vertrauen.
     "trust_proxy": false
   },
 
@@ -752,7 +791,9 @@ Der Server hört standardmäßig auf `http://127.0.0.1:3721`. Verfügbare HTTP-E
 
 | Endpunkt | Authentifizierung erforderlich | Beschreibung |
 |---|---|---|
-| `GET /health` | Nein | Gesundheitsprüfung (unauthentifiziert für Probe-Kompatibilität) |
+| `GET /health/live` | Nein | Liveness: knapp, keine Abhängigkeits-I/O — beliebig oft abfragbar |
+| `GET /health/ready` | Nein | Readiness: gecachte SQLite/Qdrant-Prüfung; 503 bei degradierter Pflichtabhängigkeit |
+| `GET /health` | Ja | Vollständiger Diagnose-Snapshot (Embedding, Retention, Scheduler, Circuit Breaker usw.) |
 | `POST /mcp` | Ja | MCP Streamable HTTP: JSON-RPC-Anfragen; eine `initialize`-Anfrage eröffnet eine neue Sitzung |
 | `GET /mcp` | Ja | MCP Streamable HTTP: eigenständiger SSE-Kanal für eine bestehende Sitzung |
 | `DELETE /mcp` | Ja | MCP Streamable HTTP: beendet eine Sitzung |
@@ -763,12 +804,17 @@ Der Server hört standardmäßig auf `http://127.0.0.1:3721`. Verfügbare HTTP-E
 Jede `/mcp`-Sitzung ist ein frischer, In-Memory-MCP-Server, der denselben zugrunde
 liegenden Speicher wie jede andere Sitzung und die REST-Endpunkte nutzt — ein Neustart
 des Prozesses verwirft alle Sitzungen, und spezifikationskonforme Clients
-initialisieren sich automatisch neu.
+initialisieren sich automatisch neu. Eine Sitzung, die länger als
+`transport.http.mcp_session.idle_timeout_ms` inaktiv ist, wird automatisch geschlossen;
+Details zur Lebensdauer von Sitzungen und zur Endpunkt-Aufteilung siehe
+[Health & Metrics](#health--metrics).
 
-Beispiel Gesundheitsprüfung:
+Beispiele für Gesundheitsprüfungen:
 
 ```bash
-curl http://127.0.0.1:3721/health
+curl http://127.0.0.1:3721/health/live
+curl http://127.0.0.1:3721/health/ready
+curl -H "Authorization: Bearer <your-token>" http://127.0.0.1:3721/health
 ```
 
 Beispiel Tool-Aufruf über HTTP:
@@ -1961,7 +2007,7 @@ Die Volltextsuche verwendet einen echten SQLite-FTS5-Index, um Erinnerungen zu f
 5. Archivierte Erinnerungen sind ausgeschlossen (die FTS-Tabelle wird mit der Haupterinnerungstabelle synchron gehalten – archivierte Zeilen werden aus FTS entfernt).
 6. Zugriffsmetadaten werden für zurückgegebene Ergebnisse aktualisiert.
 
-**Fallback:** Wenn der laufende SQLite-Build kein `fts5`-Modul kompiliert hat (per Startup-Fähigkeitsprüfung verifiziert, nicht angenommen), fällt die Volltextsuche auf einen alten `LIKE '%term%'`-Matcher mit handgestricktem Termhäufigkeits-Rang zurück, statt einen Fehler zu werfen. Das ist sichtbar, nicht still: Die `sqlite`-Komponente von `health://status` trägt eine `message`, und beim Start wird einmalig eine `fts5_unavailable`-Warnung geloggt. Siehe [Health-Endpunkt](#health-endpunkt).
+**Fallback:** Wenn der laufende SQLite-Build kein `fts5`-Modul kompiliert hat (per Startup-Fähigkeitsprüfung verifiziert, nicht angenommen), fällt die Volltextsuche auf einen alten `LIKE '%term%'`-Matcher mit handgestricktem Termhäufigkeits-Rang zurück, statt einen Fehler zu werfen. Das ist sichtbar, nicht still: Die `sqlite`-Komponente von `health://status` trägt eine `message`, und beim Start wird einmalig eine `fts5_unavailable`-Warnung geloggt. Siehe [Health-Endpunkte](#health-endpunkte).
 
 **Wann zu verwenden:** Exakte Schlüsselwortsuchen, Suche nach spezifischen Bezeichnern (Speicher-IDs, Projektnamen, Systemnamen), wenn Sie die genaue verwendete Terminologie kennen.
 
@@ -2382,15 +2428,39 @@ Gibt zurück:
 
 ## Gesundheitszustand & Metriken
 
-### Health-Endpunkt
+### Health-Endpunkte
+
+Der HTTP-Health-Check ist dreigeteilt, damit eine günstige, hochfrequente
+Liveness-Prüfung, eine begrenzte Readiness-Prüfung und der vollständige
+authentifizierte Diagnose-Snapshot jeweils den passenden Kosten- und
+Zugriffskontroll-Zuschnitt haben (bound-qdrant-http-runtime):
 
 ```bash
-GET /health        # HTTP
-# oder über CLI:
+GET /health/live   # unauthentifiziert, keine Abhängigkeits-I/O — Neustart-/Liveness-Entscheidungen
+GET /health/ready   # unauthentifiziert, gecachte Abhängigkeitsprüfung — 503 wenn nicht bereit
+GET /health          # authentifiziert, vollständiger Diagnose-Snapshot
+# oder über CLI (vollständiger Diagnose-Snapshot, wie GET /health):
 bhgbrain health
 ```
 
-Gibt einen `HealthSnapshot` zurück:
+- **`GET /health/live`** — `{ "status": "ok", "uptime_seconds": 86400 }`. Synchron, ohne
+  jede Abhängigkeit (nicht einmal SQLite), bleibt also bei jeder Abfragerate günstig.
+  Immer `200`. Für Neustart-/Liveness-Entscheidungen des Orchestrators (genau das fragt
+  auch der `HEALTHCHECK` des Docker-Images ab — siehe [Docker](#docker)).
+- **`GET /health/ready`** — prüft nur die beiden Abhängigkeiten, ohne die eine Anfrage
+  nicht funktionieren kann: SQLite (ein lokales `SELECT 1`) und Qdrant (eine begrenzte,
+  gecachte Vektorabfrage-Probe — siehe unten). Liefert `{ "ready": true|false,
+  "components": { "sqlite": {...}, "qdrant": {...} } }`, `200` wenn bereit und `503`
+  wenn eine der beiden Abhängigkeiten fehlerhaft ist. Anders als `/health/live` ist
+  dieser Endpunkt *nach* dem Rate Limiting registriert, und die Qdrant-Probe selbst ist
+  gecacht, sodass eine Flut unauthentifizierter Readiness-Abfragen nicht zu einer Flut
+  frischer Qdrant-Anfragen wird.
+- **`GET /health`** — der vollständige Diagnose-Snapshot (Embedding, Retention,
+  Scheduler, Circuit Breaker, Zähler pro Stufe usw.), der nun dieselbe
+  Bearer-Authentifizierung wie jede andere Route erfordert. Teilt sich dieselbe
+  gecachte Qdrant-Probe mit `/health/ready`.
+
+Gibt einen `HealthSnapshot` von `GET /health` zurück:
 
 ```json
 {
@@ -2444,11 +2514,71 @@ Gibt einen `HealthSnapshot` zurück:
 
 **Circuit-Breaker:** Das `circuitBreakers`-Objekt meldet den Zustand jedes Unterbrechers für externe Abhängigkeiten (`closed`, `open` oder `half-open`). Ist ein Breaker `open`, werden Anfragen an diese Abhängigkeit bis zum Ablauf des Öffnungsfensters und einer erfolgreichen Half-Open-Probe mit einem `CircuitOpenError` kurzgeschlossen. Schwellenwerte werden über `resilience.circuit_breaker` konfiguriert (siehe [Konfiguration](#konfiguration)).
 
-**HTTP-Statuscodes:**
+**HTTP-Statuscodes (`GET /health`):**
 - `200` für sowohl `healthy` als auch `degraded`
 - `503` für `unhealthy`
 
-Einbettungsgesundheit wird 30 Sekunden lang zwischengespeichert, um API-Aufrufe zu OpenAI pro Probe zu vermeiden.
+(`GET /health/ready` verwendet seine eigene `ready`/`503`-Zuordnung — siehe oben —
+unabhängig vom `healthy`/`degraded`/`unhealthy`-Statusfeld von `GET /health`.)
+
+Einbettungsgesundheit wird 30 Sekunden lang zwischengespeichert, um API-Aufrufe zu
+OpenAI pro Probe zu vermeiden. Die Qdrant-Health-Probe (gemeinsam genutzt von
+`/health` und `/health/ready`) wird aus demselben Grund 5 Sekunden lang
+zwischengespeichert und verwendet ein eigenes, kurzes clientseitiges Timeout
+(`qdrant.health_timeout_ms`, Standard 3000) statt des längeren
+`qdrant.operation_timeout_ms` der Anfragepfad-Qdrant-Aufrufe — ein stockendes Qdrant
+degradiert den Health-Status schnell, ohne dass Aufrufer die volle operative Frist
+abwarten müssen. Siehe [Vollständige Konfigurationsreferenz](#vollständige-konfigurationsreferenz).
+
+### Abhängigkeits-Timeouts, begrenzte Fan-Out und Circuit-Breaker-Abdeckung
+
+Jede Qdrant-Operation des Servers — Schreiben, Lesen, Cleanup/Kompaktierung,
+Snapshot-Erstellung, Collection-Scroll/-Liste/-Löschung — ist durch
+`qdrant.operation_timeout_ms` begrenzt (Standard 10000, clientseitig via
+`AbortController`) und läuft über den gemeinsamen Qdrant-Circuit-Breaker
+(`resilience.circuit_breaker`), sodass ein blockierter Qdrant-Endpunkt auf jedem
+Codepfad schnell fehlschlägt statt nur auf manchen. Die Health-Probe verwendet
+bewusst einen eigenen Client und ein eigenes Timeout (`qdrant.health_timeout_ms`)
+und berührt den Breaker nie (siehe oben).
+
+Ein `recall`/`search`-Aufruf ohne konkrete `collection` fächert über jede Collection
+im Namespace auf. Dieser Fan-Out wird über `qdrant.fanout` begrenzt:
+`max_collections` (Standard 25) begrenzt, wie viele Collections ein Aufruf maximal
+anspricht — darüber hinaus wird die Zielliste deterministisch gekürzt —, und
+`concurrency` (Standard 5) begrenzt, wie viele davon gleichzeitig laufen (in
+Batches fester Größe), und `per_target_limit` (Standard 50) begrenzt das
+`limit` jedes einzelnen Ziels beim tatsächlichen Fan-Out (mehr als ein Ziel) —
+eine explizite Ein-Collection-Suche nutzt immer das volle, unbegrenzte `limit`
+des Aufrufers. Kürzungen werden über das Gauge `bhgbrain_qdrant_fanout_width`
+und den Zähler `bhgbrain_qdrant_fanout_truncated_total` sichtbar gemacht (siehe
+[Metriken](#metriken)) sowie über eine `qdrant_fanout_truncated`-Logzeile, nicht im
+Antwortkörper von `search`/`recall` selbst.
+
+### MCP-Sitzungslebenszyklus
+
+Jeder `POST /mcp initialize`-Aufruf eröffnet eine Sitzung, die für die Lebensdauer
+des Prozesses im Speicher gehalten wird. `transport.http.mcp_session` begrenzt diese
+Registry, sodass ein HTTP-MCP-Client, der sich trennt, ohne je `DELETE /mcp` zu
+senden (der übliche Fall bei einem gewöhnlichen Client-Absturz oder Netzwerkabbruch),
+nicht dauerhaft Sitzungen leaken kann:
+
+- `idle_timeout_ms` (Standard 1.800.000 = 30 Minuten) — eine Sitzung ohne Anfrage
+  über diese Dauer wird von einem unabhängigen, `unref`'ten Sweep geschlossen
+  (`sweep_interval_ms`, Standard 60000). Jede Anfrage über eine Sitzung aktualisiert
+  deren Aktivität und verschiebt so den Ablauf.
+- `max_sessions` (Standard 1000) — eine harte Obergrenze für residente Sitzungen. Ein
+  neues `initialize` bei erreichter Kapazität verdrängt die am längsten inaktive
+  Sitzung, um Platz zu schaffen; ist die Registry dabei bereits leer und trotzdem "an
+  der Kapazitätsgrenze" (nur bei einer Fehlkonfiguration `max_sessions: 0` möglich),
+  schlägt die Anfrage geschlossen mit `503` fehl.
+- Die Wiederverwendung einer ID nach einem der beiden Verdrängungspfade liefert
+  dieselbe `404 Session not found`-Antwort, die auch `DELETE /mcp` bereits erzeugt —
+  keine separate Fehlerform, die behandelt werden müsste.
+
+Aktuelle und verdrängte Sitzungszahlen werden als Gauge `bhgbrain_mcp_sessions_active`
+und Zähler `bhgbrain_mcp_sessions_evicted_total{reason="idle"|"capacity"}`
+veröffentlicht (siehe [Metriken](#metriken)). `closeAll()` (Prozess-Shutdown) stoppt
+den Sweep-Timer und schließt jede lebende Sitzungs-Transport.
 
 ### Metriken
 
@@ -2485,6 +2615,11 @@ Metriken ohne Labels, sodass die Ausgabe abwärtskompatibel zum vorherigen label
 | `bhgbrain_memory_count` | Messuhr | Aktuelle Gesamt-Erinnerungsanzahl (bei Schreiben/Löschen aktualisiert) |
 | `bhgbrain_rate_limit_buckets` | Messuhr | Aktive Rate-Limit-Verfolgungseimer |
 | `bhgbrain_rate_limited_total` | Zähler | Gesamt rate-limitierte Anfragen |
+| `bhgbrain_rate_limit_capacity_rejected_total` | Zähler | Gesamtzahl der Anfragen, die mit 429 abgelehnt wurden, weil die Rate-Limit-Eimer-Map bei `security.rate_limit_max_buckets` für eine tatsächlich neue Client-Identität voll war |
+| `bhgbrain_qdrant_fanout_width` | Messuhr | Anzahl der Collections, auf die die zuletzt ausgeführte collectionslose `search`/`recall`-Abfrage aufgefächert hat, nach etwaiger Kürzung durch `qdrant.fanout.max_collections` |
+| `bhgbrain_qdrant_fanout_truncated_total` | Zähler | Wird erhöht, wenn die Zielliste einer collectionslosen Abfrage auf `qdrant.fanout.max_collections` gekürzt wurde |
+| `bhgbrain_mcp_sessions_active` | Messuhr | Aktuelle Anzahl residenter MCP-HTTP-Sitzungen |
+| `bhgbrain_mcp_sessions_evicted_total` | Zähler | Gesamtzahl der vom Sitzungsmanager geschlossenen MCP-HTTP-Sitzungen, mit Label `reason` (`idle` oder `capacity`) |
 | `recall_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive Nachprüfung von `recall` (Typ/Tags/`after`/`before`) nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
 | `search_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive `after`/`before`-Nachprüfung von `search` nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
 | `search_embedding_degraded` | Zähler | Wird erhöht, wenn eine Suche im Modus `hybrid` auf reinen Volltext zurückfällt, weil der Embedding-Provider oder der Vektorspeicher nicht verfügbar ist, mit `namespace`-Label |
@@ -2509,7 +2644,10 @@ höher ausfallen als bevor diese Metrik Fehler erfasste.
 
 ### HTTP-Authentifizierung
 
-Im HTTP-Modus erfordern Anfragen an alle Endpunkte außer `/health` ein Bearer-Token:
+Im HTTP-Modus erfordern Anfragen an alle Endpunkte außer `/health/live` und
+`/health/ready` ein Bearer-Token — der vollständige Diagnose-Snapshot `/health` ist
+wie jede andere Route authentifiziert (siehe
+[Gesundheitszustand & Metriken](#gesundheitszustand--metriken)):
 
 ```
 Authorization: Bearer <your-token>
@@ -2552,14 +2690,21 @@ Stellen Sie sicher, dass `BHGBRAIN_TOKEN` in dieser Konfiguration gesetzt ist.
 
 ### Proxy-Vertrauen
 
-`security.trust_proxy` (Standard `false`) wird direkt an Express' `app.set('trust proxy', ...)` übergeben und bestimmt damit, wie `req.ip` abgeleitet wird und auf welche Identität der Rate-Limiter sich stützt:
+`security.trust_proxy` (Standard `false`) wird direkt an Express' `app.set('trust proxy', ...)` übergeben und bestimmt damit, wie `req.ip` abgeleitet wird und auf welche Identität der Rate-Limiter sich stützt. Erlaubt sind `false`, eine positive Hop-Anzahl oder ein Array vertrauenswürdiger Proxy-IPs/-Subnetze — **das alte boolesche `true` ("jedem Hop vertrauen") wird nicht mehr akzeptiert** und schlägt bei der Konfigurationsvalidierung mit einem Migrationshinweis fehl, weil es einem aufrufer-gesetzten *linkesten* `X-Forwarded-For`-Eintrag erlaubt, seine eigene Client-Identität zu wählen — selbst hinter genau einem echten Reverse-Proxy-Hop:
 
-- **Deaktiviert (Standard):** `req.ip` ist der direkte Socket-Peer. Das ist für die dokumentierte, nur-Loopback-Bereitstellung korrekt. Steht dennoch ein Reverse-Proxy davor, werden alle proxierten Clients auf die einzelne IP des Proxys zusammengefasst, und vom Aufrufer gesetzte `X-Forwarded-For`-Header werden ignoriert (sie können also nicht zum Aufsplitten oder Umgehen von Rate-Limits gefälscht werden).
-- **Aktiviert:** `req.ip` berücksichtigt das vom direkten Peer gesetzte `X-Forwarded-For`. Nur hinter einem Reverse-Proxy aktivieren, dem Sie vertrauen, diesen Header korrekt zu setzen – ohne einen solchen vertrauenswürdigen Proxy davor kann jeder Client seine Rate-Limit-Identität fälschen.
+- **Deaktiviert (Standard, `false`):** `req.ip` ist der direkte Socket-Peer. Das ist für die dokumentierte, nur-Loopback-Bereitstellung korrekt. Steht dennoch ein Reverse-Proxy davor, werden alle proxierten Clients auf die einzelne IP des Proxys zusammengefasst, und vom Aufrufer gesetzte `X-Forwarded-For`-Header werden ignoriert (sie können also nicht zum Aufsplitten oder Umgehen von Rate-Limits gefälscht werden).
+- **Hop-Anzahl (eine positive Ganzzahl):** vertraut genau so vielen server-nächsten Reverse-Proxy-Hops. Mit `1` hinter einem vertrauenswürdigen Reverse-Proxy löst sich `req.ip` auf den rechtesten (server-nächsten) `X-Forwarded-For`-Eintrag auf — den, den Ihr Proxy tatsächlich gesetzt hat —, nicht auf ein beliebiges, aufrufer-gesetztes linkes Präfix.
+- **Subnetz-/Adressliste (ein Array von Strings):** vertraut nur Hops, deren Adresse einer der angegebenen IPs oder CIDR-Subnetze entspricht (z. B. `["10.0.0.0/8"]`), das übliche Express-/`proxy-addr`-Format.
 
 ```json
-{ "security": { "trust_proxy": true } }
+{ "security": { "trust_proxy": 1 } }
 ```
+
+```json
+{ "security": { "trust_proxy": ["10.0.0.0/8"] } }
+```
+
+Migration von einem bestehenden `"trust_proxy": true`: ersetzen Sie es durch die Hop-Anzahl Ihrer tatsächlichen Reverse-Proxy-Kette (meist `1` für einen einzelnen Load Balancer oder Ingress vor dem Server) oder das/die vertrauenswürdige(n) Subnetz(e), in dem/denen dieser läuft.
 
 ### Rate Limiting
 
@@ -2570,7 +2715,7 @@ HTTP-Anfragen werden pro Client-IP-Adresse rate-limitiert:
 - Überschreitende Clients erhalten HTTP 429 mit `{ error: { code: "RATE_LIMITED", retryable: true } }`
 - Anfragen ohne ableitbare Client-IP schlagen fail-closed mit HTTP 400 (`INVALID_INPUT`) fehl, statt sich einen gemeinsamen Ausweich-Bucket zu teilen
 - Antwortheader enthalten `X-RateLimit-Limit` und `X-RateLimit-Remaining`
-- Abgelaufene Rate-Limit-Eimer werden alle 30 Sekunden bereinigt
+- Die Eimer-Map hat eine harte Kapazität, `security.rate_limit_max_buckets` (Standard 10.000). Abgelaufene Eimer werden unabhängig alle 30 Sekunden über einen `unref`'ten Timer bereinigt (nicht opportunistisch an eingehende Anfragen gekoppelt, sodass die Bereinigung auch bei ausbleibendem Traffic weiterläuft). Bei erreichter Kapazität läuft ein letzter Sweep, bevor eine tatsächlich neue Client-Identität mit HTTP 429 (`{ error: { code: "RATE_LIMITED", retryable: true } }`) abgelehnt wird, statt die Map weiter wachsen zu lassen — ein bereits bekannter Client ist davon nie betroffen.
 - Der Rate-Limit-Status ist pro Server-/Middleware-Instanz gekapselt, sodass unabhängige Instanzen (z. B. in Tests) sich nie Buckets teilen
 
 ### Begrenzung der Anfragegröße
@@ -3885,8 +4030,12 @@ Der Server ist unter `http://localhost:3721` erreichbar (standardmäßig nur auf
 Host-Loopback veröffentlicht). Gesundheitszustand prüfen mit:
 
 ```bash
-curl http://localhost:3721/health
+curl http://localhost:3721/health/live
 ```
+
+Der eigene `HEALTHCHECK` des Containers fragt aus demselben Grund `/health/live` ab:
+er läuft ohne Anmeldedaten, und der vollständige Diagnose-Snapshot `/health` erfordert
+Bearer-Auth (siehe [Gesundheitszustand & Metriken](#gesundheitszustand--metriken)).
 
 ### Sicherheitsstandards
 
@@ -4093,7 +4242,7 @@ Sobald die Drift-/Überschuss-Prüfung abgeschlossen ist, wird die Sperre freige
 
 ### HTTP-Absicherung
 
-- `/health` ist absichtlich unauthentifiziert für Probe-Kompatibilität.
+- `/health/live` und `/health/ready` sind absichtlich unauthentifiziert für Probe-Kompatibilität; der vollständige Diagnose-Snapshot `/health` erfordert dieselbe Bearer-Auth wie jede andere Route. Siehe [Gesundheitszustand & Metriken](#gesundheitszustand--metriken).
 - Rate Limiting verwendet die vertrauenswürdige Anfragen-Identität (IP) und ignoriert `x-client-id` für die Durchsetzung.
 - Die `client_id` in Audit-/Anfrageprotokollen wird ebenso von der vertrauenswürdigen Anfragen-Identität (`req.ip`) abgeleitet, niemals vom vom Aufrufer angegebenen `x-client-id`-Header — dieser Header wird nur als nicht-maßgeblicher Debug-Hinweis akzeptiert und nie für die Audit-Spur vertraut.
 - `memory://list` erzwingt `limit`-Grenzen von `1..100`; ungültige Werte geben `INVALID_INPUT` zurück.

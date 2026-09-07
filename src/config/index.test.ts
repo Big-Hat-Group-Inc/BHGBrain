@@ -740,6 +740,115 @@ describe('transport.http socket timeout config', () => {
   });
 });
 
+// bound-qdrant-http-runtime task 2.3: security.trust_proxy narrowing.
+describe('security.trust_proxy config (bound-qdrant-http-runtime)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to false', () => {
+    const config = loadConfig('/nonexistent/config.json');
+    expect(config.security.trust_proxy).toBe(false);
+  });
+
+  it('accepts a positive hop count', () => {
+    const configPath = writeConfig({ security: { trust_proxy: 1 } });
+    const config = loadConfig(configPath);
+    expect(config.security.trust_proxy).toBe(1);
+  });
+
+  it('accepts an array of trusted subnets/IPs', () => {
+    const configPath = writeConfig({ security: { trust_proxy: ['10.0.0.0/8', '192.168.0.1'] } });
+    const config = loadConfig(configPath);
+    expect(config.security.trust_proxy).toEqual(['10.0.0.0/8', '192.168.0.1']);
+  });
+
+  it('rejects the legacy boolean true with migration guidance', () => {
+    const configPath = writeConfig({ security: { trust_proxy: true } });
+    expect(() => loadConfig(configPath)).toThrow(/trust_proxy.*no longer supported/);
+  });
+
+  it('rejects a zero or negative hop count', () => {
+    const configPath = writeConfig({ security: { trust_proxy: 0 } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
+// bound-qdrant-http-runtime task 1.1/1.4: qdrant timeout and fan-out config.
+describe('qdrant timeout and fanout config (bound-qdrant-http-runtime)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults operation_timeout_ms/health_timeout_ms/fanout when unset', () => {
+    const config = loadConfig('/nonexistent/config.json');
+    expect(config.qdrant.operation_timeout_ms).toBe(10_000);
+    expect(config.qdrant.health_timeout_ms).toBe(3_000);
+    expect(config.qdrant.fanout).toEqual({ max_collections: 25, concurrency: 5, per_target_limit: 50 });
+  });
+
+  it('rejects health_timeout_ms greater than operation_timeout_ms', () => {
+    const configPath = writeConfig({
+      qdrant: { operation_timeout_ms: 1000, health_timeout_ms: 2000 },
+    });
+    expect(() => loadConfig(configPath)).toThrow(/health_timeout_ms.*should not exceed.*operation_timeout_ms/);
+  });
+
+  it('accepts health_timeout_ms equal to operation_timeout_ms', () => {
+    const configPath = writeConfig({
+      qdrant: { operation_timeout_ms: 1000, health_timeout_ms: 1000 },
+    });
+    const config = loadConfig(configPath);
+    expect(config.qdrant.health_timeout_ms).toBe(1000);
+  });
+});
+
+// bound-qdrant-http-runtime task 3.1-3.3: transport.http.mcp_session config.
+describe('transport.http.mcp_session config (bound-qdrant-http-runtime)', () => {
+  it('defaults to idle_timeout_ms=30min, max_sessions=1000, sweep_interval_ms=60s', () => {
+    const config = loadConfig('/nonexistent/config.json');
+    expect(config.transport.http.mcp_session).toEqual({
+      idle_timeout_ms: 1_800_000,
+      max_sessions: 1000,
+      sweep_interval_ms: 60_000,
+    });
+  });
+});
+
+// bound-qdrant-http-runtime task 2.4: security.rate_limit_max_buckets config.
+describe('security.rate_limit_max_buckets config (bound-qdrant-http-runtime)', () => {
+  it('defaults to 10,000', () => {
+    const config = loadConfig('/nonexistent/config.json');
+    expect(config.security.rate_limit_max_buckets).toBe(10_000);
+  });
+});
+
 function makeConfig(deviceId?: string): BrainConfig {
   return {
     device: { id: deviceId },
