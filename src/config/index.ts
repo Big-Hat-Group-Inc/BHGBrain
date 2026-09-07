@@ -33,13 +33,13 @@ const AzureEmbeddingSchema = z.object({
     .toLowerCase()
     .regex(/^[a-z0-9-]+$/, 'resource_name must contain only lowercase letters, numbers, and hyphens'),
   api_key_env: z.string().default('AZURE_FOUNDRY_API_KEY'),
-});
+}).strict();
 
 const ConfigSchema = z.object({
   data_dir: z.string().optional(),
   device: z.object({
     id: z.string().regex(DEVICE_ID_RE).optional(),
-  }).prefault({}),
+  }).strict().prefault({}),
   embedding: z.object({
     provider: z.enum(['openai', 'azure-foundry']).default('openai'),
     model: z.string().default('text-embedding-3-small'),
@@ -55,7 +55,7 @@ const ConfigSchema = z.object({
       // feature uses (`src/llm/client.ts`), which requires an explicit cap
       // on the exponential envelope in addition to `backoff_ms`.
       max_backoff_ms: z.number().int().positive().default(10_000),
-    }).prefault({}),
+    }).strict().prefault({}),
     azure: AzureEmbeddingSchema.optional(),
     // Guards against silently mixing embedding spaces: when the store's
     // persisted expected embedding identity (see embedding-provenance)
@@ -64,7 +64,7 @@ const ConfigSchema = z.object({
     // model into the same collection. Disable only if you intentionally
     // want to mix spaces (e.g. a deliberate, monitored migration window).
     refuse_writes_on_model_mismatch: z.boolean().default(true),
-  }).superRefine((value, ctx) => {
+  }).strict().superRefine((value, ctx) => {
     if (value.provider === 'azure-foundry' && !value.azure) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -99,7 +99,7 @@ const ConfigSchema = z.object({
         path: ['dimensions'],
       });
     }
-  }).prefault({}),
+  }).strict().prefault({}),
   // Shared OpenAI-compatible chat/embedding request boundary
   // (unify-llm-client-boundaries): one base URL and retry envelope every
   // migrated feature (extraction, reranking, summarization, query expansion,
@@ -121,8 +121,8 @@ const ConfigSchema = z.object({
       // Retry-After guidance, bounding worst-case retry latency inside a
       // feature's own request deadline.
       max_backoff_ms: z.number().int().positive().default(2000),
-    }).prefault({}),
-  }).prefault({}),
+    }).strict().prefault({}),
+  }).strict().prefault({}),
   qdrant: z.object({
     mode: z.enum(['embedded', 'external']).default('embedded'),
     embedded_path: z.string().default('./qdrant'),
@@ -159,8 +159,8 @@ const ConfigSchema = z.object({
       // back down. A single explicit `collection` search is unaffected and
       // keeps using the caller's `limit` directly.
       per_target_limit: z.number().int().positive().default(50),
-    }).prefault({}),
-  }).superRefine((value, ctx) => {
+    }).strict().prefault({}),
+  }).strict().superRefine((value, ctx) => {
     if (value.health_timeout_ms > value.operation_timeout_ms) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -170,12 +170,12 @@ const ConfigSchema = z.object({
         path: ['health_timeout_ms'],
       });
     }
-  }).prefault({}),
+  }).strict().prefault({}),
   storage: z.object({
     // A bounded wait lets short-lived CLI/server writer overlap settle without
     // turning a stuck external writer into an unbounded request stall.
     sqlite_busy_timeout_ms: z.number().int().min(0).max(60_000).default(5_000),
-  }).prefault({}),
+  }).strict().prefault({}),
   backup: z.object({
     retention: z.object({
       // Backup *file* retention (how many/how old `.bhgb` artifacts to keep)
@@ -187,8 +187,8 @@ const ConfigSchema = z.object({
       // either is pruned) — see make-backup-restore-transactional task 3.4.
       max_count: z.number().int().positive().nullable().default(30),
       max_age_days: z.number().int().positive().nullable().default(90),
-    }).prefault({}),
-  }).prefault({}),
+    }).strict().prefault({}),
+  }).strict().prefault({}),
   transport: z.object({
     http: z.object({
       enabled: z.boolean().default(true),
@@ -215,8 +215,8 @@ const ConfigSchema = z.object({
         idle_timeout_ms: z.number().int().positive().default(30 * 60_000),
         max_sessions: z.number().int().positive().default(1000),
         sweep_interval_ms: z.number().int().positive().default(60_000),
-      }).prefault({}),
-    }).superRefine((value, ctx) => {
+      }).strict().prefault({}),
+    }).strict().superRefine((value, ctx) => {
       if (value.headers_timeout_ms <= value.keep_alive_timeout_ms) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -226,11 +226,11 @@ const ConfigSchema = z.object({
           path: ['headers_timeout_ms'],
         });
       }
-    }).prefault({}),
+    }).strict().prefault({}),
     stdio: z.object({
       enabled: z.boolean().default(true),
-    }).prefault({}),
-  }).prefault({}),
+    }).strict().prefault({}),
+  }).strict().prefault({}),
   defaults: z.object({
     namespace: z.string().default('global'),
     collection: z.string().default('general'),
@@ -242,7 +242,7 @@ const ConfigSchema = z.object({
     // pinning stays a small, deliberate set rather than a second unbounded
     // inject path. See add-inject-pinning.
     pin_limit_per_namespace: z.number().int().min(1).max(200).default(20),
-  }).prefault({}),
+  }).strict().prefault({}),
   retention: z.object({
     decay_after_days: z.number().int().positive().default(180),
     max_db_size_gb: z.number().positive().default(2),
@@ -253,13 +253,13 @@ const ConfigSchema = z.object({
       T1: z.number().int().positive().default(365),
       T2: z.number().int().positive().default(90),
       T3: z.number().int().positive().default(30),
-    }).prefault({}),
+    }).strict().prefault({}),
     tier_budgets: z.object({
       T0: z.null().default(null),
       T1: z.number().int().positive().default(100000),
       T2: z.number().int().positive().default(200000),
       T3: z.number().int().positive().default(200000),
-    }).prefault({}),
+    }).strict().prefault({}),
     auto_promote_access_threshold: z.number().int().positive().default(5),
     sliding_window_enabled: z.boolean().default(true),
     archive_before_delete: z.boolean().default(true),
@@ -328,8 +328,8 @@ const ConfigSchema = z.object({
       // (`extraction_timeout_ms`/`summarization_timeout_ms`) since a
       // distillation prompt bundles a whole cluster's memory contents.
       llm_timeout_ms: z.number().int().positive().default(10_000),
-    }).prefault({}),
-  }).prefault({}),
+    }).strict().prefault({}),
+  }).strict().prefault({}),
   deduplication: z.object({
     enabled: z.boolean().default(true),
     similarity_threshold: z.number().min(0).max(1).default(0.92),
@@ -348,7 +348,7 @@ const ConfigSchema = z.object({
     corroboration_enabled: z.boolean().default(true),
     corroboration_count: z.number().int().min(2).default(2),
     corroboration_margin: z.number().min(0).max(1).default(0.03),
-  }).prefault({}),
+  }).strict().prefault({}),
   // Read-side near-duplicate discovery/merge for existing memories, distinct
   // from write-time `deduplication` above: `consolidate list` surfaces
   // clusters of already-stored memories whose pairwise similarity meets
@@ -378,14 +378,14 @@ const ConfigSchema = z.object({
     // cursor covering the unscanned remainder instead of blocking until the
     // full page's neighbors are all resolved.
     neighbor_discovery_deadline_ms: z.number().int().positive().default(10_000),
-  }).prefault({}),
+  }).strict().prefault({}),
   resilience: z.object({
     circuit_breaker: z.object({
       failure_threshold: z.number().int().min(1).default(5),
       open_window_ms: z.number().int().min(1000).default(30000),
       half_open_probe_count: z.number().int().min(1).default(1),
-    }).prefault({}),
-  }).prefault({}),
+    }).strict().prefault({}),
+  }).strict().prefault({}),
   search: z.object({
     // Active results retain the caller's limit. Archived matches are an
     // explicitly additive, separately bounded appendix when requested.
@@ -393,7 +393,7 @@ const ConfigSchema = z.object({
     hybrid_weights: z.object({
       semantic: z.number().min(0).max(1).default(0.7),
       fulltext: z.number().min(0).max(1).default(0.3),
-    }).prefault({}),
+    }).strict().prefault({}),
     // Composite ranking prior applied at result-assembly time:
     // final = relevance × (w_base + w_importance·importance +
     //   w_access·log1p(access_count)/log1p(access_norm)) × exp(-decay_per_day[tier]·age_days)
@@ -408,8 +408,8 @@ const ConfigSchema = z.object({
         T1: z.number().nonnegative().default(0.002),
         T2: z.number().nonnegative().default(0.008),
         T3: z.number().nonnegative().default(0.02),
-      }).prefault({}),
-    }).prefault({}),
+      }).strict().prefault({}),
+    }).strict().prefault({}),
     // Opt-in LLM rerank stage: re-scores `recall`'s candidate pool by sending
     // the query and each candidate's text to a configured LLM, replacing
     // `score` (not `semantic_score`, so `min_score` filtering is unaffected)
@@ -425,7 +425,7 @@ const ConfigSchema = z.object({
       model: z.string().default('gpt-4o-mini'),
       model_env: z.string().default('BHGBRAIN_RERANK_API_KEY'),
       timeout_ms: z.number().int().positive().default(3000),
-    }).prefault({}),
+    }).strict().prefault({}),
     // Maximal Marginal Relevance diversity reordering applied to `recall`/
     // `search`'s composite-ranked candidate pool (never a truncator — see
     // `add-mmr-diversity-reranking`). `enabled: false` restores
@@ -438,7 +438,7 @@ const ConfigSchema = z.object({
       lambda: z.number().min(0).max(1).default(0.7),
       candidate_pool_multiplier: z.number().positive().default(3),
       candidate_pool_cap: z.number().int().positive().default(50),
-    }).prefault({}),
+    }).strict().prefault({}),
     // Multi-query expansion (add-multi-query-expansion): `semanticSearch` and
     // the semantic leg of `hybridSearch` embed/search more than one
     // representation of the query and merge candidates by id, keeping the
@@ -462,9 +462,9 @@ const ConfigSchema = z.object({
         // Enforced via AbortController on the chat-completions fetch,
         // mirroring `pipeline.extraction_timeout_ms`.
         timeout_ms: z.number().int().positive().default(3000),
-      }).prefault({}),
-    }).prefault({}),
-  }).prefault({}),
+      }).strict().prefault({}),
+    }).strict().prefault({}),
+  }).strict().prefault({}),
   security: z.object({
     require_loopback_http: z.boolean().default(true),
     allow_unauthenticated_http: z.boolean().default(false),
@@ -506,7 +506,7 @@ const ConfigSchema = z.object({
       z.number().int().positive(),
       z.array(z.string().min(1)).min(1),
     ])).default(false),
-  }).prefault({}),
+  }).strict().prefault({}),
   auto_inject: z.object({
     max_chars: z.number().int().positive().default(30000),
     max_tokens: z.number().int().positive().nullable().default(null),
@@ -527,12 +527,12 @@ const ConfigSchema = z.object({
     // if no memory were pinned. The pin cap is still enforced at write time
     // regardless of this switch.
     pinned_enabled: z.boolean().default(true),
-  }).prefault({}),
+  }).strict().prefault({}),
   observability: z.object({
     metrics_enabled: z.boolean().default(false),
     structured_logging: z.boolean().default(true),
     log_level: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
-  }).prefault({}),
+  }).strict().prefault({}),
   pipeline: z.object({
     // Default is `false`: this flag was previously live configuration that
     // had zero effect (extraction was always deterministic single-candidate).
@@ -566,7 +566,7 @@ const ConfigSchema = z.object({
     contradiction_detection: z.object({
       enabled: z.boolean().default(false),
       timeout_ms: z.number().int().positive().default(5000),
-    }).prefault({}),
+    }).strict().prefault({}),
     // Optional LLM-backed summarization tier (improve-memory-summarization).
     // Default `false`: this is a new external call with cost/latency
     // implications, unlike `auto_summarize` (which gates the free extractive
@@ -601,8 +601,8 @@ const ConfigSchema = z.object({
       api: z.number().min(0).max(1).default(1.0),
       agent: z.number().min(0).max(1).default(0.7),
       import: z.number().min(0).max(1).default(0.5),
-    }).prefault({}),
-  }).prefault({}),
+    }).strict().prefault({}),
+  }).strict().prefault({}),
   // Bounds on the `import` tool's output amplification (bound-corpus-scale-
   // workflows task 3.1/3.2): a parsed document can otherwise turn into an
   // unbounded number of embed/write calls (many tiny paragraphs) or a
@@ -631,14 +631,14 @@ const ConfigSchema = z.object({
     // the request layer; operators tuning both together should keep this at
     // or below it.
     embedding_batch_size: z.number().int().positive().default(100),
-  }).prefault({}),
+  }).strict().prefault({}),
   // Controls whether summarization quality tiers (extractive, or LLM when
   // `pipeline.summarization_enabled`) apply. `true` (default): tiered
   // summarizer. `false`: literal first-line truncation (`generateSummary`),
   // regardless of `pipeline.summarization_enabled`. See
   // improve-memory-summarization.
   auto_summarize: z.boolean().default(true),
-}).superRefine((config, ctx) => {
+}).strict().superRefine((config, ctx) => {
   const schedules: Array<{ path: ['retention', 'cleanup_schedule'] | ['retention', 'distillation', 'schedule']; value: string }> = [
     { path: ['retention', 'cleanup_schedule'], value: config.retention.cleanup_schedule },
     { path: ['retention', 'distillation', 'schedule'], value: config.retention.distillation.schedule },
@@ -671,24 +671,104 @@ export function getDefaultConfigPath(): string {
   return join(getDefaultDataDir(), 'config.json');
 }
 
-export function loadConfig(configPath?: string): BrainConfig {
-  const path = configPath ?? getDefaultConfigPath();
+/**
+ * Formats a config validation failure with the source file path attached, so
+ * an operator immediately knows *which* file to fix — not just which field
+ * (align-runtime-entrypoint-contracts task 1.1). `ZodError.message` is
+ * preserved verbatim inside the wrapped message (it already carries each
+ * issue's field path and reason as structured JSON) rather than
+ * reformatted, so this stays a strict superset of the pre-existing
+ * field-path-only error text.
+ */
+function formatConfigParseError(path: string, err: z.ZodError, context?: string): Error {
+  const suffix = context ? ` (${context})` : '';
+  return new Error(`Invalid configuration in ${path}${suffix}:\n${err.message}`, { cause: err });
+}
+
+/**
+ * Reads and strictly parses `config.json` at `path` — no environment overlay
+ * applied. This is the *raw file* value: the one thing that is ever safe to
+ * write back to disk (see `ensureDataDir`), since it has never been mutated
+ * by a `BHGBRAIN_*` runtime override (task 1.2 — env overrides must never
+ * be persisted as user configuration). An unknown key or an invalid URL/
+ * port/boolean/schedule fails with both the file path and the field path
+ * (task 1.1).
+ */
+function parseConfigFile(path: string): BrainConfig {
   let raw: Record<string, unknown> = {};
 
   if (existsSync(path)) {
     const text = readFileSync(path, 'utf-8');
-    raw = JSON.parse(text);
+    try {
+      raw = JSON.parse(text);
+    } catch (err) {
+      throw new Error(`Failed to parse ${path} as JSON: ${(err as Error).message}`, { cause: err });
+    }
   }
 
-  const config = ConfigSchema.parse(raw);
+  let config: BrainConfig;
+  try {
+    config = ConfigSchema.parse(raw);
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      throw formatConfigParseError(path, err);
+    }
+    throw err;
+  }
 
   if (!config.data_dir) {
     config.data_dir = getDefaultDataDir();
   }
 
-  applyEnvOverrides(config);
-
   return config;
+}
+
+/**
+ * Reads and strictly parses `config.json` with no environment overlay
+ * applied — the raw, file-only value. Callers that need to persist config
+ * changes back to disk (currently only `ensureDataDir`'s device-id
+ * resolution) MUST use this, never `loadConfig`'s overlaid result, or a
+ * temporary `BHGBRAIN_*` override would be written into the user's
+ * `config.json` as if it were a permanent choice (task 1.2).
+ */
+export function loadFileConfig(configPath?: string): BrainConfig {
+  const path = configPath ?? getDefaultConfigPath();
+  return parseConfigFile(path);
+}
+
+/**
+ * Applies typed `BHGBRAIN_*` environment overrides to a **copy** of
+ * `fileConfig` and revalidates the result against the same strict schema
+ * (design.md decision 4) — the input object is never mutated, so it stays
+ * safe for a caller to persist afterward. `sourcePath` is used only to
+ * label a revalidation failure.
+ */
+export function deriveRuntimeConfig(fileConfig: BrainConfig, sourcePath?: string): BrainConfig {
+  const overlay = structuredClone(fileConfig);
+  applyEnvOverrides(overlay);
+  try {
+    return ConfigSchema.parse(overlay);
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      throw formatConfigParseError(sourcePath ?? getDefaultConfigPath(), err, 'after applying environment overrides');
+    }
+    throw err;
+  }
+}
+
+/**
+ * Convenience one-shot: parse the file, then apply the environment overlay
+ * on top of a copy. This is what most read-only callers want (embedding,
+ * transport, search, etc. all consume the resulting *runtime* config).
+ * Callers that also need to persist changes back to `config.json` — i.e.
+ * `main()`/CLI startup — must instead call `loadFileConfig` +
+ * `ensureDataDir` + `deriveRuntimeConfig` separately, so persistence only
+ * ever touches the raw file value (task 1.2).
+ */
+export function loadConfig(configPath?: string): BrainConfig {
+  const path = configPath ?? getDefaultConfigPath();
+  const fileConfig = parseConfigFile(path);
+  return deriveRuntimeConfig(fileConfig, path);
 }
 
 /**
@@ -787,8 +867,34 @@ export function resolveDeviceId(config: BrainConfig): string {
   return hostId;
 }
 
+/**
+ * `ensureDataDir` must create the *actual* runtime data directory even
+ * though it otherwise only ever touches the raw file config (task 1.2) —
+ * `BHGBRAIN_DATA_DIR` is exactly the mechanism a container deployment uses
+ * to redirect storage onto a mounted volume, and that directory has to
+ * exist before `SqliteStore` opens it. Reading the env var directly here
+ * (rather than accepting the overlaid runtime config as a second
+ * parameter) keeps `ensureDataDir`'s contract to a single config object —
+ * the one instance it is safe to persist — while still creating the right
+ * directory.
+ */
+function resolveRuntimeDataDir(fileConfig: BrainConfig): string {
+  return process.env.BHGBRAIN_DATA_DIR || fileConfig.data_dir || getDefaultDataDir();
+}
+
+/**
+ * Creates the data directory (and `backups/`) and persists `config` — which
+ * MUST be the raw file-level config from `loadFileConfig`, never
+ * `loadConfig`'s environment-overlaid result — back to `config.json`. Only
+ * `device.id` resolution is ever mutated/persisted here; every
+ * `BHGBRAIN_*` runtime override lives solely on the derived runtime config
+ * a caller builds afterward via `deriveRuntimeConfig`, so a temporary
+ * override (a security toggle, a credential-bearing Qdrant URL, an
+ * alternate data dir) can never leak into the persisted file
+ * (align-runtime-entrypoint-contracts task 1.2).
+ */
 export function ensureDataDir(config: BrainConfig): void {
-  const dir = config.data_dir!;
+  const dir = resolveRuntimeDataDir(config);
   mkdirSync(dir, { recursive: true });
   mkdirSync(join(dir, 'backups'), { recursive: true });
 

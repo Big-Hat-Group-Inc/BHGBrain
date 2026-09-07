@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname, tmpdir } from 'node:os';
-import { loadConfig, applyEnvOverrides, resolveDeviceId, ensureDataDir, type BrainConfig } from './index.js';
+import { loadConfig, loadFileConfig, deriveRuntimeConfig, applyEnvOverrides, resolveDeviceId, ensureDataDir, type BrainConfig } from './index.js';
 
 // `node:os`.hostname and `node:fs`.writeFileSync are ESM builtin exports —
 // their module namespace is non-configurable, so `vi.spyOn` cannot patch
@@ -631,6 +631,183 @@ describe('pipeline.long_content_threshold_chars config (add-long-content-chunkin
     });
 
     expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
+describe('strict schema validation (align-runtime-entrypoint-contracts task 1.1)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('rejects an unknown top-level key, reporting the config file path and the field path', () => {
+    const configPath = writeConfig({ totally_made_up_field: true });
+
+    try {
+      loadConfig(configPath);
+      expect.unreachable('loadConfig should have thrown');
+    } catch (err) {
+      const message = (err as Error).message;
+      expect(message).toContain(configPath);
+      expect(message).toContain('totally_made_up_field');
+    }
+  });
+
+  it('rejects an unknown nested key inside a nested schema (not just the root)', () => {
+    const configPath = writeConfig({ embedding: { made_up_nested_field: 1 } });
+
+    try {
+      loadConfig(configPath);
+      expect.unreachable('loadConfig should have thrown');
+    } catch (err) {
+      const message = (err as Error).message;
+      expect(message).toContain(configPath);
+      expect(message).toContain('made_up_nested_field');
+    }
+  });
+
+  it('rejects an unknown key nested two levels deep (e.g. transport.http)', () => {
+    const configPath = writeConfig({ transport: { http: { made_up: 1 } } });
+
+    expect(() => loadConfig(configPath)).toThrow(/made_up/);
+  });
+
+  it('rejects a non-boolean value for a boolean field', () => {
+    const configPath = writeConfig({ transport: { http: { enabled: 'yes' } } });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a non-numeric value for a port field', () => {
+    const configPath = writeConfig({ transport: { http: { port: 'not-a-port' } } });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a malformed llm.base_url with the config file path attached', () => {
+    const configPath = writeConfig({ llm: { base_url: 'not a url' } });
+
+    expect(() => loadConfig(configPath)).toThrow(new RegExp(configPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  });
+});
+
+describe('separating raw file config from the runtime environment overlay (align-runtime-entrypoint-contracts task 1.2)', () => {
+  const tempDirs: string[] = [];
+  const ENV_TO_CLEAR = ['BHGBRAIN_REQUIRE_LOOPBACK', 'BHGBRAIN_QDRANT_URL', 'BHGBRAIN_ALLOW_UNAUTHENTICATED', 'BHGBRAIN_DATA_DIR'] as const;
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const key of ENV_TO_CLEAR) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of ENV_TO_CLEAR) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function tempDataDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-overlay-'));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  it('deriveRuntimeConfig applies env overrides without mutating the file config it was given', () => {
+    const fileConfig = loadFileConfig(join(tempDataDir(), 'config.json'));
+    const originalRequireLoopback = fileConfig.security.require_loopback_http;
+    process.env.BHGBRAIN_REQUIRE_LOOPBACK = 'false';
+
+    const runtimeConfig = deriveRuntimeConfig(fileConfig);
+
+    expect(runtimeConfig.security.require_loopback_http).toBe(false);
+    expect(fileConfig.security.require_loopback_http).toBe(originalRequireLoopback);
+  });
+
+  it('never persists a temporary security override or a credential-bearing Qdrant URL to config.json', () => {
+    const dir = tempDataDir();
+    const configPath = join(dir, 'config.json');
+    process.env.BHGBRAIN_REQUIRE_LOOPBACK = 'false';
+    process.env.BHGBRAIN_QDRANT_URL = 'https://user:s3cr3t@qdrant.example.com';
+
+    // Mirrors the real startup sequence in src/index.ts / src/cli/index.ts:
+    // resolve+persist the raw file config, then derive the runtime overlay.
+    const fileConfig = loadFileConfig(configPath);
+    fileConfig.data_dir = dir;
+    ensureDataDir(fileConfig);
+    const runtimeConfig = deriveRuntimeConfig(fileConfig, configPath);
+
+    // The runtime config a running process actually uses reflects the overrides.
+    expect(runtimeConfig.security.require_loopback_http).toBe(false);
+    expect(runtimeConfig.qdrant.external_url).toBe('https://user:s3cr3t@qdrant.example.com');
+
+    // What actually landed on disk must NOT contain either override.
+    const written = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(written.security?.require_loopback_http ?? true).toBe(true);
+    expect(written.qdrant?.external_url ?? null).toBeNull();
+  });
+
+  it('a later start without the env override returns to the persisted file value', () => {
+    const dir = tempDataDir();
+    const configPath = join(dir, 'config.json');
+
+    // First start: no override, establishes a persisted config.json.
+    const firstFileConfig = loadFileConfig(configPath);
+    firstFileConfig.data_dir = dir;
+    ensureDataDir(firstFileConfig);
+
+    // Second start: a temporary override is set for this run only.
+    process.env.BHGBRAIN_REQUIRE_LOOPBACK = 'false';
+    const secondFileConfig = loadFileConfig(configPath);
+    secondFileConfig.data_dir = dir;
+    ensureDataDir(secondFileConfig);
+    const secondRuntime = deriveRuntimeConfig(secondFileConfig, configPath);
+    expect(secondRuntime.security.require_loopback_http).toBe(false);
+    delete process.env.BHGBRAIN_REQUIRE_LOOPBACK;
+
+    // Third start: no override — must return to the file/default value, not
+    // whatever the second start's runtime overlay happened to compute.
+    const thirdFileConfig = loadFileConfig(configPath);
+    thirdFileConfig.data_dir = dir;
+    ensureDataDir(thirdFileConfig);
+    const thirdRuntime = deriveRuntimeConfig(thirdFileConfig, configPath);
+    expect(thirdRuntime.security.require_loopback_http).toBe(true);
+  });
+
+  it('ensureDataDir creates BHGBRAIN_DATA_DIR-overridden directory even though it only ever persists the file config', () => {
+    const overriddenDir = tempDataDir();
+    const originalDir = tempDataDir();
+    process.env.BHGBRAIN_DATA_DIR = overriddenDir;
+
+    const fileConfig = loadFileConfig(join(originalDir, 'config.json'));
+    // fileConfig.data_dir defaults to the real default data dir (or is unset),
+    // deliberately NOT overriddenDir — ensureDataDir must still create
+    // overriddenDir because it consults BHGBRAIN_DATA_DIR itself.
+    ensureDataDir(fileConfig);
+
+    expect(existsSync(join(overriddenDir, 'config.json'))).toBe(true);
+    expect(existsSync(join(overriddenDir, 'backups'))).toBe(true);
   });
 });
 

@@ -17,6 +17,8 @@ const distillationMocks = {
 
 vi.mock('../config/index.js', () => ({
   loadConfig: vi.fn(),
+  loadFileConfig: vi.fn(),
+  deriveRuntimeConfig: vi.fn(),
   ensureDataDir: vi.fn(),
 }));
 
@@ -199,8 +201,8 @@ describe('CLI', () => {
   });
 
   it('exits with code 1 and logs a fatal error when config loading fails', async () => {
-    const { loadConfig } = await import('../config/index.js');
-    vi.mocked(loadConfig).mockImplementation(() => {
+    const { loadFileConfig } = await import('../config/index.js');
+    vi.mocked(loadFileConfig).mockImplementation(() => {
       throw new Error('Invalid config: embedding.provider');
     });
 

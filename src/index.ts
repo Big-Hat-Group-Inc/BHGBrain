@@ -2,7 +2,7 @@
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
-import { loadConfig, ensureDataDir } from './config/index.js';
+import { loadFileConfig, deriveRuntimeConfig, ensureDataDir } from './config/index.js';
 import { SqliteStore } from './storage/sqlite.js';
 import { QdrantStore } from './storage/qdrant.js';
 import { StorageManager } from './storage/index.js';
@@ -111,8 +111,14 @@ async function main() {
   const isStdio = args.includes('--stdio');
   const configPath = args.find(a => a.startsWith('--config='))?.split('=')[1];
 
-  const config = loadConfig(configPath);
-  ensureDataDir(config);
+  // Read the raw file config first and persist device-id resolution back to
+  // it (never to the environment-overlaid runtime config below) — a
+  // temporary BHGBRAIN_* override must never end up written into
+  // config.json as if it were a durable choice. See
+  // align-runtime-entrypoint-contracts task 1.2.
+  const fileConfig = loadFileConfig(configPath);
+  ensureDataDir(fileConfig);
+  const config = deriveRuntimeConfig(fileConfig, configPath);
 
   // When using stdio transport, pino must write to stderr — stdout is reserved for MCP JSON-RPC
   const logger = createLogger(config, isStdio ? process.stderr : undefined);

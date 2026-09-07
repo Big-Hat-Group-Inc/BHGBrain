@@ -3,7 +3,7 @@
 import { Command } from 'commander';
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
-import { loadConfig, ensureDataDir } from '../config/index.js';
+import { loadFileConfig, deriveRuntimeConfig, ensureDataDir } from '../config/index.js';
 import { SqliteStore } from '../storage/sqlite.js';
 import { QdrantStore } from '../storage/qdrant.js';
 import { StorageManager } from '../storage/index.js';
@@ -23,8 +23,13 @@ import { CircuitBreaker } from '../resilience/index.js';
 import { handleTool, type ToolContext } from '../tools/index.js';
 
 async function createContext(): Promise<ToolContext> {
-  const config = loadConfig();
-  ensureDataDir(config);
+  // Same split as src/index.ts's main(): persist device-id resolution only
+  // to the raw file config, never to the environment-overlaid runtime
+  // config the rest of the CLI uses (align-runtime-entrypoint-contracts
+  // task 1.2).
+  const fileConfig = loadFileConfig();
+  ensureDataDir(fileConfig);
+  const config = deriveRuntimeConfig(fileConfig);
   const logger = createLogger(config);
 
   const sqlite = new SqliteStore(config.data_dir!);

@@ -1,8 +1,8 @@
 ## 1. Configuration and Secure Defaults
 
-- [ ] 1.1 Make root and nested configuration schemas strict and add URL, port, boolean, and cron validation; verify unknown/invalid values report file and field paths.
-- [ ] 1.2 Separate raw file configuration from runtime environment overlays and revalidate the final object; verify temporary security overrides and credential-bearing URLs are never persisted.
-- [ ] 1.3 Persist config/device changes atomically with restrictive modes and verify interrupted writes preserve the previous readable file.
+- [x] 1.1 Make root and nested configuration schemas strict and add URL, port, boolean, and cron validation; verify unknown/invalid values report file and field paths.
+- [x] 1.2 Separate raw file configuration from runtime environment overlays and revalidate the final object; verify temporary security overrides and credential-bearing URLs are never persisted.
+- [x] 1.3 Persist config/device changes atomically with restrictive modes and verify interrupted writes preserve the previous readable file.
 - [ ] 1.4 Bind the bundled vector service to loopback, stop printing generated bearer tokens, and align README commands; verify the default compose configuration exposes neither vector data nor token values externally.
 
 ## 2. Unified Context and Error Contracts
