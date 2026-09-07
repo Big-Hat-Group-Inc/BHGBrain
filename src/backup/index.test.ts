@@ -665,7 +665,7 @@ describe('BackupService restore activation', () => {
         countUnsyncedVectors: vi.fn(() => 0),
       },
       activateSqliteImage: vi.fn(() => new Promise<void>((resolve) => {
-        resolveReload = resolve;
+        resolveReload = () => resolve();
       })),
       detectAndMarkVectorDrift: vi.fn(async () => ({ mode: 'no-drift', driftedCount: 0 })),
       reconcileVectorsFromSqlite: vi.fn(),
@@ -681,7 +681,7 @@ describe('BackupService restore activation', () => {
 
     await expect(second).rejects.toMatchObject({ code: 'CONFLICT', retryable: true });
 
-    resolveReload?.();
+    (resolveReload as (() => void) | null)?.();
     await first;
 
     rmSync(tempDir, { recursive: true, force: true });

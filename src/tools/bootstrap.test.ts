@@ -18,7 +18,9 @@ describe('bootstrap tool', () => {
   let ctx: ToolContext;
   let store: SqliteStore;
   let pipelineProcess: ReturnType<typeof vi.fn>;
-  let deleteMemory: ReturnType<typeof vi.fn>;
+  let deleteMemory: ReturnType<typeof vi.fn<
+    (id: string, options?: { flush?: boolean }) => Promise<boolean>
+  >>;
   let memCounter: number;
 
   beforeEach(async () => {

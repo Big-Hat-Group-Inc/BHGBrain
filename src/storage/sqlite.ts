@@ -9,7 +9,6 @@ import { randomUUID } from 'node:crypto';
 import type {
   MemoryRecord,
   MemoryOrigin,
-  MemoryType,
   CategoryRecord,
   AuditEntry,
   ArchiveRecord,
@@ -21,12 +20,7 @@ import type {
   TierStats,
   RecallFilter,
 } from '../domain/types.js';
-
-const ALLOWED_MEMORY_TYPES: readonly MemoryType[] = ['episodic', 'semantic', 'procedural'];
-
-function isAllowedMemoryType(value: string): value is MemoryType {
-  return (ALLOWED_MEMORY_TYPES as readonly string[]).includes(value);
-}
+import { mapQdrantPayloadToMemoryFields } from './payload-mapper.js';
 
 type SqlValue = string | number | null | Uint8Array;
 export type SqlParams = SqlValue[];
@@ -34,6 +28,26 @@ export type SqlParams = SqlValue[];
 type SqlRow = Record<string, SqlValue | undefined>;
 
 type MemoryRecordWithoutEmbedding = Omit<MemoryRecord, 'embedding'>;
+
+// Fields `insertMemory` fills in with a store-level default (via `??`) when the
+// caller omits them, so the write-time shape is legitimately narrower than the
+// fully-populated row every read path returns. Modeling this explicitly (rather
+// than requiring every caller/test fixture to restate the defaults) keeps the
+// type honest about what insertMemory actually accepts without widening the
+// read-side `MemoryRecordWithoutEmbedding` contract other methods rely on.
+type MemoryInsertDefaultableField =
+  | 'retention_tier'
+  | 'expires_at'
+  | 'decay_eligible'
+  | 'review_due'
+  | 'archived'
+  | 'vector_synced'
+  | 'pinned'
+  | 'origin'
+  | 'confidence';
+type NewMemoryRecord =
+  Omit<MemoryRecordWithoutEmbedding, MemoryInsertDefaultableField>
+  & Partial<Pick<MemoryRecordWithoutEmbedding, MemoryInsertDefaultableField>>;
 
 // The symbol is deliberately module-private: callers can hold a token that
 // `beginLifecycleOperation` returned, but cannot manufacture one accepted by
@@ -102,7 +116,7 @@ export interface SqliteStorage {
   flushIfDirty(): void;
   scheduleDeferredFlush(): void;
   cancelDeferredFlush(): void;
-  insertMemory(mem: MemoryRecordWithoutEmbedding): void;
+  insertMemory(mem: NewMemoryRecord): void;
   updateMemory(id: string, fields: Partial<MemoryRecordWithoutEmbedding>): void;
   updateMemoryWithHistory(
     id: string,
@@ -1231,7 +1245,7 @@ export class SqliteStore implements SqliteStorage {
     // Intentionally empty.
   }
 
-  insertMemory(mem: MemoryRecordWithoutEmbedding): void {
+  insertMemory(mem: NewMemoryRecord): void {
     this.assertMutableAllowed();
     const retentionTier = mem.retention_tier ?? 'T2';
     const expiresAt = mem.expires_at ?? null;
@@ -1354,58 +1368,16 @@ export class SqliteStore implements SqliteStorage {
    */
   private insertMemoryFromPayloadAtomic(id: string, payload: Record<string, unknown>): void {
     const now = new Date().toISOString();
-    const content = typeof payload.content === 'string' ? payload.content : '';
-    const summary = typeof payload.summary === 'string' ? payload.summary : '';
-    const namespace = typeof payload.namespace === 'string' ? payload.namespace : 'global';
-    const collection = typeof payload.collection === 'string' ? payload.collection : 'general';
-    // Validate against the `memories.type` CHECK constraint before it ever reaches the
-    // insert — a Qdrant payload with an out-of-enum `type` must be normalized to the
-    // documented default rather than silently dropped by INSERT OR IGNORE.
-    const type: MemoryType = typeof payload.type === 'string' && isAllowedMemoryType(payload.type)
-      ? payload.type
-      : 'semantic';
-    const tags: string[] = Array.isArray(payload.tags) ? payload.tags.filter((t): t is string => typeof t === 'string') : [];
-    const importance = typeof payload.importance === 'number' ? payload.importance : 0.5;
-    const retentionTier = typeof payload.retention_tier === 'string' ? payload.retention_tier : 'T2';
-    const deviceId = typeof payload.device_id === 'string' ? payload.device_id : null;
-    // Carry forward whatever identity (if any) the source vector was already
-    // stamped with — this is metadata recovery, not a new embedding, so it
-    // must not claim the active configuration's identity. A missing field
-    // means the point predates provenance stamping and stays "unknown" (null).
-    const embeddingModel = typeof payload.embedding_model === 'string' ? payload.embedding_model : null;
-    const createdAt = typeof payload.created_at === 'string' ? payload.created_at : now;
-    const source = typeof payload.source === 'string' ? payload.source : 'import';
-    const category = typeof payload.category === 'string' ? payload.category : null;
-    const decayEligible = typeof payload.decay_eligible === 'boolean' ? payload.decay_eligible : true;
-    const checksum = typeof payload.checksum === 'string' ? payload.checksum : '';
-    // Restore pin state from the payload rather than defaulting it to false,
-    // so a `repair --mode from-qdrant` rebuild (or the cross-device fallback
-    // path) preserves it. See add-inject-pinning.
-    const pinned = typeof payload.pinned === 'boolean' ? payload.pinned : false;
-    // Narrow to a plain object (not array/null) or fall back to null, mirroring
-    // `embeddingModel`'s narrowing above — a malformed/missing field is
-    // "unknown", not an error. See add-memory-provenance-metadata.
-    const origin = payload.origin !== null && typeof payload.origin === 'object' && !Array.isArray(payload.origin)
-      ? JSON.stringify(payload.origin)
-      : null;
-    const confidence = typeof payload.confidence === 'number' ? payload.confidence : 1.0;
-    const reviewDue = typeof payload.review_due === 'string' ? payload.review_due : null;
-    const accessCount = typeof payload.access_count === 'number' && Number.isInteger(payload.access_count)
-      ? payload.access_count
-      : 0;
-    const lastAccessed = typeof payload.last_accessed === 'string' ? payload.last_accessed : now;
-    const lastOperation = typeof payload.last_operation === 'string' ? payload.last_operation : 'ADD';
-    const derivedFrom = Array.isArray(payload.derived_from)
-      ? payload.derived_from.filter((value): value is string => typeof value === 'string')
-      : null;
-
-    // Handle expires_at which may be stored as epoch seconds in Qdrant
-    let expiresAt: string | null = null;
-    if (typeof payload.expires_at === 'number' && payload.expires_at > 0) {
-      expiresAt = new Date(payload.expires_at * 1000).toISOString();
-    } else if (typeof payload.expires_at === 'string') {
-      expiresAt = payload.expires_at;
-    }
+    // Canonical narrowing (strengthen-verification-and-code-boundaries tasks
+    // 3.1/3.2) — the one exception is `content`: the mapper leaves it
+    // `undefined` rather than defaulting it, since a fallback consumer
+    // (SearchService's cross-device path) treats a contentless payload as
+    // unusable and drops it, while hydration recovers a row regardless.
+    const mem = mapQdrantPayloadToMemoryFields(payload, now);
+    const content = mem.content ?? '';
+    const tagsJson = JSON.stringify(mem.tags);
+    const originJson = mem.origin ? JSON.stringify(mem.origin) : null;
+    const derivedFromJson = mem.derived_from ? JSON.stringify(mem.derived_from) : null;
 
     this.execSql('SAVEPOINT sp_hydrate');
     try {
@@ -1416,14 +1388,14 @@ export class SqliteStore implements SqliteStorage {
           last_operation, merged_from, derived_from, stale, archived, vector_synced, pinned, device_id, embedding_model, origin, confidence, created_at, updated_at, last_accessed
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          id, namespace, collection, type, category, content, summary,
-          JSON.stringify(tags), source, checksum, importance, retentionTier,
-          expiresAt, decayEligible ? 1 : 0, reviewDue, accessCount,
-          lastOperation, null, derivedFrom ? JSON.stringify(derivedFrom) : null, 0, 0, 1, pinned ? 1 : 0,
-          deviceId, embeddingModel, origin, confidence, createdAt, now, lastAccessed,
+          id, mem.namespace, mem.collection, mem.type, mem.category, content, mem.summary,
+          tagsJson, mem.source, mem.checksum, mem.importance, mem.retention_tier,
+          mem.expires_at, mem.decay_eligible ? 1 : 0, mem.review_due, mem.access_count,
+          mem.last_operation, null, derivedFromJson, 0, 0, 1, mem.pinned ? 1 : 0,
+          mem.device_id, mem.embedding_model, originJson, mem.confidence, mem.created_at, now, mem.last_accessed,
         ],
       );
-      this.insertFtsRow(id, namespace, collection, content, summary, tags.join(' '), true);
+      this.insertFtsRow(id, mem.namespace, mem.collection, content, mem.summary, mem.tags.join(' '), true);
       this.execSql('RELEASE sp_hydrate');
     } catch (err) {
       this.execSql('ROLLBACK TO sp_hydrate');

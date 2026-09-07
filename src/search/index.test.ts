@@ -40,7 +40,14 @@ describe('SearchService', () => {
       }],
     ]);
 
-    const storage = {
+    // Kept as its own untyped-through-`unknown` local (rather than casting the
+    // object literal directly to `StorageManager`) so the returned `storage`
+    // handle below keeps its Mock inference (`.mockResolvedValue` etc.) for
+    // callers, while `SearchService` still receives something shaped like the
+    // real interface. Casting the literal itself would collapse `qdrant.search`
+    // to the production method signature and break every
+    // `storage.qdrant.search.mockResolvedValue(...)` call site in this file.
+    const storageDouble = {
       sqlite: {
         fullTextSearch: vi.fn((_ns: string, _q: string, _limit: number, _col?: string) =>
           opts.fulltextResults ?? [{ id: 'mem-1', rank: -1 }],
@@ -56,10 +63,13 @@ describe('SearchService', () => {
         recordFeedback: vi.fn(),
       },
       qdrant: {
-        search: vi.fn(async () => []),
+        search: vi.fn(async (
+          _ns: string, _col: string | undefined, _vector: number[], _limit: number, _filters?: unknown,
+        ) => [] as Array<{ id: string; score: number; payload: Record<string, unknown>; vector?: number[] }>),
       },
       logAudit: vi.fn(),
-    } as unknown as StorageManager;
+    };
+    const storage = storageDouble as unknown as StorageManager;
 
     const config = {
       search: {
@@ -112,8 +122,10 @@ describe('SearchService', () => {
     // implemented as `embedBatch([text])[0]`.
     const embedMock = vi.fn(async () => [1, 2, 3]);
     const embedding = {
+      provider: 'openai',
       model: 'test-model',
       dimensions: 3,
+      identity: 'openai/test-model@3',
       embed: embedMock,
       embedBatch: vi.fn(async (texts: string[]) => Promise.all(texts.map(() => embedMock()))),
       healthCheck: vi.fn(async () => true),
@@ -126,7 +138,7 @@ describe('SearchService', () => {
       service: new SearchService(
         config, storage, embedding, metrics, logger, opts.queryExpansionProvider, opts.rerankProvider,
       ),
-      storage,
+      storage: storageDouble,
       embedding,
       metrics,
       logger,
@@ -151,7 +163,7 @@ describe('SearchService', () => {
   // path (confirmed above: `search/index.ts` never branches on `source`).
   it('ranks and returns a distillation-sourced memory like any other memory', async () => {
     const distilled: StoredMemory = {
-      id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic',
+      id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic', category: null,
       content: 'We deploy via GitHub Actions.', summary: 'Deploy via Actions', tags: [],
       source: 'distillation',
       checksum: 'mem-1',
@@ -166,6 +178,9 @@ describe('SearchService', () => {
       derived_from: ['a', 'b', 'c'],
       archived: false,
       vector_synced: true,
+      pinned: false,
+      origin: null,
+      confidence: 1.0,
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
       last_accessed: '2026-01-01T00:00:00Z',
@@ -194,7 +209,7 @@ describe('SearchService', () => {
 
   it('a pinned memory is unaffected by pinned state: no pinned field, ordering unchanged (add-inject-pinning 5.12)', async () => {
     const pinnedMem: StoredMemory = {
-      id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic',
+      id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic', category: null,
       content: 'hello world', summary: 'hello', tags: [], source: 'cli',
       checksum: 'mem-1',
       importance: 0.9,
@@ -208,6 +223,8 @@ describe('SearchService', () => {
       archived: false,
       vector_synced: true,
       pinned: true,
+      origin: null,
+      confidence: 1.0,
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
       last_accessed: '2026-01-01T00:00:00Z',
@@ -225,7 +242,7 @@ describe('SearchService', () => {
     // the ranked input. The service-layer memoryMap must re-order results to the
     // ranking, not trust whatever order the store hands back.
     const makeMem = (id: string): StoredMemory => ({
-      id, namespace: 'global', collection: 'general', type: 'semantic',
+      id, namespace: 'global', collection: 'general', type: 'semantic', category: null,
       content: `content-${id}`, summary: `summary-${id}`, tags: [], source: 'cli',
       checksum: id,
       importance: 0.9,
@@ -238,6 +255,9 @@ describe('SearchService', () => {
       merged_from: null,
       archived: false,
       vector_synced: true,
+      pinned: false,
+      origin: null,
+      confidence: 1.0,
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
       last_accessed: '2026-01-01T00:00:00Z',
@@ -403,7 +423,7 @@ describe('SearchService', () => {
   it('carries origin/confidence from the hydrated memory into the search result', async () => {
     const memories = new Map<string, StoredMemory>([
       ['mem-1', {
-        id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic',
+        id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic', category: null,
         content: 'hello world', summary: 'hello', tags: [], source: 'agent',
         checksum: 'mem-1',
         importance: 0.9,
@@ -416,6 +436,7 @@ describe('SearchService', () => {
         merged_from: null,
         archived: false,
         vector_synced: true,
+        pinned: false,
         origin: { session_id: 'sess-1', tool: 'claude-code' },
         confidence: 0.7,
         created_at: '2026-01-01T00:00:00Z',
@@ -496,7 +517,7 @@ describe('SearchService', () => {
   it('emits a distinct PROMOTE audit event when access-driven promotion crosses the threshold', async () => {
     const memories = new Map<string, StoredMemory>([
       ['mem-1', {
-        id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic',
+        id: 'mem-1', namespace: 'global', collection: 'general', type: 'semantic', category: null,
         content: 'hello world', summary: 'hello', tags: [], source: 'cli',
         checksum: 'mem-1',
         importance: 0.9,
@@ -509,6 +530,9 @@ describe('SearchService', () => {
         merged_from: null,
         archived: false,
         vector_synced: true,
+        pinned: false,
+        origin: null,
+        confidence: 1.0,
         created_at: '2026-01-01T00:00:00Z',
         updated_at: '2026-01-01T00:00:00Z',
         last_accessed: '2026-01-01T00:00:00Z',
@@ -676,7 +700,7 @@ describe('SearchService', () => {
         },
       });
       const callOrder: string[] = [];
-      (embedding.embed as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      (embedding.embed as ReturnType<typeof vi.fn<(text: string) => Promise<number[]>>>).mockImplementation(async () => {
         callOrder.push('embed-dispatched');
         return [1, 2, 3];
       });
@@ -784,7 +808,7 @@ describe('SearchService', () => {
 
   describe('composite ranking (add-composite-recall-ranking)', () => {
     const makeMem = (id: string, overrides: Partial<StoredMemory> = {}): StoredMemory => ({
-      id, namespace: 'global', collection: 'general', type: 'semantic',
+      id, namespace: 'global', collection: 'general', type: 'semantic', category: null,
       content: `content-${id}`, summary: `summary-${id}`, tags: [], source: 'cli',
       checksum: id,
       importance: 0.5,
@@ -797,6 +821,9 @@ describe('SearchService', () => {
       merged_from: null,
       archived: false,
       vector_synced: true,
+      pinned: false,
+      origin: null,
+      confidence: 1.0,
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
       last_accessed: '2026-01-01T00:00:00Z',
@@ -1016,7 +1043,7 @@ describe('SearchService', () => {
 
   describe('MMR diversity reranking (add-mmr-diversity-reranking)', () => {
     const makeMem = (id: string, overrides: Partial<StoredMemory> = {}): StoredMemory => ({
-      id, namespace: 'global', collection: 'general', type: 'semantic',
+      id, namespace: 'global', collection: 'general', type: 'semantic', category: null,
       content: `content-${id}`, summary: `summary-${id}`, tags: [], source: 'cli',
       checksum: id,
       importance: 0.5,
@@ -1029,6 +1056,9 @@ describe('SearchService', () => {
       merged_from: null,
       archived: false,
       vector_synced: true,
+      pinned: false,
+      origin: null,
+      confidence: 1.0,
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
       last_accessed: '2026-01-01T00:00:00Z',
@@ -1227,7 +1257,7 @@ describe('SearchService', () => {
 
   describe('multi-query expansion (add-multi-query-expansion)', () => {
     const expansionMakeMem = (id: string): StoredMemory => ({
-      id, namespace: 'global', collection: 'general', type: 'semantic',
+      id, namespace: 'global', collection: 'general', type: 'semantic', category: null,
       content: `content-${id}`, summary: `summary-${id}`, tags: [], source: 'cli',
       checksum: id,
       importance: 0.5,
@@ -1240,6 +1270,9 @@ describe('SearchService', () => {
       merged_from: null,
       archived: false,
       vector_synced: true,
+      pinned: false,
+      origin: null,
+      confidence: 1.0,
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
       last_accessed: '2026-01-01T00:00:00Z',
@@ -1260,7 +1293,7 @@ describe('SearchService', () => {
         ['mem-keyword-only', expansionMakeMem('mem-keyword-only')],
       ]);
       const { service, storage, embedding } = createSearchService({ memories, ranking: noRanking });
-      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+      (embedding.embedBatch as ReturnType<typeof vi.fn<(texts: string[]) => Promise<number[][]>>>).mockImplementation(async (texts: string[]) =>
         texts.map(t => (t === 'deploy' ? [9, 9, 9] : [1, 2, 3])));
       storage.qdrant.search.mockImplementation(async (_ns: string, _col: string | undefined, vector: number[]) =>
         vector[0] === 9
@@ -1275,7 +1308,7 @@ describe('SearchService', () => {
     it('keeps the max score, not a sum, when a memory id is matched by more than one variant', async () => {
       const memories = new Map<string, StoredMemory>([['mem-1', expansionMakeMem('mem-1')]]);
       const { service, storage, embedding } = createSearchService({ memories, ranking: noRanking });
-      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+      (embedding.embedBatch as ReturnType<typeof vi.fn<(texts: string[]) => Promise<number[][]>>>).mockImplementation(async (texts: string[]) =>
         texts.map(t => (t === 'deploy' ? [9, 9, 9] : [1, 2, 3])));
       storage.qdrant.search.mockImplementation(async (_ns: string, _col: string | undefined, vector: number[]) =>
         vector[0] === 9
@@ -1294,7 +1327,7 @@ describe('SearchService', () => {
         ['a1', 'a2', 'a3', 'b1', 'b2', 'b3'].map(id => [id, expansionMakeMem(id)]),
       );
       const { service, storage, embedding } = createSearchService({ memories, ranking: noRanking });
-      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+      (embedding.embedBatch as ReturnType<typeof vi.fn<(texts: string[]) => Promise<number[][]>>>).mockImplementation(async (texts: string[]) =>
         texts.map(t => (t === 'deploy' ? [9, 9, 9] : [1, 2, 3])));
       storage.qdrant.search.mockImplementation(async (_ns: string, _col: string | undefined, vector: number[]) =>
         vector[0] === 9
@@ -1330,12 +1363,12 @@ describe('SearchService', () => {
       const { service, storage, embedding } = createSearchService({
         memories, ranking: noRanking, fulltextResults: [],
       });
-      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+      (embedding.embedBatch as ReturnType<typeof vi.fn<(texts: string[]) => Promise<number[][]>>>).mockImplementation(async (texts: string[]) =>
         texts.map(t => (t === 'deploy' ? [9, 9, 9] : [1, 2, 3])));
       storage.qdrant.search.mockImplementation(async (_ns: string, _col: string | undefined, vector: number[]) =>
         vector[0] === 9
-          ? [{ id: 'mem-keyword-only', score: 0.95 }]
-          : [{ id: 'mem-literal', score: 0.5 }]);
+          ? [{ id: 'mem-keyword-only', score: 0.95, payload: {} }]
+          : [{ id: 'mem-literal', score: 0.5, payload: {} }]);
 
       const results = await service.search('how do we deploy', 'global', undefined, 'hybrid', 10);
 
@@ -1363,7 +1396,7 @@ describe('SearchService', () => {
         },
         queryExpansionProvider,
       });
-      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+      (embedding.embedBatch as ReturnType<typeof vi.fn<(texts: string[]) => Promise<number[][]>>>).mockImplementation(async (texts: string[]) =>
         texts.map(t => {
           if (t === 'deploy') return [9, 9, 9];
           if (t === 'paraphrase one') return [7, 7, 7];
@@ -1403,7 +1436,7 @@ describe('SearchService', () => {
         },
         queryExpansionProvider,
       });
-      (embedding.embedBatch as ReturnType<typeof vi.fn>).mockImplementation(async (texts: string[]) =>
+      (embedding.embedBatch as ReturnType<typeof vi.fn<(texts: string[]) => Promise<number[][]>>>).mockImplementation(async (texts: string[]) =>
         texts.map(t => (t === 'deploy' ? [9, 9, 9] : [1, 2, 3])));
       storage.qdrant.search.mockImplementation(async (_ns: string, _col: string | undefined, vector: number[]) =>
         vector[0] === 9

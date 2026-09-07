@@ -12,7 +12,22 @@ import { SECTION_MAPPINGS } from '../pipeline/parser.js';
 
 describe('import tool', () => {
   let ctx: ToolContext;
-  let pipelineProcess: ReturnType<typeof vi.fn>;
+  // Only the fields these tests actually assert on from a captured call —
+  // WritePipeline.process's real `input` has many more (all optional except
+  // content/namespace/collection/tags/source), so this stays a subset rather
+  // than re-declaring the full shape.
+  type CapturedProcessInput = {
+    namespace: string;
+    collection: string;
+    source: string;
+    type: string;
+    content: string;
+    retention_tier?: string;
+    precomputedEmbedding?: number[];
+  };
+  let pipelineProcess: ReturnType<typeof vi.fn<
+    (input: CapturedProcessInput) => Promise<Array<{ id: string; summary: string; type: string; operation: string; created_at: string }>>
+  >>;
 
   beforeEach(() => {
     pipelineProcess = vi.fn(async () => [{ id: 'mem-1', summary: 'test', type: 'semantic', operation: 'ADD', created_at: '2026-01-01' }]);
@@ -197,7 +212,7 @@ Jane Doe, CTO at Acme Corp.`;
 
       expect(result.memories_created).toBe(3);
       expect(pipelineProcess).toHaveBeenCalledTimes(3);
-      const contents = pipelineProcess.mock.calls.map(c => (c[0] as { content: string }).content);
+      const contents = pipelineProcess.mock.calls.map(c => c[0]!.content);
       expect(contents).toEqual(['a'.repeat(10), 'a'.repeat(10), 'a'.repeat(5)]);
     });
   });
@@ -219,7 +234,7 @@ Jane Doe, CTO at Acme Corp.`;
       expect(pipelineProcess).toHaveBeenCalledTimes(5);
       // Each pipeline call receives that chunk's precomputed vector.
       for (const call of pipelineProcess.mock.calls) {
-        expect((call[0] as { precomputedEmbedding: number[] }).precomputedEmbedding).toEqual([0.1, 0.2]);
+        expect(call[0]!.precomputedEmbedding).toEqual([0.1, 0.2]);
       }
     });
 

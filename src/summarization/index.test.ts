@@ -4,6 +4,7 @@ import {
   DegradedSummarizationProvider,
   createSummarizationProvider,
   warnIfSummarizationDegraded,
+  type SummarizationProvider,
 } from './index.js';
 import type { BrainConfig } from '../config/index.js';
 import type { CircuitBreaker } from '../resilience/index.js';
@@ -93,7 +94,7 @@ describe('DegradedSummarizationProvider', () => {
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
 
-    const provider = new DegradedSummarizationProvider();
+    const provider: SummarizationProvider = new DegradedSummarizationProvider();
     await expect(provider.summarize('content', 120)).rejects.toThrow('missing API credentials');
     expect(fetchSpy).not.toHaveBeenCalled();
 

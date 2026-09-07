@@ -22,6 +22,7 @@ type MockSqliteStore = SqliteStore & {
   deleteMemoriesByIds: ReturnType<typeof vi.fn>;
   listMemoryIds: ReturnType<typeof vi.fn>;
   hydrateBatch: ReturnType<typeof vi.fn>;
+  listMemoriesWithStaleEmbeddingStamp: ReturnType<typeof vi.fn>;
 };
 type MockQdrantStore = QdrantStore & {
   upsert: ReturnType<typeof vi.fn>;
@@ -40,8 +41,11 @@ function createMockSqlite(): MockSqliteStore {
       const existing = memoryStore.get(id);
       if (existing) {
         for (const [k, v] of Object.entries(fields)) {
-          const key = k as keyof StoredMemory;
-          existing[key] = v as StoredMemory[typeof key];
+          // A generic `keyof StoredMemory` index makes TS unable to prove
+          // the right-hand union matches the specific per-key property type
+          // (it collapses to `never`), so the assignment goes through an
+          // `unknown`-keyed view rather than `StoredMemory[typeof key]`.
+          (existing as unknown as Record<string, unknown>)[k] = v;
         }
       }
     }),
@@ -79,9 +83,18 @@ function createMockSqlite(): MockSqliteStore {
           source: 'import',
           checksum: '',
           importance: 0.5,
+          retention_tier: 'T2',
+          expires_at: null,
+          decay_eligible: true,
+          review_due: null,
           access_count: 0,
           last_operation: 'ADD',
           merged_from: null,
+          archived: false,
+          vector_synced: true,
+          pinned: false,
+          origin: null,
+          confidence: 1.0,
           created_at: now,
           updated_at: now,
           last_accessed: now,
@@ -190,6 +203,9 @@ describe('StorageManager cross-store consistency', () => {
     merged_from: null,
     archived: false,
     vector_synced: true,
+    pinned: false,
+    origin: null,
+    confidence: 1.0,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     last_accessed: new Date().toISOString(),
@@ -682,7 +698,6 @@ describe('StorageManager cross-store consistency', () => {
       const outcome = await storage.detectAndMarkVectorDrift({
         expectedEmbeddingModel: 'old-model',
         expectedEmbeddingDimensions: 3,
-        allowDuringLifecycle: true,
       });
 
       expect(outcome).toEqual({ mode: 'full-rebuild', driftedCount: 1, surplusPruned: 0, surplusRemaining: 0 });

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { BrainConfig } from '../config/index.js';
 
 const handleToolMock = vi.fn();
@@ -99,7 +100,10 @@ describe('createHttpServer', () => {
         fallback_to_threshold_dedup: true,
       },
       auto_summarize: true,
-    };
+      // See the identical cast in embedding/index.test.ts's createConfig:
+      // this fixture only needs the sections the HTTP transport tests
+      // actually exercise (auth, rate limiting, MCP session bounds, etc.).
+    } as unknown as BrainConfig;
   }
 
   // Builds the Express app in-process. Requests are dispatched via
@@ -724,8 +728,29 @@ describe('createHttpServer /mcp routes', () => {
 
   // bound-qdrant-http-runtime task 3.1-3.3: MCP session lifecycle bounds.
   describe('MCP session lifecycle bounds (bound-qdrant-http-runtime tasks 3.1-3.3)', () => {
+    // Every test here uses a short idle_timeout_ms/sweep_interval_ms so its
+    // idle sweep fires within the test's own real-timer wait. Several tests
+    // deliberately leave a session alive at the end (e.g. "activity postpones
+    // idle expiry"); without closeAll() here that session's unref'd sweep
+    // timer keeps running with real timers into whichever test runs next,
+    // eventually evicting it there — a leaked-timer cross-test leak that
+    // strengthen-verification-and-code-boundaries task 2.2's "closed exactly
+    // once" test below would otherwise observe as spurious extra close()
+    // calls unrelated to the scenario it's asserting on.
+    const builtSessionManagers: Array<{ closeAll: () => Promise<void> }> = [];
+    async function buildTrackedApp(...args: Parameters<typeof buildApp>): ReturnType<typeof buildApp> {
+      const built = await buildApp(...args);
+      builtSessionManagers.push(built.mcpSessions);
+      return built;
+    }
+
+    afterEach(async () => {
+      await Promise.all(builtSessionManagers.map(m => m.closeAll()));
+      builtSessionManagers.length = 0;
+    });
+
     it('evicts the oldest session to make room once at max_sessions capacity', async () => {
-      const { app, mcpSessions, metrics } = await buildApp(
+      const { app, mcpSessions, metrics } = await buildTrackedApp(
         createConfig(false, true, { mcpSession: { max_sessions: 1 } }),
       );
 
@@ -769,7 +794,7 @@ describe('createHttpServer /mcp routes', () => {
     });
 
     it('closes an idle session once it exceeds idle_timeout_ms, via the independent sweep', async () => {
-      const { app, mcpSessions, metrics } = await buildApp(
+      const { app, mcpSessions, metrics } = await buildTrackedApp(
         createConfig(false, true, { mcpSession: { idle_timeout_ms: 30, sweep_interval_ms: 20 } }),
       );
 
@@ -798,7 +823,7 @@ describe('createHttpServer /mcp routes', () => {
     });
 
     it('activity postpones idle expiry', async () => {
-      const { app, mcpSessions } = await buildApp(
+      const { app, mcpSessions } = await buildTrackedApp(
         createConfig(false, true, { mcpSession: { idle_timeout_ms: 150, sweep_interval_ms: 20 } }),
       );
 
@@ -832,7 +857,7 @@ describe('createHttpServer /mcp routes', () => {
     });
 
     it('closeAll() stops the idle sweep timer', async () => {
-      const { mcpSessions } = await buildApp(
+      const { mcpSessions } = await buildTrackedApp(
         createConfig(false, true, { mcpSession: { idle_timeout_ms: 30, sweep_interval_ms: 20 } }),
       );
 
@@ -844,6 +869,72 @@ describe('createHttpServer /mcp routes', () => {
       // guards against `closeAll` throwing.
       await new Promise(resolve => setTimeout(resolve, 50));
       expect(mcpSessions.size).toBe(0);
+    });
+
+    // strengthen-verification-and-code-boundaries task 2.2: every session
+    // McpSessionManager itself tears down (idle sweep, capacity eviction,
+    // closeAll) must have its transport closed exactly once — a double close
+    // would surface as a second `transport.close()` call on an
+    // already-removed registry entry. (An explicit `DELETE /mcp` closes
+    // itself through the SDK's own internal request handling rather than
+    // through `McpSessionManager.evictSession`/`closeAll`, so that path is
+    // verified separately below by confirming it removes the session from
+    // the registry — leaving nothing there for a later `closeAll()` to
+    // double-close.)
+    it('closes each manager-evicted session\'s transport exactly once across idle eviction, capacity eviction, and closeAll', async () => {
+      const closeSpy = vi.spyOn(StreamableHTTPServerTransport.prototype, 'close');
+      try {
+        const { app, mcpSessions } = await buildApp(
+          createConfig(false, true, { mcpSession: { max_sessions: 1, idle_timeout_ms: 30, sweep_interval_ms: 20 } }),
+        );
+
+        // Idle-swept session: evictSession() -> exactly one close() call.
+        const idleInit = await initializeSession(app);
+        expect(idleInit.status).toBe(200);
+        await new Promise(resolve => setTimeout(resolve, 200));
+        expect(mcpSessions.size).toBe(0);
+        expect(closeSpy).toHaveBeenCalledTimes(1);
+
+        // Capacity-evicted session (max_sessions: 1): the second initialize
+        // evicts the first via the same evictSession() path -> one more
+        // close() call, and only one — the surviving second session is
+        // untouched.
+        const first = await initializeSession(app);
+        expect(first.status).toBe(200);
+        const second = await initializeSession(app);
+        expect(second.status).toBe(200);
+        expect(closeSpy).toHaveBeenCalledTimes(2);
+        expect(mcpSessions.size).toBe(1);
+
+        // DELETE the survivor: closes itself via the SDK's own internal
+        // handling (not McpSessionManager.evictSession, so it does not add
+        // to closeSpy's count), but must still leave the registry empty so
+        // it can never be double-closed by a later closeAll().
+        const secondSessionId = second.headers['mcp-session-id'];
+        await request(app)
+          .delete('/mcp')
+          .set('Authorization', 'Bearer secret-token')
+          .set('mcp-session-id', secondSessionId);
+        expect(mcpSessions.size).toBe(0);
+        expect(closeSpy).toHaveBeenCalledTimes(2);
+
+        // closeAll() on one freshly created, still-live session: exactly one
+        // more close() call, proving it did not also re-close the
+        // already-DELETEd session above.
+        const third = await initializeSession(app);
+        expect(third.status).toBe(200);
+        await mcpSessions.closeAll();
+        expect(closeSpy).toHaveBeenCalledTimes(3);
+
+        // Every recorded close() call targeted a distinct transport instance
+        // — the counts above already prove no session was closed twice, but
+        // this additionally rules out the same instance being invoked
+        // multiple times under a mock that could otherwise mask it.
+        const closedInstances = new Set(closeSpy.mock.instances);
+        expect(closedInstances.size).toBe(closeSpy.mock.calls.length);
+      } finally {
+        closeSpy.mockRestore();
+      }
     });
   });
 });

@@ -62,7 +62,7 @@ describe('logger helpers', () => {
         fallback_to_threshold_dedup: true,
       },
       auto_summarize: true,
-    };
+    } as unknown as BrainConfig;
   }
 
   beforeEach(() => {

@@ -19,6 +19,7 @@
     "start": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "eval": "tsx src/eval/run.ts",
     "lint": "npm run lint:types && npm run lint:types:test && npm run lint:eslint",
     "lint:types": "tsc --noEmit",

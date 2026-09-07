@@ -4,8 +4,7 @@ import type { BrainConfig } from '../config/index.js';
 import type { HealthService } from '../health/index.js';
 import type { SearchService } from '../search/index.js';
 import type { StorageManager } from '../storage/index.js';
-import type { BrainErrorEnvelope, ErrorEnvelope } from '../errors/index.js';
-import type { SearchResult } from '../domain/types.js';
+import type { SearchResult, ErrorEnvelope } from '../domain/types.js';
 
 type ListResult = { items: unknown[]; total_results: number };
 type InjectResult = { content: string; truncated: boolean; memories_count: number; categories_count: number };
@@ -61,19 +60,19 @@ describe('resource pagination bounds', () => {
 
   it('returns INVALID_INPUT for non-numeric limit', async () => {
     const handler = createHandler();
-    const result = await handler.handle('memory://list?limit=abc') as ResourceResult;
+    const result = await handler.handle('memory://list?limit=abc') as ErrorEnvelope;
     expect(result.error.code).toBe('INVALID_INPUT');
   });
 
   it('returns INVALID_INPUT for out-of-range limit', async () => {
     const handler = createHandler();
-    const result = await handler.handle('memory://list?limit=1000') as ResourceResult;
+    const result = await handler.handle('memory://list?limit=1000') as ErrorEnvelope;
     expect(result.error.code).toBe('INVALID_INPUT');
   });
 
   it('returns bounded paginated response for valid limit', async () => {
     const handler = createHandler();
-    const result = await handler.handle('memory://list?limit=1') as ResourceResult;
+    const result = await handler.handle('memory://list?limit=1') as ListResult;
     expect(result.items).toHaveLength(1);
     expect(result.total_results).toBe(2);
   });
@@ -117,7 +116,7 @@ describe('resource pagination bounds', () => {
       { check: async () => ({ status: 'healthy' }) } as HealthService,
     );
 
-    const result = await handler.handle(`memory://${expiredMemory.id}`) as ResourceResult;
+    const result = await handler.handle(`memory://${expiredMemory.id}`) as ErrorEnvelope;
     expect(result.error.code).toBe('NOT_FOUND');
   });
 
@@ -190,7 +189,7 @@ describe('resource pagination bounds', () => {
       { check: async () => ({ status: 'healthy' }) } as HealthService,
     );
 
-    const result = await handler.handle('memory://550e8400-e29b-41d4-a716-446655440008/revisions') as ResourceResult;
+    const result = await handler.handle('memory://550e8400-e29b-41d4-a716-446655440008/revisions') as ErrorEnvelope;
     expect(result.error.code).toBe('NOT_FOUND');
   });
 
@@ -222,7 +221,7 @@ describe('resource pagination bounds', () => {
       { check: async () => ({ status: 'healthy' }) } as HealthService,
     );
 
-    const result = await handler.handle(`memory://${expiredT1.id}`) as ResourceResult;
+    const result = await handler.handle(`memory://${expiredT1.id}`) as ErrorEnvelope;
     expect(result.error.code).toBe('NOT_FOUND');
   });
 
@@ -257,7 +256,7 @@ describe('resource pagination bounds', () => {
       { check: async () => ({ status: 'healthy' }) } as HealthService,
     );
 
-    const result = await handler.handle('memory://list?limit=10') as ResourceResult;
+    const result = await handler.handle('memory://list?limit=10') as ListResult;
     expect(result.items).toEqual([active]);
   });
 
@@ -290,7 +289,7 @@ describe('resource pagination bounds', () => {
       { check: async () => ({ status: 'healthy' }) } as HealthService,
     );
 
-    const result = await handler.handle('memory://inject') as ResourceResult;
+    const result = await handler.handle('memory://inject') as InjectResult;
     expect(result.content.length).toBeLessThanOrEqual(24);
     expect(result.truncated).toBe(true);
   });
@@ -329,7 +328,7 @@ describe('resource pagination bounds', () => {
       { check: async () => ({ status: 'healthy' }) } as HealthService,
     );
 
-    const result = await handler.handle('memory://inject') as ResourceResult;
+    const result = await handler.handle('memory://inject') as InjectResult;
     expect(result.truncated).toBe(true);
     expect([...result.content.matchAll(/\u{1F600}/gu)]).toHaveLength(3);
   });

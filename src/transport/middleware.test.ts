@@ -14,7 +14,7 @@ vi.mock('node:crypto', async (importOriginal) => {
   };
 });
 
-type ResponseDouble = Pick<Response, 'status' | 'json' | 'setHeader'>;
+type ResponseDouble = Pick<Response, 'json' | 'setHeader'> & { status: (code: number) => ResponseDouble };
 
 function createResponseDouble(): ResponseDouble {
   const response: Partial<ResponseDouble> = {};
@@ -169,7 +169,8 @@ describe('transport middleware hardening', () => {
   it('evicts expired buckets via the independent sweep timer', () => {
     vi.useFakeTimers();
     try {
-      const metrics = { setGauge: vi.fn(), incCounter: vi.fn() } as unknown as MetricsCollector;
+      const metricsDouble = { setGauge: vi.fn(), incCounter: vi.fn() };
+      const metrics = metricsDouble as unknown as MetricsCollector;
       const config = { security: { rate_limit_rpm: 100, rate_limit_max_buckets: 10_000 } } as unknown as BrainConfig;
       const middleware = createRateLimitMiddleware(config, undefined, metrics);
 
@@ -185,7 +186,7 @@ describe('transport middleware hardening', () => {
       const res2 = createResponseDouble() as unknown as Response;
       middleware(req2, res2, vi.fn());
 
-      const lastGaugeCall = metrics.setGauge.mock.calls[metrics.setGauge.mock.calls.length - 1];
+      const lastGaugeCall = metricsDouble.setGauge.mock.calls[metricsDouble.setGauge.mock.calls.length - 1];
       expect(lastGaugeCall[0]).toBe('bhgbrain_rate_limit_buckets');
       expect(lastGaugeCall[1]).toBe(1);
     } finally {

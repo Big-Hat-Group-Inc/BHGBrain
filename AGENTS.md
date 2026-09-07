@@ -29,6 +29,8 @@ npm run start            # Run compiled code
 # Testing
 npm test                 # Run all tests once
 npm run test:watch       # Run tests in watch mode
+npm run test:coverage    # Run tests with V8 coverage against the ratcheted
+                          # thresholds in vitest.config.ts (fails below them)
 
 # Evaluation
 npm run eval              # Golden-set retrieval eval (recall@k/MRR report against src/eval/fixtures)

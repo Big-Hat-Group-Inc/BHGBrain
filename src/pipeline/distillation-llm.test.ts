@@ -47,7 +47,7 @@ describe('DistillationLLMClient', () => {
   it('succeeds and truncates an oversized summary', async () => {
     process.env.BHGBRAIN_EXTRACTION_API_KEY = 'test-key';
     const longSummary = 'x'.repeat(200);
-    const fetchMock = vi.fn(async () => jsonResponse({
+    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => jsonResponse({
       choices: [{ message: { content: JSON.stringify({ content: 'We deploy via GitHub Actions.', summary: longSummary }) } }],
     }));
     global.fetch = fetchMock as unknown as typeof fetch;

@@ -14,7 +14,7 @@ describe('embedding request helper', () => {
 
   describe('executeSingleEmbeddingRequest', () => {
     it('sends the given url/headers/body and returns the raw response', async () => {
-      const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
+      const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => new Response('{}', { status: 200 }));
       vi.stubGlobal('fetch', fetchMock);
 
       const response = await executeSingleEmbeddingRequest({

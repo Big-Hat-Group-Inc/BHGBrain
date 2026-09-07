@@ -97,7 +97,7 @@ describe('HealthService', () => {
         fallback_to_threshold_dedup: true,
       },
       auto_summarize: true,
-    };
+    } as unknown as BrainConfig;
   }
 
   function createStorage(): StorageManager {

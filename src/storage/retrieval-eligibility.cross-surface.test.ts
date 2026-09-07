@@ -36,7 +36,12 @@ describe('retrieval eligibility: cross-surface fixtures (fix-retrieval-consisten
   const now = '2026-09-06T12:00:00.000Z';
   const nowDate = new Date(now);
 
-  const base = (overrides: Record<string, unknown>) => ({
+  const base = (overrides: {
+    id: string;
+    checksum: string;
+    expires_at: string | null;
+    pinned?: boolean;
+  }) => ({
     namespace: 'global',
     collection: 'work',
     type: 'semantic' as const,

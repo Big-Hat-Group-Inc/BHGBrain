@@ -13,10 +13,10 @@ import {
   CategoryInputSchema, BackupInputSchema, RepairInputSchema,
   RevisionsInputSchema, ReviewInputSchema, ConsolidateInputSchema,
   RelateInputSchema, FeedbackInputSchema,
-  type RepairInput, type ConsolidateInput,
+  type RepairInput, type ConsolidateInput, type ReviewInput,
 } from '../domain/schemas.js';
 import type {
-  WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter,
+  WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter, RetentionTier,
 } from '../domain/types.js';
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
@@ -24,6 +24,7 @@ import { assembleWithinCharBudget } from '../domain/response-budget.js';
 import { buildRestoredMemoryFromArchive } from '../domain/archive-restore.js';
 import { handleImport } from './import.js';
 import { handleBootstrap } from './bootstrap.js';
+import { computeRecallFetchLimit } from './recall-pool.js';
 import { ZodError } from 'zod';
 
 // Fixed slack reserved out of `defaults.max_response_chars` for a result
@@ -237,25 +238,10 @@ async function handleRecall(
     ? { type: input.type, tags: input.tags, after: input.after, before: input.before }
     : undefined;
 
-  // Over-fetch modestly beyond `limit` so the expired-memory exclusion inside
-  // `buildSearchResults` cannot starve the caller's limit even once the
-  // store already narrows candidates down to matching memories. Capped so a
-  // filtered recall never asks the store for an unbounded candidate pool.
-  // When MMR is eligible (recall is semantic-only, so no mode check is
-  // needed), widen the pool further using the config-driven formula so there
-  // is genuine diversity headroom beyond `limit` (add-mmr-diversity-reranking).
-  const baseFetchLimit = ctx.config.search.mmr.enabled
-    ? Math.min(input.limit * ctx.config.search.mmr.candidate_pool_multiplier, ctx.config.search.mmr.candidate_pool_cap)
-    : Math.min(input.limit * 2, 40);
-
-  // When reranking is enabled, widen the pool at least up to
-  // `search.rerank.candidate_pool` (capped at 40, the same ceiling the
-  // pre-rerank formula already used) so the rerank stage has a meaningful
-  // pool to score even for a small `limit`, without ever narrowing whatever
-  // MMR already widened it to (add-opt-in-rerank-stage).
-  const fetchLimit = ctx.config.search.rerank.enabled
-    ? Math.max(baseFetchLimit, Math.min(ctx.config.search.rerank.candidate_pool, 40))
-    : baseFetchLimit;
+  // Pure pool-sizing helper (strengthen-verification-and-code-boundaries
+  // task 3.4) — recall is semantic-only, so no mode check is needed here.
+  // See src/tools/recall-pool.ts for the boundary tests this delegates to.
+  const fetchLimit = computeRecallFetchLimit(input.limit, ctx.config.search.mmr, ctx.config.search.rerank);
 
   const results = await ctx.search.search(
     input.query, input.namespace, input.collection, 'semantic', fetchLimit, undefined, filter,
@@ -510,6 +496,12 @@ async function handleRevisions(
 // look-ahead window); `keep`/`archive`/`restore` disposition them. Content
 // revision is deliberately not duplicated here — that stays `remember`'s
 // UPDATE flow (design.md "one write path for content").
+// Dispatcher only: input parsing/namespace logging shared by every action,
+// then delegated to one focused per-action handler below (strengthen-
+// verification-and-code-boundaries task 3.3 — mirrors handleConsolidate's
+// list/merge split). Public schema (ReviewInputSchema) and dispatch-visible
+// behavior are unchanged; this only reorganizes the implementation so each
+// action's logic and tests can stand on their own.
 async function handleReview(
   ctx: ToolContext, args: unknown, clientId: string, logCtx: ToolLogContext,
 ): Promise<unknown> {
@@ -517,107 +509,133 @@ async function handleReview(
   logCtx.namespace = input.namespace;
 
   if (input.action === 'list') {
-    const now = new Date();
-    const before = new Date(now.getTime() + input.days * 24 * 60 * 60 * 1000).toISOString();
-    const due = ctx.storage.sqlite.listReviewDue(input.namespace, before, input.limit, input.cursor);
-    const last = due[due.length - 1];
-    const cursor = due.length === input.limit && last?.review_due
-      ? `${last.review_due}|${last.id}`
-      : null;
-
-    return {
-      items: due.map(m => ({
-        id: m.id,
-        namespace: m.namespace,
-        collection: m.collection,
-        summary: m.summary,
-        tags: m.tags,
-        retention_tier: m.retention_tier,
-        review_due: m.review_due,
-        expires_at: m.expires_at,
-      })),
-      cursor,
-    };
+    return handleReviewList(ctx, input);
   }
 
   // Schema refine guarantees `id` is present for keep/archive/restore.
   const id = input.id!;
-  const lifecycle = new MemoryLifecycleService(ctx.config);
-
   if (input.action === 'keep') {
-    const mem = ctx.storage.sqlite.getMemoryById(id);
-    if (!mem) throw notFound(`Memory ${id} not found`);
-    logCtx.namespace = mem.namespace;
-
-    const now = new Date();
-    const nowIso = now.toISOString();
-    // A human confirmation is at least as strong a signal as an automated
-    // access, so `keep` re-applies the tier's full lifecycle policy
-    // (review_due + expires_at) regardless of sliding-window configuration —
-    // design.md: "explicit curation beats passive policy".
-    const nextReviewDue = lifecycle.buildMetadata(mem.retention_tier, now).review_due;
-    const nextExpiry = lifecycle.computeExpiry(mem.retention_tier, now);
-
-    ctx.storage.sqlite.updateMemory(id, {
-      review_due: nextReviewDue,
-      expires_at: nextExpiry,
-      updated_at: nowIso,
-    });
-    ctx.storage.sqlite.flushIfDirty();
-
-    ctx.storage.logAudit('REVISE', id, mem.namespace, clientId, {
-      details: {
-        memory_id: id,
-        prior_tier: mem.retention_tier,
-        new_tier: mem.retention_tier,
-        actor: clientId,
-        timestamp: nowIso,
-        action: 'revise',
-      },
-    });
-
-    return { id, review_due: nextReviewDue, expires_at: nextExpiry };
+    return handleReviewKeep(ctx, id, clientId, logCtx);
   }
-
   if (input.action === 'archive') {
-    const mem = ctx.storage.sqlite.getMemoryById(id);
-    if (!mem) {
-      // Already archived (row moved to memory_archive, gone from `memories`)
-      // is a conflict, not a not-found — distinguishable from "never existed".
-      if (ctx.storage.sqlite.getArchiveByMemoryId(id)) {
-        throw conflict(`Memory ${id} is already archived`);
-      }
-      throw notFound(`Memory ${id} not found`);
-    }
-    logCtx.namespace = mem.namespace;
+    return handleReviewArchive(ctx, id, clientId, logCtx);
+  }
+  return handleReviewRestore(ctx, id, clientId, logCtx);
+}
 
-    const nowIso = new Date().toISOString();
-    ctx.storage.sqlite.archiveMemory(mem, nowIso);
-    try {
-      await ctx.storage.deleteMemory(id);
-    } catch (err) {
-      // Vector/SQLite removal failed: undo the archive row so the memory
-      // isn't left both live and archived.
-      ctx.storage.sqlite.deleteArchive(id);
-      ctx.storage.sqlite.flushIfDirty();
-      throw err;
-    }
+async function handleReviewList(
+  ctx: ToolContext, input: ReviewInput,
+): Promise<{
+  items: Array<{
+    id: string; namespace: string; collection: string; summary: string; tags: string[];
+    retention_tier: RetentionTier; review_due: string | null; expires_at: string | null;
+  }>;
+  cursor: string | null;
+}> {
+  const now = new Date();
+  const before = new Date(now.getTime() + input.days * 24 * 60 * 60 * 1000).toISOString();
+  const due = ctx.storage.sqlite.listReviewDue(input.namespace, before, input.limit, input.cursor);
+  const last = due[due.length - 1];
+  const cursor = due.length === input.limit && last?.review_due
+    ? `${last.review_due}|${last.id}`
+    : null;
 
-    ctx.storage.logAudit('ARCHIVE', id, mem.namespace, clientId, {
-      details: {
-        memory_id: id,
-        prior_tier: mem.retention_tier,
-        new_tier: null,
-        actor: clientId,
-        timestamp: nowIso,
-        action: 'archive',
-      },
-    });
-    ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
-    return { id, archived: true };
+  return {
+    items: due.map(m => ({
+      id: m.id,
+      namespace: m.namespace,
+      collection: m.collection,
+      summary: m.summary,
+      tags: m.tags,
+      retention_tier: m.retention_tier,
+      review_due: m.review_due,
+      expires_at: m.expires_at,
+    })),
+    cursor,
+  };
+}
+
+async function handleReviewKeep(
+  ctx: ToolContext, id: string, clientId: string, logCtx: ToolLogContext,
+): Promise<{ id: string; review_due: string | null; expires_at: string | null }> {
+  const mem = ctx.storage.sqlite.getMemoryById(id);
+  if (!mem) throw notFound(`Memory ${id} not found`);
+  logCtx.namespace = mem.namespace;
+
+  const lifecycle = new MemoryLifecycleService(ctx.config);
+  const now = new Date();
+  const nowIso = now.toISOString();
+  // A human confirmation is at least as strong a signal as an automated
+  // access, so `keep` re-applies the tier's full lifecycle policy
+  // (review_due + expires_at) regardless of sliding-window configuration —
+  // design.md: "explicit curation beats passive policy".
+  const nextReviewDue = lifecycle.buildMetadata(mem.retention_tier, now).review_due;
+  const nextExpiry = lifecycle.computeExpiry(mem.retention_tier, now);
+
+  ctx.storage.sqlite.updateMemory(id, {
+    review_due: nextReviewDue,
+    expires_at: nextExpiry,
+    updated_at: nowIso,
+  });
+  ctx.storage.sqlite.flushIfDirty();
+
+  ctx.storage.logAudit('REVISE', id, mem.namespace, clientId, {
+    details: {
+      memory_id: id,
+      prior_tier: mem.retention_tier,
+      new_tier: mem.retention_tier,
+      actor: clientId,
+      timestamp: nowIso,
+      action: 'revise',
+    },
+  });
+
+  return { id, review_due: nextReviewDue, expires_at: nextExpiry };
+}
+
+async function handleReviewArchive(
+  ctx: ToolContext, id: string, clientId: string, logCtx: ToolLogContext,
+): Promise<{ id: string; archived: boolean }> {
+  const mem = ctx.storage.sqlite.getMemoryById(id);
+  if (!mem) {
+    // Already archived (row moved to memory_archive, gone from `memories`)
+    // is a conflict, not a not-found — distinguishable from "never existed".
+    if (ctx.storage.sqlite.getArchiveByMemoryId(id)) {
+      throw conflict(`Memory ${id} is already archived`);
+    }
+    throw notFound(`Memory ${id} not found`);
+  }
+  logCtx.namespace = mem.namespace;
+
+  const nowIso = new Date().toISOString();
+  ctx.storage.sqlite.archiveMemory(mem, nowIso);
+  try {
+    await ctx.storage.deleteMemory(id);
+  } catch (err) {
+    // Vector/SQLite removal failed: undo the archive row so the memory
+    // isn't left both live and archived.
+    ctx.storage.sqlite.deleteArchive(id);
+    ctx.storage.sqlite.flushIfDirty();
+    throw err;
   }
 
-  // 'restore'
+  ctx.storage.logAudit('ARCHIVE', id, mem.namespace, clientId, {
+    details: {
+      memory_id: id,
+      prior_tier: mem.retention_tier,
+      new_tier: null,
+      actor: clientId,
+      timestamp: nowIso,
+      action: 'archive',
+    },
+  });
+  ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
+  return { id, archived: true };
+}
+
+async function handleReviewRestore(
+  ctx: ToolContext, id: string, clientId: string, logCtx: ToolLogContext,
+): Promise<{ id: string; restored_from: string; archive_id: number; restored: boolean }> {
   const archived = ctx.storage.sqlite.getArchiveByMemoryId(id);
   if (!archived) throw notFound(`Archived memory ${id} not found`);
   logCtx.namespace = archived.namespace;
@@ -1168,11 +1186,19 @@ async function handleBackup(ctx: ToolContext, args: unknown): Promise<unknown> {
   }
 }
 
+// Dispatcher only: routes to one focused per-mode handler (strengthen-
+// verification-and-code-boundaries task 3.3 — mirrors handleReview's/
+// handleConsolidate's split). Public schema (RepairInputSchema) and
+// dispatch-visible behavior are unchanged.
 async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
   const input = parseInput(RepairInputSchema, args);
   if (input.mode === 're-embed') {
     return handleReembed(ctx, input);
   }
+  return handleRepairFromQdrant(ctx, input);
+}
+
+async function handleRepairFromQdrant(ctx: ToolContext, input: RepairInput): Promise<unknown> {
   const dryRun = input.dry_run;
   // `all_devices` and `device_id` are mutually exclusive (enforced by the
   // schema); omitting both is the documented, backward-compatible

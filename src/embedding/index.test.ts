@@ -75,7 +75,13 @@ describe('OpenAIEmbeddingProvider', () => {
         fallback_to_threshold_dedup: true,
       },
       auto_summarize: true,
-    };
+      // Cast rather than hand-maintaining every nested field this fixture
+      // doesn't exercise: these embedding-provider tests only read
+      // `config.embedding`/`config.data_dir`, and the full `BrainConfig`
+      // shape has since grown with unrelated sections (retention scheduling,
+      // security rate-limit buckets, etc.) added by other proposals. Matches
+      // the same escape hatch `config/index.test.ts`'s own `makeConfig` uses.
+    } as unknown as BrainConfig;
   }
 
   afterEach(() => {

@@ -80,7 +80,9 @@ describe('AzureFoundryEmbeddingProvider', () => {
         fallback_to_threshold_dedup: true,
       },
       auto_summarize: true,
-    };
+      // See the identical cast in embedding/index.test.ts's createConfig:
+      // this fixture only exercises `config.embedding`/`config.data_dir`.
+    } as unknown as BrainConfig;
   }
 
   afterEach(() => {
@@ -109,7 +111,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
 
   it('sends api-key header', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    const fetchMock = vi.fn(async (_url: string, _options: RequestInit) => new Response(JSON.stringify({
       data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
     }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
@@ -128,7 +130,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
 
   it('includes dimensions for v3 models', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    const fetchMock = vi.fn(async (_url: string, _options: RequestInit) => new Response(JSON.stringify({
       data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
     }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
@@ -146,7 +148,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
 
   it('omits dimensions for ada-002', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    const fetchMock = vi.fn(async (_url: string, _options: RequestInit) => new Response(JSON.stringify({
       data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
     }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
@@ -163,7 +165,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
 
   it('chunks batches larger than max_batch_inputs', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+    const fetchMock = vi.fn(async (_url: string, _options: RequestInit) => new Response(JSON.stringify({
       data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
     }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
@@ -225,7 +227,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
 
   it('does not retry non-retryable failures', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
-    const fetchMock = vi.fn(async () => new Response('', { status: 400 }));
+    const fetchMock = vi.fn(async (_url: string, _options: RequestInit) => new Response('', { status: 400 }));
     vi.stubGlobal('fetch', fetchMock);
 
     const config = createConfig();
@@ -236,7 +238,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
 
   it('maps 429 to rateLimited error', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
-    const fetchMock = vi.fn(async () => new Response('', { status: 429 }));
+    const fetchMock = vi.fn(async (_url: string, _options: RequestInit) => new Response('', { status: 429 }));
     vi.stubGlobal('fetch', fetchMock);
 
     const config = createConfig();
@@ -251,7 +253,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
 
   it('preserves non-retryable client errors without wrapping them as unreachable', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
-    const fetchMock = vi.fn(async () => new Response('', { status: 400 }));
+    const fetchMock = vi.fn(async (_url: string, _options: RequestInit) => new Response('', { status: 400 }));
     vi.stubGlobal('fetch', fetchMock);
 
     const config = createConfig();
@@ -270,7 +272,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
       execute: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
     } as unknown as CircuitBreaker;
 
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, _options: RequestInit) => new Response(JSON.stringify({
       data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
     }), { status: 200 })));
 
@@ -286,7 +288,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
     } as unknown as CircuitBreaker;
 
     // Every attempt fails with a retryable 5xx.
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 502 })));
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, _options: RequestInit) => new Response('', { status: 502 })));
 
     const config = createConfig();
     config.embedding.retry.max_attempts = 3;
@@ -306,7 +308,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
       execute: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
     } as unknown as CircuitBreaker;
 
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, _options: RequestInit) => new Response(JSON.stringify({
       data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
     }), { status: 200 })));
 
@@ -317,7 +319,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
 
   it('healthCheck returns false on auth failure', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 401 })));
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, _options: RequestInit) => new Response('', { status: 401 })));
 
     const provider = new AzureFoundryEmbeddingProvider(createConfig());
     await expect(provider.healthCheck()).resolves.toBe(false);
@@ -325,7 +327,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
 
   it('healthCheck issues a single request with no retry/backoff on a retryable failure', async () => {
     process.env.AZURE_FOUNDRY_API_KEY = 'test-key';
-    const fetchMock = vi.fn(async () => new Response('', { status: 503 })); // retryable in embedBatch, but health should not retry
+    const fetchMock = vi.fn(async (_url: string, _options: RequestInit) => new Response('', { status: 503 })); // retryable in embedBatch, but health should not retry
     vi.stubGlobal('fetch', fetchMock);
 
     const config = createConfig();
@@ -353,7 +355,7 @@ describe('AzureFoundryEmbeddingProvider', () => {
       recordHistogram: vi.fn(),
     } as unknown as MetricsCollector;
 
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, _options: RequestInit) => new Response(JSON.stringify({
       data: [{ index: 0, embedding: [0.1, 0.2, 0.3] }],
     }), { status: 200 })));
 

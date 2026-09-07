@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { handleTool, type ToolContext } from './index.js';
-import type { BrainErrorEnvelope } from '../errors/index.js';
-import { embeddingUnavailable } from '../errors/index.js';
+import { embeddingUnavailable, internal } from '../errors/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { WritePipeline } from '../pipeline/index.js';
@@ -9,7 +8,7 @@ import type { SearchService } from '../search/index.js';
 import type { BackupService } from '../backup/index.js';
 import type { HealthService } from '../health/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
-import type { SearchResult } from '../domain/types.js';
+import type { SearchResult, ErrorEnvelope as BrainErrorEnvelope, BackupInfo, RestoreResult } from '../domain/types.js';
 import type pino from 'pino';
 
 type CollectionDeleteResult = { ok: true; deleted_memory_count: number };
@@ -54,7 +53,7 @@ describe('collections delete semantics', () => {
   });
 
   it('rejects deleting non-empty collection without force', async () => {
-    const result = await handleTool(ctx, 'collections', { action: 'delete', name: 'general' }, 'c1') as ToolResult;
+    const result = await handleTool(ctx, 'collections', { action: 'delete', name: 'general' }, 'c1') as BrainErrorEnvelope;
     expect(result.error.code).toBe('CONFLICT');
     expect(storage.deleteCollectionData).not.toHaveBeenCalled();
     expect(storage.sqlite.deleteCollection).not.toHaveBeenCalled();
@@ -66,7 +65,7 @@ describe('collections delete semantics', () => {
       namespace: 'global',
       name: 'general',
       force: true,
-    }, 'c1') as ToolResult;
+    }, 'c1') as CollectionDeleteResult;
 
     expect(result.ok).toBe(true);
     expect(result.deleted_memory_count).toBe(3);
@@ -99,7 +98,7 @@ describe('collections delete semantics', () => {
       action: 'delete',
       namespace: 'global',
       name: 'general',
-    }, 'c1') as ToolResult;
+    }, 'c1') as CollectionDeleteResult;
 
     expect(result.ok).toBe(true);
     expect(result.deleted_memory_count).toBe(0);
@@ -117,7 +116,7 @@ describe('collections delete semantics', () => {
       namespace: 'global',
       name: 'general',
       force: true,
-    }, 'c1') as ToolResult;
+    }, 'c1') as BrainErrorEnvelope;
 
     expect(result.error.code).toBe('INTERNAL');
     expect(storage.sqlite.deleteCollection).not.toHaveBeenCalled();
@@ -159,7 +158,7 @@ describe('revisions tool', () => {
   });
 
   it('lists revisions newest-first for the resolved memory', async () => {
-    const result = await handleTool(ctx, 'revisions', { action: 'list', id: UUID }, 'c1') as RevisionsResult;
+    const result = await handleTool(ctx, 'revisions', { action: 'list', id: UUID }, 'c1') as RevisionsListResult;
     expect(result.id).toBe(UUID);
     expect(result.revisions.map(r => r.revision)).toEqual([2, 1]);
   });
@@ -575,7 +574,9 @@ describe('consolidate tool', () => {
     const m2 = baseMemory({ id: S1, importance: 0.4 });
     const m3 = baseMemory({ id: OTHER, importance: 0.1 });
     (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1, m2, m3]);
-    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockImplementation(async (_ns: string, _col: string, id: string) => {
+    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn<
+      (ns: string, col: string, id: string, topK: number, minScore: number) => Promise<Array<{ id: string; score: number }>>
+    >>).mockImplementation(async (_ns: string, _col: string, id: string) => {
       if (id === T) return [{ id: S1, score: 0.95 }];
       if (id === S1) return [{ id: T, score: 0.95 }];
       return [];
@@ -597,7 +598,9 @@ describe('consolidate tool', () => {
     const m2 = baseMemory({ id: OTHER });
     (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1, m2]);
     // No edges at all -> both memories are singleton clusters.
-    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn<
+      (ns: string, col: string, id: string, topK: number, minScore: number) => Promise<Array<{ id: string; score: number }>>
+    >>).mockResolvedValue([]);
 
     const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as { clusters: unknown[] };
     expect(result.clusters).toEqual([]);
@@ -608,7 +611,9 @@ describe('consolidate tool', () => {
     const m1 = baseMemory({ id: T, importance: 0.5, access_count: 1, updated_at: '2026-01-01T00:00:00.000Z' });
     const m2 = baseMemory({ id: S1, importance: 0.5, access_count: 5, updated_at: '2026-01-02T00:00:00.000Z' });
     (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1, m2]);
-    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockImplementation(async (_ns: string, _col: string, id: string) =>
+    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn<
+      (ns: string, col: string, id: string, topK: number, minScore: number) => Promise<Array<{ id: string; score: number }>>
+    >>).mockImplementation(async (_ns: string, _col: string, id: string) =>
       id === T ? [{ id: S1, score: 0.95 }] : [{ id: T, score: 0.95 }]);
 
     const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as {
@@ -643,7 +648,9 @@ describe('consolidate tool', () => {
 
       let inFlight = 0;
       let maxInFlight = 0;
-      (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn<
+      (ns: string, col: string, id: string, topK: number, minScore: number) => Promise<Array<{ id: string; score: number }>>
+    >>).mockImplementation(async () => {
         inFlight++;
         maxInFlight = Math.max(maxInFlight, inFlight);
         await new Promise(resolve => setTimeout(resolve, 5));
@@ -670,7 +677,9 @@ describe('consolidate tool', () => {
 
       // Each call is slow enough that the second batch's pre-check trips the
       // deadline after the first (concurrency 1) member resolves.
-      (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn<
+      (ns: string, col: string, id: string, topK: number, minScore: number) => Promise<Array<{ id: string; score: number }>>
+    >>).mockImplementation(async () => {
         await new Promise(resolve => setTimeout(resolve, 15));
         return [];
       });
@@ -800,7 +809,7 @@ describe('consolidate tool', () => {
 
     const result = await handleTool(ctx, 'consolidate', {
       action: 'merge', target_id: T, source_ids: [S1, S2],
-    }, 'c1') as { target_id: string; merged: string[]; failed: string[] };
+    }, 'c1') as { target_id: string; merged: string[]; failed: string[]; failures: unknown[] };
 
     expect(result.merged).toEqual([S2]);
     expect(result.failed).toEqual([S1]);
@@ -1851,7 +1860,7 @@ describe('remember long-content threshold guard', () => {
 });
 
 describe('notifyResourceListChanged hook (complete-mcp-protocol-surface task 5.3)', () => {
-  function createCtx(notify?: ReturnType<typeof vi.fn>): ToolContext {
+  function createCtx(notify?: ReturnType<typeof vi.fn<() => void>>): ToolContext {
     return {
       config: {} as ToolContext['config'],
       storage: {
@@ -2331,7 +2340,7 @@ describe('remember tool pin cap enforcement (add-inject-pinning)', () => {
   });
 
   it('never checks the cap when pinned is omitted', async () => {
-    const process = vi.fn(async () => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
+    const process = vi.fn(async (_input: unknown) => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
     const ctx = makeCtx(process, 20, 20);
 
     const result = await handleTool(ctx, 'remember', { content: 'ordinary content' }, 'c1') as { id: string };
@@ -2385,7 +2394,7 @@ describe('remember tool origin/confidence (add-memory-provenance-metadata)', () 
   });
 
   it('a call omitting origin/confidence still succeeds unchanged (backward-compatibility regression)', async () => {
-    const process = vi.fn(async () => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
+    const process = vi.fn(async (_input: unknown) => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
     const ctx = makeCtx(process);
 
     const result = await handleTool(ctx, 'remember', { content: 'ordinary content, no provenance' }, 'c1') as { id: string };
@@ -2479,5 +2488,206 @@ describe('tag tool pinned toggle (add-inject-pinning)', () => {
     await handleTool(ctx, 'tag', { id: '550e8400-e29b-41d4-a716-446655440099', pinned: false }, 'c1');
 
     expect(updateMemory).toHaveBeenCalledWith('550e8400-e29b-41d4-a716-446655440099', expect.objectContaining({ pinned: false }));
+  });
+});
+
+// strengthen-verification-and-code-boundaries task 2.3: `forget` had no
+// tool-dispatch coverage at all — every assertion below exercises
+// `handleTool(ctx, 'forget', ...)` itself (input validation, the
+// exists-check, the vector-store double, audit logging, and the metrics
+// gauge) rather than `StorageManager.deleteMemory`, which already has its
+// own unit coverage in src/storage/index.test.ts.
+describe('forget tool', () => {
+  const UUID = '550e8400-e29b-41d4-a716-446655440042';
+  const mem = { id: UUID, namespace: 'global', collection: 'general' };
+
+  function makeCtx(deleteMemory: ReturnType<typeof vi.fn<StorageManager['deleteMemory']>>) {
+    const logAudit = vi.fn();
+    const storage = {
+      sqlite: {
+        getMemoryById: vi.fn((id: string) => (id === UUID ? mem : null)),
+        countMemories: vi.fn(() => 4),
+      },
+      deleteMemory,
+      logAudit,
+    } as unknown as StorageManager;
+
+    const ctx: ToolContext = {
+      config: {} as ToolContext['config'],
+      storage,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+    return { ctx, storage, logAudit };
+  }
+
+  it('deletes an existing memory, logs the FORGET audit entry, and updates the memory-count gauge', async () => {
+    const deleteMemory = vi.fn(async () => true);
+    const { ctx, logAudit } = makeCtx(deleteMemory);
+
+    const result = await handleTool(ctx, 'forget', { id: UUID }, 'c1') as { deleted: boolean; id: string };
+
+    expect(result).toEqual({ deleted: true, id: UUID });
+    expect(deleteMemory).toHaveBeenCalledWith(UUID);
+    expect(logAudit).toHaveBeenCalledWith('FORGET', UUID, 'global', 'c1');
+    expect(ctx.metrics.setGauge).toHaveBeenCalledWith('bhgbrain_memory_count', 4);
+  });
+
+  it('returns NOT_FOUND for an id with no matching memory, without touching the store or audit log', async () => {
+    const deleteMemory = vi.fn(async () => true);
+    const { ctx, logAudit } = makeCtx(deleteMemory);
+
+    const result = await handleTool(
+      ctx, 'forget', { id: '00000000-0000-0000-0000-000000000000' }, 'c1',
+    ) as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('NOT_FOUND');
+    expect(deleteMemory).not.toHaveBeenCalled();
+    expect(logAudit).not.toHaveBeenCalled();
+  });
+
+  // Classified partial outcome: `deleteMemory` resolving `false` (e.g. the
+  // row was already gone by the time the vector-store round trip completed)
+  // is a legitimate non-error result, not a thrown failure — the tool must
+  // pass it through as `deleted: false` rather than collapsing it into
+  // either a thrown error or a false "success", and must not audit-log a
+  // deletion that did not happen.
+  it('retains deleted: false when the store reports nothing was removed, without auditing', async () => {
+    const deleteMemory = vi.fn(async () => false);
+    const { ctx, logAudit } = makeCtx(deleteMemory);
+
+    const result = await handleTool(ctx, 'forget', { id: UUID }, 'c1') as { deleted: boolean; id: string };
+
+    expect(result).toEqual({ deleted: false, id: UUID });
+    expect(logAudit).not.toHaveBeenCalled();
+  });
+
+  // Classified partial failure: a confirmed vector delete whose local
+  // tombstone commit then fails is surfaced by `StorageManager.deleteMemory`
+  // as a thrown `internal` error (see its doc comment) rather than any
+  // return value — the tool-dispatch layer must let that specific,
+  // recognizable envelope through unchanged rather than swallowing it into a
+  // generic failure.
+  it('surfaces a partial vector/local-store failure as its own classified error envelope', async () => {
+    const deleteMemory = vi.fn(async () => {
+      throw internal(
+        'SQLite delete failed after Qdrant cleanup; deletion remains pending: disk full',
+      );
+    });
+    const { ctx, logAudit } = makeCtx(deleteMemory);
+
+    const result = await handleTool(ctx, 'forget', { id: UUID }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INTERNAL');
+    expect(result.error.message).toContain('deletion remains pending');
+    expect(logAudit).not.toHaveBeenCalled();
+  });
+});
+
+// strengthen-verification-and-code-boundaries task 2.3: `backup` had no
+// tool-dispatch coverage at all — every assertion below exercises
+// `handleTool(ctx, 'backup', ...)` against a representative `BackupService`
+// double, verifying input validation and pass-through, not
+// `BackupService.create`/`.list`/`.restore` themselves (see
+// src/backup/index.test.ts for that).
+describe('backup tool', () => {
+  function makeCtx(backup: Partial<BackupService>) {
+    const ctx: ToolContext = {
+      config: {} as ToolContext['config'],
+      storage: {} as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: backup as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+    return { ctx };
+  }
+
+  it('create dispatches to BackupService.create() and returns its BackupInfo unchanged', async () => {
+    const info: BackupInfo = {
+      path: '/data/backups/2026-09-06.db', size_bytes: 4096, memory_count: 12, created_at: '2026-09-06T00:00:00.000Z', missing: false,
+    };
+    const create = vi.fn(async () => info);
+    const { ctx } = makeCtx({ create });
+
+    const result = await handleTool(ctx, 'backup', { action: 'create' }, 'c1');
+
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(result).toEqual(info);
+  });
+
+  it('list dispatches to BackupService.list() and wraps it as { backups }', async () => {
+    const backups: BackupInfo[] = [
+      { path: '/data/backups/a.db', size_bytes: 1, memory_count: 1, created_at: '2026-09-01T00:00:00.000Z', missing: false },
+      { path: '/data/backups/b.db', size_bytes: 2, memory_count: 2, created_at: '2026-09-02T00:00:00.000Z', missing: false },
+    ];
+    const list = vi.fn(() => backups);
+    const { ctx } = makeCtx({ list });
+
+    const result = await handleTool(ctx, 'backup', { action: 'list' }, 'c1');
+
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ backups });
+  });
+
+  it('restore requires a path and never calls BackupService.restore() without one', async () => {
+    const restore = vi.fn(async () => ({}) as RestoreResult);
+    const { ctx } = makeCtx({ restore });
+
+    const result = await handleTool(ctx, 'backup', { action: 'restore' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(restore).not.toHaveBeenCalled();
+  });
+
+  it('restore dispatches to BackupService.restore(path) and returns a clean RestoreResult unchanged', async () => {
+    const clean: RestoreResult = {
+      memory_count: 42,
+      metadata_activated: true,
+      vector_reconciliation: { status: 'healthy', state: 'reconciled', unsynced_vectors: 0 },
+    };
+    const restore = vi.fn(async () => clean);
+    const { ctx } = makeCtx({ restore });
+
+    const result = await handleTool(ctx, 'backup', { action: 'restore', path: '/data/backups/2026-09-06.db' }, 'c1');
+
+    expect(restore).toHaveBeenCalledWith('/data/backups/2026-09-06.db');
+    expect(result).toEqual(clean);
+  });
+
+  // Classified partial failure: a restore that activated SQLite metadata but
+  // left vector reconciliation degraded (see BackupService.restore's
+  // `vector_reconciliation` doc comments) must reach the caller with that
+  // full, structured status intact — not collapsed to a boolean, not
+  // dropped, and not thrown as a generic error, since `metadata_activated:
+  // true` here means the restore itself substantively succeeded.
+  it('retains a degraded vector_reconciliation envelope on the RestoreResult unchanged', async () => {
+    const degraded: RestoreResult = {
+      memory_count: 42,
+      metadata_activated: true,
+      vector_reconciliation: {
+        status: 'degraded',
+        state: 'reconciling',
+        unsynced_vectors: 7,
+        message: 'vector reconciliation for the drifted subset is continuing in the background',
+      },
+    };
+    const restore = vi.fn(async () => degraded);
+    const { ctx } = makeCtx({ restore });
+
+    const result = await handleTool(
+      ctx, 'backup', { action: 'restore', path: '/data/backups/2026-09-06.db' }, 'c1',
+    ) as RestoreResult;
+
+    expect(result.vector_reconciliation).toEqual(degraded.vector_reconciliation);
+    expect(result.metadata_activated).toBe(true);
   });
 });
