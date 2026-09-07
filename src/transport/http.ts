@@ -201,17 +201,43 @@ export function createHttpServer(
 
   app.use(express.json({ limit: config.security.max_request_size_bytes }));
 
-  // Health endpoint (no auth required)
-  app.get('/health', async (_req, res) => {
-    const health = await ctx.health.check();
-    const statusCode = health.status === 'healthy' ? 200 : health.status === 'degraded' ? 200 : 503;
-    res.status(statusCode).json(health);
+  // bound-qdrant-http-runtime task 2.1/2.2: `/health` (a single unauthenticated
+  // route returning the full diagnostic snapshot) is split three ways:
+  //  - `/health/live`: terse, unauthenticated, no dependency I/O at all —
+  //    registered ahead of every other middleware so it never waits on auth,
+  //    rate limiting, or a dependency call. Safe for an orchestrator to poll
+  //    at any rate; used for restart decisions (see Docker HEALTHCHECK).
+  //  - `/health/ready`: unauthenticated but registered AFTER rate limiting
+  //    (below), so repeated public probes cannot start unbounded dependency
+  //    requests — `HealthService.checkReadiness()` also caches the Qdrant
+  //    probe itself. Required-dependency degradation (SQLite/Qdrant) maps to
+  //    503, matching "readiness SHALL fail when required storage is
+  //    degraded".
+  //  - `/health` (below, after auth): the full diagnostic snapshot —
+  //    embedding, retention, schedulers, circuit breakers, etc. — now
+  //    requires normal Bearer authentication like every other route, per
+  //    "detailed diagnostics SHALL require normal authentication and rate
+  //    limiting".
+  app.get('/health/live', (_req, res) => {
+    res.status(200).json(ctx.health.checkLiveness());
   });
 
   // Apply middleware
   app.use(createAuthMiddleware(config, logger));
   app.use(createRateLimitMiddleware(config, logger, ctx.metrics));
   app.use(createSizeLimitMiddleware(config));
+
+  app.get('/health/ready', async (_req, res) => {
+    const readiness = await ctx.health.checkReadiness();
+    res.status(readiness.ready ? 200 : 503).json(readiness);
+  });
+
+  // Authenticated diagnostic snapshot (see split rationale above).
+  app.get('/health', async (_req, res) => {
+    const health = await ctx.health.check();
+    const statusCode = health.status === 'healthy' ? 200 : health.status === 'degraded' ? 200 : 503;
+    res.status(statusCode).json(health);
+  });
 
   // Real MCP over HTTP (Streamable HTTP transport): per-session `Server` +
   // `StreamableHTTPServerTransport` pairs registered/looked up through

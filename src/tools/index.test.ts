@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { handleTool, type ToolContext } from './index.js';
-import type { BrainErrorEnvelope } from '../errors/index.js';
-import { embeddingUnavailable } from '../errors/index.js';
+import { embeddingUnavailable, internal } from '../errors/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { WritePipeline } from '../pipeline/index.js';
@@ -9,7 +8,7 @@ import type { SearchService } from '../search/index.js';
 import type { BackupService } from '../backup/index.js';
 import type { HealthService } from '../health/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
-import type { SearchResult } from '../domain/types.js';
+import type { SearchResult, ErrorEnvelope as BrainErrorEnvelope, BackupInfo, RestoreResult } from '../domain/types.js';
 import type pino from 'pino';
 
 type CollectionDeleteResult = { ok: true; deleted_memory_count: number };
@@ -54,7 +53,7 @@ describe('collections delete semantics', () => {
   });
 
   it('rejects deleting non-empty collection without force', async () => {
-    const result = await handleTool(ctx, 'collections', { action: 'delete', name: 'general' }, 'c1') as ToolResult;
+    const result = await handleTool(ctx, 'collections', { action: 'delete', name: 'general' }, 'c1') as BrainErrorEnvelope;
     expect(result.error.code).toBe('CONFLICT');
     expect(storage.deleteCollectionData).not.toHaveBeenCalled();
     expect(storage.sqlite.deleteCollection).not.toHaveBeenCalled();
@@ -66,7 +65,7 @@ describe('collections delete semantics', () => {
       namespace: 'global',
       name: 'general',
       force: true,
-    }, 'c1') as ToolResult;
+    }, 'c1') as CollectionDeleteResult;
 
     expect(result.ok).toBe(true);
     expect(result.deleted_memory_count).toBe(3);
@@ -99,7 +98,7 @@ describe('collections delete semantics', () => {
       action: 'delete',
       namespace: 'global',
       name: 'general',
-    }, 'c1') as ToolResult;
+    }, 'c1') as CollectionDeleteResult;
 
     expect(result.ok).toBe(true);
     expect(result.deleted_memory_count).toBe(0);
@@ -117,7 +116,7 @@ describe('collections delete semantics', () => {
       namespace: 'global',
       name: 'general',
       force: true,
-    }, 'c1') as ToolResult;
+    }, 'c1') as BrainErrorEnvelope;
 
     expect(result.error.code).toBe('INTERNAL');
     expect(storage.sqlite.deleteCollection).not.toHaveBeenCalled();
@@ -159,7 +158,7 @@ describe('revisions tool', () => {
   });
 
   it('lists revisions newest-first for the resolved memory', async () => {
-    const result = await handleTool(ctx, 'revisions', { action: 'list', id: UUID }, 'c1') as RevisionsResult;
+    const result = await handleTool(ctx, 'revisions', { action: 'list', id: UUID }, 'c1') as RevisionsListResult;
     expect(result.id).toBe(UUID);
     expect(result.revisions.map(r => r.revision)).toEqual([2, 1]);
   });
@@ -547,6 +546,7 @@ describe('consolidate tool', () => {
       config: {
         consolidation: {
           enabled: true, similarity_threshold: 0.9, neighbor_top_k: 20, max_scan_per_call: 500,
+          neighbor_discovery_concurrency: 8, neighbor_discovery_deadline_ms: 10_000,
           ...config,
         },
       } as unknown as ToolContext['config'],
@@ -574,7 +574,9 @@ describe('consolidate tool', () => {
     const m2 = baseMemory({ id: S1, importance: 0.4 });
     const m3 = baseMemory({ id: OTHER, importance: 0.1 });
     (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1, m2, m3]);
-    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockImplementation(async (_ns: string, _col: string, id: string) => {
+    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn<
+      (ns: string, col: string, id: string, topK: number, minScore: number) => Promise<Array<{ id: string; score: number }>>
+    >>).mockImplementation(async (_ns: string, _col: string, id: string) => {
       if (id === T) return [{ id: S1, score: 0.95 }];
       if (id === S1) return [{ id: T, score: 0.95 }];
       return [];
@@ -596,7 +598,9 @@ describe('consolidate tool', () => {
     const m2 = baseMemory({ id: OTHER });
     (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1, m2]);
     // No edges at all -> both memories are singleton clusters.
-    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn<
+      (ns: string, col: string, id: string, topK: number, minScore: number) => Promise<Array<{ id: string; score: number }>>
+    >>).mockResolvedValue([]);
 
     const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as { clusters: unknown[] };
     expect(result.clusters).toEqual([]);
@@ -607,7 +611,9 @@ describe('consolidate tool', () => {
     const m1 = baseMemory({ id: T, importance: 0.5, access_count: 1, updated_at: '2026-01-01T00:00:00.000Z' });
     const m2 = baseMemory({ id: S1, importance: 0.5, access_count: 5, updated_at: '2026-01-02T00:00:00.000Z' });
     (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1, m2]);
-    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn>).mockImplementation(async (_ns: string, _col: string, id: string) =>
+    (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn<
+      (ns: string, col: string, id: string, topK: number, minScore: number) => Promise<Array<{ id: string; score: number }>>
+    >>).mockImplementation(async (_ns: string, _col: string, id: string) =>
       id === T ? [{ id: S1, score: 0.95 }] : [{ id: T, score: 0.95 }]);
 
     const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as {
@@ -633,6 +639,62 @@ describe('consolidate tool', () => {
     expect(result.cursor).toBeNull();
   });
 
+  // bound-corpus-scale-workflows task 2.5
+  describe('list neighbor-discovery bounded concurrency and deadline', () => {
+    it('never runs more findNeighborsById calls concurrently than neighbor_discovery_concurrency', async () => {
+      const { ctx, storage } = createCtx({ neighbor_discovery_concurrency: 2, max_scan_per_call: 500 });
+      const members = Array.from({ length: 6 }, (_, i) => baseMemory({ id: `m-${i}`, created_at: `2026-01-0${i + 1}T00:00:00.000Z` }));
+      (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue(members);
+
+      let inFlight = 0;
+      let maxInFlight = 0;
+      (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn<
+      (ns: string, col: string, id: string, topK: number, minScore: number) => Promise<Array<{ id: string; score: number }>>
+    >>).mockImplementation(async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise(resolve => setTimeout(resolve, 5));
+        inFlight--;
+        return [];
+      });
+
+      await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1');
+
+      expect(maxInFlight).toBeLessThanOrEqual(2);
+      expect(storage.qdrant.findNeighborsById).toHaveBeenCalledTimes(6);
+    });
+
+    it('stops the fan-out at the deadline and returns a cursor resuming after the last resolved member, excluding unresolved members from clusters', async () => {
+      const { ctx, storage } = createCtx({
+        neighbor_discovery_concurrency: 1,
+        neighbor_discovery_deadline_ms: 12,
+        max_scan_per_call: 500,
+      });
+      const m1 = baseMemory({ id: T, created_at: '2026-01-01T00:00:00.000Z' });
+      const m2 = baseMemory({ id: S1, created_at: '2026-01-02T00:00:00.000Z' });
+      const m3 = baseMemory({ id: S2, created_at: '2026-01-03T00:00:00.000Z' });
+      (storage.sqlite.listMemoriesInCollection as ReturnType<typeof vi.fn>).mockReturnValue([m1, m2, m3]);
+
+      // Each call is slow enough that the second batch's pre-check trips the
+      // deadline after the first (concurrency 1) member resolves.
+      (storage.qdrant.findNeighborsById as ReturnType<typeof vi.fn<
+      (ns: string, col: string, id: string, topK: number, minScore: number) => Promise<Array<{ id: string; score: number }>>
+    >>).mockImplementation(async () => {
+        await new Promise(resolve => setTimeout(resolve, 15));
+        return [];
+      });
+
+      const result = await handleTool(ctx, 'consolidate', { action: 'list' }, 'c1') as {
+        clusters: Array<{ members: Array<{ id: string }> }>; cursor: string | null;
+      };
+
+      // Only the first member's neighbors were resolved before the deadline cut
+      // the fan-out short.
+      expect(storage.qdrant.findNeighborsById).toHaveBeenCalledTimes(1);
+      expect(result.cursor).toBe('2026-01-01T00:00:00.000Z|' + T);
+    });
+  });
+
   it('merge happy path: unions tags, maxes importance, sets merged_from, archives sources, and audits consolidate', async () => {
     const { ctx, storage } = createCtx();
     (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) => {
@@ -655,7 +717,7 @@ describe('consolidate tool', () => {
     expect(storage.logAudit).toHaveBeenCalledWith('ARCHIVE', S1, 'global', 'c1', expect.objectContaining({
       details: expect.objectContaining({ action: 'consolidate', merged_into: T }),
     }));
-    expect(result).toEqual({ target_id: T, merged: [S1], failed: [] });
+    expect(result).toEqual({ target_id: T, merged: [S1], failed: [], failures: [] });
   });
 
   it('merge appends to an existing merged_from rather than overwriting it', async () => {
@@ -673,7 +735,7 @@ describe('consolidate tool', () => {
     }));
   });
 
-  it('merge rejects an unknown source id with NOT_FOUND and archives nothing', async () => {
+  it('reports an unknown source with a structured outcome and archives nothing', async () => {
     const { ctx, storage } = createCtx();
     (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
       id === T ? baseMemory({ id: T }) : null);
@@ -681,9 +743,10 @@ describe('consolidate tool', () => {
 
     const result = await handleTool(ctx, 'consolidate', {
       action: 'merge', target_id: T, source_ids: [S1],
-    }, 'c1') as BrainErrorEnvelope;
+    }, 'c1') as { target_id: string; merged: string[]; failed: string[]; failures: Array<{ id: string; stage: string; code: string }> };
 
-    expect(result.error.code).toBe('NOT_FOUND');
+    expect(result).toEqual(expect.objectContaining({ target_id: T, merged: [], failed: [S1] }));
+    expect(result.failures).toEqual([{ id: S1, stage: 'lookup', code: 'NOT_FOUND', message: expect.any(String) }]);
     expect(storage.sqlite.archiveMemory).not.toHaveBeenCalled();
   });
 
@@ -746,12 +809,33 @@ describe('consolidate tool', () => {
 
     const result = await handleTool(ctx, 'consolidate', {
       action: 'merge', target_id: T, source_ids: [S1, S2],
-    }, 'c1') as { target_id: string; merged: string[]; failed: string[] };
+    }, 'c1') as { target_id: string; merged: string[]; failed: string[]; failures: unknown[] };
 
     expect(result.merged).toEqual([S2]);
     expect(result.failed).toEqual([S1]);
+    expect(result.failures).toEqual([expect.objectContaining({ id: S1, stage: 'delete', code: 'DELETE_FAILED' })]);
+    expect(storage.updateMemory).toHaveBeenCalledWith(T, expect.objectContaining({ merged_from: S2 }));
     expect(storage.sqlite.deleteArchive).toHaveBeenCalledWith(S1);
     expect(storage.sqlite.deleteArchive).not.toHaveBeenCalledWith(S2);
+  });
+
+  it('reports and logs lifecycle-locked source failures distinctly', async () => {
+    const { ctx, storage } = createCtx();
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === T ? baseMemory({ id: T }) : id === S1 ? baseMemory({ id: S1 }) : null);
+    (storage.sqlite.archiveMemory as ReturnType<typeof vi.fn>)
+      .mockImplementation(() => { throw new Error('Storage lifecycle operation in progress: restore'); });
+
+    const result = await handleTool(ctx, 'consolidate', {
+      action: 'merge', target_id: T, source_ids: [S1],
+    }, 'c1') as { merged: string[]; failed: string[]; failures: Array<{ id: string; stage: string; code: string }> };
+
+    expect(result.merged).toEqual([]);
+    expect(result.failed).toEqual([S1]);
+    expect(result.failures).toEqual([expect.objectContaining({ id: S1, stage: 'archive', code: 'LIFECYCLE_LOCKED' })]);
+    expect(ctx.logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'consolidation_source_failed', id: S1, code: 'LIFECYCLE_LOCKED',
+    }));
   });
 });
 
@@ -764,18 +848,40 @@ type RepairResult = {
 };
 
 describe('repair device filtering', () => {
+  // bound-corpus-scale-workflows task 1.3: repair now pages through Qdrant
+  // via `scrollAllPages` and routes recovered points through the same
+  // canonical `hydrateBatch` mapper `bootstrapFromQdrant` uses, instead of a
+  // bespoke per-point `insertMemory` reconstruction — these mocks exercise
+  // that path directly rather than asserting on the old `insertMemory` calls.
   function createRepairCtx(points: Array<{ id: string; payload: Record<string, unknown> }>) {
+    const existingIds = new Set<string>();
+    const hydrated: Array<{ id: string; payload: Record<string, unknown> }> = [];
     const qdrant = {
       listAllCollections: vi.fn(async () => ['bhgbrain_global_general']),
-      scrollAll: vi.fn(async () => points),
+      scrollAllPages: vi.fn(async function* () {
+        if (points.length > 0) {
+          yield { points, cursor: null, done: true, cancelled: false };
+        }
+      }),
     };
     const sqlite = {
-      getMemoryById: vi.fn(() => null),
-      getCollection: vi.fn(() => ({ name: 'general' })),
-      createCollection: vi.fn(),
-      insertMemory: vi.fn(),
+      listMemoryIds: vi.fn(() => existingIds),
+      hydrateBatch: vi.fn((
+        pts: Array<{ id: string; payload: Record<string, unknown> }>,
+        ids: Set<string>,
+      ) => {
+        let count = 0;
+        const failures: Array<{ id: string; error: string }> = [];
+        for (const point of pts) {
+          if (ids.has(point.id)) continue;
+          hydrated.push(point);
+          ids.add(point.id);
+          count++;
+        }
+        return { hydrated: count, failures };
+      }),
       flushIfDirty: vi.fn(),
-      countMemories: vi.fn(() => 0),
+      countMemories: vi.fn(() => hydrated.length),
     };
     const storage = { qdrant, sqlite } as unknown as StorageManager;
     const ctx: ToolContext = {
@@ -789,7 +895,7 @@ describe('repair device filtering', () => {
       metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
       logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
     };
-    return { ctx, sqlite };
+    return { ctx, sqlite, hydrated };
   }
 
   const twoDevicePoints = [
@@ -798,47 +904,52 @@ describe('repair device filtering', () => {
   ];
 
   it('recovers only the requested device when device_id is provided', async () => {
-    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+    const { ctx, hydrated } = createRepairCtx(twoDevicePoints);
 
     const result = await handleTool(ctx, 'repair', { device_id: 'device-a' }, 'c1') as RepairResult;
 
     expect(result.recovered).toBe(1);
     expect(result.device_id_filter).toBe('device-a');
     expect(result.all_devices).toBe(false);
-    expect(sqlite.insertMemory).toHaveBeenCalledTimes(1);
-    expect(sqlite.insertMemory).toHaveBeenCalledWith(expect.objectContaining({ id: 'p-a', device_id: 'device-a' }));
+    expect(hydrated).toHaveLength(1);
+    expect(hydrated[0]).toMatchObject({ id: 'p-a', payload: expect.objectContaining({ device_id: 'device-a' }) });
   });
 
   it('recovers points from every device when all_devices is explicitly true', async () => {
-    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+    const { ctx, hydrated } = createRepairCtx(twoDevicePoints);
 
     const result = await handleTool(ctx, 'repair', { all_devices: true }, 'c1') as RepairResult;
 
     expect(result.recovered).toBe(2);
     expect(result.all_devices).toBe(true);
     expect(result.device_id_filter).toBeNull();
-    expect(sqlite.insertMemory).toHaveBeenCalledTimes(2);
+    expect(hydrated).toHaveLength(2);
   });
 
   it('recovers points from every device when neither filter is provided (backward-compatible default)', async () => {
-    const { ctx, sqlite } = createRepairCtx(twoDevicePoints);
+    const { ctx, hydrated } = createRepairCtx(twoDevicePoints);
 
     const result = await handleTool(ctx, 'repair', {}, 'c1') as RepairResult;
 
     expect(result.recovered).toBe(2);
     expect(result.all_devices).toBe(true);
-    expect(sqlite.insertMemory).toHaveBeenCalledTimes(2);
+    expect(hydrated).toHaveLength(2);
   });
 
-  it('sets the local device_id on a recovered record whose original payload has none', async () => {
-    const { ctx, sqlite } = createRepairCtx([
+  it('routes a legacy point (no device_id on the payload) through hydration and recovers it', async () => {
+    // The canonical `hydrateBatch` mapper (shared with `bootstrapFromQdrant`)
+    // leaves `device_id` null for a payload that predates device stamping —
+    // it does not stamp the local device id, unlike the old bespoke
+    // reconstruction this replaced. See `insertMemoryFromPayloadAtomic`.
+    const { ctx, hydrated } = createRepairCtx([
       { id: 'p-legacy', payload: { content: 'pre-migration memory', namespace: 'global', collection: 'general' } },
     ]);
 
     const result = await handleTool(ctx, 'repair', {}, 'c1') as RepairResult;
 
     expect(result.recovered).toBe(1);
-    expect(sqlite.insertMemory).toHaveBeenCalledWith(expect.objectContaining({ id: 'p-legacy', device_id: 'local-device' }));
+    expect(hydrated).toHaveLength(1);
+    expect(hydrated[0]).toMatchObject({ id: 'p-legacy' });
   });
 
   it('rejects device_id and all_devices together as mutually exclusive', async () => {
@@ -847,6 +958,29 @@ describe('repair device filtering', () => {
     const result = await handleTool(ctx, 'repair', { device_id: 'device-a', all_devices: true }, 'c1') as BrainErrorEnvelope;
 
     expect(result.error.code).toBe('INVALID_INPUT');
+  });
+
+  it('skips a point already present in SQLite and reports it separately from recovered', async () => {
+    const { ctx, hydrated } = createRepairCtx(twoDevicePoints);
+    (ctx.storage.sqlite.listMemoryIds as ReturnType<typeof vi.fn>).mockReturnValue(new Set(['p-a']));
+
+    const result = await handleTool(ctx, 'repair', { all_devices: true }, 'c1') as RepairResult & { already_in_sqlite: number };
+
+    expect(result.recovered).toBe(1);
+    expect(result.already_in_sqlite).toBe(1);
+    expect(hydrated).toHaveLength(1);
+    expect(hydrated[0]).toMatchObject({ id: 'p-b' });
+  });
+
+  it('dry_run reports what would be recovered without calling hydrateBatch', async () => {
+    const { ctx, sqlite, hydrated } = createRepairCtx(twoDevicePoints);
+
+    const result = await handleTool(ctx, 'repair', { all_devices: true, dry_run: true }, 'c1') as RepairResult;
+
+    expect(result.dry_run).toBe(true);
+    expect(result.recovered).toBe(2);
+    expect(hydrated).toHaveLength(0);
+    expect(sqlite.hydrateBatch).not.toHaveBeenCalled();
   });
 });
 
@@ -1041,6 +1175,68 @@ describe('tool-handler latency recording (record-tool-latency-on-all-paths)', ()
       expect.any(Number),
       { tool: 'category', status: 'ok' },
     );
+  });
+});
+
+// Task 2.2/2.5 (make-backup-restore-transactional): a mutation that raced an
+// active restore (SqliteStore.assertMutableAllowed's in-process or
+// cross-process guard) surfaces as a plain Error naming the real lock
+// holder, not a BrainError — handleTool's outer catch is the one place every
+// tool call funnels through, so it classifies that message into a retryable
+// CONFLICT instead of a generic, non-retryable-looking INTERNAL error.
+describe('lifecycle-conflict classification at the handleTool boundary', () => {
+  function createCtx(overrides?: { storage?: Partial<StorageManager> }): ToolContext {
+    return {
+      config: {} as ToolContext['config'],
+      storage: (overrides?.storage ?? {}) as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('reports a retryable CONFLICT naming the real lock holder for an in-process lifecycle conflict', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        getCategory: () => { throw new Error('Storage lifecycle operation in progress: gc'); },
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    const result = await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('CONFLICT');
+    expect(result.error.retryable).toBe(true);
+    expect(result.error.message).toMatch(/gc/);
+  });
+
+  it('reports a retryable CONFLICT for the cross-process restore-lock guard', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        getCategory: () => { throw new Error('Storage lifecycle operation in progress: restore (held by another process)'); },
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    const result = await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('CONFLICT');
+    expect(result.error.retryable).toBe(true);
+    expect(result.error.message).toMatch(/another process/);
+  });
+
+  it('leaves an unrelated internal error classified as INTERNAL, not CONFLICT', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        getCategory: () => { throw new Error('disk full'); },
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    const result = await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INTERNAL');
   });
 });
 
@@ -1439,6 +1635,105 @@ describe('handleSearch after/before pushdown (add-time-scoped-recall)', () => {
   });
 });
 
+// bound-corpus-scale-workflows task 3.3: recall/search results are assembled
+// within `defaults.max_response_chars` via the shared response-budget
+// assembler, reporting `truncated` rather than silently returning fewer
+// results than a caller would otherwise expect.
+describe('handleRecall/handleSearch response budget (bound-corpus-scale-workflows task 3.3)', () => {
+  function makeResult(overrides: Partial<SearchResult> & { id: string }): SearchResult {
+    return {
+      content: 'x'.repeat(2000),
+      summary: 'summary',
+      type: 'semantic',
+      tags: [],
+      score: 0.9,
+      semantic_score: 0.9,
+      retention_tier: 'T2',
+      expires_at: null,
+      expiring_soon: false,
+      device_id: null,
+      created_at: '2026-03-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+      ...overrides,
+    };
+  }
+
+  function createCtx(maxResponseChars: number, searchMock: ReturnType<typeof vi.fn>): ToolContext {
+    return {
+      config: {
+        defaults: { max_response_chars: maxResponseChars },
+        search: { mmr: { enabled: false }, rerank: { enabled: false, candidate_pool: 20 } },
+      } as unknown as ToolContext['config'],
+      storage: { sqlite: { listMemoryLinks: vi.fn(() => []) } } as unknown as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: { search: searchMock } as unknown as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('recall reports truncated: false and keeps every result when the response comfortably fits the budget', async () => {
+    const matches = Array.from({ length: 5 }, (_, i) => makeResult({ id: `m${i}`, content: 'short' }));
+    const ctx = createCtx(50_000, vi.fn(async () => matches));
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5 }, 'c1') as { results: SearchResult[]; truncated: boolean };
+
+    expect(result.results).toHaveLength(5);
+    expect(result.truncated).toBe(false);
+  });
+
+  it('recall drops trailing results and reports truncated: true once large results would exceed max_response_chars', async () => {
+    // 5 results at ~2000 chars of content each -> comfortably exceeds a
+    // 3000-char budget, so not all 5 can fit.
+    const matches = Array.from({ length: 5 }, (_, i) => makeResult({ id: `m${i}` }));
+    const ctx = createCtx(3_000, vi.fn(async () => matches));
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5 }, 'c1') as { results: SearchResult[]; truncated: boolean };
+
+    expect(result.truncated).toBe(true);
+    expect(result.results.length).toBeLessThan(5);
+    // The response, once serialized, actually stays near the configured budget.
+    expect(JSON.stringify(result.results).length).toBeLessThanOrEqual(3_000);
+  });
+
+  it('search drops trailing results and reports truncated: true once large results would exceed max_response_chars', async () => {
+    const matches = Array.from({ length: 5 }, (_, i) => makeResult({ id: `m${i}` }));
+    const ctx = createCtx(3_000, vi.fn(async () => matches));
+
+    const result = await handleTool(ctx, 'search', { query: 'q', limit: 5 }, 'c1') as { results: SearchResult[]; truncated: boolean };
+
+    expect(result.truncated).toBe(true);
+    expect(result.results.length).toBeLessThan(5);
+    expect(JSON.stringify(result.results).length).toBeLessThanOrEqual(3_000);
+  });
+
+  it('recall with follow_links still honors the budget across the combined base+neighbor result set', async () => {
+    const base = makeResult({ id: 'base-1', content: 'short' });
+    const ctx = createCtx(3_000, vi.fn(async () => [base]));
+    (ctx.storage.sqlite.listMemoryLinks as ReturnType<typeof vi.fn>).mockReturnValue(
+      Array.from({ length: 5 }, (_, i) => ({ direction: 'outgoing', to_id: `neighbor-${i}`, relation: 'related' })),
+    );
+    ctx.storage.sqlite.getMemoryById = vi.fn((id: string) => ({
+      id, namespace: 'global', collection: 'general', type: 'semantic', category: null,
+      content: 'x'.repeat(2000), summary: 'summary', tags: [], source: 'cli', checksum: 'c',
+      importance: 0.5, retention_tier: 'T2', expires_at: null, decay_eligible: true, review_due: null,
+      access_count: 0, last_operation: 'ADD', merged_from: null, archived: false, vector_synced: true,
+      pinned: false, device_id: null, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+      last_accessed: '2026-01-01T00:00:00Z',
+    } as never));
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5, follow_links: true }, 'c1') as {
+      results: SearchResult[]; truncated: boolean;
+    };
+
+    expect(result.truncated).toBe(true);
+    expect(JSON.stringify(result.results).length).toBeLessThanOrEqual(3_000);
+  });
+});
+
 // add-multi-candidate-extraction task 5.5: `handleRemember` already collapses
 // a length-1 result array but returns the array unchanged otherwise
 // (src/tools/index.ts:153) — exercised here with a live multi-candidate
@@ -1565,7 +1860,7 @@ describe('remember long-content threshold guard', () => {
 });
 
 describe('notifyResourceListChanged hook (complete-mcp-protocol-surface task 5.3)', () => {
-  function createCtx(notify?: ReturnType<typeof vi.fn>): ToolContext {
+  function createCtx(notify?: ReturnType<typeof vi.fn<() => void>>): ToolContext {
     return {
       config: {} as ToolContext['config'],
       storage: {
@@ -1988,6 +2283,17 @@ describe('handleRecall follow_links (add-memory-links)', () => {
     expect(result.results).toHaveLength(1);
     expect(result.results.every(r => !r.linked_from)).toBe(true);
   });
+
+  it('skips an expired linked neighbor', async () => {
+    searchMock.mockResolvedValue([makeResult({ id: 'base-1' })]);
+    listMemoryLinksMock.mockReturnValue([
+      { id: 1, namespace: 'global', from_id: 'base-1', to_id: 'expired-neighbor', relation: 'refines', created_at: 'a', created_by: null, direction: 'outgoing' },
+    ]);
+    getMemoryByIdMock.mockReturnValue({ ...makeMemory('expired-neighbor'), expires_at: '2020-01-01T00:00:00.000Z' });
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5, follow_links: true }, 'c1') as { results: SearchResult[] };
+    expect(result.results).toHaveLength(1);
+  });
 });
 
 describe('remember tool pin cap enforcement (add-inject-pinning)', () => {
@@ -2034,7 +2340,7 @@ describe('remember tool pin cap enforcement (add-inject-pinning)', () => {
   });
 
   it('never checks the cap when pinned is omitted', async () => {
-    const process = vi.fn(async () => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
+    const process = vi.fn(async (_input: unknown) => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
     const ctx = makeCtx(process, 20, 20);
 
     const result = await handleTool(ctx, 'remember', { content: 'ordinary content' }, 'c1') as { id: string };
@@ -2088,7 +2394,7 @@ describe('remember tool origin/confidence (add-memory-provenance-metadata)', () 
   });
 
   it('a call omitting origin/confidence still succeeds unchanged (backward-compatibility regression)', async () => {
-    const process = vi.fn(async () => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
+    const process = vi.fn(async (_input: unknown) => [{ id: 'a', summary: 's', type: 'semantic', operation: 'ADD', created_at: 'now' }]);
     const ctx = makeCtx(process);
 
     const result = await handleTool(ctx, 'remember', { content: 'ordinary content, no provenance' }, 'c1') as { id: string };
@@ -2182,5 +2488,206 @@ describe('tag tool pinned toggle (add-inject-pinning)', () => {
     await handleTool(ctx, 'tag', { id: '550e8400-e29b-41d4-a716-446655440099', pinned: false }, 'c1');
 
     expect(updateMemory).toHaveBeenCalledWith('550e8400-e29b-41d4-a716-446655440099', expect.objectContaining({ pinned: false }));
+  });
+});
+
+// strengthen-verification-and-code-boundaries task 2.3: `forget` had no
+// tool-dispatch coverage at all — every assertion below exercises
+// `handleTool(ctx, 'forget', ...)` itself (input validation, the
+// exists-check, the vector-store double, audit logging, and the metrics
+// gauge) rather than `StorageManager.deleteMemory`, which already has its
+// own unit coverage in src/storage/index.test.ts.
+describe('forget tool', () => {
+  const UUID = '550e8400-e29b-41d4-a716-446655440042';
+  const mem = { id: UUID, namespace: 'global', collection: 'general' };
+
+  function makeCtx(deleteMemory: ReturnType<typeof vi.fn<StorageManager['deleteMemory']>>) {
+    const logAudit = vi.fn();
+    const storage = {
+      sqlite: {
+        getMemoryById: vi.fn((id: string) => (id === UUID ? mem : null)),
+        countMemories: vi.fn(() => 4),
+      },
+      deleteMemory,
+      logAudit,
+    } as unknown as StorageManager;
+
+    const ctx: ToolContext = {
+      config: {} as ToolContext['config'],
+      storage,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+    return { ctx, storage, logAudit };
+  }
+
+  it('deletes an existing memory, logs the FORGET audit entry, and updates the memory-count gauge', async () => {
+    const deleteMemory = vi.fn(async () => true);
+    const { ctx, logAudit } = makeCtx(deleteMemory);
+
+    const result = await handleTool(ctx, 'forget', { id: UUID }, 'c1') as { deleted: boolean; id: string };
+
+    expect(result).toEqual({ deleted: true, id: UUID });
+    expect(deleteMemory).toHaveBeenCalledWith(UUID);
+    expect(logAudit).toHaveBeenCalledWith('FORGET', UUID, 'global', 'c1');
+    expect(ctx.metrics.setGauge).toHaveBeenCalledWith('bhgbrain_memory_count', 4);
+  });
+
+  it('returns NOT_FOUND for an id with no matching memory, without touching the store or audit log', async () => {
+    const deleteMemory = vi.fn(async () => true);
+    const { ctx, logAudit } = makeCtx(deleteMemory);
+
+    const result = await handleTool(
+      ctx, 'forget', { id: '00000000-0000-0000-0000-000000000000' }, 'c1',
+    ) as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('NOT_FOUND');
+    expect(deleteMemory).not.toHaveBeenCalled();
+    expect(logAudit).not.toHaveBeenCalled();
+  });
+
+  // Classified partial outcome: `deleteMemory` resolving `false` (e.g. the
+  // row was already gone by the time the vector-store round trip completed)
+  // is a legitimate non-error result, not a thrown failure — the tool must
+  // pass it through as `deleted: false` rather than collapsing it into
+  // either a thrown error or a false "success", and must not audit-log a
+  // deletion that did not happen.
+  it('retains deleted: false when the store reports nothing was removed, without auditing', async () => {
+    const deleteMemory = vi.fn(async () => false);
+    const { ctx, logAudit } = makeCtx(deleteMemory);
+
+    const result = await handleTool(ctx, 'forget', { id: UUID }, 'c1') as { deleted: boolean; id: string };
+
+    expect(result).toEqual({ deleted: false, id: UUID });
+    expect(logAudit).not.toHaveBeenCalled();
+  });
+
+  // Classified partial failure: a confirmed vector delete whose local
+  // tombstone commit then fails is surfaced by `StorageManager.deleteMemory`
+  // as a thrown `internal` error (see its doc comment) rather than any
+  // return value — the tool-dispatch layer must let that specific,
+  // recognizable envelope through unchanged rather than swallowing it into a
+  // generic failure.
+  it('surfaces a partial vector/local-store failure as its own classified error envelope', async () => {
+    const deleteMemory = vi.fn(async () => {
+      throw internal(
+        'SQLite delete failed after Qdrant cleanup; deletion remains pending: disk full',
+      );
+    });
+    const { ctx, logAudit } = makeCtx(deleteMemory);
+
+    const result = await handleTool(ctx, 'forget', { id: UUID }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INTERNAL');
+    expect(result.error.message).toContain('deletion remains pending');
+    expect(logAudit).not.toHaveBeenCalled();
+  });
+});
+
+// strengthen-verification-and-code-boundaries task 2.3: `backup` had no
+// tool-dispatch coverage at all — every assertion below exercises
+// `handleTool(ctx, 'backup', ...)` against a representative `BackupService`
+// double, verifying input validation and pass-through, not
+// `BackupService.create`/`.list`/`.restore` themselves (see
+// src/backup/index.test.ts for that).
+describe('backup tool', () => {
+  function makeCtx(backup: Partial<BackupService>) {
+    const ctx: ToolContext = {
+      config: {} as ToolContext['config'],
+      storage: {} as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: backup as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+    return { ctx };
+  }
+
+  it('create dispatches to BackupService.create() and returns its BackupInfo unchanged', async () => {
+    const info: BackupInfo = {
+      path: '/data/backups/2026-09-06.db', size_bytes: 4096, memory_count: 12, created_at: '2026-09-06T00:00:00.000Z', missing: false,
+    };
+    const create = vi.fn(async () => info);
+    const { ctx } = makeCtx({ create });
+
+    const result = await handleTool(ctx, 'backup', { action: 'create' }, 'c1');
+
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(result).toEqual(info);
+  });
+
+  it('list dispatches to BackupService.list() and wraps it as { backups }', async () => {
+    const backups: BackupInfo[] = [
+      { path: '/data/backups/a.db', size_bytes: 1, memory_count: 1, created_at: '2026-09-01T00:00:00.000Z', missing: false },
+      { path: '/data/backups/b.db', size_bytes: 2, memory_count: 2, created_at: '2026-09-02T00:00:00.000Z', missing: false },
+    ];
+    const list = vi.fn(() => backups);
+    const { ctx } = makeCtx({ list });
+
+    const result = await handleTool(ctx, 'backup', { action: 'list' }, 'c1');
+
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ backups });
+  });
+
+  it('restore requires a path and never calls BackupService.restore() without one', async () => {
+    const restore = vi.fn(async () => ({}) as RestoreResult);
+    const { ctx } = makeCtx({ restore });
+
+    const result = await handleTool(ctx, 'backup', { action: 'restore' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INVALID_INPUT');
+    expect(restore).not.toHaveBeenCalled();
+  });
+
+  it('restore dispatches to BackupService.restore(path) and returns a clean RestoreResult unchanged', async () => {
+    const clean: RestoreResult = {
+      memory_count: 42,
+      metadata_activated: true,
+      vector_reconciliation: { status: 'healthy', state: 'reconciled', unsynced_vectors: 0 },
+    };
+    const restore = vi.fn(async () => clean);
+    const { ctx } = makeCtx({ restore });
+
+    const result = await handleTool(ctx, 'backup', { action: 'restore', path: '/data/backups/2026-09-06.db' }, 'c1');
+
+    expect(restore).toHaveBeenCalledWith('/data/backups/2026-09-06.db');
+    expect(result).toEqual(clean);
+  });
+
+  // Classified partial failure: a restore that activated SQLite metadata but
+  // left vector reconciliation degraded (see BackupService.restore's
+  // `vector_reconciliation` doc comments) must reach the caller with that
+  // full, structured status intact — not collapsed to a boolean, not
+  // dropped, and not thrown as a generic error, since `metadata_activated:
+  // true` here means the restore itself substantively succeeded.
+  it('retains a degraded vector_reconciliation envelope on the RestoreResult unchanged', async () => {
+    const degraded: RestoreResult = {
+      memory_count: 42,
+      metadata_activated: true,
+      vector_reconciliation: {
+        status: 'degraded',
+        state: 'reconciling',
+        unsynced_vectors: 7,
+        message: 'vector reconciliation for the drifted subset is continuing in the background',
+      },
+    };
+    const restore = vi.fn(async () => degraded);
+    const { ctx } = makeCtx({ restore });
+
+    const result = await handleTool(
+      ctx, 'backup', { action: 'restore', path: '/data/backups/2026-09-06.db' }, 'c1',
+    ) as RestoreResult;
+
+    expect(result.vector_reconciliation).toEqual(degraded.vector_reconciliation);
+    expect(result.metadata_activated).toBe(true);
   });
 });

@@ -18,7 +18,7 @@ afterEach(() => {
   }
 });
 
-function track(store: EvalStorage): EvalStorage {
+function track<T extends EvalStorage>(store: T): T {
   stores.push(store);
   return store;
 }

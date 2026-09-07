@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { DistillationLLMClient, DistillationLLMError } from './distillation-llm.js';
+import { DistillationLLMClient, DistillationLLMError, warnIfDistillationDegraded } from './distillation-llm.js';
 import type { BrainConfig } from '../config/index.js';
 
 function config(): BrainConfig {
@@ -47,7 +47,7 @@ describe('DistillationLLMClient', () => {
   it('succeeds and truncates an oversized summary', async () => {
     process.env.BHGBRAIN_EXTRACTION_API_KEY = 'test-key';
     const longSummary = 'x'.repeat(200);
-    const fetchMock = vi.fn(async () => jsonResponse({
+    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => jsonResponse({
       choices: [{ message: { content: JSON.stringify({ content: 'We deploy via GitHub Actions.', summary: longSummary }) } }],
     }));
     global.fetch = fetchMock as unknown as typeof fetch;
@@ -101,5 +101,86 @@ describe('DistillationLLMClient', () => {
 
     const client = new DistillationLLMClient(config());
     await expect(client.distill(MEMORIES)).rejects.toMatchObject({ reason: 'llm_error' });
+  });
+
+  // unify-llm-client-boundaries task 2.2: previously `distill()` had no
+  // AbortController/deadline at all — a hung provider response blocked the
+  // call (and, transitively, DistillationScheduler's next tick) forever.
+  it('aborts a hung request within retention.distillation.llm_timeout_ms rather than hanging forever', async () => {
+    process.env.BHGBRAIN_EXTRACTION_API_KEY = 'test-key';
+    global.fetch = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        const err = new Error('The operation was aborted.');
+        err.name = 'AbortError';
+        reject(err);
+      });
+    })) as unknown as typeof fetch;
+
+    const cfg = {
+      pipeline: { extraction_model: 'gpt-4o-mini', extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY' },
+      retention: { distillation: { llm_timeout_ms: 10 } },
+      llm: { retry: { max_attempts: 1, backoff_ms: 1, max_backoff_ms: 1 } },
+    } as unknown as BrainConfig;
+
+    const client = new DistillationLLMClient(cfg);
+    const start = Date.now();
+    const err = await client.distill(MEMORIES).catch(e => e);
+    const elapsed = Date.now() - start;
+
+    expect(err).toBeInstanceOf(DistillationLLMError);
+    expect(err.reason).toBe('llm_error');
+    // Bounded by the timeout, not hanging indefinitely — generous margin for
+    // CI scheduling jitter, still far below a real hang.
+    expect(elapsed).toBeLessThan(2000);
+  });
+
+  it('trips the breaker exactly once across a whole failed distill() call', async () => {
+    process.env.BHGBRAIN_EXTRACTION_API_KEY = 'test-key';
+    global.fetch = vi.fn(async () => jsonResponse({ error: 'boom' }, false, 500)) as unknown as typeof fetch;
+    const breaker = {
+      execute: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
+    } as unknown as import('../resilience/index.js').CircuitBreaker;
+
+    const client = new DistillationLLMClient(config(), breaker);
+    await expect(client.distill(MEMORIES)).rejects.toBeInstanceOf(DistillationLLMError);
+
+    expect(breaker.execute).toHaveBeenCalledTimes(1);
+  });
+});
+
+// unify-llm-client-boundaries task 3.2: a startup diagnostic for scheduled
+// distillation missing usable credentials.
+describe('warnIfDistillationDegraded', () => {
+  afterEach(() => {
+    delete process.env.BHGBRAIN_EXTRACTION_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+  });
+
+  function cfg(overrides: { enabled: boolean }): BrainConfig {
+    return {
+      pipeline: { extraction_model_env: 'BHGBRAIN_EXTRACTION_API_KEY' },
+      retention: { distillation: { enabled: overrides.enabled } },
+    } as unknown as BrainConfig;
+  }
+
+  it('warns when enabled but no key resolves', () => {
+    delete process.env.BHGBRAIN_EXTRACTION_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    const logger = { warn: vi.fn() };
+    warnIfDistillationDegraded(cfg({ enabled: true }), logger);
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'distillation_degraded_startup' }));
+  });
+
+  it('does not warn when disabled', () => {
+    const logger = { warn: vi.fn() };
+    warnIfDistillationDegraded(cfg({ enabled: false }), logger);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('does not warn when a key resolves', () => {
+    process.env.BHGBRAIN_EXTRACTION_API_KEY = 'test-key';
+    const logger = { warn: vi.fn() };
+    warnIfDistillationDegraded(cfg({ enabled: true }), logger);
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 });

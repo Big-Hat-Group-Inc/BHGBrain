@@ -1,4 +1,3 @@
-import { v4 as uuidv4 } from 'uuid';
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
@@ -14,17 +13,26 @@ import {
   CategoryInputSchema, BackupInputSchema, RepairInputSchema,
   RevisionsInputSchema, ReviewInputSchema, ConsolidateInputSchema,
   RelateInputSchema, FeedbackInputSchema,
-  type RepairInput, type ConsolidateInput,
+  type RepairInput, type ConsolidateInput, type ReviewInput,
 } from '../domain/schemas.js';
 import type {
-  WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter,
+  WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter, RetentionTier,
 } from '../domain/types.js';
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
-import { computeChecksum } from '../domain/normalize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
+import { assembleWithinCharBudget } from '../domain/response-budget.js';
+import { buildRestoredMemoryFromArchive } from '../domain/archive-restore.js';
 import { handleImport } from './import.js';
 import { handleBootstrap } from './bootstrap.js';
+import { computeRecallFetchLimit } from './recall-pool.js';
 import { ZodError } from 'zod';
+
+// Fixed slack reserved out of `defaults.max_response_chars` for a result
+// object's own envelope — the `results`/`truncated`/`degraded` keys, array
+// brackets, and surrounding braces — so the *whole* returned object stays
+// within budget, not just its `results` array in isolation. Comfortably
+// covers the handful of short scalar fields these tools wrap `results` in.
+const RESPONSE_BUDGET_RESERVED_CHARS = 200;
 
 export interface ToolContext {
   config: BrainConfig;
@@ -90,9 +98,19 @@ export async function handleTool(
       namespace: logCtx.namespace ?? null,
     });
     return result;
-  } catch (err) {
+  } catch (rawErr) {
     status = 'error';
     duration = Date.now() - start;
+    // A mutation that raced an active restore (this process's own lifecycle
+    // guard, or SqliteStore.assertMutableAllowed's cross-process restore-lock
+    // check — see make-backup-restore-transactional task 2.2/2.5) surfaces as
+    // a plain Error naming the real lock holder, not a BrainError. Classify
+    // it here, at the one place every tool call funnels through, so the
+    // client sees a retryable CONFLICT (and a real reason) instead of a
+    // generic INTERNAL error masking what actually happened.
+    const err = (!(rawErr instanceof BrainError) && /Storage lifecycle operation.*in progress/.test((rawErr as Error).message))
+      ? new BrainError('CONFLICT', (rawErr as Error).message, true)
+      : rawErr;
     if (err instanceof BrainError) {
       ctx.logger.warn({
         event: 'tool_error', tool: toolName, error_code: err.code, duration_ms: duration, client_id: clientId,
@@ -203,9 +221,10 @@ async function handleRemember(
 
 async function handleRecall(
   ctx: ToolContext, args: unknown, logCtx: ToolLogContext,
-): Promise<{ results: SearchResult[] }> {
+): Promise<{ results: SearchResult[]; truncated: boolean }> {
   const input = parseInput(RecallInputSchema, args);
   logCtx.namespace = input.namespace;
+  const lifecycle = new MemoryLifecycleService(ctx.config);
 
   // Push type/tags/after/before down into the store instead of discovering the
   // mismatch only after `limit` candidates are already spent
@@ -219,25 +238,10 @@ async function handleRecall(
     ? { type: input.type, tags: input.tags, after: input.after, before: input.before }
     : undefined;
 
-  // Over-fetch modestly beyond `limit` so the expired-memory exclusion inside
-  // `buildSearchResults` cannot starve the caller's limit even once the
-  // store already narrows candidates down to matching memories. Capped so a
-  // filtered recall never asks the store for an unbounded candidate pool.
-  // When MMR is eligible (recall is semantic-only, so no mode check is
-  // needed), widen the pool further using the config-driven formula so there
-  // is genuine diversity headroom beyond `limit` (add-mmr-diversity-reranking).
-  const baseFetchLimit = ctx.config.search.mmr.enabled
-    ? Math.min(input.limit * ctx.config.search.mmr.candidate_pool_multiplier, ctx.config.search.mmr.candidate_pool_cap)
-    : Math.min(input.limit * 2, 40);
-
-  // When reranking is enabled, widen the pool at least up to
-  // `search.rerank.candidate_pool` (capped at 40, the same ceiling the
-  // pre-rerank formula already used) so the rerank stage has a meaningful
-  // pool to score even for a small `limit`, without ever narrowing whatever
-  // MMR already widened it to (add-opt-in-rerank-stage).
-  const fetchLimit = ctx.config.search.rerank.enabled
-    ? Math.max(baseFetchLimit, Math.min(ctx.config.search.rerank.candidate_pool, 40))
-    : baseFetchLimit;
+  // Pure pool-sizing helper (strengthen-verification-and-code-boundaries
+  // task 3.4) — recall is semantic-only, so no mode check is needed here.
+  // See src/tools/recall-pool.ts for the boundary tests this delegates to.
+  const fetchLimit = computeRecallFetchLimit(input.limit, ctx.config.search.mmr, ctx.config.search.rerank);
 
   const results = await ctx.search.search(
     input.query, input.namespace, input.collection, 'semantic', fetchLimit, undefined, filter,
@@ -296,7 +300,13 @@ async function handleRecall(
   const sliced = filtered.slice(0, input.limit);
 
   if (!input.follow_links) {
-    return { results: sliced };
+    // Response budget (bound-corpus-scale-workflows task 3.3): assembled
+    // BEFORE serialization, one candidate at a time, rather than truncating
+    // the final JSON string (which risks invalid/ambiguous output — see
+    // design.md Decision #6). `RESPONSE_BUDGET_RESERVED_CHARS` covers this
+    // object's own envelope (the `results`/`truncated` keys and brackets).
+    const budgeted = assembleWithinCharBudget(sliced, ctx.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY, RESPONSE_BUDGET_RESERVED_CHARS);
+    return { results: budgeted.items, truncated: budgeted.truncated };
   }
 
   // One-hop neighbor expansion (add-memory-links): runs on the final,
@@ -319,7 +329,7 @@ async function handleRecall(
       // Default (non-archived-only) lookup: a link to a now-archived memory
       // contributes nothing recallable, so it is silently skipped.
       const neighborMem = ctx.storage.sqlite.getMemoryById(otherId);
-      if (!neighborMem) continue;
+      if (!neighborMem || lifecycle.isExpired(neighborMem.expires_at, new Date())) continue;
 
       appendedIds.add(otherId);
       neighbors.push({
@@ -341,7 +351,10 @@ async function handleRecall(
     }
   }
 
-  return { results: [...sliced, ...neighbors] };
+  const budgeted = assembleWithinCharBudget(
+    [...sliced, ...neighbors], ctx.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY, RESPONSE_BUDGET_RESERVED_CHARS,
+  );
+  return { results: budgeted.items, truncated: budgeted.truncated };
 }
 
 async function handleForget(
@@ -363,7 +376,7 @@ async function handleForget(
 
 async function handleSearch(
   ctx: ToolContext, args: unknown, logCtx: ToolLogContext,
-): Promise<{ results: SearchResult[]; degraded: boolean }> {
+): Promise<{ results: SearchResult[]; degraded: boolean; truncated: boolean }> {
   const input = parseInput(SearchInputSchema, args);
   logCtx.namespace = input.namespace;
   const signal: { degraded?: boolean } = {};
@@ -410,7 +423,12 @@ async function handleSearch(
 
   // `degraded` is true when hybrid mode fell back to fulltext-only (embedding /
   // vector store unavailable), so callers can tell it from a healthy result.
-  return { results: filtered.slice(0, input.limit), degraded: signal.degraded ?? false };
+  // Response budget (bound-corpus-scale-workflows task 3.3): see
+  // `handleRecall`'s matching comment.
+  const budgeted = assembleWithinCharBudget(
+    filtered.slice(0, input.limit), ctx.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY, RESPONSE_BUDGET_RESERVED_CHARS,
+  );
+  return { results: budgeted.items, degraded: signal.degraded ?? false, truncated: budgeted.truncated };
 }
 
 async function handleTag(
@@ -478,6 +496,12 @@ async function handleRevisions(
 // look-ahead window); `keep`/`archive`/`restore` disposition them. Content
 // revision is deliberately not duplicated here — that stays `remember`'s
 // UPDATE flow (design.md "one write path for content").
+// Dispatcher only: input parsing/namespace logging shared by every action,
+// then delegated to one focused per-action handler below (strengthen-
+// verification-and-code-boundaries task 3.3 — mirrors handleConsolidate's
+// list/merge split). Public schema (ReviewInputSchema) and dispatch-visible
+// behavior are unchanged; this only reorganizes the implementation so each
+// action's logic and tests can stand on their own.
 async function handleReview(
   ctx: ToolContext, args: unknown, clientId: string, logCtx: ToolLogContext,
 ): Promise<unknown> {
@@ -485,161 +509,151 @@ async function handleReview(
   logCtx.namespace = input.namespace;
 
   if (input.action === 'list') {
-    const now = new Date();
-    const before = new Date(now.getTime() + input.days * 24 * 60 * 60 * 1000).toISOString();
-    const due = ctx.storage.sqlite.listReviewDue(input.namespace, before, input.limit, input.cursor);
-    const last = due[due.length - 1];
-    const cursor = due.length === input.limit && last?.review_due
-      ? `${last.review_due}|${last.id}`
-      : null;
-
-    return {
-      items: due.map(m => ({
-        id: m.id,
-        namespace: m.namespace,
-        collection: m.collection,
-        summary: m.summary,
-        tags: m.tags,
-        retention_tier: m.retention_tier,
-        review_due: m.review_due,
-        expires_at: m.expires_at,
-      })),
-      cursor,
-    };
+    return handleReviewList(ctx, input);
   }
 
   // Schema refine guarantees `id` is present for keep/archive/restore.
   const id = input.id!;
-  const lifecycle = new MemoryLifecycleService(ctx.config);
-
   if (input.action === 'keep') {
-    const mem = ctx.storage.sqlite.getMemoryById(id);
-    if (!mem) throw notFound(`Memory ${id} not found`);
-    logCtx.namespace = mem.namespace;
-
-    const now = new Date();
-    const nowIso = now.toISOString();
-    // A human confirmation is at least as strong a signal as an automated
-    // access, so `keep` re-applies the tier's full lifecycle policy
-    // (review_due + expires_at) regardless of sliding-window configuration —
-    // design.md: "explicit curation beats passive policy".
-    const nextReviewDue = lifecycle.buildMetadata(mem.retention_tier, now).review_due;
-    const nextExpiry = lifecycle.computeExpiry(mem.retention_tier, now);
-
-    ctx.storage.sqlite.updateMemory(id, {
-      review_due: nextReviewDue,
-      expires_at: nextExpiry,
-      updated_at: nowIso,
-    });
-    ctx.storage.sqlite.flushIfDirty();
-
-    ctx.storage.logAudit('REVISE', id, mem.namespace, clientId, {
-      details: {
-        memory_id: id,
-        prior_tier: mem.retention_tier,
-        new_tier: mem.retention_tier,
-        actor: clientId,
-        timestamp: nowIso,
-        action: 'revise',
-      },
-    });
-
-    return { id, review_due: nextReviewDue, expires_at: nextExpiry };
+    return handleReviewKeep(ctx, id, clientId, logCtx);
   }
-
   if (input.action === 'archive') {
-    const mem = ctx.storage.sqlite.getMemoryById(id);
-    if (!mem) {
-      // Already archived (row moved to memory_archive, gone from `memories`)
-      // is a conflict, not a not-found — distinguishable from "never existed".
-      if (ctx.storage.sqlite.getArchiveByMemoryId(id)) {
-        throw conflict(`Memory ${id} is already archived`);
-      }
-      throw notFound(`Memory ${id} not found`);
-    }
-    logCtx.namespace = mem.namespace;
+    return handleReviewArchive(ctx, id, clientId, logCtx);
+  }
+  return handleReviewRestore(ctx, id, clientId, logCtx);
+}
 
-    const nowIso = new Date().toISOString();
-    ctx.storage.sqlite.archiveMemory(mem, nowIso);
-    try {
-      await ctx.storage.deleteMemory(id);
-    } catch (err) {
-      // Vector/SQLite removal failed: undo the archive row so the memory
-      // isn't left both live and archived.
-      ctx.storage.sqlite.deleteArchive(id);
-      ctx.storage.sqlite.flushIfDirty();
-      throw err;
-    }
+async function handleReviewList(
+  ctx: ToolContext, input: ReviewInput,
+): Promise<{
+  items: Array<{
+    id: string; namespace: string; collection: string; summary: string; tags: string[];
+    retention_tier: RetentionTier; review_due: string | null; expires_at: string | null;
+  }>;
+  cursor: string | null;
+}> {
+  const now = new Date();
+  const before = new Date(now.getTime() + input.days * 24 * 60 * 60 * 1000).toISOString();
+  const due = ctx.storage.sqlite.listReviewDue(input.namespace, before, input.limit, input.cursor);
+  const last = due[due.length - 1];
+  const cursor = due.length === input.limit && last?.review_due
+    ? `${last.review_due}|${last.id}`
+    : null;
 
-    ctx.storage.logAudit('ARCHIVE', id, mem.namespace, clientId, {
-      details: {
-        memory_id: id,
-        prior_tier: mem.retention_tier,
-        new_tier: null,
-        actor: clientId,
-        timestamp: nowIso,
-        action: 'archive',
-      },
-    });
-    ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
-    return { id, archived: true };
+  return {
+    items: due.map(m => ({
+      id: m.id,
+      namespace: m.namespace,
+      collection: m.collection,
+      summary: m.summary,
+      tags: m.tags,
+      retention_tier: m.retention_tier,
+      review_due: m.review_due,
+      expires_at: m.expires_at,
+    })),
+    cursor,
+  };
+}
+
+async function handleReviewKeep(
+  ctx: ToolContext, id: string, clientId: string, logCtx: ToolLogContext,
+): Promise<{ id: string; review_due: string | null; expires_at: string | null }> {
+  const mem = ctx.storage.sqlite.getMemoryById(id);
+  if (!mem) throw notFound(`Memory ${id} not found`);
+  logCtx.namespace = mem.namespace;
+
+  const lifecycle = new MemoryLifecycleService(ctx.config);
+  const now = new Date();
+  const nowIso = now.toISOString();
+  // A human confirmation is at least as strong a signal as an automated
+  // access, so `keep` re-applies the tier's full lifecycle policy
+  // (review_due + expires_at) regardless of sliding-window configuration —
+  // design.md: "explicit curation beats passive policy".
+  const nextReviewDue = lifecycle.buildMetadata(mem.retention_tier, now).review_due;
+  const nextExpiry = lifecycle.computeExpiry(mem.retention_tier, now);
+
+  ctx.storage.sqlite.updateMemory(id, {
+    review_due: nextReviewDue,
+    expires_at: nextExpiry,
+    updated_at: nowIso,
+  });
+  ctx.storage.sqlite.flushIfDirty();
+
+  ctx.storage.logAudit('REVISE', id, mem.namespace, clientId, {
+    details: {
+      memory_id: id,
+      prior_tier: mem.retention_tier,
+      new_tier: mem.retention_tier,
+      actor: clientId,
+      timestamp: nowIso,
+      action: 'revise',
+    },
+  });
+
+  return { id, review_due: nextReviewDue, expires_at: nextExpiry };
+}
+
+async function handleReviewArchive(
+  ctx: ToolContext, id: string, clientId: string, logCtx: ToolLogContext,
+): Promise<{ id: string; archived: boolean }> {
+  const mem = ctx.storage.sqlite.getMemoryById(id);
+  if (!mem) {
+    // Already archived (row moved to memory_archive, gone from `memories`)
+    // is a conflict, not a not-found — distinguishable from "never existed".
+    if (ctx.storage.sqlite.getArchiveByMemoryId(id)) {
+      throw conflict(`Memory ${id} is already archived`);
+    }
+    throw notFound(`Memory ${id} not found`);
+  }
+  logCtx.namespace = mem.namespace;
+
+  const nowIso = new Date().toISOString();
+  ctx.storage.sqlite.archiveMemory(mem, nowIso);
+  try {
+    await ctx.storage.deleteMemory(id);
+  } catch (err) {
+    // Vector/SQLite removal failed: undo the archive row so the memory
+    // isn't left both live and archived.
+    ctx.storage.sqlite.deleteArchive(id);
+    ctx.storage.sqlite.flushIfDirty();
+    throw err;
   }
 
-  // 'restore'
+  ctx.storage.logAudit('ARCHIVE', id, mem.namespace, clientId, {
+    details: {
+      memory_id: id,
+      prior_tier: mem.retention_tier,
+      new_tier: null,
+      actor: clientId,
+      timestamp: nowIso,
+      action: 'archive',
+    },
+  });
+  ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
+  return { id, archived: true };
+}
+
+async function handleReviewRestore(
+  ctx: ToolContext, id: string, clientId: string, logCtx: ToolLogContext,
+): Promise<{ id: string; restored_from: string; archive_id: number; restored: boolean }> {
   const archived = ctx.storage.sqlite.getArchiveByMemoryId(id);
   if (!archived) throw notFound(`Archived memory ${id} not found`);
   logCtx.namespace = archived.namespace;
 
-  const now = new Date();
-  const nowIso = now.toISOString();
-  const metadata = lifecycle.buildMetadata(archived.tier, now);
-  // Provenance-carrying stub: content is the retained summary (archive rows
-  // keep no content/vector), tagged so it's identifiable as a restore rather
-  // than implying the original memory survived intact.
-  const tags = [...new Set([...archived.tags, 'restored-from-archive'])];
-  const content = archived.summary;
-  const restoredId = uuidv4();
-
-  const memory: Omit<MemoryRecord, 'embedding'> = {
-    id: restoredId,
-    namespace: archived.namespace,
-    collection: 'general',
-    type: 'semantic',
-    category: null,
-    content,
-    summary: archived.summary,
-    tags,
+  // Shared with the CLI's `archive restore` path (src/backup/retention.ts)
+  // so checksum, expiry/review, and provenance fields cannot drift between
+  // entrypoints — see openspec/changes/make-backup-restore-transactional.
+  const memory = buildRestoredMemoryFromArchive(ctx.config, archived, {
     source: 'cli',
-    checksum: computeChecksum(content),
-    importance: 0.5,
-    retention_tier: archived.tier,
-    expires_at: metadata.expires_at,
-    decay_eligible: metadata.decay_eligible,
-    review_due: metadata.review_due,
-    access_count: 0,
-    last_operation: 'ADD',
-    merged_from: null,
-    archived: false,
-    vector_synced: true,
-    // Archive rows carry no pin state, so a `review restore` never
-    // resurrects a memory as pinned.
-    pinned: false,
-    device_id: ctx.config.device.id ?? null,
-    // Archive rows carry no origin/confidence either, so this restore has
-    // no provenance to recover — same "legacy row" default as elsewhere.
-    origin: null,
-    confidence: 1.0,
-    created_at: nowIso,
-    updated_at: nowIso,
-    last_accessed: nowIso,
-  };
+    deviceId: ctx.config.device.id ?? null,
+  });
+  const restoredId = memory.id;
+  const nowIso = memory.created_at;
 
-  const vector = await ctx.embedding.embed(content);
+  const vector = await ctx.embedding.embed(memory.content);
   await ctx.storage.writeMemory(memory, vector);
 
-  // Archive row is retained (not deleted) so the origin stays inspectable —
-  // this deliberately differs from the CLI's `archive restore` path, which
-  // deletes the archive row after restoring.
+  // Archive row is retained (not deleted) so the origin stays inspectable.
   ctx.storage.logAudit('RESTORE', restoredId, archived.namespace, clientId, {
     details: {
       memory_id: restoredId,
@@ -781,6 +795,33 @@ interface ConsolidateCluster {
   suggested_target: string;
 }
 
+interface ConsolidationSourceFailure {
+  id: string;
+  stage: 'lookup' | 'archive' | 'delete';
+  code: 'NOT_FOUND' | 'LIFECYCLE_LOCKED' | 'ARCHIVE_FAILED' | 'DELETE_FAILED';
+  message: string;
+}
+
+function consolidationFailure(
+  id: string,
+  stage: ConsolidationSourceFailure['stage'],
+  error: unknown,
+): ConsolidationSourceFailure {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    id,
+    stage,
+    code: /Storage lifecycle operation in progress/.test(message)
+      ? 'LIFECYCLE_LOCKED'
+      : stage === 'archive'
+        ? 'ARCHIVE_FAILED'
+        : stage === 'delete'
+          ? 'DELETE_FAILED'
+          : 'NOT_FOUND',
+    message,
+  };
+}
+
 // Closes the read-side gap write-time dedup leaves open for imports and
 // degraded-window writes (add-duplicate-cluster-consolidation): `list`
 // discovers clusters of near-duplicate *existing* memories via bounded,
@@ -831,25 +872,54 @@ async function handleConsolidateList(
     if (ra !== rb) parent.set(ra, rb);
   };
 
-  for (const m of page) {
-    const neighbors = await ctx.storage.qdrant.findNeighborsById(
-      namespace, collection, m.id,
-      ctx.config.consolidation.neighbor_top_k,
-      ctx.config.consolidation.similarity_threshold,
-    );
-    for (const n of neighbors) {
-      // Only edges between memories both present in this scanned page can be
-      // clustered — metadata for the suggested-target tie-break is only
-      // available for page members (design.md: "union-find over the page's
-      // neighbor edges").
-      if (byId.has(n.id)) {
-        union(m.id, n.id);
-      }
+  // Bounded-concurrency, deadline-aware fan-out (bound-corpus-scale-workflows
+  // task 2.5): the page's `findNeighborsById` ANN calls run in batches of at
+  // most `neighbor_discovery_concurrency` in flight at once — neither
+  // strictly serial (one Qdrant round trip at a time, as this loop used to
+  // be) nor unbounded (the whole page fired concurrently). The deadline is
+  // checked between batches, so at most one batch's worth of calls can run
+  // past it; `processed` then names exactly how many leading page members
+  // (in scan order) got their neighbors resolved, letting `cursor` below
+  // resume precisely after them rather than either re-scanning already-
+  // resolved members or skipping ones that were never reached.
+  const startedAt = Date.now();
+  const concurrency = Math.max(1, ctx.config.consolidation.neighbor_discovery_concurrency);
+  const deadlineMs = ctx.config.consolidation.neighbor_discovery_deadline_ms;
+  let processed = 0;
+  let deadlineReached = false;
+  for (let i = 0; i < page.length; i += concurrency) {
+    if (Date.now() - startedAt >= deadlineMs) {
+      deadlineReached = true;
+      break;
     }
+    const batch = page.slice(i, i + concurrency);
+    await Promise.all(batch.map(async m => {
+      const neighbors = await ctx.storage.qdrant.findNeighborsById(
+        namespace, collection, m.id,
+        ctx.config.consolidation.neighbor_top_k,
+        ctx.config.consolidation.similarity_threshold,
+      );
+      for (const n of neighbors) {
+        // Only edges between memories both present in this scanned page can be
+        // clustered — metadata for the suggested-target tie-break is only
+        // available for page members (design.md: "union-find over the page's
+        // neighbor edges").
+        if (byId.has(n.id)) {
+          union(m.id, n.id);
+        }
+      }
+    }));
+    processed += batch.length;
   }
 
+  // Only members whose neighbors were actually resolved this call can be
+  // safely clustered — an unresolved member (deadline cut the fan-out short
+  // before reaching it) has no discovered edges yet and would otherwise
+  // surface as a false singleton instead of being deferred to the next call.
+  const resolvedIds = new Set(page.slice(0, processed).map(m => m.id));
   const groups = new Map<string, string[]>();
   for (const m of page) {
+    if (!resolvedIds.has(m.id)) continue;
     const root = find(m.id);
     const arr = groups.get(root) ?? [];
     arr.push(m.id);
@@ -874,17 +944,26 @@ async function handleConsolidateList(
     });
   }
 
-  const last = page[page.length - 1];
-  const cursor = page.length === maxScan && last
-    ? `${last.created_at}|${last.id}`
-    : null;
+  let cursor: string | null = null;
+  if (deadlineReached && processed > 0) {
+    const lastResolved = page[processed - 1]!;
+    cursor = `${lastResolved.created_at}|${lastResolved.id}`;
+  } else if (!deadlineReached) {
+    const last = page[page.length - 1];
+    cursor = page.length === maxScan && last ? `${last.created_at}|${last.id}` : null;
+  } else {
+    // deadlineReached but processed === 0: the very first batch alone
+    // exceeded the deadline. Resume from the same input cursor (no progress
+    // to advance past) rather than fabricating one from an empty result.
+    cursor = input.cursor ?? null;
+  }
 
   return { clusters, cursor };
 }
 
 async function handleConsolidateMerge(
   ctx: ToolContext, input: ConsolidateInput, clientId: string,
-): Promise<{ target_id: string; merged: string[]; failed: string[] }> {
+): Promise<{ target_id: string; merged: string[]; failed: string[]; failures: ConsolidationSourceFailure[] }> {
   const targetId = input.target_id!;
   const sourceIds = input.source_ids!;
 
@@ -898,6 +977,7 @@ async function handleConsolidateMerge(
   // rather than rejected, so a retried merge over a partially-completed
   // attempt is safe (spec: "Retrying a partially completed merge").
   const liveSources: Array<Omit<MemoryRecord, 'embedding'>> = [];
+  const failures: ConsolidationSourceFailure[] = [];
   for (const id of sourceIds) {
     const mem = ctx.storage.sqlite.getMemoryById(id);
     if (mem) {
@@ -909,47 +989,49 @@ async function handleConsolidateMerge(
       }
       liveSources.push(mem);
     } else if (!ctx.storage.sqlite.getArchiveByMemoryId(id)) {
-      throw notFound(`Source memory ${id} not found`);
+      failures.push({
+        id,
+        stage: 'lookup',
+        code: 'NOT_FOUND',
+        message: `Source memory ${id} not found`,
+      });
     }
     // else: already archived — skipped (idempotent retry).
   }
 
   if (liveSources.length === 0) {
-    return { target_id: targetId, merged: [], failed: [] };
+    for (const failure of failures) {
+      ctx.logger.warn({ event: 'consolidation_source_failed', target_id: targetId, ...failure });
+    }
+    return { target_id: targetId, merged: [], failed: failures.map(failure => failure.id), failures };
   }
-
-  const unionTags = new Set(target.tags);
-  for (const s of liveSources) for (const t of s.tags) unionTags.add(t);
-  const maxImportance = Math.max(target.importance, ...liveSources.map(s => s.importance));
-  const mergedFromIds = liveSources.map(s => s.id);
-  const mergedFrom = target.merged_from
-    ? `${target.merged_from},${mergedFromIds.join(',')}`
-    : mergedFromIds.join(',');
 
   // Metadata-only update: no newVector, so the target's content/embedding
   // are left untouched (spec: "target's content and embedding SHALL remain
   // unchanged").
-  await ctx.storage.updateMemory(targetId, {
-    tags: [...unionTags],
-    importance: maxImportance,
-    merged_from: mergedFrom,
-    updated_at: new Date().toISOString(),
-  });
-
   const merged: string[] = [];
-  const failed: string[] = [];
   for (const source of liveSources) {
     const nowIso = new Date().toISOString();
-    ctx.storage.sqlite.archiveMemory(source, nowIso);
+    try {
+      ctx.storage.sqlite.archiveMemory(source, nowIso);
+    } catch (err) {
+      failures.push(consolidationFailure(source.id, 'archive', err));
+      continue;
+    }
     try {
       await ctx.storage.deleteMemory(source.id);
-    } catch {
+    } catch (err) {
       // Vector/SQLite removal failed: undo the archive row so the source
       // isn't left both archived and live (same rollback `review`'s
       // `archive` action uses).
-      ctx.storage.sqlite.deleteArchive(source.id);
-      ctx.storage.sqlite.flushIfDirty();
-      failed.push(source.id);
+      const failure = consolidationFailure(source.id, 'delete', err);
+      try {
+        ctx.storage.sqlite.deleteArchive(source.id);
+        ctx.storage.sqlite.flushIfDirty();
+      } catch (rollbackError) {
+        failure.message += `; archive rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+      }
+      failures.push(failure);
       continue;
     }
 
@@ -967,9 +1049,32 @@ async function handleConsolidateMerge(
     merged.push(source.id);
   }
 
+  if (merged.length > 0) {
+    const mergedSources = liveSources.filter(source => merged.includes(source.id));
+    const unionTags = new Set(target.tags);
+    for (const source of mergedSources) for (const tag of source.tags) unionTags.add(tag);
+    const maxImportance = Math.max(target.importance, ...mergedSources.map(source => source.importance));
+    const mergedFrom = target.merged_from
+      ? `${target.merged_from},${merged.join(',')}`
+      : merged.join(',');
+
+    // No new vector is produced. The target keeps its content and embedding,
+    // while its lineage records only source transitions that completed.
+    await ctx.storage.updateMemory(targetId, {
+      tags: [...unionTags],
+      importance: maxImportance,
+      merged_from: mergedFrom,
+      updated_at: new Date().toISOString(),
+    });
+  }
+
+  for (const failure of failures) {
+    ctx.logger.warn({ event: 'consolidation_source_failed', target_id: targetId, ...failure });
+  }
+
   ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
 
-  return { target_id: targetId, merged, failed };
+  return { target_id: targetId, merged, failed: failures.map(failure => failure.id), failures };
 }
 
 async function handleCollections(
@@ -1081,19 +1186,32 @@ async function handleBackup(ctx: ToolContext, args: unknown): Promise<unknown> {
   }
 }
 
+// Dispatcher only: routes to one focused per-mode handler (strengthen-
+// verification-and-code-boundaries task 3.3 — mirrors handleReview's/
+// handleConsolidate's split). Public schema (RepairInputSchema) and
+// dispatch-visible behavior are unchanged.
 async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
   const input = parseInput(RepairInputSchema, args);
   if (input.mode === 're-embed') {
     return handleReembed(ctx, input);
   }
+  return handleRepairFromQdrant(ctx, input);
+}
+
+async function handleRepairFromQdrant(ctx: ToolContext, input: RepairInput): Promise<unknown> {
   const dryRun = input.dry_run;
   // `all_devices` and `device_id` are mutually exclusive (enforced by the
   // schema); omitting both is the documented, backward-compatible
   // all-devices default, same as passing `all_devices: true` explicitly.
   const filterDeviceId = input.all_devices ? undefined : input.device_id;
-  const localDeviceId = ctx.config.device.id ?? null;
 
   const collections = await ctx.storage.qdrant.listAllCollections();
+  // Preloaded once for the whole repair run, same rationale as
+  // `bootstrapFromQdrant` (trim-sqlite-query-and-health-overhead task 2.3):
+  // a Set lookup per point instead of a `getMemoryById` query, mutated in
+  // place by `hydrateBatch` as it inserts so a later page/collection in this
+  // same run sees an id inserted earlier as already present.
+  const existingIds = ctx.storage.sqlite.listMemoryIds();
   let scannedPoints = 0;
   let recoveredCount = 0;
   let skippedNoContent = 0;
@@ -1102,119 +1220,75 @@ async function handleRepair(ctx: ToolContext, args: unknown): Promise<unknown> {
   const errors: string[] = [];
 
   for (const collectionName of collections) {
-    let points: Array<{ id: string; payload: Record<string, unknown> }>;
+    let pageIndex = 0;
     try {
-      points = await ctx.storage.qdrant.scrollAll(collectionName);
+      // Paged (bound-corpus-scale-workflows tasks 1.1/1.3) rather than
+      // buffering the whole collection before processing any of it, and
+      // routed through the same canonical payload mapper and transactional,
+      // per-page-committed hydration `bootstrapFromQdrant` uses
+      // (`SqliteStore.hydrateBatch`) instead of a bespoke field-by-field
+      // reconstruction — the prior hand-rolled mapping here silently
+      // dropped `expires_at`, `review_due`, `access_count`, `last_operation`,
+      // and `derived_from` on every recovered record, and inserted each
+      // point in its own autocommit transaction (blocking, and able to
+      // split `memories`/`memories_fts` state on a crash mid-collection).
+      // Because each page's `hydrateBatch` call commits before the next
+      // page is requested, a process interrupted partway through a
+      // collection leaves every already-hydrated page's rows valid and
+      // searchable, and a later `repair` invocation simply skips them via
+      // `existingIds` rather than duplicating or corrupting them.
+      for await (const page of ctx.storage.qdrant.scrollAllPages(collectionName)) {
+        pageIndex++;
+        scannedPoints += page.points.length;
+
+        const toHydrate: Array<{ id: string; payload: Record<string, unknown> }> = [];
+        for (const point of page.points) {
+          const content = point.payload.content as string | undefined;
+          if (!content) {
+            skippedNoContent++;
+            continue;
+          }
+
+          const pointDeviceId = (point.payload.device_id as string) ?? null;
+          if (filterDeviceId && pointDeviceId !== filterDeviceId) {
+            skippedDeviceFilter++;
+            continue;
+          }
+
+          if (existingIds.has(point.id)) {
+            alreadyInSqlite++;
+            continue;
+          }
+
+          toHydrate.push(point);
+        }
+
+        if (dryRun) {
+          recoveredCount += toHydrate.length;
+        } else if (toHydrate.length > 0) {
+          const { hydrated, failures } = ctx.storage.sqlite.hydrateBatch(toHydrate, existingIds);
+          recoveredCount += hydrated;
+          for (const failure of failures) {
+            errors.push(`Failed to insert ${failure.id}: ${failure.error}`);
+          }
+          ctx.storage.sqlite.flushIfDirty();
+        }
+
+        ctx.logger.info({
+          event: 'repair_progress',
+          collection: collectionName,
+          page: pageIndex,
+          recovered_so_far: recoveredCount,
+          done: page.done,
+        });
+      }
     } catch (err) {
       errors.push(`Failed to scroll ${collectionName}: ${(err as Error).message}`);
       continue;
     }
-
-    scannedPoints += points.length;
-
-    for (const point of points) {
-      const payload = point.payload;
-      const content = payload.content as string | undefined;
-
-      if (!content) {
-        skippedNoContent++;
-        continue;
-      }
-
-      // Filter by device_id if specified
-      const pointDeviceId = (payload.device_id as string) ?? null;
-      if (filterDeviceId && pointDeviceId !== filterDeviceId) {
-        skippedDeviceFilter++;
-        continue;
-      }
-
-      // Check if already in SQLite
-      const existing = ctx.storage.sqlite.getMemoryById(point.id);
-      if (existing) {
-        alreadyInSqlite++;
-        continue;
-      }
-
-      if (dryRun) {
-        recoveredCount++;
-        continue;
-      }
-
-      // Reconstruct and insert into SQLite
-      const now = new Date().toISOString();
-      const namespace = (payload.namespace as string) ?? 'global';
-      const collection = (payload.collection as string) ?? 'general';
-
-      // Ensure the collection exists in SQLite
-      const colRecord = ctx.storage.sqlite.getCollection(namespace, collection);
-      if (!colRecord) {
-        ctx.storage.sqlite.createCollection(
-          namespace, collection,
-          ctx.embedding.model, ctx.embedding.dimensions,
-        );
-      }
-
-      // Use original device_id from payload, or fall back to local device_id
-      const recoveredDeviceId = pointDeviceId ?? localDeviceId;
-
-      const mem: Omit<MemoryRecord, 'embedding'> = {
-        id: point.id,
-        namespace,
-        collection,
-        type: (payload.type as MemoryRecord['type']) ?? 'semantic',
-        category: (payload.category as string) ?? null,
-        content,
-        summary: (payload.summary as string) ?? '',
-        tags: Array.isArray(payload.tags) ? payload.tags as string[] : [],
-        source: (payload.source as MemoryRecord['source']) ?? 'import',
-        checksum: computeChecksum(content),
-        importance: (payload.importance as number) ?? 0.5,
-        retention_tier: (payload.retention_tier as MemoryRecord['retention_tier']) ?? 'T2',
-        expires_at: null,
-        decay_eligible: (payload.decay_eligible as boolean) ?? true,
-        review_due: null,
-        access_count: 0,
-        last_operation: 'ADD',
-        merged_from: null,
-        archived: false,
-        vector_synced: true,
-        // Restore pin state from the recovered Qdrant payload rather than
-        // defaulting it to false, so `repair --mode from-qdrant` preserves
-        // it. See add-inject-pinning.
-        pinned: typeof payload.pinned === 'boolean' ? payload.pinned : false,
-        device_id: recoveredDeviceId,
-        // Carry forward whatever identity the recovered vector was already
-        // stamped with — this reconstructs a SQLite row from an existing
-        // Qdrant point, not a new embedding, so it must not claim the active
-        // configuration's identity. Missing on the payload means the point
-        // predates provenance stamping and stays "unknown" (null).
-        embedding_model: typeof payload.embedding_model === 'string' ? payload.embedding_model : null,
-        // Same recovery posture as `embedding_model` above: carry forward
-        // whatever content provenance the payload already carries rather
-        // than inventing new provenance for a reconstructed row. A missing
-        // or malformed field narrows to "unknown" (null / 1.0), mirroring
-        // `SqliteStore.upsertMemoryFromPayload`. See
-        // add-memory-provenance-metadata.
-        origin: payload.origin !== null && typeof payload.origin === 'object' && !Array.isArray(payload.origin)
-          ? payload.origin as MemoryRecord['origin']
-          : null,
-        confidence: typeof payload.confidence === 'number' ? payload.confidence : 1.0,
-        created_at: (payload.created_at as string) ?? now,
-        updated_at: now,
-        last_accessed: now,
-      };
-
-      try {
-        ctx.storage.sqlite.insertMemory(mem);
-        recoveredCount++;
-      } catch (err) {
-        errors.push(`Failed to insert ${point.id}: ${(err as Error).message}`);
-      }
-    }
   }
 
   if (recoveredCount > 0 && !dryRun) {
-    ctx.storage.sqlite.flushIfDirty();
     ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
   }
 

@@ -1,46 +1,16 @@
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
-import type { SearchMode, SearchResult, MemoryRecord, MemoryOrigin, MemoryType, RetentionTier, RecallFilter, ArchiveRecord } from '../domain/types.js';
+import type { SearchMode, SearchResult, MemoryRecord, RecallFilter, ArchiveRecord } from '../domain/types.js';
 import type { AccessUpdate } from '../storage/sqlite.js';
+import { mapQdrantPayloadToMemoryFields } from '../storage/payload-mapper.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
-import { embeddingUnavailable, internal } from '../errors/index.js';
+import { BrainError, embeddingUnavailable, internal } from '../errors/index.js';
 import { cosineSimilarity } from './similarity.js';
 import { buildVariants, type QueryExpansionProvider } from './query-expansion.js';
 import type { RerankProvider } from '../rerank/index.js';
-
-const RRF_K = 60;
-
-const MEMORY_TYPES: readonly MemoryType[] = ['episodic', 'semantic', 'procedural'];
-const RETENTION_TIERS: readonly RetentionTier[] = ['T0', 'T1', 'T2', 'T3'];
-
-// Narrowing helpers for the cross-device Qdrant fallback: the payload is
-// untrusted external data (a different device/version may have written it), so
-// every field is validated before it can reach a SearchResult rather than
-// asserted with an unchecked cast.
-function narrowString(value: unknown): string | undefined {
-  return typeof value === 'string' ? value : undefined;
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every(v => typeof v === 'string');
-}
-
-function isMemoryType(value: unknown): value is MemoryType {
-  return typeof value === 'string' && (MEMORY_TYPES as readonly string[]).includes(value);
-}
-
-function isRetentionTier(value: unknown): value is RetentionTier {
-  return typeof value === 'string' && (RETENTION_TIERS as readonly string[]).includes(value);
-}
-
-// A malformed/absent `origin` payload field narrows to `null` — "unknown",
-// not an error, matching `SqliteStore.parseOrigin`'s fail-soft posture. See
-// add-memory-provenance-metadata.
-function narrowOrigin(value: unknown): MemoryOrigin | null {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as MemoryOrigin : null;
-}
+import { fuseRankedResults, normalizeFulltextScores } from './fusion.js';
 
 // Maps a retained archive row into the SearchResult shape so `include_archived`
 // callers get a uniform result list. `archived_memories` keeps summary/tags/tier
@@ -65,15 +35,6 @@ function archiveRecordToSearchResult(record: ArchiveRecord): SearchResult {
     last_accessed: record.expired_at,
     archived: true,
   };
-}
-
-interface RankedItem {
-  id: string;
-  semanticRank?: number;
-  fulltextRank?: number;
-  semanticScore?: number;
-  fulltextScore?: number;
-  vector?: number[];
 }
 
 export class SearchService {
@@ -243,7 +204,7 @@ export class SearchService {
       }
     }
     return Array.from(merged.values())
-      .sort((a, b) => b.score - a.score)
+      .sort((a, b) => (b.score - a.score) || a.id.localeCompare(b.id))
       .slice(0, limit);
   }
 
@@ -314,7 +275,7 @@ export class SearchService {
 
       if (includeArchived) {
         const archivedMatches = this.storage.sqlite
-          .searchArchived(namespace, query, limit)
+          .searchArchived(namespace, query, this.config.search.archive_result_limit ?? 5)
           .map(archiveRecordToSearchResult);
         results = [...results, ...archivedMatches];
       }
@@ -350,7 +311,24 @@ export class SearchService {
     let variantCount: number;
     try {
       ({ vectors, variantCount } = await this.embedQueryVariants(query));
-    } catch {
+    } catch (err) {
+      // unify-llm-client-boundaries task 2.4 / design.md Decision #6:
+      // preserve the embedding provider's original classified error (code +
+      // retryability — e.g. a non-retryable 401 vs. a retryable rate limit)
+      // instead of always replacing it with a generic retryable
+      // EMBEDDING_UNAVAILABLE. Metered/logged here so the cause is visible
+      // even though semantic mode's contract is still to raise, not degrade.
+      if (err instanceof BrainError) {
+        this.metrics?.incCounter('search_embedding_degraded', 1, { namespace, mode: 'semantic' });
+        this.logger?.warn({
+          event: 'embedding_degraded',
+          mode: 'semantic',
+          code: err.code,
+          retryable: err.retryable,
+          message: err.message,
+        });
+        throw err;
+      }
       throw embeddingUnavailable('Cannot perform semantic search: embedding provider unavailable');
     }
 
@@ -392,9 +370,10 @@ export class SearchService {
     const ftsResults = filter
       ? this.storage.sqlite.fullTextSearch(namespace, query, limit, collection, filter)
       : this.storage.sqlite.fullTextSearch(namespace, query, limit, collection);
+    const normalizedScores = normalizeFulltextScores(ftsResults);
     return this.buildSearchResults(
-      ftsResults.map(r => {
-        const normalizedScore = Math.min(1, Math.abs(r.rank) / 10);
+      ftsResults.map((r, index) => {
+        const normalizedScore = normalizedScores[index]!;
         return {
           id: r.id,
           score: normalizedScore,
@@ -458,58 +437,27 @@ export class SearchService {
       // degradation observable instead of silent (dependency outages are signal in
       // this project). Semantic mode raises EMBEDDING_UNAVAILABLE; hybrid stays
       // graceful but emits a metric + warning so operators can see it.
+      // unify-llm-client-boundaries task 2.4: surface the original classified
+      // code/retryability (when available) alongside the message, so a
+      // degraded-fulltext-only search's telemetry still distinguishes e.g. a
+      // non-retryable auth failure from a transient rate limit.
       this.metrics?.incCounter('search_embedding_degraded', 1, { namespace });
       this.logger?.warn({
         event: 'embedding_degraded',
         degraded: 'fulltext_only',
+        code: err instanceof BrainError ? err.code : undefined,
+        retryable: err instanceof BrainError ? err.retryable : undefined,
         message: (err as Error).message,
       });
       if (signal) signal.degraded = true;
     }
 
-    // Build RRF fusion
-    const itemMap = new Map<string, RankedItem>();
+    // Pure RRF fusion (strengthen-verification-and-code-boundaries task
+    // 3.4) — see src/search/fusion.ts for the boundary/tie/empty-input tests
+    // this delegates to.
+    const fused = fuseRankedResults(semanticItems, fulltextItems, weights, limit);
 
-    semanticItems.forEach((item, idx) => {
-      const existing = itemMap.get(item.id) ?? { id: item.id };
-      existing.semanticRank = idx + 1;
-      existing.semanticScore = item.score;
-      existing.vector = item.vector;
-      itemMap.set(item.id, existing);
-    });
-
-    fulltextItems.forEach((item, idx) => {
-      const existing = itemMap.get(item.id) ?? { id: item.id };
-      existing.fulltextRank = idx + 1;
-      existing.fulltextScore = Math.min(1, Math.abs(item.rank) / 10);
-      itemMap.set(item.id, existing);
-    });
-
-    // Compute RRF scores
-    const scored = Array.from(itemMap.values()).map(item => {
-      const semanticRrf = item.semanticRank
-        ? weights.semantic / (RRF_K + item.semanticRank)
-        : 0;
-      const fulltextRrf = item.fulltextRank
-        ? weights.fulltext / (RRF_K + item.fulltextRank)
-        : 0;
-      return {
-        ...item,
-        rrfScore: semanticRrf + fulltextRrf,
-      };
-    });
-
-    scored.sort((a, b) => b.rrfScore - a.rrfScore);
-
-    return this.buildSearchResults(
-      scored.slice(0, limit).map(item => ({
-        id: item.id,
-        score: item.rrfScore,
-        semantic_score: item.semanticScore,
-        fulltext_score: item.fulltextScore,
-        vector: item.vector,
-      })),
-    );
+    return this.buildSearchResults(fused);
   }
 
   /**
@@ -598,7 +546,7 @@ export class SearchService {
           }
         }
         const value = lambda * relevance - (1 - lambda) * maxSim;
-        if (value > bestValue) {
+        if (value > bestValue || (value === bestValue && candidate.id.localeCompare(remaining[bestIdx]!.id) < 0)) {
           bestValue = value;
           bestIdx = i;
         }
@@ -615,9 +563,9 @@ export class SearchService {
   // of `results` (already composite/MMR-ranked) against `query`, replacing
   // `score` (never `semantic_score`, so `min_score` filtering stays
   // unaffected) for every candidate the provider actually scored, and
-  // re-sorts the *full* list by the resulting `score` descending. Candidates
-  // outside the pool, or omitted from a partial provider response, keep
-  // their pre-rerank `score` and no `rerank_score` — never dropped.
+  // re-sorts only the evaluated pool. Candidates outside the pool retain
+  // their existing relative order after it, because an LLM judgment and a
+  // composite score are different scales and must never compete numerically.
   //
   // Mirrors `hybridSearch`'s embedding-degradation shape
   // (`src/search/index.ts:345-357`): any provider failure (network error,
@@ -635,12 +583,20 @@ export class SearchService {
         query,
         pool.map(r => ({ id: r.id, text: r.content })),
       );
-      const rerankedPool = pool.map(r => {
+      const rerankedPool = pool.map((r, index) => {
         const score = scores.get(r.id);
-        if (score === undefined) return r;
-        return { ...r, score, rerank_score: score };
+        return { result: score === undefined ? r : { ...r, score, rerank_score: score }, index };
       });
-      return [...rerankedPool, ...rest].sort((a, b) => b.score - a.score);
+      rerankedPool.sort((a, b) => {
+        const aScored = a.result.rerank_score !== undefined;
+        const bScored = b.result.rerank_score !== undefined;
+        if (aScored !== bScored) return aScored ? -1 : 1;
+        if (aScored && bScored) {
+          return (b.result.rerank_score! - a.result.rerank_score!) || a.result.id.localeCompare(b.result.id);
+        }
+        return a.index - b.index;
+      });
+      return [...rerankedPool.map(item => item.result), ...rest];
     } catch (err) {
       this.metrics?.incCounter('search_rerank_degraded');
       this.logger?.warn({
@@ -705,7 +661,7 @@ export class SearchService {
     // (a lower-relevance, high-importance/high-access/fresh memory can now
     // outrank a higher-relevance stale one), so results must be re-sorted here
     // rather than trusting the order the mode implementations produced.
-    searchResults.sort((a, b) => b.score - a.score);
+    searchResults.sort((a, b) => (b.score - a.score) || a.id.localeCompare(b.id));
 
     if (accessUpdates.length > 0) {
       this.storage.sqlite.recordAccessBatch(accessUpdates);
@@ -715,35 +671,38 @@ export class SearchService {
     return searchResults;
   }
 
-  // Validates/narrows an untrusted Qdrant payload before constructing a
-  // SearchResult for the cross-device fallback branch (a ranked id present in
-  // Qdrant but with no local SQLite row). `content` has no safe default — a
-  // payload missing it is treated as unusable and dropped. Every other field
-  // falls back to the same defaults the previous unchecked-cast code used.
+  // Builds a SearchResult for the cross-device fallback branch (a ranked id
+  // present in Qdrant but with no local SQLite row) from the same canonical
+  // payload mapper hydration/repair use (strengthen-verification-and-code-
+  // boundaries tasks 3.1/3.2) — projecting only the fields SearchResult
+  // needs. `content` has no safe default: a payload the mapper couldn't
+  // recover any content from is unusable here and dropped, unlike
+  // hydration/repair, which still insert a degraded row.
   private buildResultFromQdrantPayload(
     item: { id: string; score: number; semantic_score?: number; fulltext_score?: number },
     payload: Record<string, unknown>,
     nowIso: string,
   ): SearchResult | null {
-    const content = narrowString(payload.content);
-    if (content === undefined) return null;
+    const mem = mapQdrantPayloadToMemoryFields(payload, nowIso);
+    if (mem.content === undefined) return null;
+    if (this.lifecycle.isExpired(mem.expires_at, new Date(nowIso))) return null;
     return {
       id: item.id,
-      content,
-      summary: narrowString(payload.summary) ?? '',
-      type: isMemoryType(payload.type) ? payload.type : 'semantic',
-      tags: isStringArray(payload.tags) ? payload.tags : [],
+      content: mem.content,
+      summary: mem.summary,
+      type: mem.type,
+      tags: mem.tags,
       score: item.score,
       semantic_score: item.semantic_score,
       fulltext_score: item.fulltext_score,
-      retention_tier: isRetentionTier(payload.retention_tier) ? payload.retention_tier : 'T2',
-      expires_at: null,
-      expiring_soon: false,
-      device_id: narrowString(payload.device_id) ?? null,
-      created_at: narrowString(payload.created_at) ?? nowIso,
+      retention_tier: mem.retention_tier,
+      expires_at: mem.expires_at,
+      expiring_soon: this.lifecycle.isExpiringSoon(mem.expires_at, new Date(nowIso)),
+      device_id: mem.device_id,
+      created_at: mem.created_at,
       last_accessed: nowIso,
-      origin: narrowOrigin(payload.origin),
-      confidence: typeof payload.confidence === 'number' ? payload.confidence : 1.0,
+      origin: mem.origin,
+      confidence: mem.confidence,
     };
   }
 

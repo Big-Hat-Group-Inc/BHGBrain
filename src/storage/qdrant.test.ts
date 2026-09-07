@@ -17,20 +17,35 @@ type MockClient = {
   createPayloadIndex?: Mock<QdrantClient['createPayloadIndex']>;
   upsert?: Mock<QdrantClient['upsert']>;
   deleteCollection?: Mock<QdrantClient['deleteCollection']>;
+  scroll?: Mock<QdrantClient['scroll']>;
+  delete?: Mock<QdrantClient['delete']>;
 };
 
 function createStore(
   client: MockClient,
-  options?: { breaker?: CircuitBreaker; logger?: { warn: Mock } },
+  options?: {
+    breaker?: CircuitBreaker;
+    logger?: { warn: Mock; info?: Mock };
+    metrics?: { setGauge: Mock; incCounter: Mock };
+    fanout?: { max_collections: number; concurrency: number; per_target_limit?: number };
+  },
 ): QdrantStore {
   const config = {
     embedding: { dimensions: 3 },
-    qdrant: { mode: 'embedded' },
+    qdrant: {
+      mode: 'embedded',
+      operation_timeout_ms: 10_000,
+      health_timeout_ms: 3_000,
+      fanout: { per_target_limit: 50, ...(options?.fanout ?? { max_collections: 25, concurrency: 5 }) },
+    },
     defaults: { namespace: 'global', collection: 'general' },
   } as unknown as BrainConfig;
-  const store = new QdrantStore(config, options?.breaker, options?.logger);
-  // Inject the mock transport (no breaker -> executeWithBreaker calls through).
-  (store as unknown as { client: MockClient }).client = client;
+  const store = new QdrantStore(config, options?.breaker, options?.logger, options?.metrics as never);
+  // Inject the mock transport for both the operational and health clients (no
+  // breaker -> executeWithBreaker calls through). Tests that need to exercise
+  // the two clients independently override `healthClient` again afterward.
+  (store as unknown as { client: MockClient; healthClient: MockClient }).client = client;
+  (store as unknown as { client: MockClient; healthClient: MockClient }).healthClient = client;
   return store;
 }
 
@@ -106,6 +121,98 @@ describe('QdrantStore.search collection fan-out', () => {
     const store = createStore(client);
     const results = await store.search('global', 'work', [1, 2, 3], 10);
     expect(results).toEqual([{ id: 'w1', score: 0.9, payload: { namespace: 'global' } }]);
+  });
+});
+
+// bound-qdrant-http-runtime task 1.4: collectionless search caps how many
+// collections it fans out to and how many of those run concurrently.
+describe('QdrantStore.search bounded fan-out (bound-qdrant-http-runtime)', () => {
+  it('never runs more than `fanout.concurrency` queries in flight at once', async () => {
+    const collectionCount = 9;
+    const collections = Array.from({ length: collectionCount }, (_, i) => ({ name: `bhgbrain_global_c${i}` }));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(async () => ({ collections })),
+      query: vi.fn<QdrantClient['query']>(async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise(resolve => setTimeout(resolve, 5));
+        inFlight--;
+        return { points: [] };
+      }),
+    };
+    const store = createStore(client, { fanout: { max_collections: 25, concurrency: 3 } });
+
+    await store.search('global', undefined, [1, 2, 3], 10);
+
+    expect(client.query).toHaveBeenCalledTimes(collectionCount);
+    expect(maxInFlight).toBeLessThanOrEqual(3);
+  });
+
+  it('deterministically truncates the target list beyond max_collections and reports the width', async () => {
+    const collections = Array.from({ length: 8 }, (_, i) => ({ name: `bhgbrain_global_c${i}` }));
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(async () => ({ collections })),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const setGauge = vi.fn();
+    const incCounter = vi.fn();
+    const warn = vi.fn();
+    const store = createStore(client, {
+      fanout: { max_collections: 3, concurrency: 5 },
+      metrics: { setGauge, incCounter },
+      logger: { warn },
+    });
+
+    await store.search('global', undefined, [1, 2, 3], 10);
+
+    expect(client.query).toHaveBeenCalledTimes(3);
+    expect(setGauge).toHaveBeenCalledWith('bhgbrain_qdrant_fanout_width', 3);
+    expect(incCounter).toHaveBeenCalledWith('bhgbrain_qdrant_fanout_truncated_total');
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'qdrant_fanout_truncated' }));
+  });
+
+  it('clamps the per-collection query limit to fanout.per_target_limit while fanning out, but not for a single-collection search', async () => {
+    const collections = [{ name: 'bhgbrain_global_a' }, { name: 'bhgbrain_global_b' }];
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(async () => ({ collections })),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const store = createStore(client, { fanout: { max_collections: 25, concurrency: 5, per_target_limit: 4 } });
+
+    await store.search('global', undefined, [1, 2, 3], 100);
+
+    for (const call of client.query.mock.calls) {
+      expect((call[1] as { limit: number }).limit).toBe(4);
+    }
+
+    // A single explicit collection keeps the caller's full limit.
+    const singleClient: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const singleStore = createStore(singleClient, { fanout: { max_collections: 25, concurrency: 5, per_target_limit: 4 } });
+    await singleStore.search('global', 'work', [1, 2, 3], 100);
+    expect((singleClient.query.mock.calls[0]![1] as { limit: number }).limit).toBe(100);
+  });
+
+  it('does not truncate or report fanout metrics for a single-collection search', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => ({ points: [] })),
+    };
+    const setGauge = vi.fn();
+    const incCounter = vi.fn();
+    const store = createStore(client, {
+      fanout: { max_collections: 1, concurrency: 1 },
+      metrics: { setGauge, incCounter },
+    });
+
+    await store.search('global', 'work', [1, 2, 3], 10);
+
+    expect(setGauge).not.toHaveBeenCalled();
+    expect(incCounter).not.toHaveBeenCalled();
   });
 });
 
@@ -662,13 +769,13 @@ describe('QdrantStore ensured-collection memoization (cut-embedding-and-qdrant-r
 
     await store.upsert('global', 'general', 'id-1', [1, 2, 3], { content: 'a' });
     expect(getCollection).toHaveBeenCalledTimes(1);
-    expect(createPayloadIndex).toHaveBeenCalledTimes(2); // device_id + created_at (collection already existed)
+    expect(createPayloadIndex).toHaveBeenCalledTimes(8); // every filterable field (collection already existed)
 
     await store.upsert('global', 'general', 'id-2', [4, 5, 6], { content: 'b' });
 
     // No further ensure round trips against the now-warm collection.
     expect(getCollection).toHaveBeenCalledTimes(1);
-    expect(createPayloadIndex).toHaveBeenCalledTimes(2);
+    expect(createPayloadIndex).toHaveBeenCalledTimes(8);
     expect(upsert).toHaveBeenCalledTimes(2);
   });
 
@@ -888,4 +995,344 @@ describe('QdrantStore.healthCheck', () => {
 
     await expect(store.healthCheck()).resolves.toBe(true);
   });
+
+  // bound-qdrant-http-runtime task 1.3: only a confirmed missing collection
+  // (a message that actually names what's missing) is idempotent — a bare
+  // 404 from every endpoint on the route (wrong path, an ingress/proxy's own
+  // error page) must surface as a real failure so health reports unhealthy
+  // rather than "empty collection, all good".
+  it('reports unhealthy (throws) on a route-wide 404 that does not name a missing collection', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(async () => {
+        const err = new Error(
+          'Unexpected Response: 404 (Not Found)\nRaw response content:\n<html><body>404 page not found</body></html>',
+        );
+        throw err;
+      }),
+    };
+    const store = createStore(client);
+
+    await expect(store.healthCheck()).rejects.toThrow('404');
+  });
+
+  // bound-qdrant-http-runtime task 1.1/2.1: the health probe uses its own
+  // client instance (constructed with `qdrant.health_timeout_ms`), never the
+  // operational `client`, and never routes through the breaker.
+  it('probes through a dedicated health client, independent of the operational client and breaker', async () => {
+    const operationalQuery = vi.fn<QdrantClient['query']>(async () => {
+      throw new Error('operational client must not be used by healthCheck');
+    });
+    const healthQuery = vi.fn<QdrantClient['query']>(async () => ({ points: [] }));
+    const breaker = new CircuitBreaker({ failureThreshold: 1, openWindowMs: 60_000, halfOpenProbeCount: 1 });
+    const store = createStore(
+      { getCollections: vi.fn<QdrantClient['getCollections']>(), query: operationalQuery },
+      { breaker },
+    );
+    (store as unknown as { healthClient: MockClient }).healthClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: healthQuery,
+    };
+
+    await expect(store.healthCheck()).resolves.toBe(true);
+    expect(healthQuery).toHaveBeenCalledTimes(1);
+    expect(operationalQuery).not.toHaveBeenCalled();
+    // The breaker never saw a call from healthCheck, so it stays closed even
+    // though the operational client (unused here) would have failed.
+    expect(breaker.getState()).toBe('closed');
+  });
+});
+
+// bound-corpus-scale-workflows task 1.1: paged iterator with payload
+// projection, optional vectors, stable cursors, and cancellation.
+describe('QdrantStore.scrollAllPages', () => {
+  function makeScrollMock(pages: Array<{ points: Array<{ id: string; payload?: Record<string, unknown> }>; next?: string }>) {
+    let call = 0;
+    return vi.fn<QdrantClient['scroll']>(async () => {
+      const page = pages[call]!;
+      call++;
+      return {
+        points: page.points.map(p => ({ id: p.id, payload: p.payload ?? {}, version: 0 })),
+        next_page_offset: page.next,
+      } as never;
+    });
+  }
+
+  it('requests only the projected payload fields when payloadFields is given, and the full payload when omitted', async () => {
+    const scroll = makeScrollMock([{ points: [{ id: 'p1' }] }]);
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query: vi.fn<QdrantClient['query']>(), scroll };
+    const store = createStore(client);
+
+    for await (const _page of store.scrollAllPages('bhgbrain_global_general', { payloadFields: ['checksum', 'device_id'] })) { /* drain */ }
+
+    expect(scroll.mock.calls[0]![1]).toEqual(expect.objectContaining({ with_payload: ['checksum', 'device_id'] }));
+  });
+
+  it('requests the full payload (with_payload: true) when no projection is given', async () => {
+    const scroll = makeScrollMock([{ points: [{ id: 'p1' }] }]);
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query: vi.fn<QdrantClient['query']>(), scroll };
+    const store = createStore(client);
+
+    for await (const _page of store.scrollAllPages('bhgbrain_global_general')) { /* drain */ }
+
+    expect(scroll.mock.calls[0]![1]).toEqual(expect.objectContaining({ with_payload: true }));
+  });
+
+  it('yields one page at a time (never accumulates the whole collection) and threads next_page_offset as the resumption cursor', async () => {
+    const scroll = makeScrollMock([
+      { points: [{ id: 'p1' }, { id: 'p2' }], next: 'cursor-1' },
+      { points: [{ id: 'p3' }], next: undefined },
+    ]);
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query: vi.fn<QdrantClient['query']>(), scroll };
+    const store = createStore(client);
+
+    const pages: Array<{ points: unknown[]; cursor: string | number | null; done: boolean }> = [];
+    for await (const page of store.scrollAllPages('bhgbrain_global_general', { batchSize: 2 })) {
+      pages.push(page);
+    }
+
+    expect(pages).toHaveLength(2);
+    // First page carries only its own 2 points -- peak retained data per
+    // yield stays bounded near one page, not the whole (3-point) collection.
+    expect(pages[0]!.points).toHaveLength(2);
+    expect(pages[0]!.cursor).toBe('cursor-1');
+    expect(pages[0]!.done).toBe(false);
+    expect(pages[1]!.points).toHaveLength(1);
+    expect(pages[1]!.cursor).toBeNull();
+    expect(pages[1]!.done).toBe(true);
+    // The second server call resumed from the first call's cursor.
+    expect(scroll.mock.calls[1]![1]).toEqual(expect.objectContaining({ offset: 'cursor-1' }));
+  });
+
+  it('resumes from an explicit starting cursor when one is passed in', async () => {
+    const scroll = makeScrollMock([{ points: [{ id: 'p3' }] }]);
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query: vi.fn<QdrantClient['query']>(), scroll };
+    const store = createStore(client);
+
+    for await (const _page of store.scrollAllPages('bhgbrain_global_general', { cursor: 'cursor-1' })) { /* drain */ }
+
+    expect(scroll.mock.calls[0]![1]).toEqual(expect.objectContaining({ offset: 'cursor-1' }));
+  });
+
+  it('stops paging once isCancelled reports true, without requesting a further page', async () => {
+    const scroll = makeScrollMock([
+      { points: [{ id: 'p1' }], next: 'cursor-1' },
+      { points: [{ id: 'p2' }], next: 'cursor-2' },
+      { points: [{ id: 'p3' }], next: undefined },
+    ]);
+    const client: MockClient = { getCollections: vi.fn<QdrantClient['getCollections']>(), query: vi.fn<QdrantClient['query']>(), scroll };
+    const store = createStore(client);
+
+    let calls = 0;
+    const pages: Array<{ points: unknown[]; cancelled: boolean; done: boolean }> = [];
+    for await (const page of store.scrollAllPages('bhgbrain_global_general', { isCancelled: () => calls >= 1 })) {
+      calls++;
+      pages.push(page);
+    }
+
+    // First page fetched normally; isCancelled trips before a second server call.
+    expect(scroll).toHaveBeenCalledTimes(1);
+    expect(pages).toHaveLength(2);
+    expect(pages[0]!.cancelled).toBe(false);
+    expect(pages[1]!).toEqual({ points: [], cursor: 'cursor-1', done: false, cancelled: true });
+  });
+
+  it('scrollCollectionPages resolves the namespace/collection to the internal name and yields nothing for a never-written collection', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      scroll: vi.fn<QdrantClient['scroll']>(async () => {
+        const err = new Error('Collection `bhgbrain_global_work` doesn\'t exist!') as Error & { status?: number };
+        err.status = 404;
+        throw err;
+      }),
+    };
+    const store = createStore(client);
+
+    const pages: unknown[] = [];
+    for await (const page of store.scrollCollectionPages('global', 'work')) {
+      pages.push(page);
+    }
+
+    expect(pages).toEqual([]);
+  });
+
+  it('scrollCollectionPages propagates a genuine transport failure instead of silently yielding nothing', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      scroll: vi.fn<QdrantClient['scroll']>(async () => { throw new Error('transport failure'); }),
+    };
+    const store = createStore(client);
+
+    const drain = async () => {
+      for await (const _page of store.scrollCollectionPages('global', 'work')) { /* drain */ }
+    };
+    await expect(drain()).rejects.toThrow('transport failure');
+  });
+});
+
+// bound-qdrant-http-runtime task 1.2: every operational method — cleanup
+// (deleteMany), list (listAllCollections), scroll (scrollAllPages), collection
+// info/delete, and snapshot creation — now contributes to the shared breaker,
+// not just upsert/updatePayload/delete/compact/search.
+describe('QdrantStore operational breaker coverage (bound-qdrant-http-runtime task 1.2)', () => {
+  function failingBreaker(): CircuitBreaker {
+    return new CircuitBreaker({ failureThreshold: 1, openWindowMs: 60_000, halfOpenProbeCount: 1 });
+  }
+
+  it('deleteMany opens the breaker on failure and short-circuits the next call', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      delete: vi.fn(async () => { throw new Error('transport failure'); }),
+    };
+    const breaker = failingBreaker();
+    const store = createStore(client, { breaker });
+
+    await expect(store.deleteMany('global', 'work', ['a'])).rejects.toThrow('transport failure');
+    expect(breaker.getState()).toBe('open');
+    await expect(store.deleteMany('global', 'work', ['b'])).rejects.toThrow('Qdrant circuit breaker is open');
+    expect(client.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('listAllCollections opens the breaker on failure and short-circuits the next call', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(async () => { throw new Error('transport failure'); }),
+      query: vi.fn<QdrantClient['query']>(),
+    };
+    const breaker = failingBreaker();
+    const store = createStore(client, { breaker });
+
+    await expect(store.listAllCollections()).rejects.toThrow('transport failure');
+    expect(breaker.getState()).toBe('open');
+    await expect(store.listAllCollections()).rejects.toThrow('Qdrant circuit breaker is open');
+    expect(client.getCollections).toHaveBeenCalledTimes(1);
+  });
+
+  it('scrollAllPages opens the breaker on failure and short-circuits the next call', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      scroll: vi.fn<QdrantClient['scroll']>(async () => { throw new Error('transport failure'); }),
+    };
+    const breaker = failingBreaker();
+    const store = createStore(client, { breaker });
+
+    const drainFirst = async () => {
+      for await (const _page of store.scrollAllPages('bhgbrain_global_work')) { /* drain */ }
+    };
+    await expect(drainFirst()).rejects.toThrow('transport failure');
+    expect(breaker.getState()).toBe('open');
+
+    const drainSecond = async () => {
+      for await (const _page of store.scrollAllPages('bhgbrain_global_work')) { /* drain */ }
+    };
+    await expect(drainSecond()).rejects.toThrow('Qdrant circuit breaker is open');
+    expect(client.scroll).toHaveBeenCalledTimes(1);
+  });
+
+  it('getCollectionInfo opens the breaker on a genuine failure but returns null (not an open circuit) for a confirmed missing collection', async () => {
+    const notFound: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => {
+        const err = new Error('Collection `bhgbrain_global_work` doesn\'t exist!') as Error & { status?: number };
+        err.status = 404;
+        throw err;
+      }),
+    };
+    const store = createStore(notFound);
+    await expect(store.getCollectionInfo('global', 'work')).resolves.toBeNull();
+
+    const failing: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      getCollection: vi.fn<QdrantClient['getCollection']>(async () => { throw new Error('transport failure'); }),
+    };
+    const breaker = failingBreaker();
+    const failingStore = createStore(failing, { breaker });
+    await expect(failingStore.getCollectionInfo('global', 'work')).rejects.toThrow('transport failure');
+    expect(breaker.getState()).toBe('open');
+  });
+
+  it('deleteCollection opens the breaker on a genuine failure and short-circuits the next call', async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      deleteCollection: vi.fn(async () => { throw new Error('transport failure'); }),
+    };
+    const breaker = failingBreaker();
+    const store = createStore(client, { breaker });
+
+    await expect(store.deleteCollection('global', 'work')).rejects.toThrow('transport failure');
+    expect(breaker.getState()).toBe('open');
+    await expect(store.deleteCollection('global', 'work')).rejects.toThrow('Qdrant circuit breaker is open');
+  });
+});
+
+// bound-qdrant-http-runtime task 1.1: a stalled (accepts the connection, never
+// responds) endpoint must abort within the configured client-side deadline —
+// exercised against a real HTTP server and a real QdrantStore/QdrantClient,
+// not a mock, since the abort behavior lives in the client's own transport
+// layer (AbortController wired to the constructor's `timeout` option).
+describe('QdrantStore operational/health timeouts against a stalled endpoint (bound-qdrant-http-runtime task 1.1)', () => {
+  async function withStalledServer<T>(fn: (url: string) => Promise<T>): Promise<T> {
+    const { createServer } = await import('node:http');
+    const server = createServer(() => { /* never respond — connection stays open */ });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+    try {
+      return await fn(`http://127.0.0.1:${port}`);
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  }
+
+  it('aborts an operational call within qdrant.operation_timeout_ms', async () => {
+    await withStalledServer(async (url) => {
+      const config = {
+        embedding: { dimensions: 3 },
+        qdrant: {
+          mode: 'external',
+          external_url: url,
+          api_key_env: null,
+          operation_timeout_ms: 250,
+          health_timeout_ms: 150,
+          fanout: { max_collections: 25, concurrency: 5, per_target_limit: 50 },
+        },
+        defaults: { namespace: 'global', collection: 'general' },
+      } as unknown as BrainConfig;
+      const store = new QdrantStore(config);
+
+      const start = Date.now();
+      await expect(store.listAllCollections()).rejects.toThrow();
+      expect(Date.now() - start).toBeLessThan(2000);
+    });
+  }, 10_000);
+
+  it('aborts the health probe within the shorter qdrant.health_timeout_ms', async () => {
+    await withStalledServer(async (url) => {
+      const config = {
+        embedding: { dimensions: 3 },
+        qdrant: {
+          mode: 'external',
+          external_url: url,
+          api_key_env: null,
+          operation_timeout_ms: 5000,
+          health_timeout_ms: 150,
+          fanout: { max_collections: 25, concurrency: 5, per_target_limit: 50 },
+        },
+        defaults: { namespace: 'global', collection: 'general' },
+      } as unknown as BrainConfig;
+      const store = new QdrantStore(config);
+
+      const start = Date.now();
+      await expect(store.healthCheck()).rejects.toThrow();
+      // Bounded by the short health timeout, not the much longer operation timeout.
+      expect(Date.now() - start).toBeLessThan(2000);
+    });
+  }, 10_000);
 });

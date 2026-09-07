@@ -139,10 +139,14 @@ BHGBrain **requires an external Qdrant instance**. Even in the default `embedded
 ### Option A: Docker (recommended)
 
 ```bash
+# Loopback-only publish: Qdrant has no authentication of its own, so binding
+# to every interface (-p 6333:6333) would serve your stored vectors/payloads
+# to the whole LAN. Widen only behind your own authenticated reverse
+# proxy/firewall.
 docker run -d \
   --name qdrant \
   --restart unless-stopped \
-  -p 6333:6333 \
+  -p 127.0.0.1:6333:6333 \
   -v qdrant_storage:/qdrant/storage \
   qdrant/qdrant
 ```
@@ -161,8 +165,11 @@ services:
   qdrant:
     image: qdrant/qdrant
     restart: unless-stopped
+    # Loopback-only: Qdrant has no authentication of its own, so binding to
+    # every interface would serve your stored vectors/payloads to the whole
+    # LAN. Widen only behind your own authenticated reverse proxy/firewall.
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
 
@@ -253,6 +260,25 @@ The file is created automatically on first run with all defaults applied. Edit i
     "id": null
   },
 
+  // Shared OpenAI-compatible chat/embedding request boundary: one base URL
+  // and retry envelope every migrated feature (extraction, reranking,
+  // summarization, query expansion, contradiction detection, distillation,
+  // and OpenAI embeddings — Azure embeddings keep their derived per-resource
+  // endpoint) resolves through, instead of each hardcoding
+  // "https://api.openai.com/v1" and its own retry logic. Point base_url at
+  // a validated OpenAI-compatible gateway to route every one of those
+  // features through it at once. See "Outbound AI Request Policy" below.
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 200,
+      // Caps both the exponential backoff envelope and a provider's
+      // Retry-After guidance.
+      "max_backoff_ms": 2000
+    }
+  },
+
   // Embedding provider configuration
   "embedding": {
     // Provider: "openai" or "azure-foundry"
@@ -267,12 +293,16 @@ The file is created automatically on first run with all defaults applied. Edit i
     "dimensions": 1536,
     // Request timeout in milliseconds
     "request_timeout_ms": 30000,
-    // Maximum inputs per embedding request (chunking threshold)
+    // Maximum inputs per embedding request (chunking threshold). Honored by
+    // both providers — every embedding request (OpenAI included) is split
+    // into batches of at most this many inputs and reassembled in order.
     "max_batch_inputs": 2048,
     // Retry configuration for transient failures
     "retry": {
       "max_attempts": 3,
-      "backoff_ms": 1000
+      "backoff_ms": 1000,
+      // Caps the exponential backoff envelope, same role as llm.retry.max_backoff_ms above.
+      "max_backoff_ms": 10000
     },
     // Every vector is stamped with a provider-qualified identity
     // (`<provider>/<model>@<dimensions>`) at write time. If the store's
@@ -305,7 +335,27 @@ The file is created automatically on first run with all defaults applied. Edit i
     // External Qdrant URL (used when mode = "external")
     "external_url": null,
     // Env var name containing the Qdrant API key (used when mode = "external")
-    "api_key_env": null
+    "api_key_env": null,
+    // Client-side (AbortController-based) deadline for every request-path,
+    // cleanup, scan, and administrative Qdrant call — all routed through the
+    // shared circuit breaker. The upstream client's own default is 300000ms.
+    "operation_timeout_ms": 10000,
+    // Separate, intentionally shorter deadline used only by the health probe
+    // (its own dedicated client instance, never routed through the breaker).
+    // Must not exceed operation_timeout_ms.
+    "health_timeout_ms": 3000,
+    // Bounds for a collectionless (namespace-wide) search/recall query's
+    // fan-out across every collection in the namespace.
+    "fanout": {
+      // Target collections beyond this count are deterministically truncated.
+      "max_collections": 25,
+      // How many of those target collections are queried concurrently.
+      "concurrency": 5,
+      // Per-collection result cap applied only while genuinely fanning out
+      // (more than one target); a single explicit `collection` search always
+      // uses the caller's full `limit`.
+      "per_target_limit": 50
+    }
   },
 
   // Transport configuration
@@ -329,7 +379,18 @@ The file is created automatically on first run with all defaults applied. Edit i
       "headers_timeout_ms": 66000,
       // Time allowed to fully receive a request; does not bound long-lived
       // SSE responses on GET /mcp, which only receive a request, not send one.
-      "request_timeout_ms": 300000
+      "request_timeout_ms": 300000,
+      // Bounds the in-memory MCP HTTP session registry (see "MCP Session
+      // Lifecycle" under Health & Metrics).
+      "mcp_session": {
+        // A session with no request this long is closed automatically.
+        "idle_timeout_ms": 1800000,
+        // Hard cap on resident sessions; a new session at capacity evicts
+        // the least-recently-active one to make room.
+        "max_sessions": 1000,
+        // How often the independent idle-session sweep runs.
+        "sweep_interval_ms": 60000
+      }
     },
     "stdio": {
       // Enable MCP stdio transport
@@ -354,6 +415,18 @@ The file is created automatically on first run with all defaults applied. Edit i
     // Per-namespace cap on memories with pinned: true (see remember/tag and
     // memory://inject docs)
     "pin_limit_per_namespace": 20
+  },
+
+  // Backup *file* retention (distinct from memory-level `retention` below)
+  "backup": {
+    "retention": {
+      // Keep at most this many backups; the oldest beyond this count are
+      // pruned after every successful `backup create`. null disables this bound.
+      "max_count": 30,
+      // Prune backups older than this many days, regardless of count.
+      // null disables this bound.
+      "max_age_days": 90
+    }
   },
 
   // Memory retention and lifecycle settings
@@ -446,7 +519,15 @@ The file is created automatically on first run with all defaults applied. Edit i
       "max_cluster_size": 20,
 
       // Upper bound on clusters distilled (LLM calls made) per scheduled tick.
-      "max_clusters_per_run": 10
+      "max_clusters_per_run": 10,
+
+      // Timeout for the per-cluster distillation LLM call, enforced via the
+      // shared request executor's AbortController (see "Outbound AI Request
+      // Policy" below). Higher than the cheap-model defaults
+      // (pipeline.extraction_timeout_ms/summarization_timeout_ms) since a
+      // distillation prompt bundles a whole cluster's memory contents.
+      // Bounds worst-case latency of one scheduled tick's per-cluster calls.
+      "llm_timeout_ms": 10000
     }
   },
 
@@ -486,6 +567,9 @@ The file is created automatically on first run with all defaults applied. Edit i
 
   // Search configuration
   "search": {
+    // Active results use the caller's limit. When include_archived is true,
+    // matching archive summaries are appended under this separate cap.
+    "archive_result_limit": 5,
     // Weights used for Reciprocal Rank Fusion (RRF) in hybrid mode
     // Must sum to 1.0
     "hybrid_weights": {
@@ -573,11 +657,16 @@ The file is created automatically on first run with all defaults applied. Edit i
     "log_redaction": true,
     // Max requests per minute per client IP for HTTP transport
     "rate_limit_rpm": 100,
+    // Hard cap on the rate limiter's client-bucket map (see Rate Limiting).
+    "rate_limit_max_buckets": 10000,
     // Maximum HTTP request body size in bytes
     "max_request_size_bytes": 1048576,
     // Express "trust proxy" setting. false (default) = req.ip is the direct
-    // socket peer (loopback-accurate); true = honor X-Forwarded-For from the
-    // reverse proxy in front of the server. Only enable behind a trusted proxy.
+    // socket peer (loopback-accurate). A positive integer = trust exactly
+    // that many reverse-proxy hops (req.ip honors X-Forwarded-For from the
+    // right-most untrusted entry). An array of strings = trust only hops
+    // matching those IPs/subnets. The legacy boolean true ("trust every
+    // hop") is no longer accepted — see Proxy Trust.
     "trust_proxy": false
   },
 
@@ -653,7 +742,9 @@ The file is created automatically on first run with all defaults applied. Edit i
     "summarization_model": "gpt-4o-mini",
     // Env var name for the summarization model API key. Defaults to the same
     // variable as extraction_model_env (both are cheap-model write-path calls
-    // against the same OpenAI account) — point it elsewhere for a separate key.
+    // against the same OpenAI account) — point it elsewhere for a separate
+    // key. Like extraction_model_env, falls back to OPENAI_API_KEY when
+    // unset.
     "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
     // Summarization request timeout in milliseconds, enforced via AbortController
     "summarization_timeout_ms": 3000,
@@ -692,7 +783,7 @@ The file is created automatically on first run with all defaults applied. Edit i
 | `BHGBRAIN_TOKEN` | Required for non-loopback HTTP | — | Bearer token for HTTP authentication. Server **refuses to start** if the host is non-loopback and this is unset (unless `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Required for Qdrant Cloud | — | Set `qdrant.api_key_env` in config to the name of this variable. The default config field name is `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | No | Auto-generated from hostname | Override the device identifier for multi-device setups. See [Device Identity Resolution](#device-identity-resolution). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model, used when `pipeline.extraction_enabled` is `true`. Also the default value of `pipeline.summarization_model_env` (used when `pipeline.summarization_enabled` is `true`) — point that field at a different variable if you want a separate key for summarization. Also read by multi-query expansion's LLM paraphrase/HyDE phase (`search.query_expansion.llm_paraphrase.enabled`, see [Multi-Query Expansion](#multi-query-expansion)), which resolves the key from `pipeline.extraction_model_env` the same way, falling back to `OPENAI_API_KEY` when unset. |
+| `BHGBRAIN_EXTRACTION_API_KEY` | No | Falls back to `OPENAI_API_KEY` | API key for the LLM extraction model, used when `pipeline.extraction_enabled` is `true`. Also the default value of `pipeline.summarization_model_env` (used when `pipeline.summarization_enabled` is `true`) — point that field at a different variable if you want a separate key for summarization; whichever variable `summarization_model_env` names, it falls back to `OPENAI_API_KEY` the same way `extraction_model_env` does. Also read by multi-query expansion's LLM paraphrase/HyDE phase (`search.query_expansion.llm_paraphrase.enabled`, see [Multi-Query Expansion](#multi-query-expansion)) and contradiction detection (`pipeline.contradiction_detection.enabled`, see [Deduplication](#deduplication)), both of which resolve the key from `pipeline.extraction_model_env` the same way, falling back to `OPENAI_API_KEY` when unset. |
 | `BHGBRAIN_RERANK_API_KEY` | No | — (**no** fallback to `OPENAI_API_KEY`) | API key for the opt-in `recall` rerank stage, used when `search.rerank.enabled` is `true`. Unlike `BHGBRAIN_EXTRACTION_API_KEY`, this has no implicit fallback — enabling reranking is a deliberate, separately-keyed opt-in that never silently consumes the embedding or extraction key/budget. See [Rerank](#rerank). |
 
 Generate a secure bearer token:
@@ -745,7 +836,9 @@ The server listens at `http://127.0.0.1:3721` by default. Available HTTP endpoin
 
 | Endpoint | Auth Required | Description |
 |---|---|---|
-| `GET /health` | No | Health check (unauthenticated for probe compatibility) |
+| `GET /health/live` | No | Liveness: terse, no dependency I/O — safe to poll at any rate |
+| `GET /health/ready` | No | Readiness: cached SQLite/Qdrant check; 503 when a required dependency is degraded |
+| `GET /health` | Yes | Full diagnostic snapshot (embedding, retention, schedulers, circuit breakers, etc.) |
 | `POST /mcp` | Yes | MCP Streamable HTTP: JSON-RPC requests; an `initialize` request creates a new session |
 | `GET /mcp` | Yes | MCP Streamable HTTP: standalone SSE channel for an existing session |
 | `DELETE /mcp` | Yes | MCP Streamable HTTP: terminates a session |
@@ -755,12 +848,17 @@ The server listens at `http://127.0.0.1:3721` by default. Available HTTP endpoin
 
 Every `/mcp` session is a fresh, in-memory MCP server sharing the same underlying
 storage as every other session and the REST endpoints — restarting the process drops
-all sessions, and spec-conformant clients re-initialize automatically.
+all sessions, and spec-conformant clients re-initialize automatically. A session idle
+longer than `transport.http.mcp_session.idle_timeout_ms` is closed automatically; see
+[Health & Metrics](#health--metrics) for the full session-lifecycle and endpoint-split
+details.
 
-Health check example:
+Health check examples:
 
 ```bash
-curl http://127.0.0.1:3721/health
+curl http://127.0.0.1:3721/health/live
+curl http://127.0.0.1:3721/health/ready
+curl -H "Authorization: Bearer <your-token>" http://127.0.0.1:3721/health
 ```
 
 Tool call example over HTTP:
@@ -1934,7 +2032,7 @@ Fulltext search uses a real SQLite FTS5 index to find memories containing specif
 5. Archived memories are excluded (the FTS table is kept in sync with the main memories table - archived rows are removed from FTS).
 6. Access metadata is updated for returned results.
 
-**Fallback:** if the running SQLite build has no `fts5` module compiled in (verified via a startup capability probe, not assumed), fulltext search degrades to a legacy `LIKE '%term%'` matcher with a hand-rolled term-frequency rank instead of erroring. This is visible, not silent: `health://status`'s `sqlite` component carries a `message`, and a `fts5_unavailable` warning is logged once at startup. See [Health Endpoint](#health-endpoint).
+**Fallback:** if the running SQLite build has no `fts5` module compiled in (verified via a startup capability probe, not assumed), fulltext search degrades to a legacy `LIKE '%term%'` matcher with a hand-rolled term-frequency rank instead of erroring. This is visible, not silent: `health://status`'s `sqlite` component carries a `message`, and a `fts5_unavailable` warning is logged once at startup. See [Health Endpoints](#health-endpoints).
 
 **When to use:** Exact keyword searches, searching for specific identifiers (memory IDs, project names, system names), when you know the exact terminology used.
 
@@ -2211,29 +2309,38 @@ sequenceDiagram
     rect rgb(230, 245, 230)
         Note over C,FS: CREATE BACKUP
         C->>S: backup create
-        S->>DB: Export full database
-        DB-->>S: Raw DB bytes
-        S->>S: Compute SHA-256 checksum
-        S->>S: Build JSON header<br/>(version, count, checksum)
-        S->>FS: Atomic write .bhgb file<br/>(write-to-temp-then-rename)
+        S->>DB: VACUUM INTO a scratch export file
+        S->>FS: Stream-hash the export (bounded memory)
+        S->>S: Build JSON header<br/>(version, count, checksum, header_checksum)
+        S->>FS: Stream header + export into a unique temp file,<br/>fsync, rename into place (backups/)
         FS-->>S: Success
+        S->>S: Prune backups over count/age bounds
         S-->>C: path, size, memory_count
     end
 
     rect rgb(230, 235, 250)
         Note over C,FS: RESTORE BACKUP
         C->>S: backup restore (path)
-        S->>FS: Read .bhgb file
-        FS-->>S: Header + DB bytes
-        S->>S: Validate SHA-256 checksum
-        alt Checksum mismatch
-            S-->>C: ❌ INVALID_INPUT
+        S->>S: Acquire cross-process restore lock
+        S->>FS: Read .bhgb file; verify header_checksum + body checksum
+        alt Checksum or version invalid
+            S-->>C: ❌ INVALID_INPUT (live database untouched)
         else Checksum valid
-            S->>FS: Atomic write to data dir<br/>(write-to-temp-then-rename)
-            S->>DB: Hot-reload in-memory SQLite
-            S->>DB: Run schema migrations
-            DB-->>S: Ready
-            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+            S->>FS: Write candidate to a scratch file;<br/>open it, run integrity_check + schema/count checks
+            alt Candidate fails validation
+                S-->>C: ❌ live database untouched
+            else Candidate valid
+                S->>DB: Checkpoint + close live connection
+                S->>FS: Rename live db aside (pre-restore-*),<br/>rename candidate into place
+                S->>DB: Reopen; re-verify record count
+                alt Activation or post-activation check fails
+                    S->>FS: Rename pre-restore image back; reopen
+                    S-->>C: ❌ prior database restored and active
+                else Activation succeeds
+                    S->>S: Reconcile vectors: stream drift + surplus scan,<br/>prune vector-only orphans
+                    S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+                end
+            end
         end
     end
 ```
@@ -2249,7 +2356,7 @@ Or via CLI:
 bhgbrain backup create
 ```
 
-Backups capture the entire SQLite database (all memories, categories, collections, audit log, revisions, and archive records) as a single `.bhgb` file in the `backups/` subdirectory of your data directory.
+Backups capture the entire SQLite database (all memories, categories, collections, audit log, revisions, and archive records) as a single `.bhgb` file in the `backups/` subdirectory of your data directory. Creation streams the database export through hashing and disk output — peak memory stays bounded to a small, fixed number of chunks regardless of database size, rather than holding the whole export in memory at once.
 
 **Backup file format:**
 ```
@@ -2258,24 +2365,44 @@ Backups capture the entire SQLite database (all memories, categories, collection
 [remaining bytes: SQLite database export]
 ```
 
-The JSON header contains:
+The JSON header (format version 2) contains:
 ```json
 {
-  "version": 1,
+  "version": 2,
   "memory_count": 1234,
   "checksum": "<sha256 of db data>",
   "created_at": "2026-03-15T12:00:00Z",
   "embedding_model": "text-embedding-3-small",
-  "embedding_dimensions": 1536
+  "embedding_dimensions": 1536,
+  "header_checksum": "<sha256 of the canonical fields above>"
 }
 ```
 
-**What is NOT in the backup:**
-- Qdrant vector data is **not** included. After restoring from a backup, Qdrant collections must be rebuilt by re-embedding content. Until then, fulltext search works but semantic search does not.
+`header_checksum` authenticates the header's own fields (so a tampered `memory_count`/`checksum`/embedding fields is rejected before restore trusts them for anything destructive) and is verified in addition to the body checksum. Version-1 backups (no `header_checksum`) remain readable through a compatibility parser that never trusts their unauthenticated fields destructively; any other version is rejected with `INVALID_INPUT` before restore touches the active database.
 
-**Backup integrity:** A SHA-256 checksum of the database data is stored in the header and verified on restore. If the file is corrupted, restore fails with `INVALID_INPUT: Backup integrity check failed`. After the restored database is activated, its memory count is also cross-checked against `memory_count` in the header — a mismatch fails the restore with `INTERNAL` (logged as `backup_restore_count_mismatch`) rather than returning a successful response over silently wrong data.
+**What is NOT in the backup:**
+- Qdrant vector data is **not** included. After restoring from a backup, vectors are reconciled against drift (see below) rather than bundled into the archive — this keeps backups small and portable.
+
+**Backup integrity:** the body's SHA-256 checksum and the header's own `header_checksum` are both verified before any header field is used destructively. A corrupted or truncated file, or one whose header was tampered with independently of the body, fails restore with `INVALID_INPUT` before the active database is touched.
+
+**Durable commit:** backup files (and the restored database image) are written to a unique temporary file with restrictive `0600` permissions, `fsync`ed, renamed into place, and the containing directory is `fsync`ed too where the filesystem supports it — a process or host crash after backup creation reports success never leaves a partial file at the final path, and an interrupted write never clobbers another writer's in-progress temp file.
 
 **Backup metadata** is tracked in the SQLite `backup_metadata` table so `backup list` can return information about historical backups.
+
+**Backup file retention:** after every successful `backup create`, backups beyond the configured count or age are pruned (file and metadata row together). Configure via `backup.retention` in `config.json`:
+
+```json
+{
+  "backup": {
+    "retention": {
+      "max_count": 30,
+      "max_age_days": 90
+    }
+  }
+}
+```
+
+Either bound alone is enough to prune a backup; set a bound to `null` to disable it (both `null` disables retention entirely — not recommended, since backup storage otherwise grows unbounded and proportional to database size). A backup whose file delete fails is left in metadata so the next pass retries it, rather than losing track of it. A backup beyond the bounds whose file is *already* gone has its stale metadata row cleaned up and is flagged separately from a genuine delete. `backup list` also flags (`missing: true`) any backup whose file is gone but whose metadata row hasn't been cleaned up yet, rather than presenting it as a restorable backup.
 
 ### Listing Backups
 
@@ -2291,7 +2418,8 @@ Returns:
       "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
@@ -2307,33 +2435,54 @@ Returns:
 ```
 
 **Restore process:**
-1. Validate the file exists and the integrity checksum matches.
-2. Write the embedded SQLite database atomically to the data directory (write-to-temp-then-rename).
-3. Hot-reload the in-memory SQLite database from the restored file without restarting the process.
-4. Run schema migrations on the reloaded database to ensure forward compatibility.
-5. Reconcile vectors against actual drift (see below) and return `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
+1. Acquire the cross-process restore lock (see below) and validate the file exists, its format version is supported, and both the header and body checksums match.
+2. Write the candidate database to a scratch file and validate it *before* touching the live database: open it, run `PRAGMA integrity_check`, confirm the schema is readable, and confirm its record count matches the header's `memory_count`. A candidate that fails any of these leaves the live database completely untouched.
+3. Checkpoint and close the live connection, rename the live database file *aside* to a unique pre-restore path (not overwritten in place), rename the validated candidate into its place, and reopen.
+4. Re-verify the reopened database's record count. If activation or this post-activation check fails, the pre-restore image is renamed back into place and reopened — restore always leaves a working database, live and reopened, never a half-swapped or corrupt one.
+5. Reconcile vectors against actual drift and vector-only surplus (see below) and return `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
 
 **Restore is live:** The restored database is immediately active. There is no need to restart the server. The response includes `metadata_activated: true` to confirm this.
 
-**Post-activation memory-count check:** Because a backup is a byte-for-byte export of the SQLite database, the memory count after activation must exactly equal `memory_count` from the header. If it doesn't, restore throws `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` and logs a `backup_restore_count_mismatch` event — the call does not return a successful response.
+**Rollback guarantee:** a reported restore failure — whether from pre-activation validation, the live/candidate file swap, or the post-activation record-count check — always leaves the prior database recoverable and reopened, never a database that is missing, half-written, or silently wrong. The error message says explicitly whether the prior database was restored (`"...the prior database was restored and is active"`) versus never touched at all (`"...before any change to the active database"`).
 
-**Vector reconciliation is drift-only and bounded.** Restore does not unconditionally clear and re-embed the whole corpus: it compares each restored memory's content checksum against the vector already stored in Qdrant and marks only memories that are new or whose content changed for re-embedding. When the embedding model/dimensions changed since the backup was created, or Qdrant's existing state can't be read, restore falls back to a full rebuild instead. Once this drift check completes, the restore lifecycle lock is released — `vector_reconciliation.state` is `"reconciled"` immediately if nothing drifted, or `"reconciling"` if re-embedding the drifted subset continues in a bounded background task (a timeout and batch cap per pass, with automatic retries on transient failures) after the call has already returned. Poll `health://status` (`components.vector_reconciliation`) to watch it finish.
+**Cross-process exclusion:** an exclusive lock file (`<data_dir>/.restore.lock`) is held for the whole restore, and every SQLite mutation (in this process or another) checks for it — an overlapping restore from another CLI invocation or server process, or an ordinary write racing an active restore, fails visibly with a retryable `CONFLICT` (`"Backup restore is already active for this data directory"` or `"Storage lifecycle operation in progress: restore (held by another process)"`) instead of writing to a database image that is about to be renamed away or replaced.
 
-**Concurrent restore protection:** If a restore is already in progress, subsequent restore requests return `INVALID_INPUT: Backup restore already in progress`. That guard only covers metadata activation and the drift check, not the background re-embed, so it releases quickly even for a large restore.
+**Vector reconciliation is drift-only, bounded, and bidirectional.** Restore does not unconditionally clear and re-embed the whole corpus: it streams every managed Qdrant collection once (never buffering a whole collection in memory) and compares each point's checksum against the restored SQLite row, marking only memories that are new or whose content changed for re-embedding. It also identifies **vector-only surplus** — Qdrant points with no corresponding row in the restored SQLite image at all, left behind when the backup predates them — and deletes them in bounded batches, scoped to this device's own points (or legacy points that predate device stamping) so another device's legitimate cross-device search fallback is never touched. A surplus point that fails to delete is left as retryable orphan work and keeps `vector_reconciliation` degraded rather than being silently reported healthy, so it can never resurface in recall as a non-expiring payload fallback. When the embedding model/dimensions changed since the backup was created, restore falls back to a full rebuild instead; when Qdrant's existing state simply can't be *read* (a transient outage, not a model change), it conservatively re-embeds the corpus without clearing anything, and is reported as its own `inspection-failed` cause rather than being mislabeled as a model change. Once this check completes, the restore lock is released — `vector_reconciliation.state` is `"reconciled"` immediately if nothing drifted and no surplus remains, or `"reconciling"` if re-embedding the drifted subset continues in a bounded background task (a timeout and batch cap per pass, with automatic retries on transient failures) after the call has already returned. Poll `health://status` (`components.vector_reconciliation`) to watch it finish.
 
 ---
 
 ## Health & Metrics
 
-### Health Endpoint
+### Health Endpoints
+
+HTTP health is split three ways so a cheap, high-frequency liveness probe, a bounded
+readiness check, and the full authenticated diagnostic snapshot each have the right
+cost and access-control shape (bound-qdrant-http-runtime):
 
 ```bash
-GET /health        # HTTP
-# or via CLI:
+GET /health/live   # unauthenticated, no dependency I/O — restart/liveness decisions
+GET /health/ready   # unauthenticated, cached dependency check — 503 when not ready
+GET /health          # authenticated, full diagnostic snapshot
+# or via CLI (full diagnostic snapshot, same as GET /health):
 bhgbrain health
 ```
 
-Returns a `HealthSnapshot`:
+- **`GET /health/live`** — `{ "status": "ok", "uptime_seconds": 86400 }`. Synchronous,
+  touches no dependency at all (not even SQLite), so it stays cheap under any probe
+  rate. Always `200`. Use this for orchestrator restart decisions (it is what the
+  Docker image's own `HEALTHCHECK` polls — see [Docker](#docker)).
+- **`GET /health/ready`** — checks only the two dependencies a request cannot function
+  without: SQLite (a local `SELECT 1`) and Qdrant (a bounded, cached vector-query
+  probe — see below). Returns `{ "ready": true|false, "components": { "sqlite": {...},
+  "qdrant": {...} } }`, `200` when ready and `503` when either is unhealthy. Registered
+  *after* rate limiting (unlike `/health/live`), and the Qdrant probe itself is cached,
+  so a burst of unauthenticated readiness polling cannot turn into a burst of fresh
+  Qdrant requests.
+- **`GET /health`** — the full diagnostic snapshot (embedding, retention, schedulers,
+  circuit breakers, per-tier counts, etc.), now requiring the same Bearer auth as every
+  other route. Shares the same cached Qdrant probe as `/health/ready`.
+
+Returns a `HealthSnapshot` from `GET /health`:
 
 ```json
 {
@@ -2387,11 +2536,108 @@ Returns a `HealthSnapshot`:
 
 **Circuit breakers:** The `circuitBreakers` object reports the state of each external dependency breaker (`closed`, `open`, or `half-open`). When a breaker is `open`, requests to that dependency are short-circuited with a `CircuitOpenError` until the open window elapses and a half-open probe succeeds. Configure thresholds in `resilience.circuit_breaker` (see [Configuration](#configuration)).
 
-**HTTP status codes:**
+**HTTP status codes (`GET /health`):**
 - `200` for both `healthy` and `degraded`
 - `503` for `unhealthy`
 
-Embedding health is cached for 30 seconds to avoid per-probe API calls to OpenAI.
+(`GET /health/ready` uses its own `ready`/`503` mapping — see above — independent of
+`GET /health`'s `healthy`/`degraded`/`unhealthy` status field.)
+
+Embedding health is cached for 30 seconds to avoid per-probe API calls to OpenAI. The
+Qdrant health probe (shared by `/health` and `/health/ready`) is cached for 5 seconds
+for the same reason, and itself uses a short, independent client-side timeout
+(`qdrant.health_timeout_ms`, default 3000) rather than the longer
+`qdrant.operation_timeout_ms` used by request-path Qdrant calls — a stalled Qdrant
+degrades health quickly without making callers wait out the full operational deadline.
+See [Full Configuration Reference](#full-configuration-reference).
+
+### Dependency Timeouts, Bounded Fan-Out, and Circuit Breaker Coverage
+
+Every Qdrant operation the server issues — writes, reads, cleanup/compaction, snapshot
+creation, collection scroll/list/delete — is bounded by `qdrant.operation_timeout_ms`
+(default 10000, client-side `AbortController`-based) and routed through the shared
+Qdrant circuit breaker (`resilience.circuit_breaker`), so a black-holed Qdrant endpoint
+fails fast on every code path instead of only some. The health probe deliberately uses
+its own separate client and timeout (`qdrant.health_timeout_ms`) and never touches the
+breaker (see above).
+
+A `recall`/`search` call made without a specific `collection` fans out across every
+collection in the namespace. That fan-out is bounded by `qdrant.fanout`:
+`max_collections` (default 25) caps how many collections one call ever targets — beyond
+that the target list is deterministically truncated; `concurrency` (default 5)
+caps how many of those run at once (in fixed-size batches); and `per_target_limit`
+(default 50) clamps each target's own per-collection query `limit` while genuinely
+fanning out (more than one target) — a single explicit `collection` search always uses
+the caller's full `limit` unclamped. Truncation is surfaced via
+the `bhgbrain_qdrant_fanout_width` gauge and `bhgbrain_qdrant_fanout_truncated_total`
+counter (see [Metrics](#metrics)) and a `qdrant_fanout_truncated` log line, not in the
+`search`/`recall` response body itself.
+
+### Outbound AI Request Policy
+
+Every OpenAI-compatible feature — embedding (OpenAI provider; Azure keeps its own
+derived per-resource endpoint), multi-candidate extraction, opt-in reranking,
+LLM-backed summarization, multi-query expansion's LLM paraphrase/HyDE phase,
+contradiction detection, and scheduled distillation — issues its chat/embedding
+requests through one shared request boundary instead of each feature independently
+constructing a `fetch` call. That boundary provides:
+
+- **A shared base URL** (`llm.base_url`, default `https://api.openai.com/v1`): point it
+  at a validated OpenAI-compatible gateway to route every one of those features through
+  it at once. Feature-specific model names, credentials, and per-feature timeouts
+  (`pipeline.extraction_timeout_ms`, `search.rerank.timeout_ms`, etc.) are unaffected —
+  only the endpoint and retry envelope are shared.
+- **A deadline that covers the whole response**, not just the initial connection: the
+  configured timeout stays active through header receipt, body read, JSON parsing, and
+  the feature's own response validation. A provider that returns successful headers and
+  then stalls mid-body still aborts at the deadline and — when the feature is
+  breaker-guarded — records a breaker failure, not a silent success.
+- **Uniform HTTP/network failure classification**: `429` and `408` are always retryable;
+  `500`/`502`/`503`/`504` are retryable (other 5xx and every other 4xx are treated as
+  permanent — retrying cannot fix bad credentials or a malformed payload); network
+  errors and timeouts are retryable. A `Retry-After` header on a `429`/`5xx` response
+  raises the next attempt's delay to at least that value, capped by `llm.retry.max_backoff_ms`.
+- **Capped, jittered retry** (`llm.retry.max_attempts`/`backoff_ms`/`max_backoff_ms`,
+  defaults `3`/`200`/`2000`): the whole retry loop for one logical call — including every
+  internal attempt — records at most one circuit-breaker outcome, so a transient failure
+  that succeeds on the second attempt never trips a breaker a healthy provider wouldn't.
+  Embedding requests use their own equivalent `embedding.retry` envelope (including
+  `max_backoff_ms`) rather than `llm.retry`, since embedding already has its own
+  `max_batch_inputs` batching concern.
+- **Response validation before any provider output is trusted**: every embedding request
+  (OpenAI and Azure alike, chunked to `embedding.max_batch_inputs`) verifies the returned
+  array has exactly one vector per requested input and that every vector matches the
+  configured `embedding.dimensions` before reassembling results in input order — a short
+  or malformed batch fails the whole call rather than silently misassociating vectors
+  with the wrong memories.
+
+Semantic search preserves the embedding provider's original classified error (its code
+and whether it's retryable) rather than always replacing it with a generic message;
+hybrid search's fulltext-only degradation path logs and meters that same classification
+alongside the `fulltext_only` fallback, so an operator can tell a transient rate limit
+apart from a permanent auth failure in either mode.
+
+### MCP Session Lifecycle
+
+Each `POST /mcp initialize` call opens a session held in memory for the life of the
+process. `transport.http.mcp_session` bounds that registry so an HTTP MCP client that
+disconnects without ever sending `DELETE /mcp` (the common case for an ordinary client
+crash or network drop) cannot leak sessions forever:
+
+- `idle_timeout_ms` (default 1,800,000 = 30 minutes) — a session with no request in this
+  long is closed by an independent, unref'd sweep (`sweep_interval_ms`, default 60000).
+  Any request through a session refreshes its activity, postponing expiry.
+- `max_sessions` (default 1000) — a hard cap on resident sessions. A new `initialize`
+  once at capacity evicts the single least-recently-active session to make room; if the
+  registry is somehow already empty and still "at capacity" (only possible with a
+  `max_sessions: 0` misconfiguration), the request fails closed with `503`.
+- Reusing an id after either eviction path gets the same `404 Session not found`
+  response as `DELETE /mcp` already produced — no separate error shape to handle.
+
+Current and evicted session counts are published as the `bhgbrain_mcp_sessions_active`
+gauge and `bhgbrain_mcp_sessions_evicted_total{reason="idle"|"capacity"}` counter (see
+[Metrics](#metrics)). `closeAll()` (process shutdown) stops the sweep timer and closes
+every live session's transport.
 
 ### Metrics
 
@@ -2429,6 +2675,11 @@ label-less format).
 | `bhgbrain_memory_count` | gauge | Current total memory count (updated on write/delete) |
 | `bhgbrain_rate_limit_buckets` | gauge | Active rate limit tracking buckets |
 | `bhgbrain_rate_limited_total` | counter | Total rate-limited requests |
+| `bhgbrain_rate_limit_capacity_rejected_total` | counter | Total requests rejected with 429 because the rate-limit bucket map was at `security.rate_limit_max_buckets` capacity for a genuinely new client identity |
+| `bhgbrain_qdrant_fanout_width` | gauge | Number of collections the most recent collectionless `search`/`recall` query fanned out to, after any `qdrant.fanout.max_collections` truncation |
+| `bhgbrain_qdrant_fanout_truncated_total` | counter | Incremented whenever a collectionless query's target-collection list was truncated to `qdrant.fanout.max_collections` |
+| `bhgbrain_mcp_sessions_active` | gauge | Current resident MCP HTTP session count |
+| `bhgbrain_mcp_sessions_evicted_total` | counter | Total MCP HTTP sessions closed by the session manager, labeled `reason` (`idle` or `capacity`) |
 | `recall_zero_after_filter` | counter | Incremented when `recall`'s defensive post-retrieval type/tags/`after`/`before` re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
 | `search_zero_after_filter` | counter | Incremented when `search`'s defensive post-retrieval `after`/`before` re-check removes a result the store already claimed matched - a filter-starvation signal that should stay at 0 in steady state |
 | `search_embedding_degraded` | counter | Incremented when `hybrid`-mode search falls back to fulltext-only because the embedding provider or vector store is unavailable, labeled `namespace` |
@@ -2452,7 +2703,9 @@ Because failures are now included in `bhgbrain_tool_handler_ms`, its p95/p99 ref
 
 ### HTTP Authentication
 
-When running in HTTP mode, requests to all endpoints except `/health` require a `Bearer` token:
+When running in HTTP mode, requests to all endpoints except `/health/live` and
+`/health/ready` require a `Bearer` token — the full diagnostic `/health` snapshot is
+authenticated like every other route (see [Health & Metrics](#health--metrics)):
 
 ```
 Authorization: Bearer <your-token>
@@ -2495,14 +2748,21 @@ Make sure `BHGBRAIN_TOKEN` is set in this configuration.
 
 ### Proxy Trust
 
-`security.trust_proxy` (default `false`) is passed directly to Express's `app.set('trust proxy', ...)`, which controls how `req.ip` is derived and therefore which identity the rate limiter keys on:
+`security.trust_proxy` (default `false`) is passed directly to Express's `app.set('trust proxy', ...)`, which controls how `req.ip` is derived and therefore which identity the rate limiter keys on. It accepts `false`, a positive hop count, or an array of trusted proxy IPs/subnets — **the legacy boolean `true` ("trust every hop") is no longer accepted** and fails config validation with migration guidance, because it lets a caller-supplied *left-most* `X-Forwarded-For` entry choose its own client identity even through exactly one real reverse-proxy hop:
 
-- **Disabled (default):** `req.ip` is the direct socket peer. This is accurate for the documented loopback-only deployment. If a reverse proxy sits in front of the server anyway, every proxied client collapses into the proxy's single IP and caller-supplied `X-Forwarded-For` headers are ignored (so they cannot be spoofed to split or evade rate limits).
-- **Enabled:** `req.ip` honors `X-Forwarded-For` set by the immediate peer. Only enable this behind a reverse proxy you trust to set that header correctly — enabling it without a trusted proxy in front lets any client spoof its rate-limit identity.
+- **Disabled (default, `false`):** `req.ip` is the direct socket peer. This is accurate for the documented loopback-only deployment. If a reverse proxy sits in front of the server anyway, every proxied client collapses into the proxy's single IP and caller-supplied `X-Forwarded-For` headers are ignored (so they cannot be spoofed to split or evade rate limits).
+- **Hop count (a positive integer):** trusts exactly that many reverse-proxy hops closest to the server. With `1` behind one trusted reverse proxy, `req.ip` resolves to the right-most (nearest-to-server) `X-Forwarded-For` entry — the one your proxy actually set — not an arbitrary caller-supplied left-most prefix.
+- **Subnet/address list (an array of strings):** trusts only hops whose address matches one of the given IPs or CIDR subnets (e.g. `["10.0.0.0/8"]`), Express/`proxy-addr`'s standard shape.
 
 ```json
-{ "security": { "trust_proxy": true } }
+{ "security": { "trust_proxy": 1 } }
 ```
+
+```json
+{ "security": { "trust_proxy": ["10.0.0.0/8"] } }
+```
+
+Migrating from a pre-existing `"trust_proxy": true`: replace it with the hop count of your actual reverse-proxy chain (usually `1` for a single load balancer or ingress in front of the server) or the trusted subnet(s) it runs in.
 
 ### Rate Limiting
 
@@ -2513,7 +2773,7 @@ HTTP requests are rate-limited per client IP address:
 - Exceeded clients receive HTTP 429 with `{ error: { code: "RATE_LIMITED", retryable: true } }`
 - Requests with no derivable client IP fail closed with HTTP 400 (`INVALID_INPUT`) rather than sharing a single fallback bucket
 - Response headers include `X-RateLimit-Limit` and `X-RateLimit-Remaining`
-- Expired rate limit buckets are swept every 30 seconds
+- The client-bucket map has a hard capacity, `security.rate_limit_max_buckets` (default 10,000). Expired buckets are swept independently every 30 seconds via an unref'd timer (not opportunistically tied to request arrival, so cleanup happens even when traffic stops). At capacity, one last sweep runs before a genuinely new client identity is rejected with HTTP 429 (`{ error: { code: "RATE_LIMITED", retryable: true } }`) rather than growing the map further — an already-bucketed client is never affected by this.
 - Rate-limit state is scoped per server/middleware instance, so independent instances (e.g. in tests) never share buckets
 
 ### Request Size Limiting
@@ -2762,8 +3022,9 @@ The `bootstrap` MCP tool drives a stateful 10-section interview directly within 
 // Check progress
 { "name": "bootstrap", "arguments": { "action": "status" } }
 
-// Re-do a section
-{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+// Re-do a section — reset is destructive (permanently deletes the section's
+// memories) and requires an exact confirmation value
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3, "confirm": "RESET" } }
 ```
 
 The tool returns the next section's questions after each submission, so the agent can drive the conversation naturally. Sessions persist in SQLite — you can close your client and pick up where you left off.
@@ -3078,7 +3339,8 @@ Retrieve the most relevant memories for a query using semantic (vector) similari
       "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
       "confidence": 1.0
     }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
@@ -3094,6 +3356,14 @@ convention `search`'s `include_archived` uses) plus `linked_from` (the base resu
 id), `link_relation`, and `link_direction` (`"outgoing"` if the base result is the
 edge's source, `"incoming"` if it is the target). A neighbor that is itself archived
 is skipped.
+
+`results` is assembled within `defaults.max_response_chars` (default `50000`): large
+results (long `content` fields, a high `limit`) are included one at a time up to that
+character budget, and `truncated: true` marks a response that had to leave trailing
+results out to stay within it — `results.length` can then be smaller than `limit` even
+when more matches existed. This is distinct from `min_score`/filter narrowing, which
+`recall` cannot tell apart from a genuinely small result set; a caller that needs every
+match despite a large budget should narrow the query or lower `limit` instead.
 
 ---
 
@@ -3137,7 +3407,7 @@ Search memories using semantic, fulltext, or hybrid modes. Offers more control t
 | `after` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at >= after` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the vector/fulltext store so `limit` counts matching memories - `search`'s first pushed-down filter. |
 | `before` | `string (ISO 8601 date-time)` | No | - | Only include memories with `created_at <= before` (inclusive). Filters on creation time, not `updated_at`. Pushed down into the vector/fulltext store so `limit` counts matching memories. |
 
-**Output:** Same structure as `recall` - `{ "results": [...] }` - but without the `min_score` gate and supporting up to 50 results. Archived matches (when `include_archived: true`) carry `archived: true`, use the retained summary as `content`, and have no meaningful `score` (they're metadata-term matches, not ranked).
+**Output:** Same structure as `recall` - `{ "results": [...], "truncated": false }` - but without the `min_score` gate, supporting up to 50 results, and an additional `degraded` field (`true` when hybrid mode fell back to fulltext-only). Archived matches (when `include_archived: true`) carry `archived: true`, use the retained summary as `content`, and have no meaningful `score` (they're metadata-term matches, not ranked). `results` is subject to the same `defaults.max_response_chars` budget and `truncated` semantics documented under `recall` above.
 
 ---
 
@@ -3278,9 +3548,11 @@ Create, list, or restore memory backups.
   "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
   "size_bytes": 2048576,
   "memory_count": 1234,
-  "created_at": "2026-03-15T12:00:00Z"
+  "created_at": "2026-03-15T12:00:00Z",
+  "missing": false
 }
 ```
+Backup file retention (`backup.retention.max_count`/`max_age_days`) runs automatically after every successful `create` — see [Creating a Backup](#creating-a-backup).
 
 **`list` output:**
 ```json
@@ -3290,11 +3562,13 @@ Create, list, or restore memory backups.
       "path": "...",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
 ```
+`missing: true` flags a backup whose metadata row has no corresponding file on disk any more, rather than presenting it as restorable.
 
 **`restore` output:**
 ```json
@@ -3309,7 +3583,7 @@ Create, list, or restore memory backups.
   }
 }
 ```
-`vector_reconciliation.state` is `"reconciled"` when no memory's vector actually drifted (nothing to re-embed), or `"reconciling"` while a bounded background task re-embeds the drifted/missing subset. See [Restoring from Backup](#restoring-from-backup).
+`vector_reconciliation.state` is `"reconciled"` when no memory's vector actually drifted, no vector-only surplus remains unpruned, and nothing needs re-embedding; `"reconciling"` while a bounded background task re-embeds the drifted/missing subset or unpruned surplus remains as retryable work; `"pending"` if drift/surplus detection itself couldn't complete. See [Restoring from Backup](#restoring-from-backup).
 
 ---
 
@@ -3325,13 +3599,14 @@ Drive a stateful 10-section interview to build your work profile. Supports pause
 | `section` | `integer (1-10)` | For submit/reset | - | Section number to submit answers for or reset. |
 | `answers` | `string` | For submit | - | Your answers for the section. Max 500,000 characters. |
 | `namespace` | `string` | No | `"profile"` | Namespace scope. |
+| `confirm` | `string` | For reset | - | Must be exactly `"RESET"`. Omitted or wrong values leave storage unchanged. |
 
 **Actions:**
 
 - **`start`** — Creates a new session or resumes an existing one. Returns the first incomplete section's title, questions, and instructions.
 - **`submit`** — Stores answers as discrete memories for the given section, marks it complete, and returns the next section.
 - **`status`** — Returns progress overview: which sections are complete, memory counts, last updated.
-- **`reset`** — Deletes all memories for a section and marks it as pending for re-collection.
+- **`reset`** — **Destructive.** Permanently deletes all memories for a section and marks it as pending for re-collection. Requires `confirm: "RESET"`; an omitted or wrong value is rejected and nothing is deleted.
 
 **Output (start):**
 
@@ -3385,6 +3660,10 @@ Import a structured profile or freeform document as discrete memories in one sho
 - `dry_run: true` returns memory previews with zero writes.
 - Headings numbered outside the 10 storage-mapped sections (e.g. a document written against an older 12-section template) are not silently dropped — their numbers are reported in `sections_ignored` so you know content was skipped instead of losing it without notice.
 - If [`remember`](#remember---store-a-memory) rejected your content for exceeding `pipeline.long_content_threshold_chars`, use `import` with `format: "freeform"` here instead — it splits the document by heading/paragraph boundaries and embeds each chunk independently, avoiding the single mush-vector problem `remember`'s threshold guards against.
+- A parsed chunk longer than `import.max_chunk_chars` (default `8000`) is deterministically hard-split into that many characters per piece instead of being embedded as one oversized chunk or rejected outright — every piece still becomes its own memory candidate.
+- If the resulting chunk count (after any hard-splitting) exceeds `import.max_chunks` (default `500`), the whole call — dry run or not — is rejected with `INVALID_INPUT` naming the observed count and the configured maximum, before any embedding provider call is made.
+- Embeddings for the parsed chunks are requested from the provider in batches of `import.embedding_batch_size` (default `100`) rather than one request per chunk, so outbound provider calls scale with chunk-count/batch-size. A whole batch's embedding call failing does not lose those chunks — each falls back to being embedded individually through the normal write-pipeline path.
+- A chunk whose write fails outright (every extraction candidate for it rejected) does not abort the rest of the import: it is counted in a `failed` field and detailed in a `failures` array (`[{ "chunk_index": 4, "error": "..." }]`), both present only when at least one chunk failed.
 
 ---
 
@@ -3786,6 +4065,16 @@ name it explicitly. `cursor` is `null` once the scanned page is smaller than
 `consolidation.max_scan_per_call`; pass it back to continue scanning a larger
 namespace/collection across multiple calls.
 
+The per-point neighbor lookups a scanned page requires run with at most
+`consolidation.neighbor_discovery_concurrency` (default `8`) in flight at once —
+bounded so a large page neither serializes one lookup at a time nor fires the whole
+page's worth of requests concurrently. If the fan-out is still running once
+`consolidation.neighbor_discovery_deadline_ms` (default `10000`) elapses, `list`
+returns early with a non-null `cursor` resuming right after the last member whose
+neighbors were resolved — a member the deadline cut off before reaching is never
+included in a cluster that call, and is picked back up (with fresh neighbor discovery)
+on the next `list` call using that cursor.
+
 **Output (`action: "merge"`):**
 
 ```json
@@ -3832,8 +4121,12 @@ The server is available at `http://localhost:3721` (published to host loopback
 only by default). Check health with:
 
 ```bash
-curl http://localhost:3721/health
+curl http://localhost:3721/health/live
 ```
+
+The container's own `HEALTHCHECK` polls `/health/live` for the same reason: it runs
+with no credentials, and the full diagnostic `/health` snapshot requires Bearer auth
+(see [Health & Metrics](#health--metrics)).
 
 ### Security defaults
 
@@ -3841,12 +4134,12 @@ The container binds the API to `0.0.0.0` so the published port is reachable, and
 is **authenticated by default**:
 
 - If `BHGBRAIN_TOKEN` is unset, the entrypoint **generates a bearer token** on
-  first run, persists it to `/data/bhgbrain-token`, and prints it to the logs.
-  Retrieve it with:
+  first run and persists it to `/data/bhgbrain-token` (owner-only file mode).
+  The token value itself is never printed to container logs — only the path
+  it was saved to — so `docker compose logs` alone can never leak a working
+  credential. Retrieve it with:
 
   ```bash
-  docker compose logs bhgbrain | grep token
-  # or
   docker compose exec bhgbrain cat /data/bhgbrain-token
   ```
 
@@ -3859,6 +4152,12 @@ is **authenticated by default**:
 - The published port maps to host loopback (`127.0.0.1:3721:3721`), so the API is
   not LAN-reachable by default. Change the mapping in `docker-compose.yml` to
   expose it externally.
+
+- The `self-hosted` profile's Qdrant sidecar is loopback-only for the same
+  reason (`127.0.0.1:6333:6333`) — Qdrant has no authentication configured in
+  this stack, so every stored vector/payload would otherwise be reachable to
+  anyone on the LAN. Only widen its port mapping behind your own authenticated
+  reverse proxy or firewall.
 
 - To intentionally run **without** authentication, set
   `BHGBRAIN_ALLOW_UNAUTHENTICATED=true` (the server logs a warning; not
@@ -4033,13 +4332,15 @@ The backup is stored in the data directory (`%LOCALAPPDATA%\BHGBrain\` on Window
 
 `backup.restore` reloads runtime SQLite state before returning success. Restore responses include `metadata_activated: true` when restored data is immediately active. The server does not need to be restarted.
 
-Restore acquires a fail-safe guard (`beginRestoreOperation()`) that blocks concurrent writes only while SQLite is being activated and restored vectors are checked for drift against Qdrant. Vectors are **not** unconditionally cleared and re-embedded: only memories whose content checksum differs from (or is missing in) Qdrant are marked for re-embedding, so a no-drift restore completes without calling the embedding provider at all. If the embedding model/dimensions changed since the backup was taken, or Qdrant's existing state can't be read, restore falls back to a full rebuild instead.
+Restore acquires a fail-safe guard (`beginRestoreOperation()`, plus the cross-process `.restore.lock` file and every mutation's own lock check — see [Restoring from Backup](#restoring-from-backup)) that blocks concurrent writes while the candidate is validated in a scratch copy, the live/candidate database files are swapped, and restored vectors are checked for drift and surplus against Qdrant. Vectors are **not** unconditionally cleared and re-embedded: only memories whose content checksum differs from (or is missing in) Qdrant are marked for re-embedding, so a no-drift restore completes without calling the embedding provider at all. If the embedding model/dimensions changed since the backup was taken, restore falls back to a full rebuild instead; if Qdrant's existing state simply can't be read (a transient outage), it conservatively re-embeds the corpus without clearing anything and reports that as a distinct `inspection-failed` cause rather than a model change.
 
-Once the drift check finishes, the guard is released — re-embedding the drifted subset (if any) runs in a bounded background task (a timeout and batch cap per pass) instead of holding up the restore call or blocking other writers for its duration. It retries automatically with backoff on transient failures; if it never fully catches up, `health://status` keeps reporting `vector_reconciliation.state: "pending"` (or `"reconciling"` while a pass is in flight) rather than silently leaving semantic search blank. Progress is flushed to disk at batch granularity, so a hard crash mid-reconciliation loses at most one batch of work — restart safely resumes from the remaining unsynced set via idempotent re-upsert.
+Once the drift/surplus check finishes, the guard is released — re-embedding the drifted subset (if any) runs in a bounded background task (a timeout and batch cap per pass) instead of holding up the restore call or blocking other writers for its duration. It retries automatically with backoff on transient failures; if it never fully catches up, `health://status` keeps reporting `vector_reconciliation.state: "pending"` (or `"reconciling"` while a pass is in flight) rather than silently leaving semantic search blank. Progress is flushed to disk at batch granularity, so a hard crash mid-reconciliation loses at most one batch of work — restart safely resumes from the remaining unsynced set via idempotent re-upsert. Vector-only surplus deletion (points with no restored SQLite row) runs synchronously as part of the drift/surplus check itself, in bounded batches; a batch that fails to delete keeps `vector_reconciliation` degraded with the remaining count rather than reporting healthy over unresolved orphan work.
 
 ### HTTP Hardening
 
-- `/health` is intentionally unauthenticated for probe compatibility.
+- `/health/live` and `/health/ready` are intentionally unauthenticated for probe
+  compatibility; the full diagnostic `/health` snapshot requires the same Bearer auth
+  as every other route. See [Health & Metrics](#health--metrics).
 - Rate limiting keys on trusted request identity (IP) and ignores `x-client-id` for enforcement.
 - Audit/request-log `client_id` is likewise derived from the trusted request identity (`req.ip`), never from the caller-supplied `x-client-id` header — that header is accepted only as a non-authoritative debug hint and is never trusted for the audit trail.
 - `memory://list` enforces `limit` bounds of `1..100`; invalid values return `INVALID_INPUT`.

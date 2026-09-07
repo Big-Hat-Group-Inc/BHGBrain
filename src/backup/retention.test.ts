@@ -6,7 +6,10 @@ import { SqliteStore } from '../storage/sqlite.js';
 import { RetentionService } from './retention.js';
 import { vi } from 'vitest';
 import type { BrainConfig } from '../config/index.js';
-import type { StorageManager } from '../storage/index.js';
+import { StorageManager } from '../storage/index.js';
+import type { QdrantStore } from '../storage/qdrant.js';
+import type { EmbeddingProvider } from '../embedding/index.js';
+import { computeChecksum } from '../domain/normalize.js';
 
 describe('RetentionService', () => {
   let sqlite: SqliteStore;
@@ -36,9 +39,18 @@ describe('RetentionService', () => {
       source: 'cli' as const,
       checksum: id,
       importance: 0.2,
+      retention_tier: 'T0' as const,
+      expires_at: null,
+      decay_eligible: false,
+      review_due: null,
       access_count: 0,
       last_operation: 'ADD' as const,
       merged_from: null,
+      archived: false,
+      vector_synced: true,
+      pinned: false,
+      origin: null,
+      confidence: 1,
       created_at: '2026-01-01T00:00:00.000Z',
       updated_at: '2026-01-01T00:00:00.000Z',
       last_accessed: lastAccessed,
@@ -50,8 +62,9 @@ describe('RetentionService', () => {
   // all required by the failure-safe GC bracket even when a test isn't
   // exercising T1 review or degraded-health specifically.
   function lifecycleOpMocks() {
+    const lifecycleToken = {};
     return {
-      beginLifecycleOperation: vi.fn(),
+      beginLifecycleOperation: vi.fn(() => lifecycleToken),
       endLifecycleOperation: vi.fn(),
       setRetentionDegraded: vi.fn(),
       listReviewCandidates: vi.fn(() => []),
@@ -85,6 +98,135 @@ describe('RetentionService', () => {
       event: 'retention_stale_marked',
       stale_marked: 1,
     }));
+  });
+
+  it('allows GC-owned real SQLite mutations while rejecting an unrelated write', async () => {
+    const expired = {
+      ...memory('real-gc-expired', '2025-01-01T00:00:00.000Z'),
+      retention_tier: 'T2' as const,
+      expires_at: '2025-02-01T00:00:00.000Z',
+      decay_eligible: true,
+    };
+    sqlite.insertMemory(expired);
+    sqlite.insertAudit({
+      id: 'real-gc-preexisting-audit', timestamp: '2026-09-05T00:00:00.000Z', namespace: 'global',
+      operation: 'ADD', memory_id: expired.id, client_id: 'test',
+    });
+    sqlite.insertRevision(expired.id, 1, 'revision one', '2026-09-05T00:00:00.000Z');
+    sqlite.insertRevision(expired.id, 2, 'revision two', '2026-09-06T00:00:00.000Z');
+
+    let unrelatedWriteRejected = false;
+    let auditSequence = 0;
+    const storage = {
+      sqlite,
+      qdrant: qdrantStub(100),
+      deleteMemories: vi.fn(async (
+        memories: Array<{ id: string }>, options?: { lifecycleToken?: object },
+      ) => {
+        expect(() => sqlite.insertMemory(memory('blocked-during-gc', '2026-01-01T00:00:00.000Z'))).toThrow(
+          'Storage lifecycle operation in progress: gc',
+        );
+        unrelatedWriteRejected = true;
+        return {
+          deleted: sqlite.deleteMemoriesByIds(memories.map(item => item.id), options?.lifecycleToken as never),
+          unreconciled: [],
+          degraded: false,
+        };
+      }),
+      logAudit: vi.fn((operation, memoryId, namespace, clientId, options) => {
+        sqlite.insertAudit({
+          id: `real-gc-audit-${++auditSequence}`,
+          timestamp: '2026-09-06T00:00:00.000Z',
+          namespace,
+          operation,
+          memory_id: memoryId,
+          client_id: clientId,
+          details: options?.details ? JSON.stringify(options.details) : undefined,
+        }, options?.lifecycleToken);
+      }),
+    } as unknown as StorageManager;
+    const config = {
+      retention: {
+        archive_before_delete: true,
+        pre_expiry_warning_days: 7,
+        compaction_deleted_threshold: 1,
+        audit_log_max_entries: 2,
+        revisions_per_memory_max: 1,
+      },
+    } as unknown as BrainConfig;
+
+    const result = await new RetentionService(config, storage, { info: vi.fn() }).runGc();
+
+    expect(result).toMatchObject({ archived: 1, deleted: 1, degraded: false, audit_pruned: 1, revisions_pruned: 1 });
+    expect(unrelatedWriteRejected).toBe(true);
+    expect(sqlite.getMemoryById(expired.id)).toBeNull();
+    expect(sqlite.getArchiveByMemoryId(expired.id)).toMatchObject({ memory_id: expired.id });
+    expect(sqlite.listAudit(10).map(entry => entry.operation).sort()).toEqual(['ARCHIVE', 'FORGET']);
+    expect(sqlite.listRevisions(expired.id).map(row => row.revision)).toEqual([2]);
+    expect(sqlite.getRetentionDegraded()).toMatchObject({ degraded: false, last_success_at: expect.any(String) });
+  });
+
+  // Task 3.4: a genuine end-to-end pass through the REAL StorageManager (not a
+  // hand-rolled `deleteMemories` stub) against the REAL SqliteStore, so the
+  // actual vector-delete call (`qdrant.deleteMany`), the actual local SQLite
+  // delete (`deleteMemoriesByIds`), history pruning, and `last_success_at` are
+  // all exercised through the production code path in one pass.
+  it('runs a full end-to-end GC pass through the real StorageManager: archive, vector delete, local delete, pruning, last_success_at', async () => {
+    const expired = {
+      ...memory('e2e-expired', '2025-01-01T00:00:00.000Z'),
+      retention_tier: 'T2' as const,
+      expires_at: '2025-02-01T00:00:00.000Z',
+      decay_eligible: true,
+    };
+    sqlite.insertMemory(expired);
+    sqlite.insertRevision(expired.id, 1, 'revision one', '2026-09-05T00:00:00.000Z');
+    sqlite.insertRevision(expired.id, 2, 'revision two', '2026-09-06T00:00:00.000Z');
+    sqlite.insertAudit({
+      id: 'e2e-preexisting-audit', timestamp: '2026-09-05T00:00:00.000Z', namespace: 'global',
+      operation: 'ADD', memory_id: expired.id, client_id: 'test',
+    });
+
+    const qdrant = {
+      deleteMany: vi.fn(async () => {}),
+      getCollectionInfo: vi.fn(async () => ({ points_count: 0 })),
+      compact: vi.fn(async () => {}),
+    } as unknown as QdrantStore;
+    const embedding = {
+      provider: 'openai',
+      model: 'test',
+      dimensions: 3,
+      identity: 'openai/test@3',
+      embed: vi.fn(async () => [1, 2, 3]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [1, 2, 3])),
+      healthCheck: vi.fn(async () => true),
+    } as unknown as EmbeddingProvider;
+    const storage = new StorageManager(sqlite, qdrant, embedding);
+
+    const config = {
+      retention: {
+        archive_before_delete: true,
+        pre_expiry_warning_days: 7,
+        compaction_deleted_threshold: 1,
+        audit_log_max_entries: 2,
+        revisions_per_memory_max: 1,
+      },
+    } as unknown as BrainConfig;
+
+    const result = await new RetentionService(config, storage, { info: vi.fn() }).runGc();
+
+    expect(result).toMatchObject({ archived: 1, deleted: 1, degraded: false, audit_pruned: 1, revisions_pruned: 1 });
+    // Vector delete: the real StorageManager.deleteMemories called the real
+    // qdrant client's deleteMany for this memory's namespace/collection.
+    expect(qdrant.deleteMany).toHaveBeenCalledWith('global', 'general', [expired.id]);
+    // Local delete: the real SQLite row is gone.
+    expect(sqlite.getMemoryById(expired.id)).toBeNull();
+    // Archive: a durable archive row exists for the deleted memory.
+    expect(sqlite.getArchiveByMemoryId(expired.id)).toMatchObject({ memory_id: expired.id });
+    // Pruning: audit_log and memory_revisions were trimmed to their caps.
+    expect(sqlite.listAudit(10).map(entry => entry.operation).sort()).toEqual(['ARCHIVE', 'FORGET']);
+    expect(sqlite.listRevisions(expired.id).map(row => row.revision)).toEqual([2]);
+    // last_success_at: recorded on the real retention_state row for a clean run.
+    expect(sqlite.getRetentionDegraded()).toMatchObject({ degraded: false, last_success_at: expect.any(String) });
   });
 
   it('batches GC persistence work and audits archive + delete with structured details', async () => {
@@ -127,14 +269,14 @@ describe('RetentionService', () => {
     expect(result.unreconciled).toEqual([]);
     expect(storage.deleteMemories).toHaveBeenCalledTimes(1);
     expect(storage.sqlite.beginLifecycleOperation).toHaveBeenCalledWith('gc');
-    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith('gc');
+    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith(expect.anything(), 'gc');
     expect(storage.logAudit).toHaveBeenCalledWith('ARCHIVE', expired[0]!.id, 'global', 'system', expect.objectContaining({
       details: expect.objectContaining({ memory_id: expired[0]!.id, action: 'archive' }),
     }));
     expect(storage.logAudit).toHaveBeenCalledWith('FORGET', expired[0]!.id, 'global', 'system', expect.objectContaining({
       details: expect.objectContaining({ memory_id: expired[0]!.id, action: 'delete' }),
     }));
-    expect(storage.sqlite.setRetentionDegraded).toHaveBeenCalledWith(false, null, expect.any(String));
+    expect(storage.sqlite.setRetentionDegraded).toHaveBeenCalledWith(false, null, expect.any(String), expect.anything());
     expect(storage.sqlite.flushIfDirty).toHaveBeenCalledTimes(1);
     expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({
       event: 'retention_gc',
@@ -206,6 +348,7 @@ describe('RetentionService', () => {
       true,
       'Last cleanup (GC) run reported a partial failure',
       expect.any(String),
+      expect.anything(),
     );
     expect(storage.sqlite.flushIfDirty).toHaveBeenCalledTimes(1);
     expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({
@@ -243,7 +386,7 @@ describe('RetentionService', () => {
         listExpiredMemories: vi.fn(() => [t1Expired, t2Expired]),
         archiveMemory: vi.fn(),
         flushIfDirty: vi.fn(),
-        beginLifecycleOperation: vi.fn(),
+        beginLifecycleOperation: vi.fn(() => ({})),
         endLifecycleOperation: vi.fn(),
         setRetentionDegraded: vi.fn(),
         listReviewCandidates: vi.fn(() => [t1Expired]),
@@ -272,7 +415,9 @@ describe('RetentionService', () => {
     expect(result.scanned).toBe(1);
     expect(result.candidates.map(c => c.id)).toEqual(['t2-1']);
     expect(result.reviewCandidates.map(c => c.id)).toEqual(['t1-1']);
-    expect(storage.deleteMemories).toHaveBeenCalledWith([t2Expired], { flush: false });
+    expect(storage.deleteMemories).toHaveBeenCalledWith(
+      [t2Expired], expect.objectContaining({ flush: false, lifecycleToken: expect.anything() }),
+    );
     expect(storage.logAudit).not.toHaveBeenCalledWith('FORGET', 't1-1', expect.anything(), expect.anything(), expect.anything());
   });
 
@@ -348,12 +493,15 @@ describe('RetentionService', () => {
     expect(result.archived).toBe(0);
     // The failed memory is skipped for deletion rather than deleted without
     // a durable archive row.
-    expect(storage.deleteMemories).toHaveBeenCalledWith([], { flush: false });
-    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith('gc');
+    expect(storage.deleteMemories).toHaveBeenCalledWith(
+      [], expect.objectContaining({ flush: false, lifecycleToken: expect.anything() }),
+    );
+    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith(expect.anything(), 'gc');
     expect(storage.sqlite.setRetentionDegraded).toHaveBeenCalledWith(
       true,
       'Last cleanup (GC) run reported a partial failure',
       expect.any(String),
+      expect.anything(),
     );
   });
 
@@ -406,6 +554,36 @@ describe('RetentionService', () => {
     expect(result.compacted).toEqual(['global/general']);
     expect(qdrant.getCollectionInfo).toHaveBeenCalledWith('global', 'general');
     expect(qdrant.compact).toHaveBeenCalledWith('global', 'general', 0.1);
+  });
+
+  it('skips a collection whose Qdrant inspection fails without fabricating a ratio', async () => {
+    const expired = [{
+      ...memory('c-info-fail', '2025-01-01T00:00:00.000Z'), retention_tier: 'T3' as const,
+      expires_at: '2025-02-01T00:00:00.000Z', decay_eligible: true,
+    }];
+    const qdrant = {
+      getCollectionInfo: vi.fn(async () => { throw new Error('Qdrant 503'); }),
+      compact: vi.fn(async () => undefined),
+    };
+    const storage = {
+      sqlite: { listExpiredMemories: vi.fn(() => expired), archiveMemory: vi.fn(), flushIfDirty: vi.fn(), ...lifecycleOpMocks() },
+      qdrant,
+      deleteMemories: vi.fn(async () => ({ deleted: 1, unreconciled: [], degraded: false })),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+    const config = { retention: {
+      archive_before_delete: true, pre_expiry_warning_days: 7, compaction_deleted_threshold: 0.1,
+      audit_log_max_entries: null, revisions_per_memory_max: null,
+    } } as unknown as BrainConfig;
+    const logger = { info: vi.fn(), warn: vi.fn() };
+
+    const result = await new RetentionService(config, storage, logger).runGc();
+
+    expect(result).toMatchObject({ deleted: 1, compacted: [], degraded: false });
+    expect(qdrant.compact).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'retention_gc_collection_info_failed', error: 'Qdrant 503',
+    }));
   });
 
   it('does not compact when the deleted-vector ratio stays under the threshold', async () => {
@@ -671,5 +849,105 @@ describe('RetentionService', () => {
 
       expect(sqlite.listAudit(10)).toHaveLength(2);
     });
+  });
+
+  it('logs successful, degraded, and per-record cleanup failures at distinct levels', async () => {
+    const expired = {
+      ...memory('log-expired', '2025-01-01T00:00:00.000Z'), retention_tier: 'T2' as const,
+      expires_at: '2025-02-01T00:00:00.000Z', decay_eligible: true,
+    };
+    const commonSqlite = {
+      ...lifecycleOpMocks(),
+      listExpiredMemories: vi.fn(() => [expired]),
+      listReviewCandidates: vi.fn(() => []),
+      pruneAuditLog: vi.fn(() => 0),
+      pruneRevisions: vi.fn(() => 0),
+      flushIfDirty: vi.fn(),
+    };
+    const config = {
+      retention: {
+        archive_before_delete: true, compaction_deleted_threshold: 1,
+        audit_log_max_entries: null, revisions_per_memory_max: null,
+      },
+    } as unknown as BrainConfig;
+
+    const successLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const successStorage = {
+      sqlite: { ...commonSqlite, archiveMemory: vi.fn() },
+      qdrant: qdrantStub(),
+      deleteMemories: vi.fn(async () => ({ deleted: 1, unreconciled: [], degraded: false })),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+    await new RetentionService(config, successStorage, successLogger).runGc();
+    expect(successLogger.info).toHaveBeenCalledWith(expect.objectContaining({ event: 'retention_gc', outcome: 'ok' }));
+    expect(successLogger.warn).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'retention_gc', outcome: 'ok' }));
+
+    const failureLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const failureStorage = {
+      sqlite: { ...commonSqlite, archiveMemory: vi.fn(() => { throw new Error('archive disk failure'); }) },
+      qdrant: qdrantStub(),
+      deleteMemories: vi.fn(async () => ({ deleted: 0, unreconciled: [], degraded: false })),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+    const result = await new RetentionService(config, failureStorage, failureLogger).runGc();
+    expect(result.degraded).toBe(true);
+    expect(failureLogger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'retention_gc_archive_failed', memory_id: expired.id, error: 'archive disk failure',
+    }));
+    expect(failureLogger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'retention_gc', outcome: 'degraded' }));
+  });
+
+  // Task 2.4: the CLI's `archive restore` path (RetentionService.restoreArchive)
+  // and the `review` MCP tool's `restore` action must derive checksum,
+  // expiry/review, and provenance fields through the exact same mapping —
+  // see buildRestoredMemoryFromArchive in src/domain/archive-restore.ts. An
+  // earlier CLI-only implementation set `checksum` to `archived.memory_id`
+  // (an unrelated identifier) instead of deriving it from restored content.
+  it('restoreArchive derives checksum from restored content, retains the archive row, and matches the tool mapping', async () => {
+    const archivedMemory = {
+      ...memory('archived-1', '2025-01-01T00:00:00.000Z'),
+      retention_tier: 'T2' as const,
+      tags: ['ops'],
+    };
+    sqlite.insertMemory(archivedMemory);
+    sqlite.archiveMemory(archivedMemory, '2025-06-01T00:00:00.000Z');
+    const archiveRow = sqlite.getArchiveByMemoryId(archivedMemory.id);
+    expect(archiveRow).not.toBeNull();
+
+    const qdrant = {
+      deleteMany: vi.fn(async () => {}),
+      upsert: vi.fn(async () => {}),
+    } as unknown as QdrantStore;
+    const embedded = [4, 5, 6];
+    const embedding = {
+      provider: 'openai', model: 'test', dimensions: 3, identity: 'openai/test@3',
+      embed: vi.fn(async () => embedded),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => embedded)),
+      healthCheck: vi.fn(async () => true),
+    } as unknown as EmbeddingProvider;
+    const storage = new StorageManager(sqlite, qdrant, embedding);
+    const config = { retention: {} } as unknown as BrainConfig;
+
+    const result = await new RetentionService(config, storage).restoreArchive(archivedMemory.id);
+
+    expect(result.restored).toBe(true);
+    expect(result.restored_from).toBe(archivedMemory.id);
+    expect(result.archive_id).toBe(archiveRow!.id);
+    expect(embedding.embed).toHaveBeenCalledWith(archiveRow!.summary);
+
+    const restored = sqlite.getMemoryById(result.id)!;
+    expect(restored).not.toBeNull();
+    // Checksum is derived from the restored content, never from the
+    // original memory id.
+    expect(restored.checksum).toBe(computeChecksum(archiveRow!.summary));
+    expect(restored.checksum).not.toBe(archivedMemory.id);
+    expect(restored.tags).toEqual(expect.arrayContaining(['ops', 'restored-from-archive']));
+    expect(restored.origin).toBeNull();
+    expect(restored.confidence).toBe(1.0);
+    expect(restored.pinned).toBe(false);
+    expect(restored.retention_tier).toBe('T2');
+    // Archive row is retained (not deleted), matching the `review` tool's
+    // restore behavior.
+    expect(sqlite.getArchiveByMemoryId(archivedMemory.id)).not.toBeNull();
   });
 });

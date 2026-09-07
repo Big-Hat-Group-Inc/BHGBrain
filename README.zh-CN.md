@@ -139,10 +139,13 @@ BHGBrain **需要一个外部 Qdrant 实例**。即使在默认的 `embedded` �
 ### 方案 A：Docker（推荐）
 
 ```bash
+# 仅回环地址：Qdrant 本身没有身份验证，因此绑定到所有网络接口（-p 6333:6333）
+# 会让局域网内的任何人都能访问你存储的向量/负载数据。仅在你自己的认证反向代理/
+# 防火墙之后才扩大暴露范围。
 docker run -d \
   --name qdrant \
   --restart unless-stopped \
-  -p 6333:6333 \
+  -p 127.0.0.1:6333:6333 \
   -v qdrant_storage:/qdrant/storage \
   qdrant/qdrant
 ```
@@ -161,8 +164,11 @@ services:
   qdrant:
     image: qdrant/qdrant
     restart: unless-stopped
+    # 仅回环地址：Qdrant 本身没有身份验证，因此绑定到所有网络接口会让局域网内
+    # 的任何人都能访问你存储的向量/负载数据。仅在你自己的认证反向代理/防火墙
+    # 之后才扩大暴露范围。
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
 
@@ -242,6 +248,22 @@ BHGBrain 从以下位置加载配置文件：
     "id": null
   },
 
+  // 共享的、兼容 OpenAI 的聊天/嵌入请求边界：每个已迁移的功能（抽取、重排序、
+  // 摘要、查询扩展、矛盾检测、蒸馏，以及 OpenAI 嵌入——Azure 嵌入仍保留其
+  // 派生的按资源端点）都通过同一个基础 URL 和重试策略解析请求，而不是各自
+  // 硬编码 "https://api.openai.com/v1" 并各自实现重试逻辑。将 base_url 指向
+  // 一个经过校验的、兼容 OpenAI 的网关，即可一次性将上述所有功能路由过去。
+  // 参见下文的“Outbound AI Request Policy”。
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 200,
+      // 同时限制指数退避的上限和提供商 Retry-After 建议的上限。
+      "max_backoff_ms": 2000
+    }
+  },
+
   // 嵌入提供商配置
   "embedding": {
     // 提供商："openai" 或 "azure-foundry"
@@ -256,12 +278,16 @@ BHGBrain 从以下位置加载配置文件：
     "dimensions": 1536,
     // 请求超时时间（毫秒）
     "request_timeout_ms": 30000,
-    // 单次嵌入请求的最大输入数量（分块阈值）
+    // 单次嵌入请求的最大输入数量（分块阈值）。两个提供商均遵守此项——
+    // 每次嵌入请求（包括 OpenAI）都会被拆分为不超过此大小的批次，并按
+    // 原始顺序重新组装结果。
     "max_batch_inputs": 2048,
     // 瞬时故障的重试配置
     "retry": {
       "max_attempts": 3,
-      "backoff_ms": 1000
+      "backoff_ms": 1000,
+      // 限制指数退避的上限，作用与上文的 llm.retry.max_backoff_ms 相同。
+      "max_backoff_ms": 10000
     },
     // 每个向量在写入时都会打上带提供方限定的身份标记
     // （`<provider>/<model>@<dimensions>`）。如果存储层记录的期望身份
@@ -292,7 +318,25 @@ BHGBrain 从以下位置加载配置文件：
     // 外部 Qdrant URL（当 mode = "external" 时使用）
     "external_url": null,
     // 包含 Qdrant API key 的环境变量名称（当 mode = "external" 时使用）
-    "api_key_env": null
+    "api_key_env": null,
+    // 每个请求路径、清理、扫描及管理类 Qdrant 调用的客户端（基于
+    // AbortController）超时期限 —— 全部经过共享断路器。底层客户端自身的默
+    // 认值为 300000 毫秒。
+    "operation_timeout_ms": 10000,
+    // 仅供健康探针使用的单独、故意更短的期限（其专属的独立客户端实例，从
+    // 不经过断路器）。不得超过 operation_timeout_ms。
+    "health_timeout_ms": 3000,
+    // 未指定 collection（整个命名空间范围）的 search/recall 查询在命名空间
+    // 内所有集合上扇出时的边界。
+    "fanout": {
+      // 超过此数量的目标集合会被确定性地截断。
+      "max_collections": 25,
+      // 这些目标集合中同时并发查询的数量。
+      "concurrency": 5,
+      // 仅在真正扇出（目标数大于一）时应用的单集合结果上限；显式指定
+      // `collection` 的搜索始终使用调用方完整的 `limit`。
+      "per_target_limit": 50
+    }
   },
 
   // 传输配置
@@ -315,7 +359,18 @@ BHGBrain 从以下位置加载配置文件：
       "headers_timeout_ms": 66000,
       // 完整接收一个请求所允许的时间；不会限制 GET /mcp 上长期存在的 SSE
       // 响应，因为该响应只接收请求，不发送请求。
-      "request_timeout_ms": 300000
+      "request_timeout_ms": 300000,
+      // 为内存中的 MCP HTTP 会话注册表设置边界（参见"健康状态与指标"下的
+      // "MCP 会话生命周期"）。
+      "mcp_session": {
+        // 超过这一时长没有请求的会话会被自动关闭。
+        "idle_timeout_ms": 1800000,
+        // 常驻会话数的硬上限；达到容量上限后的新会话会驱逐最近最少活跃的
+        // 会话以腾出空间。
+        "max_sessions": 1000,
+        // 独立的空闲会话清扫器运行的频率。
+        "sweep_interval_ms": 60000
+      }
     },
     "stdio": {
       // 启用 MCP stdio 传输
@@ -340,6 +395,18 @@ BHGBrain 从以下位置加载配置文件：
     // 每个命名空间中 pinned: true 记忆数量的上限
     // （参见 remember/tag 与 memory://inject 文档）
     "pin_limit_per_namespace": 20
+  },
+
+  // 备份*文件*保留策略（与下方的记忆级 `retention` 不同）
+  "backup": {
+    "retention": {
+      // 最多保留这么多份备份；超出此数量的最旧备份会在每次成功的
+      // `backup create` 之后被清理。null 表示禁用此上限。
+      "max_count": 30,
+      // 清理超过这么多天的备份，与数量无关。
+      // null 表示禁用此上限。
+      "max_age_days": 90
+    }
   },
 
   // 记忆保留与生命周期设置
@@ -425,7 +492,14 @@ BHGBrain 从以下位置加载配置文件：
       "max_cluster_size": 20,
 
       // 每次定时运行最多蒸馏（即调用 LLM）的簇数上限。
-      "max_clusters_per_run": 10
+      "max_clusters_per_run": 10,
+
+      // 每个簇的蒸馏 LLM 调用超时时间，通过共享请求执行器的 AbortController
+      // 强制执行（参见下文的“Outbound AI Request Policy”）。高于廉价模型的
+      // 默认值（pipeline.extraction_timeout_ms / summarization_timeout_ms），
+      // 因为蒸馏提示词会将整个簇的内容打包在一起。限制了一次定时运行中
+      // 各簇调用的最坏情况延迟。
+      "llm_timeout_ms": 10000
     }
   },
 
@@ -451,6 +525,9 @@ BHGBrain 从以下位置加载配置文件：
 
   // 搜索配置
   "search": {
+    // 活跃结果使用调用方指定的 limit。当 include_archived 为 true 时，
+    // 匹配的归档摘要会在这一独立上限内追加返回。
+    "archive_result_limit": 5,
     // 混合模式下互惠排名融合（RRF）的权重
     // 权重之和必须为 1.0
     "hybrid_weights": {
@@ -533,10 +610,14 @@ BHGBrain 从以下位置加载配置文件：
     "log_redaction": true,
     // HTTP 传输下每个客户端 IP 每分钟的最大请求数
     "rate_limit_rpm": 100,
+    // 速率限制器桶映射的硬性容量上限（参见速率限制）。
+    "rate_limit_max_buckets": 10000,
     // HTTP 请求体的最大字节数
     "max_request_size_bytes": 1048576,
-    // Express 的 "trust proxy" 设置。false（默认）= req.ip 为直接 socket 对端（回环精确）；
-    // true = 采信前置反向代理设置的 X-Forwarded-For。仅在受信任的代理之后启用。
+    // Express 的 "trust proxy" 设置。false（默认）= req.ip 为直接 socket 对端
+    // （回环精确）。正整数 = 精确信任这么多跳反向代理（req.ip 采信最右侧、
+    // 不受信任条目之前的 X-Forwarded-For）。字符串数组 = 仅信任地址匹配这些
+    // IP/子网的跳点。不再接受旧式布尔值 true（"信任每一跳"）—— 参见代理信任。
     "trust_proxy": false
   },
 
@@ -603,7 +684,8 @@ BHGBrain 从以下位置加载配置文件：
     "summarization_model": "gpt-4o-mini",
     // 摘要模型 API key 的环境变量名称。默认与 extraction_model_env 相同
     // （两者都是针对同一 OpenAI 账户的低成本写入路径模型调用）——如需使用
-    // 独立的 key，可指向另一个变量。
+    // 独立的 key，可指向另一个变量。与 extraction_model_env 一样，未设置时
+    // 会回退到 OPENAI_API_KEY。
     "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
     // 摘要请求超时（毫秒），通过 AbortController 强制执行
     "summarization_timeout_ms": 3000,
@@ -636,7 +718,7 @@ BHGBrain 从以下位置加载配置文件：
 | `BHGBRAIN_TOKEN` | 非回环 HTTP 时必需 | — | HTTP 认证的 Bearer token。若主机地址为非回环且此变量未设置，服务器**拒绝启动**（除非 `allow_unauthenticated_http: true`）。 |
 | `QDRANT_API_KEY` | Qdrant Cloud 时必需 | — | 在配置中将 `qdrant.api_key_env` 设置为此变量名称。默认配置字段名为 `QDRANT_API_KEY`。 |
 | `BHGBRAIN_DEVICE_ID` | 否 | 从主机名自动生成 | 覆盖多设备设置的设备标识符。参见[设备身份解析](#设备身份解析)。 |
-| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key，在 `pipeline.extraction_enabled` 为 `true` 时使用。也是 `pipeline.summarization_model_env` 的默认值（在 `pipeline.summarization_enabled` 为 `true` 时使用）——如需为摘要使用独立的 key，可将该字段指向其他变量。多查询扩展的 LLM 改写/HyDE 阶段（`search.query_expansion.llm_paraphrase.enabled`，详见[多查询扩展](#多查询扩展)）也会读取此变量，其解析方式与此相同：先读取 `pipeline.extraction_model_env`，未设置时回退到 `OPENAI_API_KEY`。 |
+| `BHGBRAIN_EXTRACTION_API_KEY` | 否 | 回退到 `OPENAI_API_KEY` | LLM 提取模型的 API key，在 `pipeline.extraction_enabled` 为 `true` 时使用。也是 `pipeline.summarization_model_env` 的默认值（在 `pipeline.summarization_enabled` 为 `true` 时使用）——如需为摘要使用独立的 key，可将该字段指向其他变量；无论 `summarization_model_env` 指向哪个变量，它都会像 `extraction_model_env` 一样回退到 `OPENAI_API_KEY`。多查询扩展的 LLM 改写/HyDE 阶段（`search.query_expansion.llm_paraphrase.enabled`，详见[多查询扩展](#多查询扩展)）以及矛盾检测（`pipeline.contradiction_detection.enabled`，详见[去重](#去重)）也会读取此变量，二者的解析方式与此相同：先读取 `pipeline.extraction_model_env`，未设置时回退到 `OPENAI_API_KEY`。 |
 | `BHGBRAIN_RERANK_API_KEY` | 否 | 无（**不会**回退到 `OPENAI_API_KEY`） | 可选的 `recall` 重排序阶段使用的 API key，在 `search.rerank.enabled` 为 `true` 时使用。与 `BHGBRAIN_EXTRACTION_API_KEY` 不同，它没有隐式回退——启用重排序是一次刻意的、使用独立 key 的选择，绝不会悄悄消耗嵌入或提取的 key/预算。详见[重排序](#重排序)。 |
 
 生成安全的 Bearer token：
@@ -685,7 +767,9 @@ node dist/index.js
 
 | 端点 | 是否需要认证 | 说明 |
 |---|---|---|
-| `GET /health` | 否 | 健康检查（不需认证，兼容探针） |
+| `GET /health/live` | 否 | 存活检查（liveness）：极简，不涉及任何依赖 I/O —— 可任意频率轮询 |
+| `GET /health/ready` | 否 | 就绪检查（readiness）：带缓存的 SQLite/Qdrant 检查；必需依赖降级时返回 503 |
+| `GET /health` | 是 | 完整诊断快照（embedding、retention、调度器、断路器等） |
 | `POST /mcp` | 是 | MCP Streamable HTTP：JSON-RPC 请求；`initialize` 请求会创建新会话 |
 | `GET /mcp` | 是 | MCP Streamable HTTP：既有会话的独立 SSE 通道 |
 | `DELETE /mcp` | 是 | MCP Streamable HTTP：终止会话 |
@@ -694,12 +778,16 @@ node dist/index.js
 | `GET /metrics` | 是 | Prometheus 格式的指标（需 `metrics_enabled: true`） |
 
 每个 `/mcp` 会话都是一个全新的内存态 MCP 服务器，与其他会话及 REST 端点共享同一底层
-存储 —— 重启进程会丢弃所有会话，符合规范的客户端会自动重新初始化。
+存储 —— 重启进程会丢弃所有会话，符合规范的客户端会自动重新初始化。空闲超过
+`transport.http.mcp_session.idle_timeout_ms` 的会话会被自动关闭；完整的会话生命周期与
+端点划分详见[健康状态与指标](#健康状态与指标)。
 
 健康检查示例：
 
 ```bash
-curl http://127.0.0.1:3721/health
+curl http://127.0.0.1:3721/health/live
+curl http://127.0.0.1:3721/health/ready
+curl -H "Authorization: Bearer <your-token>" http://127.0.0.1:3721/health
 ```
 
 通过 HTTP 调用工具示例：
@@ -2112,29 +2200,38 @@ sequenceDiagram
     rect rgb(230, 245, 230)
         Note over C,FS: CREATE BACKUP
         C->>S: backup create
-        S->>DB: Export full database
-        DB-->>S: Raw DB bytes
-        S->>S: Compute SHA-256 checksum
-        S->>S: Build JSON header<br/>(version, count, checksum)
-        S->>FS: Atomic write .bhgb file<br/>(write-to-temp-then-rename)
+        S->>DB: VACUUM INTO a scratch export file
+        S->>FS: Stream-hash the export (bounded memory)
+        S->>S: Build JSON header<br/>(version, count, checksum, header_checksum)
+        S->>FS: Stream header + export into a unique temp file,<br/>fsync, rename into place (backups/)
         FS-->>S: Success
+        S->>S: Prune backups over count/age bounds
         S-->>C: path, size, memory_count
     end
 
     rect rgb(230, 235, 250)
         Note over C,FS: RESTORE BACKUP
         C->>S: backup restore (path)
-        S->>FS: Read .bhgb file
-        FS-->>S: Header + DB bytes
-        S->>S: Validate SHA-256 checksum
-        alt Checksum mismatch
-            S-->>C: ❌ INVALID_INPUT
+        S->>S: Acquire cross-process restore lock
+        S->>FS: Read .bhgb file; verify header_checksum + body checksum
+        alt Checksum or version invalid
+            S-->>C: ❌ INVALID_INPUT (live database untouched)
         else Checksum valid
-            S->>FS: Atomic write to data dir<br/>(write-to-temp-then-rename)
-            S->>DB: Hot-reload in-memory SQLite
-            S->>DB: Run schema migrations
-            DB-->>S: Ready
-            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+            S->>FS: Write candidate to a scratch file;<br/>open it, run integrity_check + schema/count checks
+            alt Candidate fails validation
+                S-->>C: ❌ live database untouched
+            else Candidate valid
+                S->>DB: Checkpoint + close live connection
+                S->>FS: Rename live db aside (pre-restore-*),<br/>rename candidate into place
+                S->>DB: Reopen; re-verify record count
+                alt Activation or post-activation check fails
+                    S->>FS: Rename pre-restore image back; reopen
+                    S-->>C: ❌ prior database restored and active
+                else Activation succeeds
+                    S->>S: Reconcile vectors: stream drift + surplus scan,<br/>prune vector-only orphans
+                    S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+                end
+            end
         end
     end
 ```
@@ -2150,7 +2247,7 @@ sequenceDiagram
 bhgbrain backup create
 ```
 
-备份捕获整个 SQLite 数据库（所有记忆、类别、集合、审计日志、版本历史和归档记录），作为单个 `.bhgb` 文件保存在数据目录的 `backups/` 子目录中。
+备份捕获整个 SQLite 数据库（所有记忆、类别、集合、审计日志、版本历史和归档记录），作为单个 `.bhgb` 文件保存在数据目录的 `backups/` 子目录中。创建过程会以流式方式对导出内容进行哈希计算和磁盘写入——无论数据库大小如何，峰值内存都限定在一个较小的固定数量的数据块内，而不是一次性将整个导出内容保存在内存中。
 
 **备份文件格式：**
 ```
@@ -2159,24 +2256,44 @@ bhgbrain backup create
 [剩余字节：SQLite 数据库导出]
 ```
 
-JSON 头部包含：
+JSON 头部（格式版本 2）包含：
 ```json
 {
-  "version": 1,
+  "version": 2,
   "memory_count": 1234,
   "checksum": "<db 数据的 sha256>",
   "created_at": "2026-03-15T12:00:00Z",
   "embedding_model": "text-embedding-3-small",
-  "embedding_dimensions": 1536
+  "embedding_dimensions": 1536,
+  "header_checksum": "<上述规范字段的 sha256>"
 }
 ```
 
-**备份中不包含的内容：**
-- Qdrant 向量数据**不**包含在内。从备份恢复后，必须通过重新嵌入内容来重建 Qdrant 集合。在此之前，全文搜索可用，但语义搜索不可用。
+`header_checksum` 对头部自身的字段进行认证（因此在恢复过程将其用于任何破坏性用途之前，被篡改的 `memory_count`/`checksum`/嵌入字段会被拒绝），并与正文校验和一并验证。版本 1 的备份（没有 `header_checksum`）仍可通过兼容性解析器读取，该解析器绝不会将未经认证的字段用于任何破坏性用途；任何其他版本都会在恢复触及活动数据库之前以 `INVALID_INPUT` 被拒绝。
 
-**备份完整性：** 数据库数据的 SHA-256 校验和存储在头部并在恢复时验证。如果文件损坏，恢复失败并返回 `INVALID_INPUT: Backup integrity check failed`。恢复的数据库激活后，其记忆数量还会与头部中的 `memory_count` 进行交叉核对；如果不一致，恢复将以 `INTERNAL` 失败（记录为 `backup_restore_count_mismatch` 事件），而不是在数据静默错误的情况下返回成功响应。
+**备份中不包含的内容：**
+- Qdrant 向量数据**不**包含在内。从备份恢复后，向量会根据漂移进行协调（见下文），而不是打包进档案中——这使得备份更小、更便于携带。
+
+**备份完整性：** 正文的 SHA-256 校验和以及头部自身的 `header_checksum` 都会在任何头部字段被用于破坏性用途之前得到验证。文件损坏或被截断，或其头部被独立于正文篡改，都会导致恢复在触及活动数据库之前以 `INVALID_INPUT` 失败。
+
+**持久性提交：** 备份文件（以及恢复的数据库镜像）会被写入具有严格 `0600` 权限的唯一临时文件，执行 `fsync`，然后重命名到最终位置；在文件系统支持的情况下，所在目录也会执行 `fsync`——进程或主机在备份创建报告成功后崩溃，绝不会在最终路径留下不完整的文件，中断的写入也绝不会覆盖另一个写入者仍在进行中的临时文件。
 
 **备份元数据**追踪在 SQLite 的 `backup_metadata` 表中，以便 `backup list` 可以返回历史备份信息。
+
+**备份文件保留策略：** 每次 `backup create` 成功后，会清理超出配置数量或年龄的备份（文件与元数据行一并清理）。通过 `config.json` 中的 `backup.retention` 进行配置：
+
+```json
+{
+  "backup": {
+    "retention": {
+      "max_count": 30,
+      "max_age_days": 90
+    }
+  }
+}
+```
+
+任一限制单独满足即可触发清理该备份；将某个限制设为 `null` 可禁用它（两者都设为 `null` 会完全禁用保留策略——不建议这样做，因为备份存储会因此无限增长，并与数据库大小成正比）。文件删除失败的备份会保留在元数据中，以便下一轮重试，而不会失去对它的追踪。超出限制且文件已经不存在的备份，其过期元数据行会被清理，并与真正的删除操作分开标记。`backup list` 还会标记（`missing: true`）任何文件已消失但元数据行尚未清理的备份，而不是将其呈现为可恢复的备份。
 
 ### 列出备份
 
@@ -2192,7 +2309,8 @@ JSON 头部包含：
       "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
@@ -2208,20 +2326,19 @@ JSON 头部包含：
 ```
 
 **恢复过程：**
-1. 验证文件存在且完整性校验和匹配。
-
-2. 将嵌入的 SQLite 数据库原子性写入数据目录（先写临时文件再重命名）。
-3. 从恢复的文件热重载内存中的 SQLite 数据库，无需重启进程。
-4. 对重新加载的数据库运行 schema 迁移以确保向前兼容。
-5. 根据实际漂移（drift）对向量进行协调（见下文），并返回 `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`。
+1. 获取跨进程恢复锁（见下文），并验证文件存在、格式版本受支持，且头部与正文的校验和均匹配。
+2. 将候选数据库写入临时文件，并在*触及活动数据库之前*对其进行验证：打开它、运行 `PRAGMA integrity_check`、确认 schema 可读，并确认其记录数量与头部的 `memory_count` 一致。任何一项检查失败的候选文件都会使活动数据库完全不受影响。
+3. 对活动连接执行 checkpoint 并关闭，将活动数据库文件*挪至一旁*，改名为一个唯一的恢复前路径（而非原地覆盖），将验证通过的候选文件改名到位，然后重新打开。
+4. 重新验证重新打开的数据库的记录数量。如果激活或此激活后检查失败，恢复前的镜像会被改名回原位并重新打开——恢复始终会留下一个可用、处于活动状态且已重新打开的数据库，绝不会留下一半替换或损坏的数据库。
+5. 根据实际漂移和纯向量剩余项（见下文）协调向量，并返回 `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`。
 
 **恢复是实时的：** 恢复的数据库立即生效。无需重启服务器。响应包含 `metadata_activated: true` 以确认这一点。
 
-**激活后的记忆数量核对：** 由于备份是 SQLite 数据库的逐字节导出，激活后的记忆数量必须与头部中的 `memory_count` 完全一致。如果不一致，恢复将抛出 `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` 并记录 `backup_restore_count_mismatch` 事件——该调用不会返回成功响应。
+**回滚保证：** 报告的恢复失败——无论是来自激活前验证、活动/候选文件交换，还是激活后记录数量检查——都始终会使先前的数据库保持可恢复且已重新打开的状态，绝不会留下缺失、写了一半或悄然出错的数据库。错误消息会明确说明先前的数据库是否已被恢复（`"...the prior database was restored and is active"`）还是从未被触及（`"...before any change to the active database"`）。
 
-**向量协调仅针对实际漂移，且有边界限制。** 恢复不会无条件清空并重新嵌入整个语料库：它会将每条恢复记忆的内容校验和与 Qdrant 中已存储的向量进行比较，只将新增或内容发生变化的记忆标记为需要重新嵌入。如果自备份创建以来嵌入模型/维度发生了变化，或无法读取 Qdrant 的现有状态，恢复会转而执行完整重建。一旦漂移检查完成，恢复生命周期锁即被释放——如果没有任何漂移，`vector_reconciliation.state` 会立即变为 `"reconciled"`；如果漂移子集的重新嵌入需要在调用已经返回之后，在一个有边界的后台任务（每轮有超时和批次上限，并带有自动重试）中继续进行，则为 `"reconciling"`。可轮询 `health://status`（`components.vector_reconciliation`）以观察其完成情况。
+**跨进程互斥：** 一个独占锁文件（`<data_dir>/.restore.lock`）在整个恢复过程中被持有，每一次 SQLite 写操作（无论在本进程还是另一进程中）都会检查它——来自另一个 CLI 调用或服务器进程的重叠恢复，或与活动恢复竞争的普通写操作，都会以可重试的 `CONFLICT`（`"Backup restore is already active for this data directory"` 或 `"Storage lifecycle operation in progress: restore (held by another process)"`）明确失败，而不会写入即将被改名或替换的数据库镜像。
 
-**并发恢复保护：** 如果恢复操作已在进行中，后续恢复请求返回 `INVALID_INPUT: Backup restore already in progress`。该锁仅覆盖元数据激活和漂移检查阶段，不包括后台重新嵌入，因此即使是大规模恢复也会很快释放。
+**向量协调仅针对实际漂移，具有边界限制，且是双向的。** 恢复不会无条件清空并重新嵌入整个语料库：它会以流式方式遍历每个受管理的 Qdrant 集合一次（绝不会将整个集合缓冲到内存中），并将每个点的校验和与恢复的 SQLite 行进行比较，只将新增或内容发生变化的记忆标记为需要重新嵌入。它还会识别**纯向量剩余项**——在恢复的 SQLite 镜像中完全没有对应行的 Qdrant 点，这些点是备份早于它们创建时遗留下来的——并以有边界的批次删除它们，且仅限于本设备自身的点（或早于设备标记功能的旧有数据点），以确保另一台设备合法的跨设备搜索回退永远不会被触及。删除失败的剩余项会作为可重试的孤立工作保留下来，并使 `vector_reconciliation` 保持降级状态，而不是被错误地报告为健康，从而确保它永远不会作为一个永不过期的载荷回退出现在 `recall` 中。当自备份创建以来嵌入模型/维度发生了变化时，恢复会转而执行完整重建；当 Qdrant 的现有状态根本无法*读取*时（一次瞬时故障，而非模型变更），会保守地重新嵌入整个语料库而不清空任何内容，并将其报告为独立的 `inspection-failed` 原因，而不是被错误地归类为模型变更。一旦此项检查完成，恢复锁即被释放——如果没有任何漂移且没有剩余项未清理，`vector_reconciliation.state` 会立即变为 `"reconciled"`；如果漂移子集的重新嵌入在调用已经返回之后，在一个有边界的后台任务（每轮有超时和批次上限，并带有自动重试）中继续进行，或者仍有未清理的剩余项作为可重试的工作，则为 `"reconciling"`。可轮询 `health://status`（`components.vector_reconciliation`）以观察其完成情况。
 
 ---
 
@@ -2229,13 +2346,32 @@ JSON 头部包含：
 
 ### 健康端点
 
+HTTP 健康检查分为三部分，让廉价、高频的存活探针、有边界的就绪检查、以及完整的认证诊断
+快照各自具有恰当的成本与访问控制模型（bound-qdrant-http-runtime）：
+
 ```bash
-GET /health        # HTTP
-# 或通过 CLI：
+GET /health/live   # 无需认证，无依赖 I/O —— 用于重启/存活决策
+GET /health/ready   # 无需认证，带缓存的依赖检查 —— 未就绪时返回 503
+GET /health          # 需认证，完整诊断快照
+# 或通过 CLI（完整诊断快照，等同于 GET /health）：
 bhgbrain health
 ```
 
-返回 `HealthSnapshot`：
+- **`GET /health/live`** —— `{ "status": "ok", "uptime_seconds": 86400 }`。同步执行，
+  不涉及任何依赖（连 SQLite 都不涉及），因此在任何探测频率下都保持廉价。始终返回
+  `200`。用于编排器的重启决策（Docker 镜像自身的 `HEALTHCHECK` 探测的正是它 —— 参见
+  [Docker](#docker)）。
+- **`GET /health/ready`** —— 只检查请求无法离开的两个依赖：SQLite（本地
+  `SELECT 1`）和 Qdrant（有边界、带缓存的向量查询探针 —— 见下文）。返回
+  `{ "ready": true|false, "components": { "sqlite": {...}, "qdrant": {...} } }`，就绪
+  时为 `200`，任一依赖不健康时为 `503`。与 `/health/live` 不同，该端点注册在限流之
+  *后*，且 Qdrant 探针本身带缓存，因此一连串未认证的就绪轮询不会转化为一连串新的
+  Qdrant 请求。
+- **`GET /health`** —— 完整诊断快照（embedding、retention、调度器、断路器、各层计数
+  等），现在要求与其他路由相同的 Bearer 认证。与 `/health/ready` 共享同一个带缓存的
+  Qdrant 探针。
+
+返回 `GET /health` 的 `HealthSnapshot`：
 
 ```json
 {
@@ -2283,11 +2419,90 @@ bhgbrain health
 | `embedding` | 嵌入 API 调用成功 | 缺少凭据或无法访问 | — |
 | `retention` | 所有预算在限制内，无未同步向量 | 预算超出或未同步向量 > 0 | — |
 
-**HTTP 状态码：**
+**HTTP 状态码（`GET /health`）：**
 - `200`——对于 `healthy` 和 `degraded`
 - `503`——对于 `unhealthy`
 
-嵌入健康状态缓存 30 秒，以避免每次探针对 OpenAI 发起 API 调用。
+（`GET /health/ready` 使用自己的 `ready`/`503` 映射 —— 见上文 —— 与 `GET /health` 的
+`healthy`/`degraded`/`unhealthy` 状态字段相互独立。）
+
+嵌入健康状态缓存 30 秒，以避免每次探针对 OpenAI 发起 API 调用。Qdrant 健康探针（由
+`/health` 与 `/health/ready` 共用）出于同样的原因缓存 5 秒，并使用自己独立的短客户端
+超时（`qdrant.health_timeout_ms`，默认 3000），而不是请求路径 Qdrant 调用所用的更长
+的 `qdrant.operation_timeout_ms` —— 卡住的 Qdrant 能快速使健康状态降级，调用方无需
+等待完整的操作期限。参见[完整配置参考](#完整配置参考)。
+
+### 依赖超时、有边界的扇出与断路器覆盖
+
+服务器发出的每一次 Qdrant 操作 —— 写入、读取、清理/压缩、快照创建、集合
+scroll/列出/删除 —— 都受 `qdrant.operation_timeout_ms` 约束（默认 10000，基于客户端
+的 `AbortController`），并统一经过共享的 Qdrant 断路器（`resilience.circuit_breaker`），
+因此被黑洞化的 Qdrant 端点会在每条代码路径上快速失败，而不只是部分路径。健康探针刻意
+使用独立的客户端与超时（`qdrant.health_timeout_ms`），且从不触碰断路器（见上文）。
+
+未指定 `collection` 的 `recall`/`search` 调用会在命名空间内的每个集合上扇出。这一扇出
+受 `qdrant.fanout` 约束：`max_collections`（默认 25）限制一次调用最多面向多少个集合
+—— 超出部分会被确定性地截断 —— `concurrency`（默认 5）限制其中有多少并发执行（以固
+定大小的批次进行），`per_target_limit`（默认 50）则在真正扇出（目标数大于一）时限制
+每个目标自身的 `limit` —— 显式指定 `collection` 的搜索始终使用调用方完整、不受限制的
+`limit`。截断情况通过 `bhgbrain_qdrant_fanout_width` 仪表和
+`bhgbrain_qdrant_fanout_truncated_total` 计数器（参见[指标](#指标)）以及一条
+`qdrant_fanout_truncated` 日志行暴露，而不会出现在 `search`/`recall` 响应体本身中。
+
+### Outbound AI Request Policy
+
+每一个兼容 OpenAI 的功能——嵌入（OpenAI 提供商；Azure 保留其自身派生的按资源端点）、
+多候选提取、可选的重排序、LLM 摘要、多查询扩展的 LLM 改写/HyDE 阶段、矛盾检测，以及
+定时蒸馏——都通过同一个共享请求边界发出其聊天/嵌入请求，而不是各功能各自独立构造
+`fetch` 调用。该边界提供：
+
+- **共享的基础 URL**（`llm.base_url`，默认 `https://api.openai.com/v1`）：将其指向一个
+  经过校验的、兼容 OpenAI 的网关，即可一次性将上述所有功能路由过去。各功能自身的模型
+  名称、凭据和超时设置（`pipeline.extraction_timeout_ms`、`search.rerank.timeout_ms`
+  等）不受影响——只有端点和重试策略是共享的。
+- **覆盖整个响应过程的超时**，而不仅是初始连接：所配置的超时会在接收响应头、读取响应
+  体、JSON 解析以及该功能自身的响应校验期间持续生效。一个返回成功响应头之后却在响应体
+  中途卡住的提供商，仍会在超时到达时中止——如果该功能受断路器保护，这会被记为一次
+  断路器失败，而不是静默的成功。
+- **统一的 HTTP/网络故障分类**：`429` 和 `408` 始终可重试；`500`/`502`/`503`/`504`
+  可重试（其他 5xx 状态码以及任何其他 4xx 状态码都被视为永久性故障——重试无法修复
+  错误的凭据或格式错误的载荷）；网络错误和超时可重试。`429`/`5xx` 响应中有效的
+  `Retry-After` 头会将下一次尝试的延迟提升到至少该值，并受 `llm.retry.max_backoff_ms`
+  上限约束。
+- **带上限和抖动的重试**（`llm.retry.max_attempts`/`backoff_ms`/`max_backoff_ms`，默认
+  `3`/`200`/`2000`）：一次逻辑调用的整个重试循环——包括每一次内部尝试——最多只记录一次
+  断路器结果，因此第二次尝试就成功的瞬时故障绝不会触发一个健康提供商本不会触发的断路器。
+  嵌入请求使用自己等价的 `embedding.retry` 策略（同样包含 `max_backoff_ms`）而不是
+  `llm.retry`，因为嵌入本身已经有自己的批量拆分需求（`max_batch_inputs`）。
+- **在信任任何提供商输出之前先做响应校验**：每一次嵌入请求（无论 OpenAI 还是 Azure，
+  均按 `embedding.max_batch_inputs` 分块）都会校验返回的数组中恰好包含与请求输入数量
+  相同的向量数，且每个向量都与配置的 `embedding.dimensions` 一致，然后才会按输入顺序
+  重新组装结果——过短或格式错误的批次会使整次调用失败，而不是悄悄地将向量与错误的
+  记忆关联起来。
+
+语义搜索会保留嵌入提供商原始的、已分类的错误（其代码以及是否可重试），而不是总用一个
+通用信息替换它；混合搜索退化为纯全文检索的路径也会记录并度量同样的分类信息，并连同
+`fulltext_only` 回退一起上报，使运维人员在两种模式下都能区分瞬时限流与永久性认证失败。
+
+### MCP 会话生命周期
+
+每次 `POST /mcp initialize` 调用都会打开一个在进程生命周期内保存在内存中的会话。
+`transport.http.mcp_session` 为这一注册表设置边界，使得一个未发送 `DELETE /mcp` 就断开
+连接的 HTTP MCP 客户端（普通客户端崩溃或网络中断的常见情形）不会无限期泄漏会话：
+
+- `idle_timeout_ms`（默认 1,800,000 = 30 分钟）—— 超过这一时长没有请求的会话会被独立
+  的、`unref` 的清扫器关闭（`sweep_interval_ms`，默认 60000）。通过某个会话发出的任何
+  请求都会刷新其活跃度，从而推迟过期。
+- `max_sessions`（默认 1000）—— 常驻会话数的硬上限。达到容量上限后的新 `initialize`
+  会驱逐最近最少活跃的会话以腾出空间；如果注册表本已为空却仍然“达到容量”（只有在
+  `max_sessions: 0` 这种误配置下才可能发生），请求会以失败关闭（fail closed）的方式返
+  回 `503`。
+- 在任一驱逐路径之后重用某个 ID，会得到与 `DELETE /mcp` 已经产生的相同的
+  `404 Session not found` 响应 —— 无需处理另一套错误形态。
+
+当前及被驱逐的会话数分别以 `bhgbrain_mcp_sessions_active` 仪表和
+`bhgbrain_mcp_sessions_evicted_total{reason="idle"|"capacity"}` 计数器发布（参见
+[指标](#指标)）。`closeAll()`（进程关闭时）会停止清扫定时器并关闭每个存活会话的传输层。
 
 ### 指标
 
@@ -2324,6 +2539,11 @@ GET /metrics
 | `bhgbrain_memory_count` | gauge | 当前总记忆数量（写入/删除时更新） |
 | `bhgbrain_rate_limit_buckets` | gauge | 活跃的速率限制追踪桶 |
 | `bhgbrain_rate_limited_total` | counter | 被速率限制的请求总数 |
+| `bhgbrain_rate_limit_capacity_rejected_total` | counter | 因速率限制桶映射对某个全新客户端身份已达到 `security.rate_limit_max_buckets` 容量上限而以 429 拒绝的请求总数 |
+| `bhgbrain_qdrant_fanout_width` | gauge | 最近一次未指定 collection 的 `search`/`recall` 查询在经过 `qdrant.fanout.max_collections` 截断后实际扇出的集合数 |
+| `bhgbrain_qdrant_fanout_truncated_total` | counter | 每当未指定 collection 的查询的目标集合列表被截断到 `qdrant.fanout.max_collections` 时递增 |
+| `bhgbrain_mcp_sessions_active` | gauge | 当前常驻的 MCP HTTP 会话数 |
+| `bhgbrain_mcp_sessions_evicted_total` | counter | 会话管理器关闭的 MCP HTTP 会话总数，带 `reason` 标签（`idle` 或 `capacity`） |
 | `recall_zero_after_filter` | counter | 当 `recall` 检索后的类型/标签/`after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
 | `search_zero_after_filter` | counter | 当 `search` 检索后的 `after`/`before` 防御性复查移除了存储层已声称匹配的结果时递增——这是过滤饥饿的信号，稳态下应保持为 0 |
 | `search_embedding_degraded` | counter | 当 `hybrid` 模式搜索因嵌入提供方或向量存储不可用而降级为仅全文搜索时递增，按 `namespace` 分类 |
@@ -2347,7 +2567,9 @@ bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
 
 ### HTTP 认证
 
-在 HTTP 模式下运行时，所有端点（`/health` 除外）的请求都需要 `Bearer` token：
+在 HTTP 模式下运行时，除 `/health/live` 与 `/health/ready` 外的所有端点的请求都需要
+`Bearer` token —— 完整诊断快照 `/health` 现在与其他路由一样需要认证（参见
+[健康状态与指标](#健康状态与指标)）：
 
 ```
 Authorization: Bearer <your-token>
@@ -2390,14 +2612,21 @@ SECURITY: HTTP binding to "0.0.0.0" is externally reachable but no bearer token 
 
 ### 代理信任
 
-`security.trust_proxy`（默认 `false`）会直接传给 Express 的 `app.set('trust proxy', ...)`，从而控制 `req.ip` 的推导方式，也就决定了速率限制器所依据的身份：
+`security.trust_proxy`（默认 `false`）会直接传给 Express 的 `app.set('trust proxy', ...)`，从而控制 `req.ip` 的推导方式，也就决定了速率限制器所依据的身份。它接受 `false`、一个正整数跳数，或一个受信任代理 IP/子网数组 —— **不再接受旧式布尔值 `true`（"信任每一跳"）**，配置校验会失败并给出迁移提示，因为它会让调用方提交的、位于 `X-Forwarded-For` *最左侧*的条目自行选择客户端身份，即便只经过恰好一跳真实反向代理：
 
-- **禁用（默认）：** `req.ip` 为直接 socket 对端地址。这对文档中仅回环的部署方式是精确的。如果前面仍然放置了反向代理，所有被代理的客户端都会被合并为代理的单一 IP，并且调用方提交的 `X-Forwarded-For` 头会被忽略（因此无法被伪造来拆分或规避速率限制）。
-- **启用：** `req.ip` 会采信直接对端设置的 `X-Forwarded-For`。仅应在您信任其正确设置该头部的反向代理之后启用——在没有受信任代理的情况下启用会让任何客户端伪造其速率限制身份。
+- **禁用（默认，`false`）：** `req.ip` 为直接 socket 对端地址。这对文档中仅回环的部署方式是精确的。如果前面仍然放置了反向代理，所有被代理的客户端都会被合并为代理的单一 IP，并且调用方提交的 `X-Forwarded-For` 头会被忽略（因此无法被伪造来拆分或规避速率限制）。
+- **跳数（正整数）：** 精确信任离服务器最近的这么多跳反向代理。当设为 `1` 且位于一个受信任的反向代理之后时，`req.ip` 会解析为 `X-Forwarded-For` 中最右侧（离服务器最近）的条目 —— 即代理实际设置的那一项 —— 而不是调用方任意提交的最左侧前缀。
+- **子网/地址列表（字符串数组）：** 只信任地址匹配给定 IP 或 CIDR 子网之一的跳点（例如 `["10.0.0.0/8"]`），即 Express/`proxy-addr` 的标准形式。
 
 ```json
-{ "security": { "trust_proxy": true } }
+{ "security": { "trust_proxy": 1 } }
 ```
+
+```json
+{ "security": { "trust_proxy": ["10.0.0.0/8"] } }
+```
+
+从已有的 `"trust_proxy": true` 迁移：将其替换为您实际反向代理链的跳数（在服务器前只有单一负载均衡器或 ingress 的常见情形下通常为 `1`），或其运行所在的受信任子网。
 
 ### 速率限制
 
@@ -2408,7 +2637,7 @@ HTTP 请求按客户端 IP 地址进行速率限制：
 - 超出限制的客户端收到 HTTP 429 和 `{ error: { code: "RATE_LIMITED", retryable: true } }`
 - 无法推导出客户端 IP 的请求会以 HTTP 400（`INVALID_INPUT`）安全失败关闭，而不是共享单一的兜底桶
 - 响应头包含 `X-RateLimit-Limit` 和 `X-RateLimit-Remaining`
-- 每 30 秒清扫一次过期的速率限制桶
+- 桶映射有一个硬性容量上限 `security.rate_limit_max_buckets`（默认 10,000）。过期的桶通过一个 `unref` 定时器每 30 秒独立清扫一次（不再机会主义地依附于请求到达，因此即使流量完全停止，清理也会继续进行）。达到容量上限时，会先运行最后一次清扫，之后仍会以 HTTP 429（`{ error: { code: "RATE_LIMITED", retryable: true } }`）拒绝一个全新的客户端身份，而不是继续让映射增长 —— 已经存在的客户端永远不会因此受影响。
 - 速率限制状态按服务器/中间件实例隔离，因此独立实例（例如测试中）永远不会共享桶
 
 ### 请求大小限制
@@ -2643,8 +2872,8 @@ BHGBrain 提供三种构建你的工作档案的方式，从全程引导到批�
 // 查看进度
 { "name": "bootstrap", "arguments": { "action": "status" } }
 
-// 重做某一节
-{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+// 重做某一节——reset 是破坏性操作（会永久删除该节的记忆），需要提供精确的确认值
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3, "confirm": "RESET" } }
 ```
 
 每次提交后，该工具会返回下一节的问题，方便智能体自然地推进对话。会话持久化在 SQLite 中——你可以关闭客户端，之后从中断处继续。
@@ -2943,7 +3172,8 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
       "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
       "confidence": 1.0
     }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
@@ -2957,6 +3187,13 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 `include_archived` 采用相同约定），以及 `linked_from`（基础结果的 id）、
 `link_relation` 和 `link_direction`（若基础结果是该边的源端则为 `"outgoing"`，若是
 目标端则为 `"incoming"`）。已归档的关联记忆会被跳过。
+
+`results` 的组装会控制在 `defaults.max_response_chars`（默认 `50000`）字符预算内：
+体积较大的结果（较长的 `content` 字段、较高的 `limit`）会逐条纳入，直到达到该字符
+预算为止；`truncated: true` 表示为了保持在预算内而省略了末尾的结果——此时即便存在
+更多匹配项，`results.length` 也可能小于 `limit`。这与 `min_score`/过滤条件收窄不
+同，`recall` 无法将二者与结果本身就很少的情况区分开；如果调用方即便预算充足也需要
+获取全部匹配项，应改为收窄查询或降低 `limit`。
 
 ---
 
@@ -3000,7 +3237,7 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `after` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at >= after`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到向量/全文存储层——这是 `search` 的第一个下推过滤条件。 |
 | `before` | `string（ISO 8601 日期时间）` | 否 | - | 仅包含 `created_at <= before`（含边界）的记忆。按创建时间过滤，而非 `updated_at`。下推到向量/全文存储层。 |
 
-**输出：** 与 `recall` 相同的结构——`{ "results": [...] }`——但没有 `min_score` 关卡，支持最多 50 条结果。归档命中（当 `include_archived: true` 时）带有 `archived: true`，使用保留的摘要作为 `content`，且没有有意义的 `score`（它们是元数据词条匹配，而非排序结果）。
+**输出：** 与 `recall` 相同的结构——`{ "results": [...], "truncated": false }`——但没有 `min_score` 关卡，支持最多 50 条结果，并多一个 `degraded` 字段（混合模式回退为纯全文搜索时为 `true`）。归档命中（当 `include_archived: true` 时）带有 `archived: true`，使用保留的摘要作为 `content`，且没有有意义的 `score`（它们是元数据词条匹配，而非排序结果）。`results` 遵循与上文 `recall` 相同的 `defaults.max_response_chars` 预算及 `truncated` 语义。
 
 ---
 
@@ -3141,9 +3378,11 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
   "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
   "size_bytes": 2048576,
   "memory_count": 1234,
-  "created_at": "2026-03-15T12:00:00Z"
+  "created_at": "2026-03-15T12:00:00Z",
+  "missing": false
 }
 ```
+每次 `create` 成功后都会自动执行备份文件保留策略（`backup.retention.max_count`/`max_age_days`）——参见[创建备份](#创建备份)。
 
 **`list` 输出：**
 ```json
@@ -3153,11 +3392,13 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
       "path": "...",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
 ```
+`missing: true` 标记某条元数据行在磁盘上已无对应文件的备份，而不是将其呈现为可恢复的备份。
 
 **`restore` 输出：**
 ```json
@@ -3172,7 +3413,7 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
   }
 }
 ```
-当没有向量真正发生漂移（无需重新嵌入）时，`vector_reconciliation.state` 为 `"reconciled"`；当一个有边界的后台任务正在重新嵌入漂移或缺失的子集时，为 `"reconciling"`。参见[从备份恢复](#从备份恢复)。
+当没有向量真正发生漂移、没有纯向量剩余项未清理、且无需任何重新嵌入时，`vector_reconciliation.state` 为 `"reconciled"`；当一个有边界的后台任务正在重新嵌入漂移或缺失的子集，或仍有未清理的剩余项作为可重试工作时，为 `"reconciling"`；如果漂移/剩余项检测本身未能完成，则为 `"pending"`。参见[从备份恢复](#从备份恢复)。
 
 ---
 
@@ -3188,13 +3429,14 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 | `section` | `integer (1-10)` | submit/reset 时需要 | - | 要提交答案或重置的节号。 |
 | `answers` | `string` | submit 时需要 | - | 该节的答案。最多 500,000 个字符。 |
 | `namespace` | `string` | 否 | `"profile"` | 命名空间范围。 |
+| `confirm` | `string` | reset 时需要 | - | 必须精确等于 `"RESET"`。缺失或错误的值不会改变任何存储数据。 |
 
 **动作：**
 
 - **`start`** —— 创建新会话或恢复现有会话。返回第一个未完成节的标题、问题和说明。
 - **`submit`** —— 将答案作为离散记忆存储到给定节，将其标记为已完成，并返回下一节。
 - **`status`** —— 返回进度概览：哪些节已完成、记忆数量、最后更新时间。
-- **`reset`** —— 删除某一节的所有记忆，并将其标记为待重新采集。
+- **`reset`** —— **破坏性操作。** 永久删除某一节的所有记忆，并将其标记为待重新采集。需要提供 `confirm: "RESET"`；缺失或错误的值会被拒绝，且不会删除任何数据。
 
 **输出（start）：**
 
@@ -3248,6 +3490,10 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 - `dry_run: true` 返回记忆预览且不产生任何写入。
 - 编号超出 10 个存储映射节范围的标题（例如按旧的 12 节模板编写的文档）不会被静默丢弃——其编号会记录在 `sections_ignored` 中，让你知道内容被跳过而不是在毫无提示的情况下丢失。
 - 如果 [`remember`](#remember存储记忆) 因内容超过 `pipeline.long_content_threshold_chars` 而拒绝了你的内容，改用 `format: "freeform"` 的 `import`——它会按标题/段落边界拆分文档并独立嵌入每个片段，从而避开 `remember` 的阈值所防范的单一混合向量问题。
+- 解析出的片段若长于 `import.max_chunk_chars`（默认 `8000`），会被确定性地按该字符数硬拆分为多块，而不是作为一个超长片段被嵌入或被直接拒绝——每一块仍会成为独立的记忆候选项。
+- 若拆分后的片段总数超过 `import.max_chunks`（默认 `500`），整次调用——无论是否为 dry run——都会在发起任何嵌入服务调用之前，以 `INVALID_INPUT` 被拒绝，并说明实际片段数与配置的上限。
+- 解析出的片段会按 `import.embedding_batch_size`（默认 `100`）分批向嵌入服务商请求向量，而不是每个片段单独请求一次，因此出站请求数会随片段数/批大小扩展，而非片段数本身。若整批嵌入请求失败，这些片段并不会因此丢失——每个片段会回退为通过正常写入流程单独嵌入。
+- 若某个片段彻底写入失败（其每个提取候选都被拒绝），不会中止本次导入的其余部分：该片段会计入 `failed` 字段，并在 `failures` 数组中列出详情（`[{ "chunk_index": 4, "error": "..." }]`），两者仅在至少有一个片段失败时才会出现。
 
 ---
 
@@ -3596,6 +3842,13 @@ SQLite 数据库——用于多设备设置、数据丢失恢复或新设备接�
 
 在被扫描的这一页内，只要两条记忆之间的相似度边达到或超过 `consolidation.similarity_threshold`（默认 `0.9`——刻意低于写入时去重的 UPDATE 阈值，因此 `list` 会呈现出那些去重机制本身不会自动合并的候选项），就会被归入同一个簇。`suggested_target` **仅是提示**：取 `importance` 最高的成员（若相同则比较 `access_count`，再相同则取 `updated_at` 最新的一个）。`merge` 从不据此自动推断 `target_id`——调用方必须显式指定。当被扫描的这一页小于 `consolidation.max_scan_per_call` 时，`cursor` 为 `null`；否则将其传回以便跨多次调用继续扫描。
 
+扫描到的一页所需的近邻查询，最多以 `consolidation.neighbor_discovery_concurrency`
+（默认 `8`）个并发执行——加以限制，使一大页既不会逐个串行查询，也不会一次性并发触发整页
+的查询。若 `consolidation.neighbor_discovery_deadline_ms`（默认 `10000`）已过而扇出仍
+未完成，`list` 会提前返回一个非空的 `cursor`，从最后一个已解析近邻的成员之后继续——被
+截止时间挡在外面的成员本次调用不会被归入任何簇，会在下一次使用该 cursor 调用 `list`
+时（重新进行近邻查询）被继续处理。
+
 **输出（`action: "merge"`）：**
 
 ```json
@@ -3628,18 +3881,19 @@ docker compose up
 服务器默认监听 `http://localhost:3721`（默认仅发布到宿主机回环地址）。使用以下命令检查健康状态：
 
 ```bash
-curl http://localhost:3721/health
+curl http://localhost:3721/health/live
 ```
+
+容器自身的 `HEALTHCHECK` 出于同样原因探测 `/health/live`：它在没有任何凭据的情况下运
+行，而完整诊断快照 `/health` 需要 Bearer 认证（参见[健康状态与指标](#健康状态与指标)）。
 
 ### 安全默认值
 
 容器将 API 绑定到 `0.0.0.0` 以便发布的端口可访问，并且**默认启用认证**：
 
-- 如果未设置 `BHGBRAIN_TOKEN`，入口脚本会在首次运行时**生成一个 Bearer token**，将其持久化到 `/data/bhgbrain-token`，并打印到日志中。可通过以下方式获取：
+- 如果未设置 `BHGBRAIN_TOKEN`，入口脚本会在首次运行时**生成一个 Bearer token**，并将其持久化到 `/data/bhgbrain-token`（文件权限仅限属主访问）。token 的值本身永远不会写入容器日志——只会记录它保存的路径——因此仅凭 `docker compose logs` 永远无法泄露有效凭据。可通过以下方式获取：
 
   ```bash
-  docker compose logs bhgbrain | grep token
-  # 或
   docker compose exec bhgbrain cat /data/bhgbrain-token
   ```
 
@@ -3650,6 +3904,8 @@ curl http://localhost:3721/health
   ```
 
 - 发布的端口映射到宿主机回环地址（`127.0.0.1:3721:3721`），因此默认情况下 API 无法从局域网访问。要对外暴露，请修改 `docker-compose.yml` 中的映射。
+
+- `self-hosted` profile 中的 Qdrant sidecar 出于同样的原因也仅绑定到回环地址（`127.0.0.1:6333:6333`）——该技术栈中 Qdrant 没有配置任何身份验证，否则局域网内的任何人都能访问每一个存储的向量/负载数据。仅在你自己的认证反向代理/防火墙之后才扩大其端口映射。
 
 - 若要刻意在**不启用认证**的情况下运行，设置 `BHGBRAIN_ALLOW_UNAUTHENTICATED=true`（服务器会记录警告；不建议用于非回环绑定）。
 
@@ -3821,13 +4077,13 @@ bhgbrain backup create
 
 `backup.restore` 在返回成功之前重新加载运行时 SQLite 状态。当恢复的数据立即生效时，恢复响应包含 `metadata_activated: true`。服务器无需重启。
 
-恢复操作会获取一个故障保护锁（`beginRestoreOperation()`），该锁仅在 SQLite 被激活以及恢复的向量针对 Qdrant 进行漂移检查期间阻止并发写入。向量**不会**被无条件清空并重新嵌入：只有内容校验和与 Qdrant 中不一致（或在其中缺失）的记忆才会被标记为需要重新嵌入，因此无漂移的恢复完成时甚至不会调用嵌入提供方。如果自备份创建以来嵌入模型/维度发生了变化，或无法读取 Qdrant 的现有状态，恢复会转而执行完整重建。
+恢复操作会获取一个故障保护锁（`beginRestoreOperation()`，此外还有跨进程的 `.restore.lock` 文件以及每次写操作自身的锁检查——参见[从备份恢复](#从备份恢复)），该锁在候选数据库于临时副本中被验证、活动/候选数据库文件被交换、以及恢复的向量针对 Qdrant 进行漂移与剩余项检查期间阻止并发写入。向量**不会**被无条件清空并重新嵌入：只有内容校验和与 Qdrant 中不一致（或在其中缺失）的记忆才会被标记为需要重新嵌入，因此无漂移的恢复完成时甚至不会调用嵌入提供方。如果自备份创建以来嵌入模型/维度发生了变化，恢复会转而执行完整重建；如果 Qdrant 的现有状态根本无法读取（一次瞬时故障），则会保守地重新嵌入整个语料库而不清空任何内容，并将其报告为独立的 `inspection-failed` 原因，而不是被错误地归类为模型变更。
 
-漂移检查完成后，该锁即被释放——对漂移子集（如果有）的重新嵌入会在一个有边界的后台任务（每轮有超时和批次上限）中运行，而不会拖住恢复调用或在此期间阻塞其他写入。遇到暂时性故障时会自动带退避重试；如果始终未能完全追上进度，`health://status` 会持续报告 `vector_reconciliation.state: "pending"`（或在某轮任务进行中时报告 `"reconciling"`），而不是悄无声息地让语义搜索为空。进度会按批次粒度落盘，因此进程在协调过程中被强制终止最多只会丢失一个批次的工作——重启后会通过幂等的重新 upsert，安全地从剩余未同步集合继续。
+漂移/剩余项检查完成后，该锁即被释放——对漂移子集（如果有）的重新嵌入会在一个有边界的后台任务（每轮有超时和批次上限）中运行，而不会拖住恢复调用或在此期间阻塞其他写入。遇到暂时性故障时会自动带退避重试；如果始终未能完全追上进度，`health://status` 会持续报告 `vector_reconciliation.state: "pending"`（或在某轮任务进行中时报告 `"reconciling"`），而不是悄无声息地让语义搜索为空。进度会按批次粒度落盘，因此进程在协调过程中被强制终止最多只会丢失一个批次的工作——重启后会通过幂等的重新 upsert，安全地从剩余未同步集合继续。纯向量剩余项（在 SQLite 中没有对应恢复行的点）的删除操作会作为漂移/剩余项检查本身的一部分同步执行，以有边界的批次进行；某批次删除失败会使 `vector_reconciliation` 连同剩余数量一起保持降级状态，而不是在未解决的孤立工作上被错误地报告为健康。
 
 ### HTTP 安全加固
 
-- `/health` 有意设计为无需认证，以兼容探针。
+- `/health/live` 与 `/health/ready` 有意设计为无需认证，以兼容探针；完整诊断快照 `/health` 与其他路由一样需要相同的 Bearer 认证。参见[健康状态与指标](#健康状态与指标)。
 - 速率限制以受信任的请求身份（IP）为键，忽略 `x-client-id` 用于强制执行。
 - 审计/请求日志中的 `client_id` 同样源自受信任的请求身份（`req.ip`），而非调用方提供的 `x-client-id` 头部——该头部仅作为非权威的调试提示接受，绝不用于审计追踪的信任来源。
 - `memory://list` 强制 `limit` 范围为 `1..100`；无效值返回 `INVALID_INPUT`。

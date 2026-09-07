@@ -147,6 +147,25 @@ describe('LlmExtractionProvider', () => {
 
     expect(breaker.execute).toHaveBeenCalledTimes(1);
   });
+
+  // unify-llm-client-boundaries task 2.3: an HTTP failure now records
+  // exactly one breaker outcome for the whole call, including every internal
+  // retry attempt, rather than the un-breakered/un-retried bare fetch this
+  // provider had before migrating to the shared request executor.
+  it('records a single breaker failure across a whole retried HTTP-error call, then returns null', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 500 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const breaker = {
+      execute: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
+    } as unknown as CircuitBreaker;
+
+    const provider = new LlmExtractionProvider(createConfig(), 'test-key', breaker);
+    const result = await provider.extractCandidates('content');
+
+    expect(result).toBeNull();
+    expect(breaker.execute).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+  });
 });
 
 describe('createExtractionProvider', () => {

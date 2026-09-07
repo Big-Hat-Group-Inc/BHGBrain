@@ -4,8 +4,43 @@ import type { CircuitBreaker } from '../resilience/index.js';
 import { CircuitOpenError } from '../resilience/index.js';
 import { internal, invalidInput } from '../errors/index.js';
 import type { RecallFilter } from '../domain/types.js';
+import type { MetricsCollector } from '../health/metrics.js';
 
 const COLLECTION_PREFIX = 'bhgbrain_';
+
+/** Options accepted by `QdrantStore.scrollAllPages`/`scrollCollectionPages` — see their doc comments. */
+export interface ScrollPageOptions {
+  batchSize?: number;
+  withVector?: boolean;
+  /** Restrict the server-side payload projection to these fields; omit for the full payload. */
+  payloadFields?: string[];
+  /** Resume from a cursor returned by a prior page (see `ScrollPageResult.cursor`). */
+  cursor?: string | number;
+  /** Polled before each page fetch; once true, scanning stops and the final page reports `cancelled: true`. */
+  isCancelled?: () => boolean;
+}
+
+/** One page yielded by `QdrantStore.scrollAllPages`/`scrollCollectionPages`. */
+export interface ScrollPageResult {
+  points: Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>;
+  /** Stable resumption token — pass back via `ScrollPageOptions.cursor` to continue after this page. `null` once exhausted. */
+  cursor: string | number | null;
+  /** True when this is the last page (no further page remains). */
+  done: boolean;
+  /** True when this page was cut short by `ScrollPageOptions.isCancelled` rather than reaching the end of the collection. */
+  cancelled: boolean;
+}
+
+const REQUIRED_PAYLOAD_INDEXES: ReadonlyArray<{ field_name: string; field_schema: 'keyword' | 'bool' | 'integer' | 'datetime' }> = [
+  { field_name: 'namespace', field_schema: 'keyword' },
+  { field_name: 'type', field_schema: 'keyword' },
+  { field_name: 'tags', field_schema: 'keyword' },
+  { field_name: 'retention_tier', field_schema: 'keyword' },
+  { field_name: 'decay_eligible', field_schema: 'bool' },
+  { field_name: 'expires_at', field_schema: 'integer' },
+  { field_name: 'device_id', field_schema: 'keyword' },
+  { field_name: 'created_at', field_schema: 'datetime' },
+];
 
 // Only `.`/`_`/`-` plus alphanumerics may appear in an encoded segment. Raw
 // `namespace` (`^[a-zA-Z0-9/-]{1,200}$`) and `collection`/`category.name`
@@ -58,6 +93,15 @@ function extractDenseVector(value: unknown): number[] | undefined {
 
 export class QdrantStore {
   private client: QdrantClient;
+  // bound-qdrant-http-runtime task 1.1/2.1: a dedicated client instance used
+  // only by `healthCheck()`, configured with its own (shorter)
+  // `qdrant.health_timeout_ms` client-side deadline — deliberately separate
+  // from `client`'s `qdrant.operation_timeout_ms` so a stalled dependency
+  // fails the health probe quickly without waiting out the longer
+  // operational deadline. `healthCheck()` never routes through
+  // `executeWithBreaker` (see design.md decision 1), so this client's calls
+  // never count toward or get short-circuited by the operational breaker.
+  private healthClient: QdrantClient;
   private dimensions: number;
 
   // cut-embedding-and-qdrant-round-trips: per-instance memo of collections
@@ -83,9 +127,17 @@ export class QdrantStore {
   constructor(
     private config: BrainConfig,
     private readonly breaker?: CircuitBreaker,
-    private readonly logger?: { warn: (obj: Record<string, unknown>) => void },
+    private readonly logger?: { warn: (obj: Record<string, unknown>) => void; info?: (obj: Record<string, unknown>) => void },
+    private readonly metrics?: MetricsCollector,
   ) {
     this.dimensions = config.embedding.dimensions;
+    // bound-qdrant-http-runtime task 1.1: the client's own `timeout` option
+    // (ms) is enforced client-side via AbortController (see
+    // @qdrant/js-client-rest's api-client.js) — this is what actually bounds
+    // a black-holed/stalled endpoint, unlike the per-request `timeout` field
+    // some client methods accept, which is a server-side hint only.
+    const operationTimeoutMs = config.qdrant.operation_timeout_ms;
+    const healthTimeoutMs = config.qdrant.health_timeout_ms;
 
     if (config.qdrant.mode === 'external' && config.qdrant.external_url) {
       const apiKey = config.qdrant.api_key_env
@@ -94,10 +146,27 @@ export class QdrantStore {
       this.client = new QdrantClient({
         url: config.qdrant.external_url,
         apiKey,
+        timeout: operationTimeoutMs,
+      });
+      this.healthClient = new QdrantClient({
+        url: config.qdrant.external_url,
+        apiKey,
+        timeout: healthTimeoutMs,
+        // Skip the constructor's own background compatibility-check request
+        // for this second client instance — `client` above already performs
+        // it once; a duplicate isn't useful and would itself be an
+        // uncounted, unbounded-by-config startup request.
+        checkCompatibility: false,
       });
     } else {
       this.client = new QdrantClient({
         url: 'http://localhost:6333',
+        timeout: operationTimeoutMs,
+      });
+      this.healthClient = new QdrantClient({
+        url: 'http://localhost:6333',
+        timeout: healthTimeoutMs,
+        checkCompatibility: false,
       });
     }
   }
@@ -138,43 +207,16 @@ export class QdrantStore {
           distance: 'Cosine',
         },
       });
-      await this.client.createPayloadIndex(name, {
-        field_name: 'namespace',
-        field_schema: 'keyword',
-      });
-      await this.client.createPayloadIndex(name, {
-        field_name: 'type',
-        field_schema: 'keyword',
-      });
-      await this.client.createPayloadIndex(name, {
-        field_name: 'retention_tier',
-        field_schema: 'keyword',
-      });
-      await this.client.createPayloadIndex(name, {
-        field_name: 'decay_eligible',
-        field_schema: 'bool',
-      });
-      await this.client.createPayloadIndex(name, {
-        field_name: 'expires_at',
-        field_schema: 'integer',
-      });
       created = true;
     }
 
-    // Ensured unconditionally (not just on first create) so that collections
-    // created before device provenance shipped — the exact post-upgrade,
-    // multi-device Qdrant Cloud scenario this feature targets — still get the
-    // index. Idempotent: a second call against an already-indexed collection
-    // is a tolerated no-op.
-    await this.ensureDeviceIdIndex(name);
-
-    // Same retroactive-indexing rationale as `ensureDeviceIdIndex`: collections
-    // created before add-time-scoped-recall shipped still get the `created_at`
-    // datetime index so `after`/`before` range filters run indexed rather than
-    // linearly scanned. Unindexed range filtering is still correct (Qdrant
-    // filters on unindexed fields, just slower), so this is a performance
-    // addition, not a correctness dependency.
-    await this.ensureCreatedAtIndex(name);
+    // Always verify every filterable field, including on collections that
+    // existed before a particular index was introduced. The collection is
+    // memoized only after all calls complete, so a partial failure retries on
+    // the next use instead of becoming a permanent half-configured state.
+    for (const index of REQUIRED_PAYLOAD_INDEXES) {
+      await this.ensurePayloadIndex(name, index);
+    }
 
     // Only memoized once the *entire* sequence above has succeeded — a
     // partial failure (e.g. an index call rejecting) must not be memoized,
@@ -191,26 +233,12 @@ export class QdrantStore {
     this.collectionListCache = null;
   }
 
-  private async ensureDeviceIdIndex(name: string): Promise<void> {
+  private async ensurePayloadIndex(
+    name: string,
+    index: { field_name: string; field_schema: 'keyword' | 'bool' | 'integer' | 'datetime' },
+  ): Promise<void> {
     try {
-      await this.client.createPayloadIndex(name, {
-        field_name: 'device_id',
-        field_schema: 'keyword',
-      });
-    } catch (err) {
-      if (this.isAlreadyExistsError(err)) {
-        return;
-      }
-      throw err;
-    }
-  }
-
-  private async ensureCreatedAtIndex(name: string): Promise<void> {
-    try {
-      await this.client.createPayloadIndex(name, {
-        field_name: 'created_at',
-        field_schema: 'datetime',
-      });
+      await this.client.createPayloadIndex(name, index);
     } catch (err) {
       if (this.isAlreadyExistsError(err)) {
         return;
@@ -252,6 +280,24 @@ export class QdrantStore {
     });
   }
 
+  /** Refreshes filter/ranking metadata without changing an embedding. */
+  async updatePayload(
+    namespace: string,
+    collection: string,
+    id: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    await this.executeWithBreaker(async () => {
+      const name = this.collectionName(namespace, collection);
+      await this.ensureCollection(namespace, collection);
+      await this.client.setPayload(name, {
+        wait: true,
+        points: [id],
+        payload: { ...payload, namespace },
+      });
+    });
+  }
+
   async delete(namespace: string, collection: string, id: string): Promise<void> {
     await this.executeWithBreaker(async () => {
       const name = this.collectionName(namespace, collection);
@@ -272,17 +318,19 @@ export class QdrantStore {
   async deleteMany(namespace: string, collection: string, ids: string[]): Promise<void> {
     if (ids.length === 0) return;
     const name = this.collectionName(namespace, collection);
-    try {
-      await this.client.delete(name, {
-        wait: true,
-        points: ids,
-      });
-    } catch (err) {
-      if (this.isNotFoundError(err)) {
-        return;
+    await this.executeWithBreaker(async () => {
+      try {
+        await this.client.delete(name, {
+          wait: true,
+          points: ids,
+        });
+      } catch (err) {
+        if (this.isNotFoundError(err)) {
+          return;
+        }
+        throw err;
       }
-      throw err;
-    }
+    });
   }
 
   async search(
@@ -337,20 +385,65 @@ export class QdrantStore {
       if (targets.length === 0) return [];
     }
 
-    const perCollection = await Promise.all(targets.map(name =>
-      this.executeWithBreaker(() => this.client.query(name, {
-        query: vector,
-        limit,
-        filter: must.length > 0 ? { must } : undefined,
-        score_threshold: filters?.minScore,
-        with_payload: true,
-        with_vector: filters?.withVector ?? false,
-      })).then(response => response.points).catch((err: unknown) => {
-        // A target collection that no longer exists simply contributes no results.
-        if (this.isNotFoundError(err)) return [];
-        throw err;
-      }),
-    ));
+    // bound-qdrant-http-runtime task 1.4: a collectionless query otherwise fans
+    // out to every collection in the namespace at once — unbounded in width (a
+    // namespace with hundreds of collections), in-flight concurrency (one
+    // `Promise.all` over the whole target list), and per-target result cost (a
+    // large caller-supplied `limit` applied identically to every target).
+    // Truncate the target list deterministically (first `max_collections`, in
+    // the order `listAllCollections` returned them), run the fan-out in
+    // fixed-size concurrency batches rather than firing every query at once —
+    // the same batched-concurrency shape already used for consolidation's
+    // neighbor fan-out (src/tools/index.ts) — and clamp each target's own
+    // `limit` to `per_target_limit` (see below) while genuinely fanning out.
+    // Width and truncation are surfaced via metrics/logs, not the return
+    // value, so this stays additive to existing callers of `search`.
+    const fanoutConfig = this.config.qdrant.fanout;
+    const requestedWidth = targets.length;
+    let truncated = false;
+    if (targets.length > 1 && targets.length > fanoutConfig.max_collections) {
+      targets = targets.slice(0, fanoutConfig.max_collections);
+      truncated = true;
+    }
+    if (targets.length > 1) {
+      this.metrics?.setGauge('bhgbrain_qdrant_fanout_width', targets.length);
+      if (truncated) {
+        this.metrics?.incCounter('bhgbrain_qdrant_fanout_truncated_total');
+        this.logger?.warn({
+          event: 'qdrant_fanout_truncated',
+          namespace,
+          requested_collections: requestedWidth,
+          queried_collections: targets.length,
+          max_collections: fanoutConfig.max_collections,
+        });
+      }
+    }
+
+    // Per-target result budget: only clamps while genuinely fanning out
+    // (more than one target) — a single explicit `collection` search keeps
+    // using the caller's `limit` directly, unchanged from before this task.
+    const perTargetLimit = targets.length > 1 ? Math.min(limit, fanoutConfig.per_target_limit) : limit;
+
+    const fanoutConcurrency = Math.max(1, fanoutConfig.concurrency);
+    const perCollection: Array<Array<{ id: unknown; score: number; payload?: Record<string, unknown> | null; vector?: unknown }>> = [];
+    for (let i = 0; i < targets.length; i += fanoutConcurrency) {
+      const batch = targets.slice(i, i + fanoutConcurrency);
+      const batchResults = await Promise.all(batch.map(name =>
+        this.executeWithBreaker(() => this.client.query(name, {
+          query: vector,
+          limit: perTargetLimit,
+          filter: must.length > 0 ? { must } : undefined,
+          score_threshold: filters?.minScore,
+          with_payload: true,
+          with_vector: filters?.withVector ?? false,
+        })).then(response => response.points).catch((err: unknown) => {
+          // A target collection that no longer exists simply contributes no results.
+          if (this.isNotFoundError(err)) return [];
+          throw err;
+        }),
+      ));
+      perCollection.push(...batchResults);
+    }
 
     const merged = perCollection.flat().map(r => ({
       id: r.id as string,
@@ -463,9 +556,14 @@ export class QdrantStore {
     // free. It targets the default namespace/collection so a fresh install
     // with no data yet still exercises the call; a missing collection or an
     // empty result set are both healthy - only a raised failure is not.
+    // bound-qdrant-http-runtime task 1.1/2.1: deliberately uses `healthClient`
+    // (its own short `qdrant.health_timeout_ms` client-side deadline) rather
+    // than `client`, and is never routed through `executeWithBreaker` — a
+    // stalled dependency must fail this probe on its own short timeout, not
+    // wait on (or itself trip) the longer operational breaker.
     const name = this.collectionName(this.config.defaults.namespace, this.config.defaults.collection);
     try {
-      await this.client.query(name, {
+      await this.healthClient.query(name, {
         query: new Array(this.dimensions).fill(0),
         limit: 1,
         with_payload: false,
@@ -481,12 +579,22 @@ export class QdrantStore {
 
   async getCollectionInfo(namespace: string, collection: string): Promise<{ points_count: number } | null> {
     const name = this.collectionName(namespace, collection);
-    try {
-      const info = await this.client.getCollection(name);
-      return { points_count: info.points_count ?? 0 };
-    } catch {
-      return null;
-    }
+    return this.executeWithBreaker(async () => {
+      try {
+        const info = await this.client.getCollection(name);
+        return { points_count: info.points_count ?? 0 };
+      } catch (err) {
+        // bound-qdrant-http-runtime task 1.3: only a confirmed missing
+        // collection is a tolerated `null` — routing, auth, timeout, and other
+        // service failures must propagate so callers (retention GC's
+        // compaction check) can distinguish "nothing to compact" from "the
+        // dependency call itself failed".
+        if (this.isNotFoundError(err)) {
+          return null;
+        }
+        throw err;
+      }
+    });
   }
 
   /**
@@ -515,27 +623,34 @@ export class QdrantStore {
 
   async deleteCollection(namespace: string, collection: string): Promise<void> {
     const name = this.collectionName(namespace, collection);
-    try {
-      await this.client.deleteCollection(name);
-    } catch (err) {
-      if (!this.isNotFoundError(err)) {
-        throw err;
+    await this.executeWithBreaker(async () => {
+      try {
+        await this.client.deleteCollection(name);
+      } catch (err) {
+        if (!this.isNotFoundError(err)) {
+          throw err;
+        }
+        // Already gone — the ensured-memo and list cache still need clearing
+        // below so a later write re-ensures instead of trusting a stale memo.
       }
-      // Already gone — the ensured-memo and list cache still need clearing
-      // below so a later write re-ensures instead of trusting a stale memo.
-    }
+    });
     this.ensuredCollections.delete(name);
     this.invalidateCollectionListCache();
   }
 
   async createSnapshot(namespace: string, collection: string): Promise<string | null> {
     const name = this.collectionName(namespace, collection);
-    try {
-      const snapshot = await this.client.createSnapshot(name);
-      return snapshot?.name ?? null;
-    } catch {
-      return null;
-    }
+    return this.executeWithBreaker(async () => {
+      try {
+        const snapshot = await this.client.createSnapshot(name);
+        return snapshot?.name ?? null;
+      } catch (err) {
+        if (this.isNotFoundError(err)) {
+          return null;
+        }
+        throw err;
+      }
+    });
   }
 
   async listAllCollections(): Promise<string[]> {
@@ -543,12 +658,79 @@ export class QdrantStore {
     if (this.collectionListCache && this.collectionListCache.expiresAt > now) {
       return this.collectionListCache.names;
     }
-    const response = await this.client.getCollections();
+    const response = await this.executeWithBreaker(() => this.client.getCollections());
     const names = response.collections
       .map(c => c.name)
       .filter(name => name.startsWith(COLLECTION_PREFIX));
     this.collectionListCache = { names, expiresAt: now + QdrantStore.COLLECTION_LIST_TTL_MS };
     return names;
+  }
+
+  /**
+   * Pages through `collectionName` one server round trip at a time, yielding
+   * each page as it arrives rather than accumulating the whole collection in
+   * memory — used by callers that only need to inspect points once each (a
+   * restored-ID/checksum reconciliation scan, bootstrap/repair hydration,
+   * distillation clustering) instead of holding a potentially large corpus's
+   * payloads live for the whole pass. See make-backup-restore-transactional
+   * task 3.1 and bound-corpus-scale-workflows task 1.1.
+   *
+   * `options.payloadFields` lets a caller that only inspects a handful of
+   * payload keys (checksum-drift detection: `checksum`/`device_id`/
+   * `namespace`/`collection`) request Qdrant's server-side field-projected
+   * `with_payload` (an explicit field list rather than `true`) instead of
+   * the full record, trimming both the wire payload and the memory retained
+   * per page — omit it (the default) for callers that reconstruct a whole
+   * memory record and therefore need every field (bootstrap/repair
+   * hydration).
+   *
+   * Each yielded page carries a stable `cursor` (Qdrant's own
+   * `next_page_offset`, opaque to the caller) that can be handed back via
+   * `options.cursor` to resume scanning a collection from exactly where a
+   * prior pass left off — e.g. across a deadline-bounded caller's
+   * invocations — and `done`, true once no further page remains.
+   *
+   * `options.isCancelled`, when provided, is polled before each server round
+   * trip; once it reports true the generator yields one final page with
+   * `cancelled: true` and an empty `points` array and returns, so a caller
+   * enforcing a deadline or responding to shutdown never blocks the event
+   * loop waiting on a page it no longer needs. `scrollAll` below is a thin
+   * accumulator over this for callers that do need the full list at once.
+   */
+  async *scrollAllPages(
+    collectionName: string,
+    options: ScrollPageOptions = {},
+  ): AsyncGenerator<ScrollPageResult> {
+    const batchSize = options.batchSize ?? 100;
+    const withVector = options.withVector ?? false;
+    let offset: string | number | undefined = options.cursor;
+
+    while (true) {
+      if (options.isCancelled?.()) {
+        yield { points: [], cursor: offset ?? null, done: false, cancelled: true };
+        return;
+      }
+
+      const response = await this.executeWithBreaker(() => this.client.scroll(collectionName, {
+        limit: batchSize,
+        offset,
+        with_payload: options.payloadFields ?? true,
+        with_vector: withVector,
+      }));
+
+      const points = response.points.map(point => ({
+        id: point.id as string,
+        payload: (point.payload ?? {}) as Record<string, unknown>,
+        vector: withVector ? extractDenseVector(point.vector) : undefined,
+      }));
+
+      const nextOffset = response.next_page_offset as string | number | undefined;
+      const done = !nextOffset;
+      yield { points, cursor: nextOffset ?? null, done, cancelled: false };
+
+      if (done) break;
+      offset = nextOffset;
+    }
   }
 
   async scrollAll(
@@ -561,37 +743,18 @@ export class QdrantStore {
     withVector = false,
   ): Promise<Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>> {
     const allPoints: Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }> = [];
-    let offset: string | number | undefined = undefined;
-
-    while (true) {
-      const response = await this.client.scroll(collectionName, {
-        limit: batchSize,
-        offset,
-        with_payload: true,
-        with_vector: withVector,
-      });
-
-      for (const point of response.points) {
-        allPoints.push({
-          id: point.id as string,
-          payload: (point.payload ?? {}) as Record<string, unknown>,
-          vector: withVector ? extractDenseVector(point.vector) : undefined,
-        });
-      }
-
-      if (!response.next_page_offset) break;
-      offset = response.next_page_offset as string | number | undefined;
+    for await (const page of this.scrollAllPages(collectionName, { batchSize, withVector })) {
+      allPoints.push(...page.points);
     }
-
     return allPoints;
   }
 
   /**
    * `scrollAll` scoped to one namespace/collection, resolving the internal
-   * prefixed collection name so callers (e.g. `DistillationService`'s
-   * clustering pass) never need to duplicate `collectionName`'s prefix
-   * convention. A collection that has never been written to simply yields no
-   * points, same convention as `searchSimilar`/`findNeighborsById`.
+   * prefixed collection name so callers never need to duplicate
+   * `collectionName`'s prefix convention. A collection that has never been
+   * written to simply yields no points, same convention as
+   * `searchSimilar`/`findNeighborsById`.
    */
   async scrollCollection(
     namespace: string,
@@ -610,13 +773,52 @@ export class QdrantStore {
     }
   }
 
+  /**
+   * Paged counterpart to `scrollCollection` — namespace/collection-scoped
+   * `scrollAllPages`, for callers (distillation clustering) that need
+   * incremental pages rather than a fully-buffered array. A collection that
+   * has never been written to simply yields no pages, same tolerant
+   * convention as `scrollCollection`.
+   */
+  async *scrollCollectionPages(
+    namespace: string,
+    collection: string,
+    options: ScrollPageOptions = {},
+  ): AsyncGenerator<ScrollPageResult> {
+    const name = this.collectionName(namespace, collection);
+    try {
+      yield* this.scrollAllPages(name, options);
+    } catch (err) {
+      if (this.isNotFoundError(err)) {
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * bound-qdrant-http-runtime task 1.3: narrowed so only a *confirmed missing
+   * managed collection or point* is treated idempotently. The real client's
+   * generic HTTP error wrapper (`QdrantClientUnexpectedResponseError`) never
+   * sets `.status`/`.response.status` and its message is just
+   * `"Unexpected Response: 404 (Not Found)\n..."` for ANY non-2xx response —
+   * including a routing failure, an ingress/reverse-proxy's own 404 page, or
+   * every endpoint on the route going 404 (e.g. a misconfigured URL). Such a
+   * bare 404 must surface as a real failure (unhealthy/thrown), not silently
+   * collapse into "the collection doesn't exist yet". Only Qdrant's own
+   * not-found errors, which always name what's missing ("Collection `x`
+   * doesn't exist!", "Not found: Collection `x`...", a missing point, etc.),
+   * are treated as idempotent no-ops.
+   */
   private isNotFoundError(err: unknown): boolean {
     if (!err || typeof err !== 'object') return false;
     const maybeErr = err as { status?: number; response?: { status?: number }; message?: string };
     const status = maybeErr.status ?? maybeErr.response?.status;
-    if (status === 404) return true;
     const message = maybeErr.message?.toLowerCase() ?? '';
-    return message.includes('not found') || message.includes('does not exist');
+    const is404 = status === 404 || message.includes('(not found)') || message.includes('404 ');
+    if (!is404) return false;
+    return message.includes('does not exist') || message.includes('doesn\'t exist') ||
+      (message.includes('not found') && (message.includes('collection') || message.includes('point')));
   }
 
   private isAlreadyExistsError(err: unknown): boolean {

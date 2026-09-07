@@ -3,7 +3,7 @@ import { WritePipeline } from './index.js';
 import type { BrainConfig } from '../config/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { StorageManager } from '../storage/index.js';
-import type { ExtractionProvider } from './extraction.js';
+import type { ExtractionProvider, RawCandidate } from './extraction.js';
 import { checkEntailment } from './entailment.js';
 import type { SummarizationProvider } from '../summarization/index.js';
 
@@ -37,8 +37,10 @@ describe('WritePipeline NOOP handling', () => {
     // `storage.qdrant.searchSimilar` to simulate failures, and those
     // overrides must not leak into later tests.
     embedding = {
+      provider: 'openai',
       model: 'test-model',
       dimensions: 2,
+      identity: 'openai/test-model@2',
       embed: vi.fn(async () => [0.1, 0.2]),
       embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
       healthCheck: vi.fn(async () => true),
@@ -243,7 +245,7 @@ describe('WritePipeline NOOP handling', () => {
   it('uses full-text similarity to choose UPDATE over ADD in fallback mode', async () => {
     embedding.embed = vi.fn(async () => { throw new Error('embedding unavailable'); });
     storage.sqlite.fullTextSearch = vi.fn(() => [{ id: 'existing-id', rank: 5 }]);
-    storage.sqlite.getMemoryById = vi.fn(() => ({
+    (storage.sqlite as unknown as { getMemoryById: ReturnType<typeof vi.fn> }).getMemoryById = vi.fn(() => ({
       id: 'existing-id',
       summary: 'existing summary',
       type: 'semantic',
@@ -271,7 +273,7 @@ describe('WritePipeline NOOP handling', () => {
   it('falls back to ADD when full-text similarity is below the update threshold', async () => {
     embedding.embed = vi.fn(async () => { throw new Error('embedding unavailable'); });
     storage.sqlite.fullTextSearch = vi.fn(() => [{ id: 'existing-id', rank: 1 }]);
-    storage.sqlite.getMemoryById = vi.fn(() => ({
+    (storage.sqlite as unknown as { getMemoryById: ReturnType<typeof vi.fn> }).getMemoryById = vi.fn(() => ({
       id: 'existing-id',
       summary: 'existing summary',
       type: 'semantic',
@@ -344,8 +346,10 @@ describe('WritePipeline distillation derived_from (add-memory-distillation)', ()
 
   beforeEach(() => {
     embedding = {
+      provider: 'openai',
       model: 'test-model',
       dimensions: 2,
+      identity: 'openai/test-model@2',
       embed: vi.fn(async () => [0.1, 0.2]),
       embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
       healthCheck: vi.fn(async () => true),
@@ -446,8 +450,10 @@ describe('WritePipeline pinned (add-inject-pinning)', () => {
 
   beforeEach(() => {
     embedding = {
+      provider: 'openai',
       model: 'test-model',
       dimensions: 2,
+      identity: 'openai/test-model@2',
       embed: vi.fn(async () => [0.1, 0.2]),
       embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
       healthCheck: vi.fn(async () => true),
@@ -562,8 +568,10 @@ describe('WritePipeline provenance (add-memory-provenance-metadata)', () => {
 
   beforeEach(() => {
     embedding = {
+      provider: 'openai',
       model: 'test-model',
       dimensions: 2,
+      identity: 'openai/test-model@2',
       embed: vi.fn(async () => [0.1, 0.2]),
       embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
       healthCheck: vi.fn(async () => true),
@@ -714,8 +722,10 @@ describe('WritePipeline dedup candidate window corroboration', () => {
   beforeEach(() => {
     vi.mocked(checkEntailment).mockReset();
     embedding = {
+      provider: 'openai',
       model: 'test-model',
       dimensions: 2,
+      identity: 'openai/test-model@2',
       embed: vi.fn(async () => [0.1, 0.2]),
       embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
       healthCheck: vi.fn(async () => true),
@@ -903,8 +913,10 @@ describe('WritePipeline contradiction detection', () => {
   beforeEach(() => {
     vi.mocked(checkEntailment).mockReset();
     embedding = {
+      provider: 'openai',
       model: 'test-model',
       dimensions: 2,
+      identity: 'openai/test-model@2',
       embed: vi.fn(async () => [0.1, 0.2]),
       embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
       healthCheck: vi.fn(async () => true),
@@ -1085,8 +1097,10 @@ describe('WritePipeline multi-candidate extraction', () => {
   beforeEach(() => {
     vi.mocked(checkEntailment).mockReset();
     embedding = {
+      provider: 'openai',
       model: 'test-model',
       dimensions: 2,
+      identity: 'openai/test-model@2',
       embed: vi.fn(async () => [0.1, 0.2]),
       embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
       healthCheck: vi.fn(async () => true),
@@ -1129,7 +1143,7 @@ describe('WritePipeline multi-candidate extraction', () => {
   });
 
   it('invokes the extraction provider at or above extraction_min_chars and writes N independent candidates', async () => {
-    extraction.extractCandidates = vi.fn(async () => [
+    extraction.extractCandidates = vi.fn(async (): Promise<RawCandidate[]> => [
       { content: 'Alice owns the infra repo', type: 'semantic', importance: 0.7 },
       { content: 'Deploys go through GitHub Actions' },
       { content: 'We use pnpm instead of npm' },
@@ -1261,8 +1275,10 @@ describe('WritePipeline summarization', () => {
 
   beforeEach(() => {
     embedding = {
+      provider: 'openai',
       model: 'test-model',
       dimensions: 2,
+      identity: 'openai/test-model@2',
       embed: vi.fn(async () => [0.1, 0.2]),
       embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
       healthCheck: vi.fn(async () => true),
@@ -1378,8 +1394,10 @@ describe('WritePipeline auto-tagging (add-auto-tagging)', () => {
 
   beforeEach(() => {
     embedding = {
+      provider: 'openai',
       model: 'test-model',
       dimensions: 2,
+      identity: 'openai/test-model@2',
       embed: vi.fn(async () => [0.1, 0.2]),
       embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.1, 0.2])),
       healthCheck: vi.fn(async () => true),
@@ -1442,7 +1460,7 @@ describe('WritePipeline auto-tagging (add-auto-tagging)', () => {
 
   it('UPDATE unions auto-derived tags into mergedTags like any candidate tag', async () => {
     storage.qdrant.searchSimilar = vi.fn(async () => [{ id: 'existing-id', score: 0.95 }]);
-    storage.sqlite.getMemoryById = vi.fn(() => ({
+    (storage.sqlite as unknown as { getMemoryById: ReturnType<typeof vi.fn> }).getMemoryById = vi.fn(() => ({
       id: 'existing-id',
       summary: 'existing summary',
       type: 'semantic',
@@ -1512,5 +1530,133 @@ describe('WritePipeline auto-tagging (add-auto-tagging)', () => {
 
     const [writtenMemory] = vi.mocked(storage.writeMemory).mock.calls[0]!;
     expect(writtenMemory.tags).toEqual(['manual-tag']);
+  });
+});
+
+// bound-corpus-scale-workflows task 3.2: the batched-import path supplies an
+// already-computed embedding so `decide()` skips its own `embed()` call.
+describe('WritePipeline precomputedEmbedding (bound-corpus-scale-workflows task 3.2)', () => {
+  const config = {
+    deduplication: { similarity_threshold: 0.92 },
+    pipeline: {
+      extraction_enabled: false,
+      fallback_to_threshold_dedup: true,
+      contradiction_detection: { enabled: false, timeout_ms: 5000 },
+      default_confidence: { cli: 1.0, api: 1.0, agent: 0.7, import: 0.5 },
+    },
+  } as unknown as BrainConfig;
+
+  let embedding: EmbeddingProvider;
+  let storage: StorageManager;
+
+  beforeEach(() => {
+    embedding = {
+      provider: 'openai',
+      model: 'test-model',
+      dimensions: 2,
+      identity: 'openai/test-model@2',
+      embed: vi.fn(async () => [0.9, 0.9]), // distinct from the precomputed vector below, so tests can tell them apart
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [0.9, 0.9])),
+      healthCheck: vi.fn(async () => true),
+    };
+    storage = {
+      sqlite: {
+        getMemoryByChecksum: vi.fn(() => null),
+        getMemoryById: vi.fn(() => null),
+        insertMemory: vi.fn(),
+        flushIfDirty: vi.fn(),
+        fullTextSearch: vi.fn(() => []),
+      },
+      qdrant: {
+        searchSimilar: vi.fn(async () => []), // no near-duplicates -> ADD path
+      },
+      updateMemory: vi.fn(),
+      writeMemory: vi.fn(),
+      writeMemoryWithoutVector: vi.fn(),
+      deleteMemory: vi.fn(async () => true),
+      logAudit: vi.fn(),
+    } as unknown as StorageManager;
+  });
+
+  it('writes the precomputed vector and skips embedding.embed entirely when content is unmodified and single-candidate', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+    const precomputed = [0.1, 0.2];
+
+    const result = await pipeline.process({
+      content: 'fresh content for the precomputed-embedding path',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'import',
+      precomputedEmbedding: precomputed,
+    });
+
+    expect(result[0]!.operation).toBe('ADD');
+    expect(embedding.embed).not.toHaveBeenCalled();
+    const [, vector] = vi.mocked(storage.writeMemory).mock.calls[0]!;
+    expect(vector).toEqual(precomputed);
+  });
+
+  it('falls back to embedding.embed when no precomputedEmbedding is supplied (unaffected default behavior)', async () => {
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    await pipeline.process({
+      content: 'fresh content with no precomputed vector',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'import',
+    });
+
+    expect(embedding.embed).toHaveBeenCalledTimes(1);
+    const [, vector] = vi.mocked(storage.writeMemory).mock.calls[0]!;
+    expect(vector).toEqual([0.9, 0.9]);
+  });
+
+  it('never reaches embedding for an exact-checksum duplicate, precomputed or not (dedup-before-embed ordering preserved)', async () => {
+    storage.sqlite.getMemoryByChecksum = vi.fn(() => ({
+      id: 'dup-id', summary: 'dup', type: 'semantic', content: 'dup', created_at: '2026-01-01T00:00:00.000Z',
+    } as never));
+    const pipeline = new WritePipeline(config, storage, embedding);
+
+    const result = await pipeline.process({
+      content: 'exact duplicate content',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'import',
+      precomputedEmbedding: [0.1, 0.2],
+    });
+
+    expect(result[0]!.operation).toBe('NOOP');
+    expect(embedding.embed).not.toHaveBeenCalled();
+    expect(storage.writeMemory).not.toHaveBeenCalled();
+  });
+
+  it('embeds fresh instead of reusing the precomputed vector when extraction splits content into multiple candidates', async () => {
+    const multiCandidateConfig = {
+      ...config,
+      pipeline: { ...config.pipeline, extraction_enabled: true, extraction_min_chars: 0 },
+    } as unknown as BrainConfig;
+    const extraction = {
+      extractCandidates: vi.fn(async () => [
+        { content: 'first extracted fact' },
+        { content: 'second extracted fact' },
+      ]),
+    } as unknown as ExtractionProvider;
+    const pipeline = new WritePipeline(multiCandidateConfig, storage, embedding, undefined, extraction);
+
+    await pipeline.process({
+      content: 'original content that gets split into two candidates',
+      namespace: 'global',
+      collection: 'general',
+      tags: [],
+      source: 'import',
+      precomputedEmbedding: [0.1, 0.2],
+    });
+
+    // Neither extracted candidate's text matches the precomputed vector's
+    // source content, so both must embed fresh rather than reuse it.
+    expect(embedding.embed).toHaveBeenCalledTimes(2);
   });
 });

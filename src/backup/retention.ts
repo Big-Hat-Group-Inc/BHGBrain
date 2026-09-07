@@ -1,12 +1,23 @@
-import { v4 as uuidv4 } from 'uuid';
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager, DeleteMemoriesResult } from '../storage/index.js';
 import type { ArchiveRecord, MemoryRecord, RetentionTier } from '../domain/types.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
+import { buildRestoredMemoryFromArchive } from '../domain/archive-restore.js';
 import type { MetricsCollector } from '../health/metrics.js';
+
+type CleanupPageSqlite = {
+  listExpiredMemoriesPage?: (
+    nowIso: string, limit: number, cursor?: string, tier?: RetentionTier,
+  ) => Array<Omit<MemoryRecord, 'embedding'>>;
+  countExpiredDeletableMemories?: (nowIso: string, tier?: RetentionTier) => number;
+};
 
 export interface GarbageCollectionResult {
   scanned: number;
+  // Eligible T2/T3 rows left after this bounded pass. A true continuation
+  // means the scheduler/CLI should invoke another pass to drain the backlog.
+  remaining: number;
+  continuation: boolean;
   archived: number;
   deleted: number;
   // true when one or more expired memories' vector deletion failed mid-batch;
@@ -46,23 +57,49 @@ export class RetentionService {
   constructor(
     private config: BrainConfig,
     private storage: StorageManager,
-    private logger?: { info: (obj: Record<string, unknown>) => void },
+    private logger?: {
+      info: (obj: Record<string, unknown>) => void;
+      warn?: (obj: Record<string, unknown>) => void;
+      error?: (obj: Record<string, unknown>) => void;
+    },
     private metrics?: MetricsCollector,
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
+  }
+
+  private warn(event: Record<string, unknown>): void {
+    if (this.logger?.warn) {
+      this.logger.warn(event);
+    } else {
+      this.logger?.info(event);
+    }
+  }
+
+  private error(event: Record<string, unknown>): void {
+    if (this.logger?.error) {
+      this.logger.error(event);
+    } else {
+      this.warn(event);
+    }
   }
 
   async runGc(options?: { dryRun?: boolean; tier?: RetentionTier }): Promise<GarbageCollectionResult> {
     const nowIso = new Date().toISOString();
     const gcStart = Date.now();
 
-    // Direct archive/delete is restricted to T2/T3: T0 is never selected by
-    // retention policy, and T1 requires warning/review semantics rather than
-    // TTL-only deletion, so it is excluded here and surfaced separately below.
-    const expiredAll = this.storage.sqlite.listExpiredMemories(nowIso, options?.tier);
-    const deletable = expiredAll.filter(
-      memory => memory.retention_tier === 'T2' || memory.retention_tier === 'T3',
-    );
+    // Direct archive/delete is restricted to T2/T3. The real store uses a
+    // keyset page; the legacy branch keeps narrow test doubles compatible.
+    const pageSize = this.config.retention.cleanup_batch_size ?? 200;
+    const maxDurationMs = this.config.retention.cleanup_max_duration_ms ?? 30_000;
+    const pagedSqlite = this.storage.sqlite as typeof this.storage.sqlite & CleanupPageSqlite;
+    const deletable = pagedSqlite.listExpiredMemoriesPage
+      ? pagedSqlite.listExpiredMemoriesPage(nowIso, pageSize, undefined, options?.tier)
+      : this.storage.sqlite.listExpiredMemories(nowIso, options?.tier).filter(
+        memory => memory.retention_tier === 'T2' || memory.retention_tier === 'T3',
+      );
+    const remainingAfterPass = () => pagedSqlite.countExpiredDeletableMemories
+      ? pagedSqlite.countExpiredDeletableMemories(nowIso, options?.tier)
+      : 0;
     const reviewCandidates = (!options?.tier || options.tier === 'T1')
       ? this.storage.sqlite.listReviewCandidates(nowIso)
       : [];
@@ -82,10 +119,13 @@ export class RetentionService {
     }));
 
     if (options?.dryRun) {
+      const remaining = Math.max(0, remainingAfterPass() - deletable.length);
       this.logger?.info({
         event: 'retention_gc',
         outcome: 'dry_run',
         scanned: deletable.length,
+        remaining,
+        continuation: remaining > 0,
         archived: 0,
         deleted: 0,
         degraded: false,
@@ -93,6 +133,8 @@ export class RetentionService {
       });
       return {
         scanned: deletable.length,
+        remaining,
+        continuation: remaining > 0,
         archived: 0,
         deleted: 0,
         degraded: false,
@@ -108,22 +150,28 @@ export class RetentionService {
     // Bracket the destructive phase so a crash mid-run is always visible as
     // an in-progress lifecycle operation (mirrors the restore path), and
     // guarantee the lock is released via `finally` regardless of outcome.
-    this.storage.sqlite.beginLifecycleOperation('gc');
+    const lifecycleToken = this.storage.sqlite.beginLifecycleOperation('gc');
     let archived = 0;
     let archiveFailed = false;
+    let timeBudgetReached = false;
     const archivedOk: typeof deletable = [];
 
     try {
       for (const memory of deletable) {
+        if (Date.now() - gcStart >= maxDurationMs) {
+          timeBudgetReached = true;
+          break;
+        }
         if (!this.config.retention.archive_before_delete) {
           archivedOk.push(memory);
           continue;
         }
         try {
-          this.storage.sqlite.archiveMemory(memory, nowIso);
+          this.storage.sqlite.archiveMemory(memory, nowIso, lifecycleToken);
           archived++;
           this.storage.logAudit('ARCHIVE', memory.id, memory.namespace, 'system', {
             flush: false,
+            lifecycleToken,
             details: {
               memory_id: memory.id,
               prior_tier: memory.retention_tier,
@@ -139,7 +187,7 @@ export class RetentionService {
           // delete without a durable archive row when archival is enabled)
           // and keep going so one bad row doesn't abort the whole run.
           archiveFailed = true;
-          this.logger?.info({
+          this.warn({
             event: 'retention_gc_archive_failed',
             memory_id: memory.id,
             error: (err as Error).message,
@@ -149,9 +197,9 @@ export class RetentionService {
 
       let deleteResult: DeleteMemoriesResult;
       try {
-        deleteResult = await this.storage.deleteMemories(archivedOk, { flush: false });
+        deleteResult = await this.storage.deleteMemories(archivedOk, { flush: false, lifecycleToken });
       } catch (err) {
-        this.logger?.info({ event: 'retention_gc_delete_failed', error: (err as Error).message });
+        this.warn({ event: 'retention_gc_delete_failed', error: (err as Error).message });
         deleteResult = { deleted: 0, unreconciled: archivedOk.map(m => m.id), degraded: true };
       }
 
@@ -163,6 +211,7 @@ export class RetentionService {
         if (unreconciledIds.has(memory.id)) continue;
         this.storage.logAudit('FORGET', memory.id, memory.namespace, 'system', {
           flush: false,
+          lifecycleToken,
           details: {
             memory_id: memory.id,
             prior_tier: memory.retention_tier,
@@ -180,9 +229,9 @@ export class RetentionService {
       // exclusion (the dryRun branch returns above without reaching here).
       // `null` disables the corresponding prune.
       const auditCap = this.config.retention.audit_log_max_entries;
-      const auditPruned = auditCap !== null ? this.storage.sqlite.pruneAuditLog(auditCap) : 0;
+      const auditPruned = auditCap !== null ? this.storage.sqlite.pruneAuditLog(auditCap, lifecycleToken) : 0;
       const revisionsCap = this.config.retention.revisions_per_memory_max;
-      const revisionsPruned = revisionsCap !== null ? this.storage.sqlite.pruneRevisions(revisionsCap) : 0;
+      const revisionsPruned = revisionsCap !== null ? this.storage.sqlite.pruneRevisions(revisionsCap, lifecycleToken) : 0;
 
       this.storage.sqlite.flushIfDirty();
 
@@ -191,9 +240,12 @@ export class RetentionService {
         degraded,
         degraded ? 'Last cleanup (GC) run reported a partial failure' : null,
         nowIso,
+        lifecycleToken,
       );
 
       const compacted = await this.maybeCompact(archivedOk, unreconciledIds, nowIso);
+      const remaining = remainingAfterPass();
+      const continuation = remaining > 0 || timeBudgetReached;
 
       const durationMs = Date.now() - gcStart;
       this.metrics?.recordHistogram('bhgbrain_gc_duration_ms', durationMs);
@@ -203,10 +255,12 @@ export class RetentionService {
         this.metrics?.incCounter('bhgbrain_gc_compactions_total', compacted.length);
       }
 
-      this.logger?.info({
+      (degraded ? this.warn.bind(this) : this.logger?.info.bind(this.logger))?.({
         event: 'retention_gc',
         outcome: degraded ? 'degraded' : 'ok',
         scanned: deletable.length,
+        remaining,
+        continuation,
         archived,
         deleted: deleteResult.deleted,
         degraded,
@@ -220,6 +274,8 @@ export class RetentionService {
 
       return {
         scanned: deletable.length,
+        remaining,
+        continuation,
         archived,
         deleted: deleteResult.deleted,
         degraded,
@@ -236,18 +292,30 @@ export class RetentionService {
       // health, and return a well-formed result instead of throwing a raw
       // error out of the scheduler or CLI.
       this.storage.sqlite.flushIfDirty();
-      this.storage.sqlite.setRetentionDegraded(true, (err as Error).message, nowIso);
-      this.logger?.info({
+      try {
+        this.storage.sqlite.setRetentionDegraded(true, (err as Error).message, nowIso, lifecycleToken);
+      } catch (stateError) {
+        this.error({
+          event: 'retention_gc_state_record_failed',
+          error: (stateError as Error).message,
+          original_error: (err as Error).message,
+        });
+      }
+      this.warn({
         event: 'retention_gc',
         outcome: 'degraded',
         error: (err as Error).message,
         scanned: deletable.length,
+        remaining: remainingAfterPass(),
+        continuation: true,
         archived,
         deleted: 0,
         degraded: true,
       });
       return {
         scanned: deletable.length,
+        remaining: remainingAfterPass(),
+        continuation: true,
         archived,
         deleted: 0,
         degraded: true,
@@ -259,7 +327,7 @@ export class RetentionService {
         revisions_pruned: 0,
       };
     } finally {
-      this.storage.sqlite.endLifecycleOperation('gc');
+      this.storage.sqlite.endLifecycleOperation(lifecycleToken, 'gc');
     }
   }
 
@@ -291,7 +359,18 @@ export class RetentionService {
 
     const compacted: string[] = [];
     for (const { namespace, collection, count } of deletedByCollection.values()) {
-      const info = await this.storage.qdrant.getCollectionInfo(namespace, collection);
+      let info: { points_count: number } | null;
+      try {
+        info = await this.storage.qdrant.getCollectionInfo(namespace, collection);
+      } catch (err) {
+        this.warn({
+          event: 'retention_gc_collection_info_failed',
+          namespace,
+          collection,
+          error: (err as Error).message,
+        });
+        continue;
+      }
       const remaining = info?.points_count ?? 0;
       const ratio = count + remaining > 0 ? count / (count + remaining) : 0;
       if (ratio < threshold) continue;
@@ -299,7 +378,7 @@ export class RetentionService {
       await this.storage.qdrant.compact(namespace, collection, threshold);
       const key = `${namespace}/${collection}`;
       compacted.push(key);
-      this.logger?.info({
+      this.warn({
         event: 'retention_gc_compaction',
         namespace,
         collection,
@@ -367,62 +446,37 @@ export class RetentionService {
     return this.lifecycle.buildMetadata(tier, new Date());
   }
 
-  async restoreArchive(memoryId: string): Promise<{ restored: boolean; id: string }> {
+  async restoreArchive(
+    memoryId: string,
+  ): Promise<{ restored: boolean; id: string; restored_from?: string; archive_id?: number }> {
     const archived = this.storage.sqlite.getArchiveByMemoryId(memoryId);
     if (!archived) {
       return { restored: false, id: memoryId };
     }
 
-    const now = new Date().toISOString();
-    const metadata = this.lifecycle.buildMetadata(archived.tier, new Date(now));
-    const memory: Omit<MemoryRecord, 'embedding'> = {
-      id: archived.memory_id || uuidv4(),
-      namespace: archived.namespace,
-      collection: 'general',
-      type: 'semantic',
-      category: null,
-      content: archived.summary,
-      summary: archived.summary,
-      tags: archived.tags,
-      source: 'cli',
-      checksum: archived.memory_id,
-      importance: 0.5,
-      retention_tier: archived.tier,
-      expires_at: metadata.expires_at,
-      decay_eligible: metadata.decay_eligible,
-      review_due: metadata.review_due,
-      access_count: 0,
-      last_operation: 'ADD',
-      merged_from: null,
-      archived: false,
-      vector_synced: true,
-      // Archive rows carry no pin state (ArchiveRecord has no `pinned`
-      // field), so a restore never resurrects a memory as pinned.
-      pinned: false,
-      // Archive rows carry no origin/confidence either (ArchiveRecord has
-      // neither field) — a restore has no provenance to recover, so this
-      // matches the "legacy row" default (origin: null, confidence: 1.0).
-      // See add-memory-provenance-metadata.
-      origin: null,
-      confidence: 1.0,
-      created_at: now,
-      updated_at: now,
-      last_accessed: now,
-    };
+    // Shared with the `review` MCP tool's `restore` action (src/tools/index.ts)
+    // so checksum, expiry/review, and provenance fields cannot drift between
+    // the CLI and tool entrypoints — see
+    // openspec/changes/make-backup-restore-transactional (task 2.4). An
+    // earlier version of this method derived `checksum` from
+    // `archived.memory_id` (an unrelated identifier) rather than the
+    // restored content.
+    const memory = buildRestoredMemoryFromArchive(this.config, archived, { source: 'cli' });
     const vector = await this.storage.embedding.embed(memory.content);
     await this.storage.writeMemory(memory, vector);
-    this.storage.sqlite.deleteArchive(memoryId);
+    // Archive row is retained (not deleted) so the origin stays inspectable,
+    // matching the `review` tool's restore behavior.
     this.storage.logAudit('RESTORE', memory.id, memory.namespace, 'system', {
       details: {
         memory_id: memory.id,
         prior_tier: null,
         new_tier: archived.tier,
         actor: 'system',
-        timestamp: now,
+        timestamp: memory.created_at,
         action: 'restore',
       },
     });
     this.storage.sqlite.flushIfDirty();
-    return { restored: true, id: memory.id };
+    return { restored: true, id: memory.id, restored_from: archived.memory_id, archive_id: archived.id };
   }
 }

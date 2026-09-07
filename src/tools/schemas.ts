@@ -112,8 +112,12 @@ export const MCP_TOOL_DEFINITIONS = [
       type: 'object' as const,
       properties: {
         results: { type: 'array', items: SEARCH_RESULT_SCHEMA },
+        truncated: {
+          type: 'boolean',
+          description: 'True when trailing results were left out to keep the response within defaults.max_response_chars (see bound-corpus-scale-workflows).',
+        },
       },
-      required: ['results'],
+      required: ['results', 'truncated'],
     },
     // Pure read: destructiveHint/idempotentHint are meaningless per spec when
     // readOnlyHint is true, so only readOnlyHint/openWorldHint are declared.
@@ -159,8 +163,12 @@ export const MCP_TOOL_DEFINITIONS = [
       properties: {
         results: { type: 'array', items: SEARCH_RESULT_SCHEMA },
         degraded: { type: 'boolean' },
+        truncated: {
+          type: 'boolean',
+          description: 'True when trailing results were left out to keep the response within defaults.max_response_chars (see bound-corpus-scale-workflows).',
+        },
       },
-      required: ['results'],
+      required: ['results', 'truncated'],
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
   },

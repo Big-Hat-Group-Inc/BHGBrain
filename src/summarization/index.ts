@@ -1,6 +1,13 @@
 import type { BrainConfig } from '../config/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type { CircuitBreaker } from '../resilience/index.js';
+import {
+  executeLlmRequest,
+  extractChatMessageContent,
+  resolveApiKey,
+  resolveLlmBaseUrl,
+  resolveLlmRetryConfig,
+} from '../llm/client.js';
 
 /**
  * LLM-backed summarization provider interface. `summarize` never resolves
@@ -32,7 +39,8 @@ export class OpenAISummarizationProvider implements SummarizationProvider {
   private readonly apiKey: string;
   private readonly model: string;
   private readonly timeoutMs: number;
-  private baseUrl = 'https://api.openai.com/v1';
+  private readonly baseUrl: string;
+  private readonly retry: ReturnType<typeof resolveLlmRetryConfig>;
 
   constructor(
     config: BrainConfig,
@@ -43,6 +51,8 @@ export class OpenAISummarizationProvider implements SummarizationProvider {
     this.apiKey = apiKey;
     this.model = config.pipeline.summarization_model;
     this.timeoutMs = config.pipeline.summarization_timeout_ms;
+    this.baseUrl = resolveLlmBaseUrl(config.llm?.base_url);
+    this.retry = resolveLlmRetryConfig(config.llm?.retry);
   }
 
   async summarize(content: string, maxLen: number): Promise<string> {
@@ -55,47 +65,32 @@ export class OpenAISummarizationProvider implements SummarizationProvider {
     }
   }
 
+  // unify-llm-client-boundaries task 2.3: routed through the shared
+  // OpenAI-compatible request executor — same base URL resolution,
+  // deadline-through-body-parse coverage, HTTP/network classification, and
+  // capped-jitter retry as every other migrated chat feature. The breaker
+  // now wraps the whole retry loop (one outcome per `summarize()` call).
   private async callChatCompletion(content: string, maxLen: number): Promise<string> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-
-    const executeFetch = () => fetch(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
+    return executeLlmRequest({
+      url: `${this.baseUrl}/chat/completions`,
       headers: {
         'Authorization': `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
+      body: {
         model: this.model,
         messages: [
           { role: 'system', content: `${SYSTEM_PROMPT_PREFIX} ${maxLen} characters.` },
           { role: 'user', content },
         ],
-      }),
-      signal: controller.signal,
+      },
+      timeoutMs: this.timeoutMs,
+      retry: this.retry,
+      breaker: this.breaker,
+      useBreaker: this.breaker !== undefined,
+      errorPrefix: 'Summarization',
+      parseResponse: async response => extractChatMessageContent(response, 'Summarization'),
     });
-
-    try {
-      const response = this.breaker
-        ? await this.breaker.execute(executeFetch)
-        : await executeFetch();
-
-      if (!response.ok) {
-        const body = await response.text().catch(() => '');
-        throw new Error(`Summarization API error ${response.status}: ${body.slice(0, 200)}`);
-      }
-
-      const data = await response.json() as {
-        choices: Array<{ message: { content: string } }>;
-      };
-      const message = data.choices[0]?.message.content;
-      if (!message) {
-        throw new Error('Summarization API response had no message content');
-      }
-      return message;
-    } finally {
-      clearTimeout(timer);
-    }
   }
 }
 
@@ -115,10 +110,18 @@ export class DegradedSummarizationProvider implements SummarizationProvider {
 
 /**
  * Resolves the summarization API key: the configured
- * `summarization_model_env` var (defaults to the same var extraction uses).
+ * `summarization_model_env` var (defaults to the same var extraction uses),
+ * falling back to `OPENAI_API_KEY` when unset — matching the documented
+ * fallback for `BHGBRAIN_EXTRACTION_API_KEY` (README.md "Environment
+ * Variables") and the outbound-ai-request-policy spec scenario "Only the
+ * common API key is set" (unify-llm-client-boundaries task 1.2). Before this
+ * fix, an operator who set only `OPENAI_API_KEY` and enabled summarization
+ * got `DegradedSummarizationProvider` instead of a working provider, unlike
+ * every sibling feature (extraction, query expansion, entailment,
+ * distillation) that already falls back the same way.
  */
 function resolveSummarizationApiKey(config: BrainConfig): string | undefined {
-  return process.env[config.pipeline.summarization_model_env];
+  return resolveApiKey(config.pipeline.summarization_model_env, { fallbackToOpenAI: true });
 }
 
 /**

@@ -27,7 +27,15 @@ export function createAuthMiddleware(config: BrainConfig, logger: pino.Logger) {
   const expectedToken = process.env[tokenEnv];
 
   return (req: Request, res: Response, next: NextFunction): void => {
-    if (req.path === '/health') {
+    // bound-qdrant-http-runtime task 2.1: `/health/live` is registered ahead
+    // of this middleware entirely (src/transport/http.ts), so it never
+    // reaches here. `/health/ready` stays unauthenticated (a readiness probe
+    // is meant to be pollable by an orchestrator with no credentials) but is
+    // still registered after this middleware in the route table, so it must
+    // be exempted explicitly here rather than by route order. The full
+    // diagnostic `/health` snapshot is intentionally NOT exempted any more —
+    // it now requires normal Bearer authentication like every other route.
+    if (req.path === '/health/ready') {
       next();
       return;
     }
@@ -83,28 +91,42 @@ export function deriveTrustedClientId(req: Request): string | undefined {
   return req.ip || undefined;
 }
 
+const RATE_LIMIT_WINDOW_MS = 60_000;
+// bound-qdrant-http-runtime task 2.4: an independent sweep interval, not tied
+// to request arrival — bucket cleanup now happens even when traffic from a
+// rotating-identity burst stops entirely, instead of only opportunistically
+// piggybacking on the next request.
+const RATE_LIMIT_SWEEP_INTERVAL_MS = 30_000;
+// Fallback used only when a caller constructs a config bypassing Zod
+// validation (as several existing unit tests deliberately do) without
+// `security.rate_limit_max_buckets` — production configs always have the
+// Zod-validated default (10,000) filled in.
+const DEFAULT_RATE_LIMIT_MAX_BUCKETS = 10_000;
+
 export function createRateLimitMiddleware(
   config: BrainConfig,
   logger?: pino.Logger,
   metrics?: MetricsCollector,
 ): RateLimitMiddleware {
   const maxRpm = config.security.rate_limit_rpm;
+  const maxBuckets = config.security.rate_limit_max_buckets ?? DEFAULT_RATE_LIMIT_MAX_BUCKETS;
   const clientBuckets = new Map<string, { count: number; resetAt: number }>();
-  let lastRateLimitSweepAt = 0;
+
+  function sweepExpired(now: number): void {
+    for (const [clientId, bucket] of clientBuckets.entries()) {
+      if (now >= bucket.resetAt) {
+        clientBuckets.delete(clientId);
+      }
+    }
+  }
+
+  // Unref'd so this timer never keeps the process alive on its own (matches
+  // every other periodic timer in this codebase, e.g. CleanupScheduler).
+  const sweepTimer = setInterval(() => sweepExpired(Date.now()), RATE_LIMIT_SWEEP_INTERVAL_MS);
+  sweepTimer.unref?.();
 
   const middleware = ((req: Request, res: Response, next: NextFunction): void => {
     const now = Date.now();
-    const windowMs = 60_000;
-    const sweepEveryMs = 30_000;
-
-    if (now - lastRateLimitSweepAt >= sweepEveryMs) {
-      for (const [clientId, bucket] of clientBuckets.entries()) {
-        if (now >= bucket.resetAt) {
-          clientBuckets.delete(clientId);
-        }
-      }
-      lastRateLimitSweepAt = now;
-    }
 
     const clientHint = req.headers['x-client-id'] as string | undefined;
     const trustedClientId = deriveTrustedClientId(req);
@@ -123,7 +145,34 @@ export function createRateLimitMiddleware(
 
     let bucket = clientBuckets.get(trustedClientId);
     if (!bucket || now >= bucket.resetAt) {
-      bucket = { count: 0, resetAt: now + windowMs };
+      // bound-qdrant-http-runtime task 2.4: fail-closed capacity policy — a
+      // genuinely new client key is only admitted while under the configured
+      // hard cap. At capacity, run one last sweep first (an expired bucket
+      // may free room without rejecting anyone), and only reject if the map
+      // is still full. Rotating identities (spoofed X-Forwarded-For under a
+      // trust-all setting, or simply many distinct real clients) therefore
+      // cannot grow the map without bound — a request from an *existing*
+      // bucket is never rejected this way.
+      if (!bucket && clientBuckets.size >= maxBuckets) {
+        sweepExpired(now);
+        if (clientBuckets.size >= maxBuckets) {
+          metrics?.incCounter('bhgbrain_rate_limit_capacity_rejected_total');
+          logger?.warn({
+            event: 'rate_limit_capacity_exceeded',
+            client_hint: clientHint,
+            max_buckets: maxBuckets,
+          });
+          res.status(429).json({
+            error: {
+              code: 'RATE_LIMITED',
+              message: 'Rate limiter is at capacity; try again shortly',
+              retryable: true,
+            },
+          });
+          return;
+        }
+      }
+      bucket = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
       clientBuckets.set(trustedClientId, bucket);
     }
 
@@ -151,7 +200,6 @@ export function createRateLimitMiddleware(
 
   middleware.resetForTests = (): void => {
     clientBuckets.clear();
-    lastRateLimitSweepAt = 0;
   };
 
   return middleware;

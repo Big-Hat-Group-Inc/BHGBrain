@@ -69,7 +69,9 @@ describe('buildMcpServer', () => {
 
     expect(handle).toHaveBeenCalledWith('memory://list');
     expect(result.contents[0]?.uri).toBe('memory://list');
-    expect(JSON.stringify(result.contents[0]?.text)).toContain('memory://list');
+    const [content] = result.contents;
+    expect(content && 'text' in content).toBe(true);
+    expect(JSON.stringify(content && 'text' in content ? content.text : undefined)).toContain('memory://list');
 
     await client.close();
     await server.close();

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SqliteStore } from './sqlite.js';
 import { DatabaseSync } from 'node:sqlite';
 import type { StatementSync } from 'node:sqlite';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -33,9 +33,18 @@ describe('SqliteStore', () => {
     source: 'cli' as const,
     checksum: 'abc123',
     importance: 0.7,
+    retention_tier: 'T2' as const,
+    expires_at: null,
+    decay_eligible: true,
+    review_due: null,
     access_count: 0,
     last_operation: 'ADD' as const,
     merged_from: null,
+    archived: false,
+    vector_synced: true,
+    pinned: false,
+    origin: null as { session_id?: string; tool?: string; repo?: string; branch?: string } | null,
+    confidence: 1.0,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     last_accessed: new Date().toISOString(),
@@ -48,6 +57,15 @@ describe('SqliteStore', () => {
     expect(retrieved).not.toBeNull();
     expect(retrieved!.content).toBe(mem.content);
     expect(retrieved!.tags).toEqual(mem.tags);
+  });
+
+  it('sets the configured bounded SQLite busy timeout at open', async () => {
+    const configured = new SqliteStore(tempDir, { busyTimeoutMs: 321 });
+    await configured.init();
+    const db = (configured as unknown as { db: DatabaseSync }).db;
+    const row = db.prepare('PRAGMA busy_timeout').get() as { timeout: number };
+    expect(row.timeout).toBe(321);
+    configured.close();
   });
 
   // add-memory-distillation, task 7.2: derived_from round-trips through
@@ -88,6 +106,17 @@ describe('SqliteStore', () => {
     expect(store.getMemoryById(mem.id)).toBeNull();
   });
 
+  it('stages deletion intents as hidden, recoverable vector drift', () => {
+    const mem = sampleMemory();
+    store.insertMemory(mem);
+
+    store.stageDeletionIntent([mem.id]);
+    expect(store.getMemoryById(mem.id)).toBeNull();
+
+    store.clearDeletionIntent([mem.id], { vectorSynced: false });
+    expect(store.getMemoryById(mem.id)).toEqual(expect.objectContaining({ id: mem.id, vector_synced: false }));
+  });
+
   // openspec/changes/upgrade-fulltext-to-fts5, task 1.1, flipped by
   // migrate-sqlite-to-native-engine task 4.1: the startup FTS5 capability
   // probe. This is a canary, not just a smoke test — `node:sqlite`'s bundled
@@ -117,6 +146,47 @@ describe('SqliteStore', () => {
     const list = store.listMemories('global', 10);
     expect(list[0]!.id).toBe(mem2.id);
     expect(list[1]!.id).toBe(mem1.id);
+  });
+
+  it('uses one expiry boundary before list, collection, count, and full-text limits', () => {
+    const now = '2026-09-06T12:00:00.000Z';
+    const expired = {
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000011', checksum: 'expired',
+      content: 'eligibility needle', summary: 'expired', collection: 'work',
+      expires_at: '2026-09-06T11:59:59.999Z', created_at: '2026-09-06T11:00:00.000Z',
+    };
+    const atBoundary = {
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000012', checksum: 'boundary',
+      content: 'eligibility needle', summary: 'boundary', collection: 'work',
+      expires_at: now, created_at: '2026-09-06T10:00:00.000Z',
+    };
+    store.insertMemory(expired);
+    store.insertMemory(atBoundary);
+
+    expect(store.listMemories('global', 10, undefined, now).map(mem => mem.id)).toEqual([atBoundary.id]);
+    expect(store.listMemoriesInCollection('global', 'work', 10, undefined, now).map(mem => mem.id)).toEqual([atBoundary.id]);
+    expect(store.countMemories('global', now)).toBe(1);
+    expect(store.countMemoriesInCollection('global', 'work', now)).toBe(1);
+    expect(store.fullTextSearch('global', 'eligibility', 10, undefined, undefined, now).map(result => result.id))
+      .toEqual([atBoundary.id]);
+  });
+
+  it('selects equal-ranked full-text candidates in stable memory-id order', () => {
+    const first = {
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000021', checksum: 'tie-a',
+      content: 'stable ranking phrase', summary: 'same',
+    };
+    const second = {
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000022', checksum: 'tie-b',
+      content: 'stable ranking phrase', summary: 'same',
+    };
+    store.insertMemory(second);
+    store.insertMemory(first);
+
+    const once = store.fullTextSearch('global', 'stable ranking phrase', 1);
+    const again = store.fullTextSearch('global', 'stable ranking phrase', 1);
+    expect(once.map(result => result.id)).toEqual([first.id]);
+    expect(again).toEqual(once);
   });
 
   it('updates memory fields', () => {
@@ -317,14 +387,14 @@ describe('SqliteStore', () => {
       const mem = sampleMemory();
       store.insertMemory(mem);
       store.flush();
-      store.beginLifecycleOperation('restore');
+      const lifecycleToken = store.beginLifecycleOperation('restore');
 
       expect(() => store.recordFeedback({
         memory_id: mem.id, namespace: 'global', query: null, score: null, useful: true,
         client_id: 'c1', created_at: new Date().toISOString(),
       })).toThrow(/lifecycle operation/);
 
-      store.endLifecycleOperation('restore');
+      store.endLifecycleOperation(lifecycleToken, 'restore');
     });
   });
 
@@ -496,14 +566,14 @@ describe('SqliteStore', () => {
     store.insertMemory(mem);
     store.flush();
 
-    store.beginLifecycleOperation('restore');
+    const lifecycleToken = store.beginLifecycleOperation('restore');
     expect(() => store.setCategory('Blocked', 'custom', 'nope')).toThrow('lifecycle operation');
 
     const before = store.getMemoryById(mem.id)!;
     store.touchMemory(mem.id);
     const after = store.getMemoryById(mem.id)!;
     expect(after.access_count).toBe(before.access_count);
-    store.endLifecycleOperation('restore');
+    store.endLifecycleOperation(lifecycleToken, 'restore');
   });
 
   // -- Restore/flush race coverage (real SqliteStore, not mocked) --
@@ -529,7 +599,7 @@ describe('SqliteStore', () => {
       // Mirrors BackupService.beginRestoreOperation(): acquiring the restore
       // lifecycle lock must cancel the pending timer synchronously, before any
       // restored bytes are written to disk.
-      store.beginLifecycleOperation('restore');
+      const lifecycleToken = store.beginLifecycleOperation('restore');
 
       // Simulate the restore write: different bytes land on disk directly
       // (bypassing this store's flush()), exactly as atomicWriteFileSync does
@@ -555,7 +625,7 @@ describe('SqliteStore', () => {
 
       // The real reload path: reads afterward observe the restored dataset.
       await store.reloadFromDisk();
-      store.endLifecycleOperation('restore');
+      store.endLifecycleOperation(lifecycleToken, 'restore');
 
       expect(store.getMemoryById(mem.id)).toBeNull();
       expect(store.getMemoryById(restoredMem.id)).not.toBeNull();
@@ -569,7 +639,7 @@ describe('SqliteStore', () => {
     store.insertMemory(mem);
     store.flush();
 
-    store.beginLifecycleOperation('restore');
+    const lifecycleToken = store.beginLifecycleOperation('restore');
     const reloadPromise = store.reloadFromDisk();
 
     // While the reload is in flight -- mirroring the window between
@@ -581,7 +651,7 @@ describe('SqliteStore', () => {
     expect(() => store.insertMemory({ ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440098', checksum: 'racer' })).toThrow(/lifecycle operation/);
 
     await reloadPromise;
-    store.endLifecycleOperation('restore');
+    store.endLifecycleOperation(lifecycleToken, 'restore');
 
     // Guard lifted once the lifecycle operation ends.
     expect(() => store.markStale(mem.id)).not.toThrow();
@@ -1017,6 +1087,30 @@ describe('SqliteStore', () => {
     ]);
   });
 
+  it('keyset-pages expired T2/T3 memories in deterministic expiry and id order', () => {
+    const expiresAt = '2026-01-01T00:00:00.000Z';
+    for (const id of ['00000000-0000-0000-0000-0000000000e3', '00000000-0000-0000-0000-0000000000e1', '00000000-0000-0000-0000-0000000000e2']) {
+      store.insertMemory({
+        ...sampleMemory(), id, checksum: id, retention_tier: 'T2', expires_at: expiresAt, decay_eligible: true,
+      });
+    }
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000e4', checksum: 't1',
+      retention_tier: 'T1', expires_at: expiresAt, decay_eligible: true,
+    });
+
+    const page1 = store.listExpiredMemoriesPage('2026-02-01T00:00:00.000Z', 2);
+    const cursor = `${page1[1]!.expires_at}|${page1[1]!.id}`;
+    const page2 = store.listExpiredMemoriesPage('2026-02-01T00:00:00.000Z', 2, cursor);
+
+    expect(page1.map(memory => memory.id)).toEqual([
+      '00000000-0000-0000-0000-0000000000e1',
+      '00000000-0000-0000-0000-0000000000e2',
+    ]);
+    expect(page2.map(memory => memory.id)).toEqual(['00000000-0000-0000-0000-0000000000e3']);
+    expect(store.countExpiredDeletableMemories('2026-02-01T00:00:00.000Z')).toBe(3);
+  });
+
   it('searchArchived matches retained summary/tags and scopes to the given namespace', () => {
     const mem = { ...sampleMemory(), namespace: 'global', retention_tier: 'T2' as const };
     store.archiveMemory({ ...mem, summary: 'a note about kubernetes', tags: ['ops'] }, '2026-01-01T00:00:00.000Z');
@@ -1034,6 +1128,40 @@ describe('SqliteStore', () => {
 
     const noMatch = store.searchArchived('global', 'nonexistent-term', 10);
     expect(noMatch).toEqual([]);
+  });
+
+  it('converges repeated archive attempts to one current archive record', () => {
+    const mem = { ...sampleMemory(), retention_tier: 'T2' as const };
+    store.archiveMemory({ ...mem, summary: 'first summary', tags: ['first'] }, '2026-01-01T00:00:00.000Z');
+    store.archiveMemory({ ...mem, summary: 'replacement summary', tags: ['replacement'] }, '2026-02-01T00:00:00.000Z');
+
+    expect(store.countArchivedMemories()).toBe(1);
+    expect(store.getArchiveByMemoryId(mem.id)).toMatchObject({
+      memory_id: mem.id,
+      summary: 'replacement summary',
+      expired_at: '2026-02-01T00:00:00.000Z',
+      tags: ['replacement'],
+    });
+  });
+
+  it('deduplicates legacy archive rows before installing the archive identity index', async () => {
+    const internal = store as unknown as { db: DatabaseSync };
+    internal.db.exec('DROP INDEX idx_memory_archive_memory_id_unique');
+    const insert = internal.db.prepare(
+      `INSERT INTO memory_archive (memory_id, summary, tier, namespace, created_at, expired_at, access_count, tags)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    insert.run('legacy-archive', 'older', 'T2', 'global', '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z', 1, '[]');
+    insert.run('legacy-archive', 'newer', 'T2', 'global', '2026-01-01T00:00:00.000Z', '2026-02-02T00:00:00.000Z', 2, '[]');
+    store.close();
+
+    store = new SqliteStore(tempDir);
+    await store.init();
+
+    expect(store.countArchivedMemories()).toBe(1);
+    expect(store.getArchiveByMemoryId('legacy-archive')).toMatchObject({
+      summary: 'newer', expired_at: '2026-02-02T00:00:00.000Z', access_count: 2,
+    });
   });
 
   it('searchArchived matches multi-word queries whose terms are non-contiguous in the summary', () => {
@@ -1079,6 +1207,20 @@ describe('SqliteStore', () => {
     // Regression: the old `LIKE '%%'` shape matched every archived row.
     expect(store.searchArchived('global', '', 10)).toEqual([]);
     expect(store.searchArchived('global', '   ', 10)).toEqual([]);
+  });
+
+  it('does not let archive LIKE wildcards enumerate unrelated rows', () => {
+    const mem = { ...sampleMemory(), namespace: 'global', retention_tier: 'T2' as const };
+    store.archiveMemory({ ...mem, summary: 'alpha only', tags: [] }, '2026-01-01T00:00:00.000Z');
+    store.archiveMemory(
+      { ...mem, id: '00000000-0000-0000-0000-0000000000ac', summary: 'bravo only', tags: [] },
+      '2026-01-02T00:00:00.000Z',
+    );
+
+    expect(store.searchArchived('global', '%', 10)).toEqual([]);
+    expect(store.searchArchived('global', '_', 10)).toEqual([]);
+    expect(store.searchArchived('global', '😀', 10)).toEqual([]);
+    expect(store.searchArchived('global', 'alpha!!!', 10).map(row => row.memory_id)).toEqual([mem.id]);
   });
 
   it('searchArchive (CLI, namespace-agnostic) tokenizes the same way', () => {
@@ -1489,6 +1631,42 @@ describe('SqliteStore origin/confidence (add-memory-provenance-metadata)', () =>
       }
     });
 
+    // Task 1.4 (make-backup-restore-transactional): `exportDataToFile`
+    // returns a path instead of a whole-database `Buffer`, so a caller
+    // (backup creation) can stream it rather than buffering it in memory.
+    it('exportDataToFile() writes a standalone export and reports its real size, leaving cleanup to the caller', async () => {
+      const mem = {
+        ...sampleMemory(),
+        retention_tier: 'T2' as const, expires_at: null, decay_eligible: true, review_due: null,
+        archived: false, vector_synced: true, pinned: false, origin: null, confidence: 1,
+      };
+      store.insertMemory(mem);
+      store.flush();
+
+      const { path: exportPath, sizeBytes } = store.exportDataToFile();
+      try {
+        expect(existsSync(exportPath)).toBe(true);
+        expect(readFileSync(exportPath).length).toBe(sizeBytes);
+
+        const standaloneDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-standalone-'));
+        try {
+          const standaloneStore = new SqliteStore(standaloneDir);
+          writeFileSync(join(standaloneDir, 'brain.db'), readFileSync(exportPath));
+          await standaloneStore.init();
+          try {
+            expect(standaloneStore.getMemoryById(mem.id)?.content).toBe(mem.content);
+          } finally {
+            standaloneStore.close();
+          }
+        } finally {
+          rmSync(standaloneDir, { recursive: true, force: true });
+        }
+      } finally {
+        // exportDataToFile() leaves cleanup to the caller (unlike exportData()).
+        rmSync(exportPath, { force: true });
+      }
+    });
+
     it('activateDatabaseImage() swaps in a replacement image while the store is open (Windows close-before-overwrite)', async () => {
       const mem = sampleMemory();
       store.insertMemory(mem);
@@ -1679,6 +1857,115 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
       );
       expect(detail).toContain('USING INDEX idx_memories_unsynced_created');
     });
+
+    // -- bound-corpus-scale-workflows task 2.4 --
+
+    it('listExpiringMemories uses idx_memories_archived_expiry with no temp B-tree sort', () => {
+      const detail = plan(
+        `SELECT * FROM memories WHERE archived = 0 AND expires_at IS NOT NULL AND expires_at >= ? AND expires_at <= ? ORDER BY expires_at ASC LIMIT ?`,
+        ['2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z', 10],
+      );
+      expect(detail).toContain('USING INDEX idx_memories_archived_expiry');
+      expect(detail).not.toContain('USE TEMP B-TREE');
+    });
+
+    it('listReviewDue uses idx_memories_tier_review_due with no temp B-tree sort', () => {
+      const detail = plan(
+        `SELECT * FROM memories WHERE archived = 0 AND namespace = ? AND retention_tier = 'T1'
+         AND review_due IS NOT NULL AND review_due <= ? AND (review_due > ? OR (review_due = ? AND id > ?))
+         ORDER BY review_due ASC, id ASC LIMIT ?`,
+        ['global', '2026-06-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'cursor-id', 10],
+      );
+      expect(detail).toContain('USING INDEX idx_memories_tier_review_due');
+      expect(detail).not.toContain('USE TEMP B-TREE');
+    });
+
+    it('listPinnedMemories uses idx_memories_pinned_updated with no temp B-tree sort', () => {
+      const detail = plan(
+        `SELECT * FROM memories WHERE namespace = ? AND archived = 0 AND deletion_pending = 0 AND pinned = 1 ORDER BY updated_at DESC`,
+        ['global'],
+      );
+      expect(detail).toContain('USING INDEX idx_memories_pinned_updated');
+      expect(detail).not.toContain('USE TEMP B-TREE');
+    });
+
+    // No covering index for listMemoriesWithStaleEmbeddingStamp: see the
+    // SCHEMA_SQL comment above idx_memories_archived_expiry for why one
+    // (archived, created_at, id)) was deliberately not added — at a
+    // realistic scale it displaced idx_memories_ns_created/
+    // idx_memories_unsynced_created for their own unrelated, hotter-path
+    // queries. `embedding_model != ?` is not seekable by any index
+    // regardless; the selector stays keyset-paginated and
+    // deadline/batch-bounded instead (StorageManager.reembedMismatchedVectors).
+  });
+
+  // -- bound-corpus-scale-workflows task 2.3: FTS5 maintenance seeks by rowid --
+
+  describe('memories_fts rowid-seek maintenance', () => {
+    it('a single-memory delete issues a rowid-keyed FTS delete (an O(1) seek, not an unindexed-column scan)', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+
+      const dbInternal = (store as unknown as { db: DatabaseSync }).db;
+      const originalPrepare = dbInternal.prepare.bind(dbInternal);
+      const seen: string[] = [];
+      dbInternal.prepare = ((sql: string) => {
+        if (sql.includes('memories_fts')) seen.push(sql);
+        return originalPrepare(sql);
+      }) as typeof dbInternal.prepare;
+
+      try {
+        expect(store.deleteMemory(mem.id)).toBe(true);
+      } finally {
+        dbInternal.prepare = originalPrepare;
+      }
+
+      expect(seen.some(sql => /DELETE FROM memories_fts WHERE rowid = \?/.test(sql))).toBe(true);
+      // Word-boundary match: "rowid = ?" itself contains the substring
+      // "id =", so a plain .includes('id =') would false-positive here.
+      expect(seen.some(sql => /\bid\s*=/.test(sql))).toBe(false);
+
+      // The deleted memory is really gone from the FTS index, not just from `memories`.
+      expect(store.fullTextSearch('global', mem.content.split(' ')[0]!, 10).some(r => r.id === mem.id)).toBe(false);
+    });
+
+    it('a content-changing update issues a rowid-keyed FTS delete+reinsert', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+
+      const dbInternal = (store as unknown as { db: DatabaseSync }).db;
+      const originalPrepare = dbInternal.prepare.bind(dbInternal);
+      const seen: string[] = [];
+      dbInternal.prepare = ((sql: string) => {
+        if (sql.includes('memories_fts')) seen.push(sql);
+        return originalPrepare(sql);
+      }) as typeof dbInternal.prepare;
+
+      try {
+        store.updateMemory(mem.id, { content: 'updated searchable content about kayaking' });
+      } finally {
+        dbInternal.prepare = originalPrepare;
+      }
+
+      expect(seen.some(sql => /DELETE FROM memories_fts WHERE rowid = \?/.test(sql))).toBe(true);
+      expect(seen.some(sql => /INSERT INTO memories_fts \(rowid,/.test(sql))).toBe(true);
+      expect(store.fullTextSearch('global', 'kayaking', 10).some(r => r.id === mem.id)).toBe(true);
+    });
+
+    it('a rowid-keyed delete against memories_fts is a seek, not a full shadow-table scan (EXPLAIN QUERY PLAN)', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      const dbInternal = (store as unknown as { db: DatabaseSync }).db;
+      const rows = dbInternal.prepare(`EXPLAIN QUERY PLAN DELETE FROM memories_fts WHERE rowid = ?`)
+        .all(1) as unknown as Array<{ detail: string }>;
+      const detail = rows.map(r => r.detail).join(' | ');
+      // FTS5's own EXPLAIN QUERY PLAN detail marks a satisfied equality
+      // constraint with a trailing "=" ("INDEX 0:="); an unconstrained scan
+      // (what the removed `id UNINDEXED` column forced) reports "INDEX 0:"
+      // with no trailing "=" — verified directly against a scratch FTS5
+      // table before writing this assertion.
+      expect(detail).toContain('VIRTUAL TABLE INDEX 0:=');
+    });
   });
 
   // -- task 1.3: migration from the old single-column-prefix indexes --
@@ -1725,6 +2012,65 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
         expect(indexNames).toContain('idx_memories_ns_coll_created');
         expect(indexNames).toContain('idx_memories_stale_accessed');
         expect(indexNames).toContain('idx_memories_unsynced_created');
+        // bound-corpus-scale-workflows task 2.4
+        expect(indexNames).toContain('idx_memories_tier_review_due');
+        expect(indexNames).toContain('idx_memories_pinned_updated');
+        expect(indexNames).toContain('idx_memories_archived_expiry');
+      } finally {
+        migStore.close();
+      }
+    } finally {
+      rmSync(migDir, { recursive: true, force: true });
+    }
+  });
+
+  // bound-corpus-scale-workflows task 2.4: an existing database carrying the
+  // superseded two-column idx_memories_review_due/idx_memories_pinned
+  // indexes must have them dropped and replaced by the new
+  // ORDER-BY-covering ones on the next init(), not left alongside them.
+  it('drops the superseded idx_memories_review_due/idx_memories_pinned indexes and replaces them on init()', async () => {
+    const migDir = mkdtempSync(join(tmpdir(), 'bhgbrain-index-migration-test-'));
+    try {
+      const legacyDb = new DatabaseSync(join(migDir, 'brain.db'));
+      legacyDb.exec(`
+        CREATE TABLE memories (
+          id TEXT PRIMARY KEY,
+          namespace TEXT NOT NULL DEFAULT 'global',
+          collection TEXT NOT NULL DEFAULT 'general',
+          type TEXT NOT NULL CHECK(type IN ('episodic','semantic','procedural')),
+          category TEXT,
+          content TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          tags TEXT NOT NULL DEFAULT '[]',
+          source TEXT NOT NULL DEFAULT 'cli',
+          checksum TEXT NOT NULL,
+          importance REAL NOT NULL DEFAULT 0.5,
+          retention_tier TEXT NOT NULL DEFAULT 'T2',
+          review_due TEXT,
+          pinned INTEGER NOT NULL DEFAULT 0,
+          access_count INTEGER NOT NULL DEFAULT 0,
+          last_operation TEXT NOT NULL DEFAULT 'ADD',
+          merged_from TEXT,
+          stale INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          last_accessed TEXT NOT NULL
+        );
+        CREATE INDEX idx_memories_review_due ON memories(retention_tier, review_due);
+        CREATE INDEX idx_memories_pinned ON memories(namespace, pinned);
+      `);
+      legacyDb.close();
+
+      const migStore = new SqliteStore(migDir);
+      await migStore.init();
+      try {
+        const dbInternal = (migStore as unknown as { db: DatabaseSync }).db;
+        const indexNames = (dbInternal.prepare(`SELECT name FROM sqlite_master WHERE type = 'index'`).all() as unknown as Array<{ name: string }>)
+          .map(row => row.name);
+        expect(indexNames).not.toContain('idx_memories_review_due');
+        expect(indexNames).not.toContain('idx_memories_pinned');
+        expect(indexNames).toContain('idx_memories_tier_review_due');
+        expect(indexNames).toContain('idx_memories_pinned_updated');
       } finally {
         migStore.close();
       }
@@ -1759,6 +2105,17 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
 
     it('returns 0 for an empty id list', () => {
       expect(store.deleteMemoriesByIds([])).toBe(0);
+    });
+
+    it('chunks corpus-sized ID state updates below SQLite parameter limits', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      const ids = Array.from({ length: 32_767 }, (_, index) => `bulk-${index}`);
+      ids[32_766] = mem.id;
+
+      expect(() => store.markVectorsSyncBatch(ids, false)).not.toThrow();
+      expect(store.getMemoryById(mem.id)!.vector_synced).toBe(false);
+      expect(store.getMemoriesByIds(ids)).toEqual([expect.objectContaining({ id: mem.id })]);
     });
   });
 
@@ -1865,7 +2222,7 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
       store.getMemoryById(mem.id);
       store.getMemoryById(mem.id);
 
-      const getMemoryByIdSql = 'SELECT * FROM memories WHERE id = ? AND archived = 0';
+      const getMemoryByIdSql = 'SELECT * FROM memories WHERE id = ? AND archived = 0 AND deletion_pending = 0';
       const prepareCallsForThisSql = prepareSpy.mock.calls.filter(call => call[0] === getMemoryByIdSql);
       expect(prepareCallsForThisSql).toHaveLength(1);
       prepareSpy.mockRestore();
@@ -1940,6 +2297,186 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
       const remainingA = store.listRevisions('mem-a').map(r => r.revision).sort((a, b) => a - b);
       expect(remainingA).toEqual([4, 5]);
       expect(store.listRevisions('mem-b')).toHaveLength(1);
+    });
+
+    it('allocates the next revision from the persisted maximum after pruning', () => {
+      for (let r = 1; r <= 5; r++) {
+        store.insertRevision('mem-a', r, `content v${r}`, new Date().toISOString());
+      }
+      store.pruneRevisions(2);
+
+      const next = store.insertNextRevision('mem-a', 'content v6', new Date().toISOString());
+
+      expect(next).toBe(6);
+      expect(store.listRevisions('mem-a').map(row => row.revision).sort((a, b) => a - b)).toEqual([4, 5, 6]);
+    });
+  });
+
+});
+
+// Task 2.1/2.2/2.3 (make-backup-restore-transactional): activateDatabaseImage
+// validates a candidate image in a scratch copy before ever touching the
+// live database and rolls back to a preserved pre-restore image on any later
+// failure, and ordinary mutations are rejected while another process holds
+// the cross-process restore lock.
+describe('SqliteStore restore activation (make-backup-restore-transactional)', () => {
+  let store: SqliteStore;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-'));
+    store = new SqliteStore(tempDir);
+    await store.init();
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const sampleMemory = () => ({
+    id: '550e8400-e29b-41d4-a716-446655440000',
+    namespace: 'global',
+    collection: 'general',
+    type: 'semantic' as const,
+    category: null,
+    content: 'test content',
+    summary: 'test content',
+    tags: [] as string[],
+    source: 'cli' as const,
+    checksum: 'abc123',
+    importance: 0.5,
+    access_count: 0,
+    last_operation: 'ADD' as const,
+    merged_from: null,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    last_accessed: new Date().toISOString(),
+    retention_tier: 'T2' as const,
+    expires_at: null,
+    decay_eligible: true,
+    review_due: null,
+    archived: false,
+    vector_synced: true,
+    pinned: false,
+    origin: null,
+    confidence: 1,
+  });
+
+  describe('activateDatabaseImage', () => {
+    async function buildCandidate(memories: ReturnType<typeof sampleMemory>[]): Promise<Buffer> {
+      const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-candidate-'));
+      const candidate = new SqliteStore(dir);
+      await candidate.init();
+      for (const mem of memories) candidate.insertMemory(mem);
+      candidate.flush();
+      const bytes = readFileSync(candidate.getDatabasePath());
+      candidate.close();
+      rmSync(dir, { recursive: true, force: true });
+      return bytes;
+    }
+
+    it('activates a valid candidate image, replacing the live database', async () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      store.flush();
+
+      const candidateMem = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440077', checksum: 'candidate-chk' };
+      const candidateBytes = await buildCandidate([candidateMem]);
+
+      await store.activateDatabaseImage(candidateBytes, { expectedMemoryCount: 1 });
+
+      expect(store.getMemoryById(mem.id)).toBeNull();
+      expect(store.getMemoryById(candidateMem.id)).not.toBeNull();
+    });
+
+    it('rejects a candidate that is not a valid SQLite file, leaving the live store untouched', async () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      store.flush();
+
+      await expect(store.activateDatabaseImage(Buffer.from('not a sqlite file at all')))
+        .rejects.toThrow(/not a valid SQLite file|failed integrity check/);
+
+      expect(store.getMemoryById(mem.id)).not.toBeNull();
+      expect(store.countMemories()).toBe(1);
+    });
+
+    it('rejects a candidate whose record count does not match expectedMemoryCount, leaving the live store untouched', async () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      store.flush();
+
+      const candidateBytes = await buildCandidate([
+        { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440088', checksum: 'x' },
+      ]);
+
+      await expect(store.activateDatabaseImage(candidateBytes, { expectedMemoryCount: 5 }))
+        .rejects.toThrow(/record count mismatch/);
+
+      expect(store.getMemoryById(mem.id)).not.toBeNull();
+      expect(store.countMemories()).toBe(1);
+    });
+
+    it('leaves no stray scratch or pre-restore files behind after a successful activation', async () => {
+      store.insertMemory(sampleMemory());
+      store.flush();
+      const candidateBytes = await buildCandidate([
+        { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440066', checksum: 'z' },
+      ]);
+
+      await store.activateDatabaseImage(candidateBytes, { expectedMemoryCount: 1 });
+
+      const leftovers = readdirSync(tempDir).filter(
+        name => name.includes('.restore-scratch-') || name.includes('.pre-restore-'),
+      );
+      expect(leftovers).toEqual([]);
+    });
+
+    it('leaves no stray scratch files behind after a rejected candidate', async () => {
+      store.insertMemory(sampleMemory());
+      store.flush();
+
+      await expect(store.activateDatabaseImage(Buffer.from('garbage'))).rejects.toThrow();
+
+      const leftovers = readdirSync(tempDir).filter(
+        name => name.includes('.restore-scratch-') || name.includes('.pre-restore-'),
+      );
+      expect(leftovers).toEqual([]);
+    });
+  });
+
+  // Task 2.2: another process's restore (recognized by the presence of the
+  // cross-process restore lock file `BackupService` maintains — this store
+  // has no lifecycle op of its own, so the in-process guard alone would miss
+  // it) must block ordinary mutations rather than let them race the swap.
+  describe('cross-process restore lock guard', () => {
+    const restoreLockPath = () => join(tempDir, '.restore.lock');
+
+    it('rejects an ordinary mutation while another process holds the restore lock, and allows it again once released', () => {
+      writeFileSync(restoreLockPath(), '');
+      try {
+        expect(() => store.setCategory('Blocked', 'custom', 'nope')).toThrow(/restore/);
+        expect(() => store.pruneAuditLog(100)).toThrow(/restore/);
+      } finally {
+        rmSync(restoreLockPath(), { force: true });
+      }
+
+      // Lock released: ordinary mutations succeed again.
+      expect(() => store.setCategory('Allowed', 'custom', 'ok')).not.toThrow();
+    });
+
+    it('does not block a restore this same process is running, only writers unaware of it', () => {
+      writeFileSync(restoreLockPath(), '');
+      try {
+        const lifecycleToken = store.beginLifecycleOperation('restore');
+        // The restoring process's own token-authorized call is unaffected by
+        // the lock file it created for itself.
+        expect(() => store.pruneAuditLog(100, lifecycleToken)).not.toThrow();
+        store.endLifecycleOperation(lifecycleToken, 'restore');
+      } finally {
+        rmSync(restoreLockPath(), { force: true });
+      }
     });
   });
 });

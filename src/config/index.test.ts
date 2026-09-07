@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname, tmpdir } from 'node:os';
-import { loadConfig, applyEnvOverrides, resolveDeviceId, ensureDataDir, type BrainConfig } from './index.js';
+import { loadConfig, loadFileConfig, deriveRuntimeConfig, applyEnvOverrides, resolveDeviceId, ensureDataDir, type BrainConfig } from './index.js';
 
 // `node:os`.hostname and `node:fs`.writeFileSync are ESM builtin exports —
 // their module namespace is non-configurable, so `vi.spyOn` cannot patch
@@ -36,6 +36,14 @@ describe('loadConfig Azure embedding validation', () => {
     writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
     return path;
   }
+
+  it('rejects malformed and unsatisfiable retention schedules with their exact paths', () => {
+    const malformed = writeConfig({ retention: { cleanup_schedule: 'not a cron' } });
+    expect(() => loadConfig(malformed)).toThrow(/"cleanup_schedule"/);
+
+    const unsatisfiable = writeConfig({ retention: { distillation: { schedule: '0 0 31 2 *' } } });
+    expect(() => loadConfig(unsatisfiable)).toThrow(/"distillation"[\s\S]*"schedule"/);
+  });
 
   it('loads valid Azure embedding config with defaults applied', () => {
     const configPath = writeConfig({
@@ -152,6 +160,89 @@ describe('loadConfig Azure embedding validation', () => {
 
     expect(config.embedding.model).toBe('text-embedding-3-large');
     expect(config.embedding.dimensions).toBe(3072);
+  });
+});
+
+describe('llm config (unify-llm-client-boundaries)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    tempDirs.push(dir);
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify(raw));
+    return configPath;
+  }
+
+  it('defaults base_url and retry when omitted', () => {
+    const config = loadConfig(writeConfig({}));
+
+    expect(config.llm.base_url).toBe('https://api.openai.com/v1');
+    expect(config.llm.retry).toEqual({ max_attempts: 3, backoff_ms: 200, max_backoff_ms: 2000 });
+  });
+
+  it('accepts a validated custom OpenAI-compatible base URL and retry overrides', () => {
+    const config = loadConfig(writeConfig({
+      llm: {
+        base_url: 'https://gateway.internal.example.com/v1',
+        retry: { max_attempts: 5, backoff_ms: 50, max_backoff_ms: 1000 },
+      },
+    }));
+
+    expect(config.llm.base_url).toBe('https://gateway.internal.example.com/v1');
+    expect(config.llm.retry).toEqual({ max_attempts: 5, backoff_ms: 50, max_backoff_ms: 1000 });
+  });
+
+  it('rejects a malformed base_url', () => {
+    expect(() => loadConfig(writeConfig({ llm: { base_url: 'not-a-url' } }))).toThrow();
+  });
+
+  it('rejects a retry.max_attempts above the documented cap', () => {
+    expect(() => loadConfig(writeConfig({ llm: { retry: { max_attempts: 6 } } }))).toThrow();
+  });
+});
+
+describe('retention.distillation.llm_timeout_ms config', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    tempDirs.push(dir);
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify(raw));
+    return configPath;
+  }
+
+  it('defaults to 10000ms when omitted', () => {
+    const config = loadConfig(writeConfig({}));
+    expect(config.retention.distillation.llm_timeout_ms).toBe(10_000);
+  });
+
+  it('accepts an explicit override', () => {
+    const config = loadConfig(writeConfig({ retention: { distillation: { llm_timeout_ms: 20_000 } } }));
+    expect(config.retention.distillation.llm_timeout_ms).toBe(20_000);
+  });
+
+  it('rejects a non-positive value', () => {
+    expect(() => loadConfig(writeConfig({ retention: { distillation: { llm_timeout_ms: 0 } } }))).toThrow();
   });
 });
 
@@ -377,12 +468,16 @@ describe('consolidation config (add-duplicate-cluster-consolidation)', () => {
     expect(config.consolidation.similarity_threshold).toBe(0.9);
     expect(config.consolidation.neighbor_top_k).toBe(20);
     expect(config.consolidation.max_scan_per_call).toBe(500);
+    // bound-corpus-scale-workflows task 2.5
+    expect(config.consolidation.neighbor_discovery_concurrency).toBe(8);
+    expect(config.consolidation.neighbor_discovery_deadline_ms).toBe(10_000);
   });
 
   it('honors explicit overrides', () => {
     const configPath = writeConfig({
       consolidation: {
         enabled: false, similarity_threshold: 0.85, neighbor_top_k: 10, max_scan_per_call: 100,
+        neighbor_discovery_concurrency: 3, neighbor_discovery_deadline_ms: 5000,
       },
     });
 
@@ -392,6 +487,8 @@ describe('consolidation config (add-duplicate-cluster-consolidation)', () => {
     expect(config.consolidation.similarity_threshold).toBe(0.85);
     expect(config.consolidation.neighbor_top_k).toBe(10);
     expect(config.consolidation.max_scan_per_call).toBe(100);
+    expect(config.consolidation.neighbor_discovery_concurrency).toBe(3);
+    expect(config.consolidation.neighbor_discovery_deadline_ms).toBe(5000);
   });
 
   it('rejects a similarity_threshold outside [0,1]', () => {
@@ -534,6 +631,183 @@ describe('pipeline.long_content_threshold_chars config (add-long-content-chunkin
     });
 
     expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
+describe('strict schema validation (align-runtime-entrypoint-contracts task 1.1)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('rejects an unknown top-level key, reporting the config file path and the field path', () => {
+    const configPath = writeConfig({ totally_made_up_field: true });
+
+    try {
+      loadConfig(configPath);
+      expect.unreachable('loadConfig should have thrown');
+    } catch (err) {
+      const message = (err as Error).message;
+      expect(message).toContain(configPath);
+      expect(message).toContain('totally_made_up_field');
+    }
+  });
+
+  it('rejects an unknown nested key inside a nested schema (not just the root)', () => {
+    const configPath = writeConfig({ embedding: { made_up_nested_field: 1 } });
+
+    try {
+      loadConfig(configPath);
+      expect.unreachable('loadConfig should have thrown');
+    } catch (err) {
+      const message = (err as Error).message;
+      expect(message).toContain(configPath);
+      expect(message).toContain('made_up_nested_field');
+    }
+  });
+
+  it('rejects an unknown key nested two levels deep (e.g. transport.http)', () => {
+    const configPath = writeConfig({ transport: { http: { made_up: 1 } } });
+
+    expect(() => loadConfig(configPath)).toThrow(/made_up/);
+  });
+
+  it('rejects a non-boolean value for a boolean field', () => {
+    const configPath = writeConfig({ transport: { http: { enabled: 'yes' } } });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a non-numeric value for a port field', () => {
+    const configPath = writeConfig({ transport: { http: { port: 'not-a-port' } } });
+
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+
+  it('rejects a malformed llm.base_url with the config file path attached', () => {
+    const configPath = writeConfig({ llm: { base_url: 'not a url' } });
+
+    expect(() => loadConfig(configPath)).toThrow(new RegExp(configPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  });
+});
+
+describe('separating raw file config from the runtime environment overlay (align-runtime-entrypoint-contracts task 1.2)', () => {
+  const tempDirs: string[] = [];
+  const ENV_TO_CLEAR = ['BHGBRAIN_REQUIRE_LOOPBACK', 'BHGBRAIN_QDRANT_URL', 'BHGBRAIN_ALLOW_UNAUTHENTICATED', 'BHGBRAIN_DATA_DIR'] as const;
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const key of ENV_TO_CLEAR) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of ENV_TO_CLEAR) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function tempDataDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-overlay-'));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  it('deriveRuntimeConfig applies env overrides without mutating the file config it was given', () => {
+    const fileConfig = loadFileConfig(join(tempDataDir(), 'config.json'));
+    const originalRequireLoopback = fileConfig.security.require_loopback_http;
+    process.env.BHGBRAIN_REQUIRE_LOOPBACK = 'false';
+
+    const runtimeConfig = deriveRuntimeConfig(fileConfig);
+
+    expect(runtimeConfig.security.require_loopback_http).toBe(false);
+    expect(fileConfig.security.require_loopback_http).toBe(originalRequireLoopback);
+  });
+
+  it('never persists a temporary security override or a credential-bearing Qdrant URL to config.json', () => {
+    const dir = tempDataDir();
+    const configPath = join(dir, 'config.json');
+    process.env.BHGBRAIN_REQUIRE_LOOPBACK = 'false';
+    process.env.BHGBRAIN_QDRANT_URL = 'https://user:s3cr3t@qdrant.example.com';
+
+    // Mirrors the real startup sequence in src/index.ts / src/cli/index.ts:
+    // resolve+persist the raw file config, then derive the runtime overlay.
+    const fileConfig = loadFileConfig(configPath);
+    fileConfig.data_dir = dir;
+    ensureDataDir(fileConfig);
+    const runtimeConfig = deriveRuntimeConfig(fileConfig, configPath);
+
+    // The runtime config a running process actually uses reflects the overrides.
+    expect(runtimeConfig.security.require_loopback_http).toBe(false);
+    expect(runtimeConfig.qdrant.external_url).toBe('https://user:s3cr3t@qdrant.example.com');
+
+    // What actually landed on disk must NOT contain either override.
+    const written = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(written.security?.require_loopback_http ?? true).toBe(true);
+    expect(written.qdrant?.external_url ?? null).toBeNull();
+  });
+
+  it('a later start without the env override returns to the persisted file value', () => {
+    const dir = tempDataDir();
+    const configPath = join(dir, 'config.json');
+
+    // First start: no override, establishes a persisted config.json.
+    const firstFileConfig = loadFileConfig(configPath);
+    firstFileConfig.data_dir = dir;
+    ensureDataDir(firstFileConfig);
+
+    // Second start: a temporary override is set for this run only.
+    process.env.BHGBRAIN_REQUIRE_LOOPBACK = 'false';
+    const secondFileConfig = loadFileConfig(configPath);
+    secondFileConfig.data_dir = dir;
+    ensureDataDir(secondFileConfig);
+    const secondRuntime = deriveRuntimeConfig(secondFileConfig, configPath);
+    expect(secondRuntime.security.require_loopback_http).toBe(false);
+    delete process.env.BHGBRAIN_REQUIRE_LOOPBACK;
+
+    // Third start: no override — must return to the file/default value, not
+    // whatever the second start's runtime overlay happened to compute.
+    const thirdFileConfig = loadFileConfig(configPath);
+    thirdFileConfig.data_dir = dir;
+    ensureDataDir(thirdFileConfig);
+    const thirdRuntime = deriveRuntimeConfig(thirdFileConfig, configPath);
+    expect(thirdRuntime.security.require_loopback_http).toBe(true);
+  });
+
+  it('ensureDataDir creates BHGBRAIN_DATA_DIR-overridden directory even though it only ever persists the file config', () => {
+    const overriddenDir = tempDataDir();
+    const originalDir = tempDataDir();
+    process.env.BHGBRAIN_DATA_DIR = overriddenDir;
+
+    const fileConfig = loadFileConfig(join(originalDir, 'config.json'));
+    // fileConfig.data_dir defaults to the real default data dir (or is unset),
+    // deliberately NOT overriddenDir — ensureDataDir must still create
+    // overriddenDir because it consults BHGBRAIN_DATA_DIR itself.
+    ensureDataDir(fileConfig);
+
+    expect(existsSync(join(overriddenDir, 'config.json'))).toBe(true);
+    expect(existsSync(join(overriddenDir, 'backups'))).toBe(true);
   });
 });
 
@@ -723,6 +997,115 @@ describe('transport.http socket timeout config', () => {
     });
 
     expect(() => loadConfig(configPath)).toThrow(/headers_timeout_ms.*must be greater than.*keep_alive_timeout_ms/);
+  });
+});
+
+// bound-qdrant-http-runtime task 2.3: security.trust_proxy narrowing.
+describe('security.trust_proxy config (bound-qdrant-http-runtime)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults to false', () => {
+    const config = loadConfig('/nonexistent/config.json');
+    expect(config.security.trust_proxy).toBe(false);
+  });
+
+  it('accepts a positive hop count', () => {
+    const configPath = writeConfig({ security: { trust_proxy: 1 } });
+    const config = loadConfig(configPath);
+    expect(config.security.trust_proxy).toBe(1);
+  });
+
+  it('accepts an array of trusted subnets/IPs', () => {
+    const configPath = writeConfig({ security: { trust_proxy: ['10.0.0.0/8', '192.168.0.1'] } });
+    const config = loadConfig(configPath);
+    expect(config.security.trust_proxy).toEqual(['10.0.0.0/8', '192.168.0.1']);
+  });
+
+  it('rejects the legacy boolean true with migration guidance', () => {
+    const configPath = writeConfig({ security: { trust_proxy: true } });
+    expect(() => loadConfig(configPath)).toThrow(/trust_proxy.*no longer supported/);
+  });
+
+  it('rejects a zero or negative hop count', () => {
+    const configPath = writeConfig({ security: { trust_proxy: 0 } });
+    expect(() => loadConfig(configPath)).toThrow();
+  });
+});
+
+// bound-qdrant-http-runtime task 1.1/1.4: qdrant timeout and fan-out config.
+describe('qdrant timeout and fanout config (bound-qdrant-http-runtime)', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(() => {
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function writeConfig(raw: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-config-'));
+    const path = join(dir, 'config.json');
+    tempDirs.push(dir);
+    writeFileSync(path, JSON.stringify(raw, null, 2), 'utf-8');
+    return path;
+  }
+
+  it('defaults operation_timeout_ms/health_timeout_ms/fanout when unset', () => {
+    const config = loadConfig('/nonexistent/config.json');
+    expect(config.qdrant.operation_timeout_ms).toBe(10_000);
+    expect(config.qdrant.health_timeout_ms).toBe(3_000);
+    expect(config.qdrant.fanout).toEqual({ max_collections: 25, concurrency: 5, per_target_limit: 50 });
+  });
+
+  it('rejects health_timeout_ms greater than operation_timeout_ms', () => {
+    const configPath = writeConfig({
+      qdrant: { operation_timeout_ms: 1000, health_timeout_ms: 2000 },
+    });
+    expect(() => loadConfig(configPath)).toThrow(/health_timeout_ms.*should not exceed.*operation_timeout_ms/);
+  });
+
+  it('accepts health_timeout_ms equal to operation_timeout_ms', () => {
+    const configPath = writeConfig({
+      qdrant: { operation_timeout_ms: 1000, health_timeout_ms: 1000 },
+    });
+    const config = loadConfig(configPath);
+    expect(config.qdrant.health_timeout_ms).toBe(1000);
+  });
+});
+
+// bound-qdrant-http-runtime task 3.1-3.3: transport.http.mcp_session config.
+describe('transport.http.mcp_session config (bound-qdrant-http-runtime)', () => {
+  it('defaults to idle_timeout_ms=30min, max_sessions=1000, sweep_interval_ms=60s', () => {
+    const config = loadConfig('/nonexistent/config.json');
+    expect(config.transport.http.mcp_session).toEqual({
+      idle_timeout_ms: 1_800_000,
+      max_sessions: 1000,
+      sweep_interval_ms: 60_000,
+    });
+  });
+});
+
+// bound-qdrant-http-runtime task 2.4: security.rate_limit_max_buckets config.
+describe('security.rate_limit_max_buckets config (bound-qdrant-http-runtime)', () => {
+  it('defaults to 10,000', () => {
+    const config = loadConfig('/nonexistent/config.json');
+    expect(config.security.rate_limit_max_buckets).toBe(10_000);
   });
 });
 

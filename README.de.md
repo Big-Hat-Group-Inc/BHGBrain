@@ -139,10 +139,14 @@ BHGBrain **erfordert eine externe Qdrant-Instanz**. Auch im Standard-`embedded`-
 ### Option A: Docker (empfohlen)
 
 ```bash
+# Nur Loopback: Qdrant hat keine eigene Authentifizierung, daher würde eine
+# Bindung an alle Schnittstellen (-p 6333:6333) Ihre gespeicherten
+# Vektoren/Payloads für das gesamte LAN freigeben. Nur hinter Ihrem eigenen
+# authentifizierten Reverse-Proxy/Ihrer eigenen Firewall erweitern.
 docker run -d \
   --name qdrant \
   --restart unless-stopped \
-  -p 6333:6333 \
+  -p 127.0.0.1:6333:6333 \
   -v qdrant_storage:/qdrant/storage \
   qdrant/qdrant
 ```
@@ -161,8 +165,12 @@ services:
   qdrant:
     image: qdrant/qdrant
     restart: unless-stopped
+    # Nur Loopback: Qdrant hat keine eigene Authentifizierung, daher würde eine
+    # Bindung an alle Schnittstellen Ihre gespeicherten Vektoren/Payloads für
+    # das gesamte LAN freigeben. Nur hinter Ihrem eigenen authentifizierten
+    # Reverse-Proxy/Ihrer eigenen Firewall erweitern.
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
 
@@ -242,6 +250,26 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "id": null
   },
 
+  // Gemeinsame OpenAI-kompatible Chat-/Embedding-Anfragegrenze: eine Basis-URL
+  // und ein Retry-Regelwerk, über die jedes migrierte Feature (Extraktion,
+  // Reranking, Zusammenfassung, Query-Expansion, Widerspruchserkennung,
+  // Distillation und OpenAI-Embeddings — Azure-Embeddings behalten ihren
+  // abgeleiteten ressourcenspezifischen Endpunkt) läuft, statt dass jedes
+  // Feature einzeln "https://api.openai.com/v1" und eine eigene Retry-Logik
+  // fest codiert. Setzen Sie base_url auf ein validiertes OpenAI-kompatibles
+  // Gateway, um alle diese Features gleichzeitig darüber zu leiten. Siehe
+  // "Outbound AI Request Policy" weiter unten.
+  "llm": {
+    "base_url": "https://api.openai.com/v1",
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 200,
+      // Begrenzt sowohl die exponentielle Backoff-Hülle als auch die
+      // Retry-After-Vorgabe eines Anbieters.
+      "max_backoff_ms": 2000
+    }
+  },
+
   // Konfiguration des Einbettungsanbieters
   "embedding": {
     // Anbieter: "openai" oder "azure-foundry"
@@ -257,12 +285,17 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "dimensions": 1536,
     // Anfrage-Timeout in Millisekunden
     "request_timeout_ms": 30000,
-    // Maximale Anzahl Eingaben pro Embedding-Anfrage (Chunking-Schwellenwert)
+    // Maximale Anzahl Eingaben pro Embedding-Anfrage (Chunking-Schwellenwert).
+    // Gilt für beide Anbieter — jede Embedding-Anfrage (auch bei OpenAI) wird
+    // in Batches von höchstens dieser Größe aufgeteilt und in der ursprünglichen
+    // Reihenfolge wieder zusammengesetzt.
     "max_batch_inputs": 2048,
     // Retry-Konfiguration für vorübergehende Fehler
     "retry": {
       "max_attempts": 3,
-      "backoff_ms": 1000
+      "backoff_ms": 1000,
+      // Begrenzt die exponentielle Backoff-Hülle, analog zu llm.retry.max_backoff_ms oben.
+      "max_backoff_ms": 10000
     },
     // Jeder Vektor wird beim Schreiben mit einer anbieterqualifizierten Identität
     // (`<provider>/<model>@<dimensions>`) gestempelt. Weicht die vom Store erwartete
@@ -295,7 +328,28 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Externe Qdrant-URL (wird verwendet wenn mode = "external")
     "external_url": null,
     // Name der Umgebungsvariable mit dem Qdrant API-Schlüssel (wird verwendet wenn mode = "external")
-    "api_key_env": null
+    "api_key_env": null,
+    // Clientseitige (AbortController-basierte) Frist für jeden Qdrant-Aufruf im
+    // Anfragepfad, für Cleanup, Scans und administrative Aufrufe — alle über
+    // den gemeinsamen Circuit Breaker geleitet. Der Standard des zugrunde
+    // liegenden Clients selbst liegt bei 300000 ms.
+    "operation_timeout_ms": 10000,
+    // Separate, bewusst kürzere Frist, die nur von der Health-Probe verwendet
+    // wird (eigene, dedizierte Client-Instanz, nie über den Breaker geleitet).
+    // Darf operation_timeout_ms nicht überschreiten.
+    "health_timeout_ms": 3000,
+    // Grenzen für den Fan-Out einer collectionslosen (namespace-weiten)
+    // search/recall-Abfrage über jede Collection im Namespace.
+    "fanout": {
+      // Zielcollections über dieser Anzahl werden deterministisch gekürzt.
+      "max_collections": 25,
+      // Wie viele dieser Zielcollections gleichzeitig abgefragt werden.
+      "concurrency": 5,
+      // Pro-Collection-Ergebnisobergrenze, die nur beim tatsächlichen
+      // Fan-Out (mehr als ein Ziel) angewendet wird; eine explizite
+      // Ein-Collection-Suche nutzt immer das volle `limit` des Aufrufers.
+      "per_target_limit": 50
+    }
   },
 
   // Transport-Konfiguration
@@ -320,7 +374,19 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
       // Zeit, die zum vollständigen Empfangen einer Anfrage erlaubt ist; begrenzt
       // nicht lang laufende SSE-Antworten auf GET /mcp, die nur eine Anfrage
       // empfangen, keine senden.
-      "request_timeout_ms": 300000
+      "request_timeout_ms": 300000,
+      // Begrenzt die In-Memory-MCP-HTTP-Sitzungsregistry (siehe
+      // "MCP-Sitzungslebenszyklus" unter Gesundheitszustand & Metriken).
+      "mcp_session": {
+        // Eine Sitzung ohne Anfrage über diese Dauer wird automatisch geschlossen.
+        "idle_timeout_ms": 1800000,
+        // Harte Obergrenze für residente Sitzungen; eine neue Sitzung bei
+        // erreichter Kapazität verdrängt die am längsten inaktive, um Platz
+        // zu schaffen.
+        "max_sessions": 1000,
+        // Wie oft der unabhängige Idle-Sitzungs-Sweep läuft.
+        "sweep_interval_ms": 60000
+      }
     },
     "stdio": {
       // MCP stdio-Transport aktivieren
@@ -345,6 +411,18 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Obergrenze pro Namespace für Erinnerungen mit pinned: true (siehe
     // remember/tag und die memory://inject-Dokumentation)
     "pin_limit_per_namespace": 20
+  },
+
+  // Aufbewahrung von Sicherungs*dateien* (getrennt von der Erinnerungs-`retention` unten)
+  "backup": {
+    "retention": {
+      // Höchstens so viele Sicherungen behalten; die ältesten darüber hinaus
+      // werden nach jeder erfolgreichen `backup create` entfernt. null deaktiviert diese Grenze.
+      "max_count": 30,
+      // Sicherungen entfernen, die älter als so viele Tage sind, unabhängig von der Anzahl.
+      // null deaktiviert diese Grenze.
+      "max_age_days": 90
+    }
   },
 
   // Einstellungen für Aufbewahrung und Lebenszyklus von Erinnerungen
@@ -441,7 +519,16 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
       "max_cluster_size": 20,
 
       // Obergrenze der pro geplantem Lauf destillierten Cluster (LLM-Aufrufe).
-      "max_clusters_per_run": 10
+      "max_clusters_per_run": 10,
+
+      // Timeout für den LLM-Aufruf pro Cluster, durchgesetzt über den
+      // AbortController der gemeinsamen Anfrageausführung (siehe "Outbound
+      // AI Request Policy" weiter unten). Höher als die Standardwerte der
+      // günstigen Modelle (pipeline.extraction_timeout_ms/
+      // summarization_timeout_ms), da ein Distillation-Prompt den Inhalt
+      // eines ganzen Clusters bündelt. Begrenzt die Worst-Case-Latenz der
+      // Pro-Cluster-Aufrufe eines geplanten Laufs.
+      "llm_timeout_ms": 10000
     }
   },
 
@@ -469,6 +556,10 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
 
   // Suchkonfiguration
   "search": {
+    // Aktive Ergebnisse nutzen das vom Aufrufer angegebene Limit. Wenn
+    // include_archived true ist, werden passende Archiv-Zusammenfassungen
+    // zusätzlich bis zu dieser separaten Obergrenze angehängt.
+    "archive_result_limit": 5,
     // Gewichtungen für Reciprocal Rank Fusion (RRF) im Hybrid-Modus
     // Müssen sich zu 1.0 summieren
     "hybrid_weights": {
@@ -562,11 +653,17 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "log_redaction": true,
     // Maximale Anfragen pro Minute pro Client-IP für den HTTP-Transport
     "rate_limit_rpm": 100,
+    // Harte Obergrenze für die Eimer-Map des Rate-Limiters (siehe Rate Limiting).
+    "rate_limit_max_buckets": 10000,
     // Maximale HTTP-Anfrage-Body-Größe in Bytes
     "max_request_size_bytes": 1048576,
     // Express-Einstellung "trust proxy". false (Standard) = req.ip ist der direkte
-    // Socket-Peer (Loopback-genau); true = X-Forwarded-For vom vorgeschalteten
-    // Reverse-Proxy berücksichtigen. Nur hinter einem vertrauenswürdigen Proxy aktivieren.
+    // Socket-Peer (Loopback-genau). Eine positive Ganzzahl = genau so vielen
+    // Reverse-Proxy-Hops vertrauen (req.ip berücksichtigt X-Forwarded-For vom
+    // rechtesten, nicht-vertrauenswürdigen Eintrag). Ein Array von Strings =
+    // nur Hops vertrauen, die diesen IPs/Subnetzen entsprechen. Das alte
+    // boolesche true ("jedem Hop vertrauen") wird nicht mehr akzeptiert —
+    // siehe Proxy-Vertrauen.
     "trust_proxy": false
   },
 
@@ -647,6 +744,7 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     // Standardmäßig dieselbe Variable wie extraction_model_env (beide sind
     // günstige Modellaufrufe im Schreibpfad gegen dasselbe OpenAI-Konto) — bei
     // Bedarf auf eine andere Variable für einen separaten Schlüssel verweisen.
+    // Fällt wie extraction_model_env auf OPENAI_API_KEY zurück, wenn nicht gesetzt.
     "summarization_model_env": "BHGBRAIN_EXTRACTION_API_KEY",
     // Timeout für die Zusammenfassungsanfrage in Millisekunden, per AbortController erzwungen
     "summarization_timeout_ms": 3000,
@@ -685,7 +783,7 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
 | `BHGBRAIN_TOKEN` | Erforderlich für nicht-Loopback-HTTP | — | Bearer-Token für HTTP-Authentifizierung. Der Server **verweigert den Start**, wenn der Host nicht Loopback ist und dieser Wert nicht gesetzt ist (außer `allow_unauthenticated_http: true`). |
 | `QDRANT_API_KEY` | Erforderlich für Qdrant Cloud | — | Setzen Sie `qdrant.api_key_env` in der Konfiguration auf den Namen dieser Variable. Der Standard-Konfigurationsfeldname ist `QDRANT_API_KEY`. |
 | `BHGBRAIN_DEVICE_ID` | Nein | Automatisch aus dem Hostnamen generiert | Überschreibt den Gerätebezeichner für Multi-Device-Setups. Siehe [Geräteidentitätsauflösung](#geräteidentitätsauflösung). |
-| `BHGBRAIN_EXTRACTION_API_KEY` | Nein | Fällt auf `OPENAI_API_KEY` zurück | API-Schlüssel für das LLM-Extraktionsmodell, verwendet wenn `pipeline.extraction_enabled` auf `true` steht. Auch der Standardwert von `pipeline.summarization_model_env` (verwendet wenn `pipeline.summarization_enabled` auf `true` steht) — auf eine andere Variable verweisen, wenn ein separater Schlüssel für die Zusammenfassung gewünscht ist. Wird auch von der LLM-Paraphrase/HyDE-Phase der Multi-Query-Expansion gelesen (`search.query_expansion.llm_paraphrase.enabled`, siehe [Multi-Query-Expansion](#multi-query-expansion)), die den Schlüssel auf dieselbe Weise aus `pipeline.extraction_model_env` auflöst und bei fehlender Variable auf `OPENAI_API_KEY` zurückfällt. |
+| `BHGBRAIN_EXTRACTION_API_KEY` | Nein | Fällt auf `OPENAI_API_KEY` zurück | API-Schlüssel für das LLM-Extraktionsmodell, verwendet wenn `pipeline.extraction_enabled` auf `true` steht. Auch der Standardwert von `pipeline.summarization_model_env` (verwendet wenn `pipeline.summarization_enabled` auf `true` steht) — auf eine andere Variable verweisen, wenn ein separater Schlüssel für die Zusammenfassung gewünscht ist; unabhängig davon, welche Variable `summarization_model_env` benennt, fällt sie ebenso wie `extraction_model_env` auf `OPENAI_API_KEY` zurück. Wird auch von der LLM-Paraphrase/HyDE-Phase der Multi-Query-Expansion gelesen (`search.query_expansion.llm_paraphrase.enabled`, siehe [Multi-Query-Expansion](#multi-query-expansion)) sowie von der Widerspruchserkennung (`pipeline.contradiction_detection.enabled`, siehe [Deduplizierung](#deduplizierung)) — beide lösen den Schlüssel auf dieselbe Weise aus `pipeline.extraction_model_env` auf und fallen bei fehlender Variable auf `OPENAI_API_KEY` zurück. |
 | `BHGBRAIN_RERANK_API_KEY` | Nein | — (**kein** Fallback auf `OPENAI_API_KEY`) | API-Schlüssel für die optionale `recall`-Rerank-Stufe, verwendet wenn `search.rerank.enabled` auf `true` steht. Anders als `BHGBRAIN_EXTRACTION_API_KEY` gibt es hier keinen impliziten Fallback — die Aktivierung des Reranking ist ein bewusster, separat verschlüsselter Opt-in, der nie stillschweigend das Embedding- oder Extraktions-Budget verbraucht. Siehe [Rerank](#rerank). |
 
 Sicheres Bearer-Token generieren:
@@ -736,7 +834,9 @@ Der Server hört standardmäßig auf `http://127.0.0.1:3721`. Verfügbare HTTP-E
 
 | Endpunkt | Authentifizierung erforderlich | Beschreibung |
 |---|---|---|
-| `GET /health` | Nein | Gesundheitsprüfung (unauthentifiziert für Probe-Kompatibilität) |
+| `GET /health/live` | Nein | Liveness: knapp, keine Abhängigkeits-I/O — beliebig oft abfragbar |
+| `GET /health/ready` | Nein | Readiness: gecachte SQLite/Qdrant-Prüfung; 503 bei degradierter Pflichtabhängigkeit |
+| `GET /health` | Ja | Vollständiger Diagnose-Snapshot (Embedding, Retention, Scheduler, Circuit Breaker usw.) |
 | `POST /mcp` | Ja | MCP Streamable HTTP: JSON-RPC-Anfragen; eine `initialize`-Anfrage eröffnet eine neue Sitzung |
 | `GET /mcp` | Ja | MCP Streamable HTTP: eigenständiger SSE-Kanal für eine bestehende Sitzung |
 | `DELETE /mcp` | Ja | MCP Streamable HTTP: beendet eine Sitzung |
@@ -747,12 +847,17 @@ Der Server hört standardmäßig auf `http://127.0.0.1:3721`. Verfügbare HTTP-E
 Jede `/mcp`-Sitzung ist ein frischer, In-Memory-MCP-Server, der denselben zugrunde
 liegenden Speicher wie jede andere Sitzung und die REST-Endpunkte nutzt — ein Neustart
 des Prozesses verwirft alle Sitzungen, und spezifikationskonforme Clients
-initialisieren sich automatisch neu.
+initialisieren sich automatisch neu. Eine Sitzung, die länger als
+`transport.http.mcp_session.idle_timeout_ms` inaktiv ist, wird automatisch geschlossen;
+Details zur Lebensdauer von Sitzungen und zur Endpunkt-Aufteilung siehe
+[Health & Metrics](#health--metrics).
 
-Beispiel Gesundheitsprüfung:
+Beispiele für Gesundheitsprüfungen:
 
 ```bash
-curl http://127.0.0.1:3721/health
+curl http://127.0.0.1:3721/health/live
+curl http://127.0.0.1:3721/health/ready
+curl -H "Authorization: Bearer <your-token>" http://127.0.0.1:3721/health
 ```
 
 Beispiel Tool-Aufruf über HTTP:
@@ -1945,7 +2050,7 @@ Die Volltextsuche verwendet einen echten SQLite-FTS5-Index, um Erinnerungen zu f
 5. Archivierte Erinnerungen sind ausgeschlossen (die FTS-Tabelle wird mit der Haupterinnerungstabelle synchron gehalten – archivierte Zeilen werden aus FTS entfernt).
 6. Zugriffsmetadaten werden für zurückgegebene Ergebnisse aktualisiert.
 
-**Fallback:** Wenn der laufende SQLite-Build kein `fts5`-Modul kompiliert hat (per Startup-Fähigkeitsprüfung verifiziert, nicht angenommen), fällt die Volltextsuche auf einen alten `LIKE '%term%'`-Matcher mit handgestricktem Termhäufigkeits-Rang zurück, statt einen Fehler zu werfen. Das ist sichtbar, nicht still: Die `sqlite`-Komponente von `health://status` trägt eine `message`, und beim Start wird einmalig eine `fts5_unavailable`-Warnung geloggt. Siehe [Health-Endpunkt](#health-endpunkt).
+**Fallback:** Wenn der laufende SQLite-Build kein `fts5`-Modul kompiliert hat (per Startup-Fähigkeitsprüfung verifiziert, nicht angenommen), fällt die Volltextsuche auf einen alten `LIKE '%term%'`-Matcher mit handgestricktem Termhäufigkeits-Rang zurück, statt einen Fehler zu werfen. Das ist sichtbar, nicht still: Die `sqlite`-Komponente von `health://status` trägt eine `message`, und beim Start wird einmalig eine `fts5_unavailable`-Warnung geloggt. Siehe [Health-Endpunkte](#health-endpunkte).
 
 **Wann zu verwenden:** Exakte Schlüsselwortsuchen, Suche nach spezifischen Bezeichnern (Speicher-IDs, Projektnamen, Systemnamen), wenn Sie die genaue verwendete Terminologie kennen.
 
@@ -2222,30 +2327,38 @@ sequenceDiagram
     rect rgb(230, 245, 230)
         Note over C,FS: CREATE BACKUP
         C->>S: backup create
-        S->>DB: Export full database
-        DB-->>S: Raw DB bytes
-        S->>S: Compute SHA-256 checksum
-        S->>S: Build JSON header<br/>(version, count, checksum)
-        S->>FS: Atomic write .bhgb file<br/>(write-to-temp-then-rename)
+        S->>DB: VACUUM INTO a scratch export file
+        S->>FS: Stream-hash the export (bounded memory)
+        S->>S: Build JSON header<br/>(version, count, checksum, header_checksum)
+        S->>FS: Stream header + export into a unique temp file,<br/>fsync, rename into place (backups/)
         FS-->>S: Success
+        S->>S: Prune backups over count/age bounds
         S-->>C: path, size, memory_count
     end
 
     rect rgb(230, 235, 250)
         Note over C,FS: RESTORE BACKUP
         C->>S: backup restore (path)
-        S->>FS: Read .bhgb file
-        FS-->>S: Header + DB bytes
-        S->>S: Validate SHA-256 checksum
-
-        alt Checksum mismatch
-            S-->>C: ❌ INVALID_INPUT
+        S->>S: Acquire cross-process restore lock
+        S->>FS: Read .bhgb file; verify header_checksum + body checksum
+        alt Checksum or version invalid
+            S-->>C: ❌ INVALID_INPUT (live database untouched)
         else Checksum valid
-            S->>FS: Atomic write to data dir<br/>(write-to-temp-then-rename)
-            S->>DB: Hot-reload in-memory SQLite
-            S->>DB: Run schema migrations
-            DB-->>S: Ready
-            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+            S->>FS: Write candidate to a scratch file;<br/>open it, run integrity_check + schema/count checks
+            alt Candidate fails validation
+                S-->>C: ❌ live database untouched
+            else Candidate valid
+                S->>DB: Checkpoint + close live connection
+                S->>FS: Rename live db aside (pre-restore-*),<br/>rename candidate into place
+                S->>DB: Reopen; re-verify record count
+                alt Activation or post-activation check fails
+                    S->>FS: Rename pre-restore image back; reopen
+                    S-->>C: ❌ prior database restored and active
+                else Activation succeeds
+                    S->>S: Reconcile vectors: stream drift + surplus scan,<br/>prune vector-only orphans
+                    S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+                end
+            end
         end
     end
 ```
@@ -2261,7 +2374,7 @@ Oder über CLI:
 bhgbrain backup create
 ```
 
-Sicherungen erfassen die gesamte SQLite-Datenbank (alle Erinnerungen, Kategorien, Sammlungen, Audit-Protokoll, Revisionen und Archivdatensätze) als einzelne `.bhgb`-Datei im Unterverzeichnis `backups/` Ihres Datenverzeichnisses.
+Sicherungen erfassen die gesamte SQLite-Datenbank (alle Erinnerungen, Kategorien, Sammlungen, Audit-Protokoll, Revisionen und Archivdatensätze) als einzelne `.bhgb`-Datei im Unterverzeichnis `backups/` Ihres Datenverzeichnisses. Die Erstellung streamt den Datenbankexport durch Hashing und Festplattenausgabe — der Spitzenspeicherverbrauch bleibt unabhängig von der Datenbankgröße auf eine kleine, feste Anzahl von Chunks begrenzt, statt den gesamten Export auf einmal im Speicher zu halten.
 
 **Sicherungsdateiformat:**
 ```
@@ -2270,24 +2383,44 @@ Sicherungen erfassen die gesamte SQLite-Datenbank (alle Erinnerungen, Kategorien
 [verbleibende Bytes: SQLite-Datenbankexport]
 ```
 
-Der JSON-Header enthält:
+Der JSON-Header (Formatversion 2) enthält:
 ```json
 {
-  "version": 1,
+  "version": 2,
   "memory_count": 1234,
   "checksum": "<sha256 of db data>",
   "created_at": "2026-03-15T12:00:00Z",
   "embedding_model": "text-embedding-3-small",
-  "embedding_dimensions": 1536
+  "embedding_dimensions": 1536,
+  "header_checksum": "<sha256 of the canonical fields above>"
 }
 ```
 
-**Was NICHT in der Sicherung enthalten ist:**
-- Qdrant-Vektordaten sind **nicht** enthalten. Nach der Wiederherstellung aus einer Sicherung müssen Qdrant-Sammlungen durch erneutes Einbetten der Inhalte neu aufgebaut werden. Bis dahin funktioniert die Volltextsuche, aber nicht die semantische Suche.
+`header_checksum` authentifiziert die Header-Felder selbst (sodass ein manipulierter `memory_count`/`checksum`/Embedding-Felder abgelehnt wird, bevor die Wiederherstellung ihnen für irgendetwas Destruktives vertraut) und wird zusätzlich zur Body-Prüfsumme verifiziert. Version-1-Sicherungen (ohne `header_checksum`) bleiben über einen Kompatibilitäts-Parser lesbar, der ihren nicht authentifizierten Feldern nie destruktiv vertraut; jede andere Version wird mit `INVALID_INPUT` abgelehnt, bevor die Wiederherstellung die aktive Datenbank berührt.
 
-**Sicherungsintegrität:** Ein SHA-256-Prüfsumme der Datenbankdaten wird im Header gespeichert und bei der Wiederherstellung überprüft. Wenn die Datei beschädigt ist, schlägt die Wiederherstellung mit `INVALID_INPUT: Backup integrity check failed` fehl. Nachdem die wiederhergestellte Datenbank aktiviert wurde, wird ihre Erinnerungsanzahl außerdem gegen `memory_count` im Header abgeglichen — eine Abweichung lässt die Wiederherstellung mit `INTERNAL` fehlschlagen (protokolliert als `backup_restore_count_mismatch`), statt eine erfolgreiche Antwort über stillschweigend falsche Daten zurückzugeben.
+**Was NICHT in der Sicherung enthalten ist:**
+- Qdrant-Vektordaten sind **nicht** enthalten. Nach der Wiederherstellung aus einer Sicherung werden Vektoren gegen Abweichungen abgeglichen (siehe unten), statt im Archiv gebündelt zu sein — das hält Sicherungen klein und portabel.
+
+**Sicherungsintegrität:** Sowohl die SHA-256-Prüfsumme des Bodys als auch die eigene `header_checksum` des Headers werden verifiziert, bevor irgendein Header-Feld destruktiv verwendet wird. Eine beschädigte oder abgeschnittene Datei, oder eine, deren Header unabhängig vom Body manipuliert wurde, lässt die Wiederherstellung mit `INVALID_INPUT` fehlschlagen, bevor die aktive Datenbank berührt wird.
+
+**Dauerhaftes Committen:** Sicherungsdateien (und das wiederhergestellte Datenbank-Image) werden in eine eindeutige temporäre Datei mit restriktiven `0600`-Berechtigungen geschrieben, per `fsync` gesichert, an ihren endgültigen Platz umbenannt, und das enthaltende Verzeichnis wird ebenfalls per `fsync` gesichert, sofern das Dateisystem dies unterstützt — ein Prozess- oder Host-Absturz, nachdem die Sicherungserstellung Erfolg gemeldet hat, hinterlässt niemals eine unvollständige Datei am endgültigen Pfad, und ein unterbrochener Schreibvorgang überschreibt nie die temporäre Datei eines anderen Schreibers, die noch in Arbeit ist.
 
 **Sicherungsmetadaten** werden in der SQLite-Tabelle `backup_metadata` verfolgt, damit `backup list` Informationen über historische Sicherungen zurückgeben kann.
+
+**Aufbewahrung von Sicherungsdateien:** Nach jeder erfolgreichen `backup create` werden Sicherungen, die die konfigurierte Anzahl oder das Alter überschreiten, entfernt (Datei und Metadaten-Zeile zusammen). Konfiguration über `backup.retention` in `config.json`:
+
+```json
+{
+  "backup": {
+    "retention": {
+      "max_count": 30,
+      "max_age_days": 90
+    }
+  }
+}
+```
+
+Jede Grenze allein genügt, um eine Sicherung zu entfernen; setzen Sie eine Grenze auf `null`, um sie zu deaktivieren (beide `null` deaktiviert die Aufbewahrung vollständig — nicht empfohlen, da der Sicherungsspeicher sonst unbegrenzt und proportional zur Datenbankgröße wächst). Eine Sicherung, deren Datei-Löschung fehlschlägt, bleibt in den Metadaten, damit der nächste Durchlauf sie erneut versucht, statt den Überblick über sie zu verlieren. Eine Sicherung außerhalb der Grenzen, deren Datei bereits verschwunden ist, wird in ihrer veralteten Metadaten-Zeile bereinigt und getrennt von einer echten Löschung markiert. `backup list` markiert außerdem (`missing: true`) jede Sicherung, deren Datei verschwunden ist, deren Metadaten-Zeile aber noch nicht bereinigt wurde, statt sie als wiederherstellbare Sicherung darzustellen.
 
 ### Sicherungen auflisten
 
@@ -2303,7 +2436,8 @@ Gibt zurück:
       "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
@@ -2319,34 +2453,57 @@ Gibt zurück:
 ```
 
 **Wiederherstellungsprozess:**
-1. Prüfen, ob die Datei vorhanden ist und die Integritätsprüfsumme übereinstimmt.
-
-2. Die eingebettete SQLite-Datenbank atomar in das Datenverzeichnis schreiben (Schreiben-in-Temp-dann-Umbenennen).
-3. Die im-Arbeitsspeicher-SQLite-Datenbank aus der wiederhergestellten Datei ohne Neustart des Prozesses neu laden.
-4. Schema-Migrationen auf der neu geladenen Datenbank ausführen, um Vorwärtskompatibilität sicherzustellen.
-5. Vektoren gegen tatsächliche Abweichungen (Drift) abgleichen (siehe unten) und `{ memory_count: <Anzahl>, metadata_activated: true, vector_reconciliation: {...} }` zurückgeben.
+1. Die prozessübergreifende Wiederherstellungssperre erwerben (siehe unten) und prüfen, ob die Datei vorhanden ist, ihre Formatversion unterstützt wird und sowohl Header- als auch Body-Prüfsumme übereinstimmen.
+2. Die Kandidaten-Datenbank in eine Scratch-Datei schreiben und sie *vor* jeder Berührung der Live-Datenbank validieren: öffnen, `PRAGMA integrity_check` ausführen, bestätigen, dass das Schema lesbar ist, und bestätigen, dass ihre Datensatzanzahl mit `memory_count` aus dem Header übereinstimmt. Ein Kandidat, der eine dieser Prüfungen nicht besteht, lässt die Live-Datenbank vollständig unberührt.
+3. Die Live-Verbindung checkpointen und schließen, die Live-Datenbankdatei *beiseite* an einen eindeutigen Pre-Restore-Pfad umbenennen (nicht direkt überschrieben), den validierten Kandidaten an ihre Stelle umbenennen und neu öffnen.
+4. Die Datensatzanzahl der neu geöffneten Datenbank erneut verifizieren. Wenn die Aktivierung oder diese Prüfung nach der Aktivierung fehlschlägt, wird das Pre-Restore-Image zurück an seinen Platz umbenannt und neu geöffnet — die Wiederherstellung hinterlässt immer eine funktionierende, live geöffnete Datenbank, nie eine halb ausgetauschte oder beschädigte.
+5. Vektoren gegen tatsächliche Abweichungen (Drift) und vektor-only Überschuss (siehe unten) abgleichen und `{ memory_count: <Anzahl>, metadata_activated: true, vector_reconciliation: {...} }` zurückgeben.
 
 **Wiederherstellung ist live:** Die wiederhergestellte Datenbank ist sofort aktiv. Ein Neustart des Servers ist nicht erforderlich. Die Antwort enthält `metadata_activated: true` zur Bestätigung.
 
-**Prüfung der Erinnerungsanzahl nach der Aktivierung:** Da ein Backup ein Byte-für-Byte-Export der SQLite-Datenbank ist, muss die Erinnerungsanzahl nach der Aktivierung exakt `memory_count` aus dem Header entsprechen. Andernfalls wirft die Wiederherstellung `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` und protokolliert ein `backup_restore_count_mismatch`-Ereignis — der Aufruf gibt keine erfolgreiche Antwort zurück.
+**Rollback-Garantie:** Ein gemeldeter Wiederherstellungsfehler — ob aus der Vor-Aktivierungs-Validierung, dem Live/Kandidat-Dateiaustausch oder der Datensatzanzahl-Prüfung nach der Aktivierung — hinterlässt immer die vorherige Datenbank wiederherstellbar und neu geöffnet, nie eine Datenbank, die fehlt, halb geschrieben oder stillschweigend falsch ist. Die Fehlermeldung sagt explizit, ob die vorherige Datenbank wiederhergestellt wurde (`"...the prior database was restored and is active"`) oder nie berührt wurde (`"...before any change to the active database"`).
 
-**Die Vektor-Abgleichung ist drift-basiert und begrenzt.** Die Wiederherstellung leert und re-embedded nicht bedingungslos den gesamten Bestand: Sie vergleicht die Inhalts-Prüfsumme jeder wiederhergestellten Erinnerung mit dem bereits in Qdrant gespeicherten Vektor und markiert nur neue oder inhaltlich geänderte Erinnerungen für ein erneutes Embedding. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben oder der Qdrant-Zustand nicht gelesen werden kann, greift stattdessen ein vollständiger Neuaufbau. Sobald diese Drift-Prüfung abgeschlossen ist, wird die Restore-Lifecycle-Sperre freigegeben — `vector_reconciliation.state` ist sofort `"reconciled"`, wenn nichts abgewichen ist, oder `"reconciling"`, wenn das erneute Embedding der abweichenden Teilmenge in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf, mit automatischen Wiederholungsversuchen) fortgesetzt wird, nachdem der Aufruf bereits zurückgekehrt ist. Fragen Sie `health://status` (`components.vector_reconciliation`) ab, um den Fortschritt zu beobachten.
+**Prozessübergreifender Ausschluss:** Eine exklusive Sperrdatei (`<data_dir>/.restore.lock`) wird für die gesamte Wiederherstellung gehalten, und jede SQLite-Mutation (in diesem oder einem anderen Prozess) prüft auf sie — eine überlappende Wiederherstellung von einem anderen CLI-Aufruf oder Serverprozess, oder ein gewöhnlicher Schreibvorgang, der mit einer aktiven Wiederherstellung konkurriert, schlägt sichtbar mit einem wiederholbaren `CONFLICT` fehl (`"Backup restore is already active for this data directory"` oder `"Storage lifecycle operation in progress: restore (held by another process)"`), statt auf ein Datenbank-Image zu schreiben, das gerade umbenannt oder ersetzt wird.
 
-**Schutz vor gleichzeitiger Wiederherstellung:** Wenn bereits eine Wiederherstellung läuft, geben nachfolgende Wiederherstellungsanfragen `INVALID_INPUT: Backup restore already in progress` zurück. Diese Sperre deckt nur die Metadaten-Aktivierung und die Drift-Prüfung ab, nicht das Hintergrund-Re-Embedding, und wird daher auch bei einer großen Wiederherstellung schnell wieder freigegeben.
+**Die Vektor-Abgleichung ist drift-basiert, begrenzt und bidirektional.** Die Wiederherstellung leert und re-embedded nicht bedingungslos den gesamten Bestand: Sie durchläuft jede verwaltete Qdrant-Sammlung einmal als Stream (ohne je eine ganze Sammlung im Speicher zu puffern) und vergleicht die Prüfsumme jedes Punkts mit der wiederhergestellten SQLite-Zeile, wobei nur neue oder inhaltlich geänderte Erinnerungen für ein erneutes Embedding markiert werden. Sie identifiziert außerdem **vektor-only Überschuss** — Qdrant-Punkte ohne entsprechende Zeile im wiederhergestellten SQLite-Image überhaupt, die zurückbleiben, wenn die Sicherung ihnen vorausgeht — und löscht sie in begrenzten Batches, beschränkt auf die eigenen Punkte dieses Geräts (oder Legacy-Punkte, die der Geräte-Kennzeichnung vorausgehen), sodass der legitime geräteübergreifende Such-Fallback eines anderen Geräts nie berührt wird. Ein Überschuss-Punkt, dessen Löschung fehlschlägt, bleibt als wiederholbare Waisen-Arbeit zurück und hält `vector_reconciliation` degradiert, statt fälschlich als gesund gemeldet zu werden, sodass er nie als nicht-verfallender Payload-Fallback im Recall auftauchen kann. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben, greift stattdessen ein vollständiger Neuaufbau; wenn der Qdrant-Zustand einfach nicht *gelesen* werden kann (ein vorübergehender Ausfall, keine Modelländerung), wird der Bestand konservativ neu eingebettet, ohne etwas zu löschen, und als eigene Ursache `inspection-failed` gemeldet, statt fälschlich als Modelländerung eingestuft zu werden. Sobald diese Prüfung abgeschlossen ist, wird die Wiederherstellungssperre freigegeben — `vector_reconciliation.state` ist sofort `"reconciled"`, wenn nichts abgewichen ist und kein Überschuss verbleibt, oder `"reconciling"`, wenn das erneute Embedding der abweichenden Teilmenge in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf, mit automatischen Wiederholungsversuchen) fortgesetzt wird oder unbereinigter Überschuss als wiederholbare Arbeit verbleibt, nachdem der Aufruf bereits zurückgekehrt ist. Fragen Sie `health://status` (`components.vector_reconciliation`) ab, um den Fortschritt zu beobachten.
 
 ---
 
 ## Gesundheitszustand & Metriken
 
-### Health-Endpunkt
+### Health-Endpunkte
+
+Der HTTP-Health-Check ist dreigeteilt, damit eine günstige, hochfrequente
+Liveness-Prüfung, eine begrenzte Readiness-Prüfung und der vollständige
+authentifizierte Diagnose-Snapshot jeweils den passenden Kosten- und
+Zugriffskontroll-Zuschnitt haben (bound-qdrant-http-runtime):
 
 ```bash
-GET /health        # HTTP
-# oder über CLI:
+GET /health/live   # unauthentifiziert, keine Abhängigkeits-I/O — Neustart-/Liveness-Entscheidungen
+GET /health/ready   # unauthentifiziert, gecachte Abhängigkeitsprüfung — 503 wenn nicht bereit
+GET /health          # authentifiziert, vollständiger Diagnose-Snapshot
+# oder über CLI (vollständiger Diagnose-Snapshot, wie GET /health):
 bhgbrain health
 ```
 
-Gibt einen `HealthSnapshot` zurück:
+- **`GET /health/live`** — `{ "status": "ok", "uptime_seconds": 86400 }`. Synchron, ohne
+  jede Abhängigkeit (nicht einmal SQLite), bleibt also bei jeder Abfragerate günstig.
+  Immer `200`. Für Neustart-/Liveness-Entscheidungen des Orchestrators (genau das fragt
+  auch der `HEALTHCHECK` des Docker-Images ab — siehe [Docker](#docker)).
+- **`GET /health/ready`** — prüft nur die beiden Abhängigkeiten, ohne die eine Anfrage
+  nicht funktionieren kann: SQLite (ein lokales `SELECT 1`) und Qdrant (eine begrenzte,
+  gecachte Vektorabfrage-Probe — siehe unten). Liefert `{ "ready": true|false,
+  "components": { "sqlite": {...}, "qdrant": {...} } }`, `200` wenn bereit und `503`
+  wenn eine der beiden Abhängigkeiten fehlerhaft ist. Anders als `/health/live` ist
+  dieser Endpunkt *nach* dem Rate Limiting registriert, und die Qdrant-Probe selbst ist
+  gecacht, sodass eine Flut unauthentifizierter Readiness-Abfragen nicht zu einer Flut
+  frischer Qdrant-Anfragen wird.
+- **`GET /health`** — der vollständige Diagnose-Snapshot (Embedding, Retention,
+  Scheduler, Circuit Breaker, Zähler pro Stufe usw.), der nun dieselbe
+  Bearer-Authentifizierung wie jede andere Route erfordert. Teilt sich dieselbe
+  gecachte Qdrant-Probe mit `/health/ready`.
+
+Gibt einen `HealthSnapshot` von `GET /health` zurück:
 
 ```json
 {
@@ -2400,11 +2557,122 @@ Gibt einen `HealthSnapshot` zurück:
 
 **Circuit-Breaker:** Das `circuitBreakers`-Objekt meldet den Zustand jedes Unterbrechers für externe Abhängigkeiten (`closed`, `open` oder `half-open`). Ist ein Breaker `open`, werden Anfragen an diese Abhängigkeit bis zum Ablauf des Öffnungsfensters und einer erfolgreichen Half-Open-Probe mit einem `CircuitOpenError` kurzgeschlossen. Schwellenwerte werden über `resilience.circuit_breaker` konfiguriert (siehe [Konfiguration](#konfiguration)).
 
-**HTTP-Statuscodes:**
+**HTTP-Statuscodes (`GET /health`):**
 - `200` für sowohl `healthy` als auch `degraded`
 - `503` für `unhealthy`
 
-Einbettungsgesundheit wird 30 Sekunden lang zwischengespeichert, um API-Aufrufe zu OpenAI pro Probe zu vermeiden.
+(`GET /health/ready` verwendet seine eigene `ready`/`503`-Zuordnung — siehe oben —
+unabhängig vom `healthy`/`degraded`/`unhealthy`-Statusfeld von `GET /health`.)
+
+Einbettungsgesundheit wird 30 Sekunden lang zwischengespeichert, um API-Aufrufe zu
+OpenAI pro Probe zu vermeiden. Die Qdrant-Health-Probe (gemeinsam genutzt von
+`/health` und `/health/ready`) wird aus demselben Grund 5 Sekunden lang
+zwischengespeichert und verwendet ein eigenes, kurzes clientseitiges Timeout
+(`qdrant.health_timeout_ms`, Standard 3000) statt des längeren
+`qdrant.operation_timeout_ms` der Anfragepfad-Qdrant-Aufrufe — ein stockendes Qdrant
+degradiert den Health-Status schnell, ohne dass Aufrufer die volle operative Frist
+abwarten müssen. Siehe [Vollständige Konfigurationsreferenz](#vollständige-konfigurationsreferenz).
+
+### Abhängigkeits-Timeouts, begrenzte Fan-Out und Circuit-Breaker-Abdeckung
+
+Jede Qdrant-Operation des Servers — Schreiben, Lesen, Cleanup/Kompaktierung,
+Snapshot-Erstellung, Collection-Scroll/-Liste/-Löschung — ist durch
+`qdrant.operation_timeout_ms` begrenzt (Standard 10000, clientseitig via
+`AbortController`) und läuft über den gemeinsamen Qdrant-Circuit-Breaker
+(`resilience.circuit_breaker`), sodass ein blockierter Qdrant-Endpunkt auf jedem
+Codepfad schnell fehlschlägt statt nur auf manchen. Die Health-Probe verwendet
+bewusst einen eigenen Client und ein eigenes Timeout (`qdrant.health_timeout_ms`)
+und berührt den Breaker nie (siehe oben).
+
+Ein `recall`/`search`-Aufruf ohne konkrete `collection` fächert über jede Collection
+im Namespace auf. Dieser Fan-Out wird über `qdrant.fanout` begrenzt:
+`max_collections` (Standard 25) begrenzt, wie viele Collections ein Aufruf maximal
+anspricht — darüber hinaus wird die Zielliste deterministisch gekürzt —, und
+`concurrency` (Standard 5) begrenzt, wie viele davon gleichzeitig laufen (in
+Batches fester Größe), und `per_target_limit` (Standard 50) begrenzt das
+`limit` jedes einzelnen Ziels beim tatsächlichen Fan-Out (mehr als ein Ziel) —
+eine explizite Ein-Collection-Suche nutzt immer das volle, unbegrenzte `limit`
+des Aufrufers. Kürzungen werden über das Gauge `bhgbrain_qdrant_fanout_width`
+und den Zähler `bhgbrain_qdrant_fanout_truncated_total` sichtbar gemacht (siehe
+[Metriken](#metriken)) sowie über eine `qdrant_fanout_truncated`-Logzeile, nicht im
+Antwortkörper von `search`/`recall` selbst.
+
+### Outbound AI Request Policy
+
+Jedes OpenAI-kompatible Feature — Embedding (OpenAI-Provider; Azure behält seinen
+eigenen abgeleiteten ressourcenspezifischen Endpunkt), Multi-Kandidaten-Extraktion,
+optionales Reranking, LLM-gestützte Zusammenfassung, die LLM-Paraphrase/HyDE-Phase der
+Multi-Query-Expansion, Widerspruchserkennung und geplante Distillation — sendet seine
+Chat-/Embedding-Anfragen über eine gemeinsame Anfragegrenze, statt dass jedes Feature
+unabhängig einen eigenen `fetch`-Aufruf konstruiert. Diese Grenze bietet:
+
+- **Eine gemeinsame Basis-URL** (`llm.base_url`, Standard `https://api.openai.com/v1`):
+  Zeigen Sie sie auf ein validiertes OpenAI-kompatibles Gateway, um alle diese Features
+  gleichzeitig darüber zu leiten. Feature-spezifische Modellnamen, Zugangsdaten und
+  Pro-Feature-Timeouts (`pipeline.extraction_timeout_ms`, `search.rerank.timeout_ms` usw.)
+  bleiben unberührt — nur Endpunkt und Retry-Regelwerk sind gemeinsam.
+- **Eine Deadline, die die gesamte Antwort abdeckt**, nicht nur den anfänglichen
+  Verbindungsaufbau: Der konfigurierte Timeout bleibt während des Header-Empfangs, des
+  Body-Lesens, der JSON-Parsierung und der eigenen Antwortvalidierung des Features aktiv.
+  Ein Anbieter, der erfolgreiche Header zurückgibt und dann mitten im Body stockt, bricht
+  weiterhin bei der Deadline ab und — sofern das Feature durch einen Circuit Breaker
+  abgesichert ist — zählt das als Breaker-Fehlschlag, nicht als stiller Erfolg.
+- **Einheitliche HTTP-/Netzwerkfehlerklassifizierung**: `429` und `408` sind immer
+  wiederholbar; `500`/`502`/`503`/`504` sind wiederholbar (andere 5xx-Codes sowie jeder
+  andere 4xx-Code gelten als dauerhaft — ein erneuter Versuch kann falsche Zugangsdaten
+  oder eine fehlerhafte Nutzlast nicht beheben); Netzwerkfehler und Timeouts sind
+  wiederholbar. Ein `Retry-After`-Header bei einer `429`/`5xx`-Antwort hebt die Verzögerung
+  des nächsten Versuchs auf mindestens diesen Wert an, begrenzt durch
+  `llm.retry.max_backoff_ms`.
+- **Begrenzte, mit Jitter versehene Wiederholungen** (`llm.retry.max_attempts`/
+  `backoff_ms`/`max_backoff_ms`, Standard `3`/`200`/`2000`): Die gesamte Retry-Schleife
+  für einen logischen Aufruf — einschließlich jedes internen Versuchs — zählt höchstens
+  ein Circuit-Breaker-Ergebnis, sodass ein vorübergehender Fehlschlag, der beim zweiten
+  Versuch gelingt, niemals einen Breaker auslöst, den ein gesunder Anbieter nicht auslösen
+  würde. Embedding-Anfragen verwenden ihr eigenes, gleichwertiges `embedding.retry`-
+  Regelwerk (einschließlich `max_backoff_ms`) statt `llm.retry`, da Embeddings bereits ein
+  eigenes Batching-Anliegen (`max_batch_inputs`) haben.
+- **Antwortvalidierung, bevor einer Anbieterausgabe vertraut wird**: Jede
+  Embedding-Anfrage (OpenAI und Azure gleichermaßen, in Blöcke von
+  `embedding.max_batch_inputs` aufgeteilt) prüft, dass das zurückgegebene Array genau
+  einen Vektor pro angefragter Eingabe enthält und dass jeder Vektor mit den
+  konfigurierten `embedding.dimensions` übereinstimmt, bevor die Ergebnisse in der
+  Eingabereihenfolge wieder zusammengesetzt werden — ein zu kurzer oder fehlerhafter
+  Batch lässt den gesamten Aufruf fehlschlagen, statt Vektoren stillschweigend den
+  falschen Erinnerungen zuzuordnen.
+
+Die semantische Suche bewahrt den ursprünglichen klassifizierten Fehler des
+Embedding-Anbieters (dessen Code und ob er wiederholbar ist), statt ihn immer durch eine
+generische Meldung zu ersetzen; der Fallback-Pfad der hybriden Suche auf reine
+Volltextsuche protokolliert und misst dieselbe Klassifizierung zusammen mit dem
+`fulltext_only`-Fallback, sodass ein Betreiber in beiden Modi eine vorübergehende
+Ratenbegrenzung von einem dauerhaften Authentifizierungsfehler unterscheiden kann.
+
+### MCP-Sitzungslebenszyklus
+
+Jeder `POST /mcp initialize`-Aufruf eröffnet eine Sitzung, die für die Lebensdauer
+des Prozesses im Speicher gehalten wird. `transport.http.mcp_session` begrenzt diese
+Registry, sodass ein HTTP-MCP-Client, der sich trennt, ohne je `DELETE /mcp` zu
+senden (der übliche Fall bei einem gewöhnlichen Client-Absturz oder Netzwerkabbruch),
+nicht dauerhaft Sitzungen leaken kann:
+
+- `idle_timeout_ms` (Standard 1.800.000 = 30 Minuten) — eine Sitzung ohne Anfrage
+  über diese Dauer wird von einem unabhängigen, `unref`'ten Sweep geschlossen
+  (`sweep_interval_ms`, Standard 60000). Jede Anfrage über eine Sitzung aktualisiert
+  deren Aktivität und verschiebt so den Ablauf.
+- `max_sessions` (Standard 1000) — eine harte Obergrenze für residente Sitzungen. Ein
+  neues `initialize` bei erreichter Kapazität verdrängt die am längsten inaktive
+  Sitzung, um Platz zu schaffen; ist die Registry dabei bereits leer und trotzdem "an
+  der Kapazitätsgrenze" (nur bei einer Fehlkonfiguration `max_sessions: 0` möglich),
+  schlägt die Anfrage geschlossen mit `503` fehl.
+- Die Wiederverwendung einer ID nach einem der beiden Verdrängungspfade liefert
+  dieselbe `404 Session not found`-Antwort, die auch `DELETE /mcp` bereits erzeugt —
+  keine separate Fehlerform, die behandelt werden müsste.
+
+Aktuelle und verdrängte Sitzungszahlen werden als Gauge `bhgbrain_mcp_sessions_active`
+und Zähler `bhgbrain_mcp_sessions_evicted_total{reason="idle"|"capacity"}`
+veröffentlicht (siehe [Metriken](#metriken)). `closeAll()` (Prozess-Shutdown) stoppt
+den Sweep-Timer und schließt jede lebende Sitzungs-Transport.
 
 ### Metriken
 
@@ -2441,6 +2709,11 @@ Metriken ohne Labels, sodass die Ausgabe abwärtskompatibel zum vorherigen label
 | `bhgbrain_memory_count` | Messuhr | Aktuelle Gesamt-Erinnerungsanzahl (bei Schreiben/Löschen aktualisiert) |
 | `bhgbrain_rate_limit_buckets` | Messuhr | Aktive Rate-Limit-Verfolgungseimer |
 | `bhgbrain_rate_limited_total` | Zähler | Gesamt rate-limitierte Anfragen |
+| `bhgbrain_rate_limit_capacity_rejected_total` | Zähler | Gesamtzahl der Anfragen, die mit 429 abgelehnt wurden, weil die Rate-Limit-Eimer-Map bei `security.rate_limit_max_buckets` für eine tatsächlich neue Client-Identität voll war |
+| `bhgbrain_qdrant_fanout_width` | Messuhr | Anzahl der Collections, auf die die zuletzt ausgeführte collectionslose `search`/`recall`-Abfrage aufgefächert hat, nach etwaiger Kürzung durch `qdrant.fanout.max_collections` |
+| `bhgbrain_qdrant_fanout_truncated_total` | Zähler | Wird erhöht, wenn die Zielliste einer collectionslosen Abfrage auf `qdrant.fanout.max_collections` gekürzt wurde |
+| `bhgbrain_mcp_sessions_active` | Messuhr | Aktuelle Anzahl residenter MCP-HTTP-Sitzungen |
+| `bhgbrain_mcp_sessions_evicted_total` | Zähler | Gesamtzahl der vom Sitzungsmanager geschlossenen MCP-HTTP-Sitzungen, mit Label `reason` (`idle` oder `capacity`) |
 | `recall_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive Nachprüfung von `recall` (Typ/Tags/`after`/`before`) nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
 | `search_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive `after`/`before`-Nachprüfung von `search` nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
 | `search_embedding_degraded` | Zähler | Wird erhöht, wenn eine Suche im Modus `hybrid` auf reinen Volltext zurückfällt, weil der Embedding-Provider oder der Vektorspeicher nicht verfügbar ist, mit `namespace`-Label |
@@ -2465,7 +2738,10 @@ höher ausfallen als bevor diese Metrik Fehler erfasste.
 
 ### HTTP-Authentifizierung
 
-Im HTTP-Modus erfordern Anfragen an alle Endpunkte außer `/health` ein Bearer-Token:
+Im HTTP-Modus erfordern Anfragen an alle Endpunkte außer `/health/live` und
+`/health/ready` ein Bearer-Token — der vollständige Diagnose-Snapshot `/health` ist
+wie jede andere Route authentifiziert (siehe
+[Gesundheitszustand & Metriken](#gesundheitszustand--metriken)):
 
 ```
 Authorization: Bearer <your-token>
@@ -2508,14 +2784,21 @@ Stellen Sie sicher, dass `BHGBRAIN_TOKEN` in dieser Konfiguration gesetzt ist.
 
 ### Proxy-Vertrauen
 
-`security.trust_proxy` (Standard `false`) wird direkt an Express' `app.set('trust proxy', ...)` übergeben und bestimmt damit, wie `req.ip` abgeleitet wird und auf welche Identität der Rate-Limiter sich stützt:
+`security.trust_proxy` (Standard `false`) wird direkt an Express' `app.set('trust proxy', ...)` übergeben und bestimmt damit, wie `req.ip` abgeleitet wird und auf welche Identität der Rate-Limiter sich stützt. Erlaubt sind `false`, eine positive Hop-Anzahl oder ein Array vertrauenswürdiger Proxy-IPs/-Subnetze — **das alte boolesche `true` ("jedem Hop vertrauen") wird nicht mehr akzeptiert** und schlägt bei der Konfigurationsvalidierung mit einem Migrationshinweis fehl, weil es einem aufrufer-gesetzten *linkesten* `X-Forwarded-For`-Eintrag erlaubt, seine eigene Client-Identität zu wählen — selbst hinter genau einem echten Reverse-Proxy-Hop:
 
-- **Deaktiviert (Standard):** `req.ip` ist der direkte Socket-Peer. Das ist für die dokumentierte, nur-Loopback-Bereitstellung korrekt. Steht dennoch ein Reverse-Proxy davor, werden alle proxierten Clients auf die einzelne IP des Proxys zusammengefasst, und vom Aufrufer gesetzte `X-Forwarded-For`-Header werden ignoriert (sie können also nicht zum Aufsplitten oder Umgehen von Rate-Limits gefälscht werden).
-- **Aktiviert:** `req.ip` berücksichtigt das vom direkten Peer gesetzte `X-Forwarded-For`. Nur hinter einem Reverse-Proxy aktivieren, dem Sie vertrauen, diesen Header korrekt zu setzen – ohne einen solchen vertrauenswürdigen Proxy davor kann jeder Client seine Rate-Limit-Identität fälschen.
+- **Deaktiviert (Standard, `false`):** `req.ip` ist der direkte Socket-Peer. Das ist für die dokumentierte, nur-Loopback-Bereitstellung korrekt. Steht dennoch ein Reverse-Proxy davor, werden alle proxierten Clients auf die einzelne IP des Proxys zusammengefasst, und vom Aufrufer gesetzte `X-Forwarded-For`-Header werden ignoriert (sie können also nicht zum Aufsplitten oder Umgehen von Rate-Limits gefälscht werden).
+- **Hop-Anzahl (eine positive Ganzzahl):** vertraut genau so vielen server-nächsten Reverse-Proxy-Hops. Mit `1` hinter einem vertrauenswürdigen Reverse-Proxy löst sich `req.ip` auf den rechtesten (server-nächsten) `X-Forwarded-For`-Eintrag auf — den, den Ihr Proxy tatsächlich gesetzt hat —, nicht auf ein beliebiges, aufrufer-gesetztes linkes Präfix.
+- **Subnetz-/Adressliste (ein Array von Strings):** vertraut nur Hops, deren Adresse einer der angegebenen IPs oder CIDR-Subnetze entspricht (z. B. `["10.0.0.0/8"]`), das übliche Express-/`proxy-addr`-Format.
 
 ```json
-{ "security": { "trust_proxy": true } }
+{ "security": { "trust_proxy": 1 } }
 ```
+
+```json
+{ "security": { "trust_proxy": ["10.0.0.0/8"] } }
+```
+
+Migration von einem bestehenden `"trust_proxy": true`: ersetzen Sie es durch die Hop-Anzahl Ihrer tatsächlichen Reverse-Proxy-Kette (meist `1` für einen einzelnen Load Balancer oder Ingress vor dem Server) oder das/die vertrauenswürdige(n) Subnetz(e), in dem/denen dieser läuft.
 
 ### Rate Limiting
 
@@ -2526,7 +2809,7 @@ HTTP-Anfragen werden pro Client-IP-Adresse rate-limitiert:
 - Überschreitende Clients erhalten HTTP 429 mit `{ error: { code: "RATE_LIMITED", retryable: true } }`
 - Anfragen ohne ableitbare Client-IP schlagen fail-closed mit HTTP 400 (`INVALID_INPUT`) fehl, statt sich einen gemeinsamen Ausweich-Bucket zu teilen
 - Antwortheader enthalten `X-RateLimit-Limit` und `X-RateLimit-Remaining`
-- Abgelaufene Rate-Limit-Eimer werden alle 30 Sekunden bereinigt
+- Die Eimer-Map hat eine harte Kapazität, `security.rate_limit_max_buckets` (Standard 10.000). Abgelaufene Eimer werden unabhängig alle 30 Sekunden über einen `unref`'ten Timer bereinigt (nicht opportunistisch an eingehende Anfragen gekoppelt, sodass die Bereinigung auch bei ausbleibendem Traffic weiterläuft). Bei erreichter Kapazität läuft ein letzter Sweep, bevor eine tatsächlich neue Client-Identität mit HTTP 429 (`{ error: { code: "RATE_LIMITED", retryable: true } }`) abgelehnt wird, statt die Map weiter wachsen zu lassen — ein bereits bekannter Client ist davon nie betroffen.
 - Der Rate-Limit-Status ist pro Server-/Middleware-Instanz gekapselt, sodass unabhängige Instanzen (z. B. in Tests) sich nie Buckets teilen
 
 ### Begrenzung der Anfragegröße
@@ -2795,8 +3078,10 @@ Das `bootstrap`-MCP-Tool führt direkt innerhalb von BHGBrain ein zustandsbehaft
 // Fortschritt abfragen
 { "name": "bootstrap", "arguments": { "action": "status" } }
 
-// Einen Abschnitt erneut durchführen
-{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3 } }
+// Einen Abschnitt erneut durchführen — reset ist destruktiv (löscht die
+// Erinnerungen des Abschnitts dauerhaft) und erfordert einen exakten
+// Bestätigungswert
+{ "name": "bootstrap", "arguments": { "action": "reset", "section": 3, "confirm": "RESET" } }
 ```
 
 Das Tool gibt nach jeder Einreichung die Fragen des nächsten Abschnitts zurück, sodass der Agent das Gespräch natürlich führen kann. Sitzungen bleiben in SQLite erhalten — Sie können Ihren Client schließen und später dort weitermachen, wo Sie aufgehört haben.
@@ -3107,7 +3392,8 @@ Die relevantesten Erinnerungen für eine Abfrage mithilfe semantischer (Vektor-)
       "origin": { "session_id": "sess-abc123", "tool": "claude-code", "repo": "BHGBrain", "branch": "main" },
       "confidence": 1.0
     }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
@@ -3124,6 +3410,16 @@ Platzhalter, kein Relevanzscore — dieselbe Konvention wie bei `include_archive
 `search`) sowie `linked_from` (die ID des Basisergebnisses), `link_relation` und
 `link_direction` (`"outgoing"`, wenn das Basisergebnis die Quelle der Kante ist,
 `"incoming"`, wenn es das Ziel ist). Ein bereits archivierter Nachbar wird übersprungen.
+
+`results` wird innerhalb von `defaults.max_response_chars` (Standard `50000`)
+zusammengestellt: umfangreiche Ergebnisse (lange `content`-Felder, ein hohes `limit`)
+werden nacheinander bis zu diesem Zeichenbudget aufgenommen, und `truncated: true`
+kennzeichnet eine Antwort, bei der nachfolgende Ergebnisse weggelassen werden mussten,
+um innerhalb des Budgets zu bleiben — `results.length` kann dann kleiner als `limit`
+sein, obwohl mehr Treffer existierten. Dies unterscheidet sich von der
+`min_score`/Filter-Einschränkung, die `recall` nicht von einer tatsächlich kleinen
+Ergebnismenge unterscheiden kann; ein Aufrufer, der trotz eines großen Budgets jeden
+Treffer benötigt, sollte stattdessen die Abfrage eingrenzen oder `limit` senken.
 
 ---
 
@@ -3167,7 +3463,7 @@ Erinnerungen mithilfe semantischer, Volltext- oder Hybrid-Modi durchsuchen. Biet
 | `after` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at >= after` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Vektor-/Volltextspeicher hinuntergereicht — der erste hinuntergereichte Filter von `search`. |
 | `before` | `string (ISO-8601-Datumszeit)` | Nein | - | Nur Erinnerungen mit `created_at <= before` (einschließlich). Filtert nach Erstellungszeitpunkt, nicht nach `updated_at`. Wird in den Vektor-/Volltextspeicher hinuntergereicht. |
 
-**Ausgabe:** Gleiche Struktur wie `recall` — `{ "results": [...] }` — aber ohne den `min_score`-Filter und mit Unterstützung von bis zu 50 Ergebnissen. Archivtreffer (bei `include_archived: true`) tragen `archived: true`, verwenden die gespeicherte Zusammenfassung als `content` und haben keinen aussagekräftigen `score` (es sind Metadaten-Texttreffer, keine gerankten Ergebnisse).
+**Ausgabe:** Gleiche Struktur wie `recall` — `{ "results": [...], "truncated": false }` — aber ohne den `min_score`-Filter, mit Unterstützung von bis zu 50 Ergebnissen und einem zusätzlichen `degraded`-Feld (`true`, wenn der Hybrid-Modus auf reine Volltextsuche zurückgefallen ist). Archivtreffer (bei `include_archived: true`) tragen `archived: true`, verwenden die gespeicherte Zusammenfassung als `content` und haben keinen aussagekräftigen `score` (es sind Metadaten-Texttreffer, keine gerankten Ergebnisse). `results` unterliegt demselben `defaults.max_response_chars`-Budget und derselben `truncated`-Semantik, die oben unter `recall` beschrieben ist.
 
 ---
 
@@ -3308,9 +3604,11 @@ Speichersicherungen erstellen, auflisten oder wiederherstellen.
   "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
   "size_bytes": 2048576,
   "memory_count": 1234,
-  "created_at": "2026-03-15T12:00:00Z"
+  "created_at": "2026-03-15T12:00:00Z",
+  "missing": false
 }
 ```
+Die Aufbewahrung von Sicherungsdateien (`backup.retention.max_count`/`max_age_days`) läuft automatisch nach jeder erfolgreichen `create` — siehe [Sicherung erstellen](#sicherung-erstellen).
 
 **`list`-Ausgabe:**
 ```json
@@ -3320,11 +3618,13 @@ Speichersicherungen erstellen, auflisten oder wiederherstellen.
       "path": "...",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
 ```
+`missing: true` markiert eine Sicherung, deren Metadaten-Zeile keine entsprechende Datei mehr auf der Festplatte hat, statt sie als wiederherstellbar darzustellen.
 
 **`restore`-Ausgabe:**
 ```json
@@ -3339,7 +3639,7 @@ Speichersicherungen erstellen, auflisten oder wiederherstellen.
   }
 }
 ```
-`vector_reconciliation.state` ist `"reconciled"`, wenn kein Vektor tatsächlich abgewichen ist (nichts erneut einzubetten), oder `"reconciling"`, während eine begrenzte Hintergrundaufgabe die abweichende/fehlende Teilmenge erneut einbettet. Siehe [Aus Sicherung wiederherstellen](#aus-sicherung-wiederherstellen).
+`vector_reconciliation.state` ist `"reconciled"`, wenn kein Vektor tatsächlich abgewichen ist, kein vektor-only Überschuss unbereinigt verbleibt und nichts erneut eingebettet werden muss; `"reconciling"`, während eine begrenzte Hintergrundaufgabe die abweichende/fehlende Teilmenge erneut einbettet oder unbereinigter Überschuss als wiederholbare Arbeit verbleibt; `"pending"`, wenn die Drift-/Überschuss-Erkennung selbst nicht abgeschlossen werden konnte. Siehe [Aus Sicherung wiederherstellen](#aus-sicherung-wiederherstellen).
 
 ---
 
@@ -3355,13 +3655,14 @@ Führt ein zustandsbehaftetes 10-Abschnitte-Interview durch, um Ihr Arbeitsprofi
 | `section` | `integer (1-10)` | Für submit/reset | - | Abschnittsnummer, für die Antworten eingereicht oder zurückgesetzt werden. |
 | `answers` | `string` | Für submit | - | Ihre Antworten für den Abschnitt. Maximal 500.000 Zeichen. |
 | `namespace` | `string` | Nein | `"profile"` | Namensraum-Geltungsbereich. |
+| `confirm` | `string` | Für reset | - | Muss exakt `"RESET"` sein. Bei fehlendem oder falschem Wert bleibt der Speicher unverändert. |
 
 **Aktionen:**
 
 - **`start`** — Erstellt eine neue Sitzung oder setzt eine bestehende fort. Gibt Titel, Fragen und Anweisungen des ersten unvollständigen Abschnitts zurück.
 - **`submit`** — Speichert Antworten als einzelne Erinnerungen für den angegebenen Abschnitt, markiert ihn als abgeschlossen und gibt den nächsten Abschnitt zurück.
 - **`status`** — Gibt eine Fortschrittsübersicht zurück: welche Abschnitte abgeschlossen sind, Erinnerungsanzahl, letzte Aktualisierung.
-- **`reset`** — Löscht alle Erinnerungen eines Abschnitts und markiert ihn als ausstehend für eine erneute Erfassung.
+- **`reset`** — **Destruktiv.** Löscht alle Erinnerungen eines Abschnitts dauerhaft und markiert ihn als ausstehend für eine erneute Erfassung. Erfordert `confirm: "RESET"`; ein fehlender oder falscher Wert wird abgelehnt und es wird nichts gelöscht.
 
 **Ausgabe (start):**
 
@@ -3415,6 +3716,10 @@ Importiert ein strukturiertes Profil- oder Freiform-Dokument in einem Schritt al
 - `dry_run: true` gibt Erinnerungsvorschauen ohne Schreibvorgänge zurück.
 - Überschriften, die außerhalb der 10 speicher-zugeordneten Abschnitte nummeriert sind (z. B. ein Dokument, das gegen eine ältere 12-Abschnitte-Vorlage geschrieben wurde), werden nicht stillschweigend verworfen — ihre Nummern werden in `sections_ignored` gemeldet, damit Sie wissen, dass Inhalt übersprungen wurde, statt ihn unbemerkt zu verlieren.
 - Wenn [`remember`](#remember--erinnerung-speichern) Ihren Inhalt wegen Überschreitung von `pipeline.long_content_threshold_chars` abgelehnt hat, verwenden Sie stattdessen `import` mit `format: "freeform"` — es teilt das Dokument nach Überschriften-/Absatzgrenzen und bettet jeden Abschnitt einzeln ein, wodurch das Problem eines einzelnen Matsch-Vektors vermieden wird, vor dem der Schwellenwert von `remember` schützt.
+- Ein geparster Abschnitt, der länger als `import.max_chunk_chars` (Standard `8000`) ist, wird deterministisch in Stücke dieser Zeichenzahl aufgeteilt, statt als ein überlanger Abschnitt eingebettet oder ganz abgelehnt zu werden — jedes Stück wird weiterhin zu einem eigenen Erinnerungskandidaten.
+- Überschreitet die resultierende Abschnittsanzahl (nach eventueller Aufteilung) `import.max_chunks` (Standard `500`), wird der gesamte Aufruf — Dry-Run oder nicht — mit `INVALID_INPUT` abgelehnt, das die beobachtete Anzahl und das konfigurierte Maximum nennt, bevor irgendein Aufruf des Embedding-Anbieters erfolgt.
+- Einbettungen für die geparsten Abschnitte werden in Stapeln von `import.embedding_batch_size` (Standard `100`) beim Anbieter angefragt statt eine Anfrage pro Abschnitt, sodass ausgehende Anbieteraufrufe mit Abschnittsanzahl/Stapelgröße skalieren. Schlägt eine ganze Stapel-Einbettungsanfrage fehl, gehen diese Abschnitte nicht verloren — jeder fällt auf individuelles Einbetten über den normalen Schreibpfad zurück.
+- Ein Abschnitt, dessen Schreibvorgang vollständig fehlschlägt (jeder Extraktionskandidat dafür abgelehnt), bricht den Rest des Imports nicht ab: Er wird in einem `failed`-Feld gezählt und in einem `failures`-Array detailliert (`[{ "chunk_index": 4, "error": "..." }]`), beide nur vorhanden, wenn mindestens ein Abschnitt fehlgeschlagen ist.
 
 ---
 
@@ -3779,6 +4084,16 @@ Findet und führt nahezu doppelte, bereits vorhandene Erinnerungen zusammen — 
 
 Erinnerungen werden zu einem Cluster gruppiert, wenn sie innerhalb der gescannten Seite durch eine Ähnlichkeitskante bei oder über `consolidation.similarity_threshold` (Standard `0.9` — bewusst unterhalb der schreibzeitigen UPDATE-Schwellenwerte der Duplikaterkennung, sodass `list` Kandidaten aufzeigt, die die Duplikaterkennung selbst nicht automatisch zusammengeführt hätte) verbunden sind. `suggested_target` ist **nur ein Hinweis**: das Mitglied mit der höchsten `importance` (bei Gleichstand entscheidet `access_count`, dann die zuletzt aktualisierte `updated_at`). `merge` leitet `target_id` niemals daraus ab — ein Aufrufer muss sie explizit benennen. `cursor` ist `null`, sobald die gescannte Seite kleiner als `consolidation.max_scan_per_call` ist; zum Fortsetzen des Scans über mehrere Aufrufe hinweg zurückgeben.
 
+Die Nachbarschaftsabfragen, die eine gescannte Seite benötigt, laufen mit höchstens
+`consolidation.neighbor_discovery_concurrency` (Standard `8`) gleichzeitig — begrenzt,
+damit eine große Seite weder eine Abfrage nach der anderen seriell abarbeitet noch alle
+Abfragen der Seite gleichzeitig auslöst. Läuft der Fan-out noch, wenn
+`consolidation.neighbor_discovery_deadline_ms` (Standard `10000`) abgelaufen ist, kehrt
+`list` vorzeitig mit einem nicht-null `cursor` zurück, der direkt nach dem letzten
+Mitglied fortsetzt, dessen Nachbarn aufgelöst wurden — ein Mitglied, das die Frist vorher
+abgeschnitten hat, wird in diesem Aufruf keinem Cluster zugeordnet und beim nächsten
+`list`-Aufruf mit diesem Cursor (mit neuer Nachbarschaftssuche) erneut aufgegriffen.
+
 **Ausgabe (`action: "merge"`):**
 
 ```json
@@ -3812,8 +4127,12 @@ Der Server ist unter `http://localhost:3721` erreichbar (standardmäßig nur auf
 Host-Loopback veröffentlicht). Gesundheitszustand prüfen mit:
 
 ```bash
-curl http://localhost:3721/health
+curl http://localhost:3721/health/live
 ```
+
+Der eigene `HEALTHCHECK` des Containers fragt aus demselben Grund `/health/live` ab:
+er läuft ohne Anmeldedaten, und der vollständige Diagnose-Snapshot `/health` erfordert
+Bearer-Auth (siehe [Gesundheitszustand & Metriken](#gesundheitszustand--metriken)).
 
 ### Sicherheitsstandards
 
@@ -3821,12 +4140,12 @@ Der Container bindet die API an `0.0.0.0`, damit der veröffentlichte Port errei
 und ist **standardmäßig authentifiziert**:
 
 - Ist `BHGBRAIN_TOKEN` nicht gesetzt, **generiert** der Entrypoint beim ersten Start
-  ein Bearer-Token, speichert es dauerhaft unter `/data/bhgbrain-token` und gibt es in
-  den Logs aus. Abrufen mit:
+  ein Bearer-Token und speichert es dauerhaft unter `/data/bhgbrain-token` (Datei-Modus
+  nur für den Besitzer). Der Token-Wert selbst wird nie in die Container-Logs
+  geschrieben — nur der Pfad, unter dem er gespeichert wurde —, sodass `docker compose
+  logs` allein niemals ein gültiges Zugangstoken preisgeben kann. Abrufen mit:
 
   ```bash
-  docker compose logs bhgbrain | grep token
-  # oder
   docker compose exec bhgbrain cat /data/bhgbrain-token
   ```
 
@@ -3839,6 +4158,12 @@ und ist **standardmäßig authentifiziert**:
 - Der veröffentlichte Port wird auf Host-Loopback abgebildet (`127.0.0.1:3721:3721`),
   sodass die API standardmäßig nicht im LAN erreichbar ist. Ändern Sie das Mapping in
   `docker-compose.yml`, um sie extern verfügbar zu machen.
+
+- Der Qdrant-Sidecar des `self-hosted`-Profils ist aus demselben Grund nur auf Loopback
+  gebunden (`127.0.0.1:6333:6333`) — Qdrant hat in diesem Stack keine eigene
+  Authentifizierung, sodass sonst jeder gespeicherte Vektor/jedes Payload für jeden im
+  LAN erreichbar wäre. Erweitern Sie das Port-Mapping nur hinter Ihrem eigenen
+  authentifizierten Reverse-Proxy/Ihrer eigenen Firewall.
 
 - Um bewusst **ohne** Authentifizierung zu laufen, setzen Sie
   `BHGBRAIN_ALLOW_UNAUTHENTICATED=true` (der Server protokolliert eine Warnung; nicht
@@ -4014,13 +4339,13 @@ Die Sicherung wird im Datenverzeichnis gespeichert (`%LOCALAPPDATA%\BHGBrain\` u
 
 `backup.restore` lädt den Laufzeit-SQLite-Zustand vor der Rückgabe des Erfolgs neu. Wiederherstellungsantworten enthalten `metadata_activated: true`, wenn die wiederhergestellten Daten sofort aktiv sind. Der Server muss nicht neu gestartet werden.
 
-Die Wiederherstellung erwirbt eine Fail-Safe-Sperre (`beginRestoreOperation()`), die gleichzeitige Schreibvorgänge nur so lange blockiert, wie SQLite aktiviert und die wiederhergestellten Vektoren auf Abweichungen (Drift) gegenüber Qdrant geprüft werden. Vektoren werden **nicht** bedingungslos geleert und neu eingebettet: Nur Erinnerungen, deren Inhalts-Prüfsumme von Qdrant abweicht (oder dort fehlt), werden für ein erneutes Embedding markiert, sodass eine Wiederherstellung ohne Abweichungen abgeschlossen wird, ohne den Embedding-Anbieter überhaupt aufzurufen. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben oder der Qdrant-Zustand nicht gelesen werden kann, greift stattdessen ein vollständiger Neuaufbau.
+Die Wiederherstellung erwirbt eine Fail-Safe-Sperre (`beginRestoreOperation()`, zusätzlich zur prozessübergreifenden `.restore.lock`-Datei und der eigenen Sperrprüfung jeder Mutation — siehe [Aus Sicherung wiederherstellen](#aus-sicherung-wiederherstellen)), die gleichzeitige Schreibvorgänge blockiert, während der Kandidat in einer Scratch-Kopie validiert, die Live-/Kandidat-Datenbankdateien ausgetauscht und die wiederhergestellten Vektoren auf Abweichungen und Überschuss gegenüber Qdrant geprüft werden. Vektoren werden **nicht** bedingungslos geleert und neu eingebettet: Nur Erinnerungen, deren Inhalts-Prüfsumme von Qdrant abweicht (oder dort fehlt), werden für ein erneutes Embedding markiert, sodass eine Wiederherstellung ohne Abweichungen abgeschlossen wird, ohne den Embedding-Anbieter überhaupt aufzurufen. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben, greift stattdessen ein vollständiger Neuaufbau; wenn der Qdrant-Zustand einfach nicht gelesen werden kann (ein vorübergehender Ausfall), wird der Bestand konservativ neu eingebettet, ohne etwas zu löschen, und als eigene Ursache `inspection-failed` gemeldet, statt fälschlich als Modelländerung eingestuft zu werden.
 
-Sobald die Drift-Prüfung abgeschlossen ist, wird die Sperre freigegeben — das erneute Embedding der abweichenden Teilmenge (falls vorhanden) läuft in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf), anstatt den Wiederherstellungsaufruf zu blockieren oder andere Schreibvorgänge währenddessen aufzuhalten. Bei vorübergehenden Fehlern wird automatisch mit Backoff wiederholt; falls die Abgleichung nie vollständig aufholt, meldet `health://status` weiterhin `vector_reconciliation.state: "pending"` (oder `"reconciling"`, während ein Durchlauf läuft), anstatt die semantische Suche stillschweigend leer zu lassen. Der Fortschritt wird in Batch-Granularität auf die Festplatte geschrieben, sodass ein harter Absturz während der Abgleichung höchstens einen Batch an Arbeit verliert — ein Neustart setzt über idempotentes Re-Upsert sicher bei der verbleibenden nicht synchronisierten Menge fort.
+Sobald die Drift-/Überschuss-Prüfung abgeschlossen ist, wird die Sperre freigegeben — das erneute Embedding der abweichenden Teilmenge (falls vorhanden) läuft in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf), anstatt den Wiederherstellungsaufruf zu blockieren oder andere Schreibvorgänge währenddessen aufzuhalten. Bei vorübergehenden Fehlern wird automatisch mit Backoff wiederholt; falls die Abgleichung nie vollständig aufholt, meldet `health://status` weiterhin `vector_reconciliation.state: "pending"` (oder `"reconciling"`, während ein Durchlauf läuft), anstatt die semantische Suche stillschweigend leer zu lassen. Der Fortschritt wird in Batch-Granularität auf die Festplatte geschrieben, sodass ein harter Absturz während der Abgleichung höchstens einen Batch an Arbeit verliert — ein Neustart setzt über idempotentes Re-Upsert sicher bei der verbleibenden nicht synchronisierten Menge fort. Die Löschung von vektor-only Überschuss (Punkte ohne wiederhergestellte SQLite-Zeile) läuft synchron als Teil der Drift-/Überschuss-Prüfung selbst, in begrenzten Batches; ein Batch, dessen Löschung fehlschlägt, hält `vector_reconciliation` degradiert mit der verbleibenden Anzahl, statt fälschlich als gesund über unbereinigte Waisen-Arbeit gemeldet zu werden.
 
 ### HTTP-Absicherung
 
-- `/health` ist absichtlich unauthentifiziert für Probe-Kompatibilität.
+- `/health/live` und `/health/ready` sind absichtlich unauthentifiziert für Probe-Kompatibilität; der vollständige Diagnose-Snapshot `/health` erfordert dieselbe Bearer-Auth wie jede andere Route. Siehe [Gesundheitszustand & Metriken](#gesundheitszustand--metriken).
 - Rate Limiting verwendet die vertrauenswürdige Anfragen-Identität (IP) und ignoriert `x-client-id` für die Durchsetzung.
 - Die `client_id` in Audit-/Anfrageprotokollen wird ebenso von der vertrauenswürdigen Anfragen-Identität (`req.ip`) abgeleitet, niemals vom vom Aufrufer angegebenen `x-client-id`-Header — dieser Header wird nur als nicht-maßgeblicher Debug-Hinweis akzeptiert und nie für die Audit-Spur vertraut.
 - `memory://list` erzwingt `limit`-Grenzen von `1..100`; ungültige Werte geben `INVALID_INPUT` zurück.

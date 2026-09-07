@@ -1,5 +1,16 @@
 import type { BrainConfig } from '../config/index.js';
+import type { CircuitBreaker } from '../resilience/index.js';
+import type { MetricsCollector } from '../health/metrics.js';
 import { BrainError, internal } from '../errors/index.js';
+import {
+  executeLlmRequest,
+  extractChatMessageContent,
+  requireApiKey,
+  resolveApiKey,
+  resolveLlmBaseUrl,
+  resolveLlmRetryConfig,
+  LlmRequestError,
+} from '../llm/client.js';
 
 /**
  * Three-way relationship between an existing memory and a new candidate that
@@ -11,8 +22,6 @@ import { BrainError, internal } from '../errors/index.js';
 export type EntailmentLabel = 'agree' | 'refine' | 'contradict';
 
 const VALID_LABELS: readonly EntailmentLabel[] = ['agree', 'refine', 'contradict'];
-
-const CHAT_COMPLETIONS_URL = 'https://api.openai.com/v1/chat/completions';
 
 const SYSTEM_PROMPT = [
   'You classify the relationship between an EXISTING memory and a CANDIDATE memory',
@@ -30,85 +39,122 @@ const SYSTEM_PROMPT = [
   'ones. Respond with only the single word: agree, refine, or contradict.',
 ].join('\n');
 
+interface EntailmentLogger {
+  warn: (obj: Record<string, unknown>) => void;
+}
+
 /**
  * Minimal, single-purpose chat-completions call used only for the three-way
- * entailment classification below. Modeled on the `fetch`-based pattern in
- * `OpenAIEmbeddingProvider` (`src/embedding/index.ts`): resolve the API key
- * from the env var named by config, POST JSON, parse JSON back. Not a
- * reusable extraction framework — see design.md Decisions, "Prerequisite /
- * gating", option 2.
+ * entailment classification below, routed through the shared OpenAI-
+ * compatible request boundary (`src/llm/client.ts` — unify-llm-client-
+ * boundaries) so it gets the same base-URL resolution, deadline-through-
+ * body-parse coverage, HTTP/network classification, capped-jitter retry, and
+ * (when a breaker is supplied) circuit-breaker integration as every other
+ * migrated chat feature — previously this was the one migrated-later
+ * outlier: a bare `fetch` with a timeout but no retry, no breaker, and no
+ * metrics (task 2.1).
  *
  * Always throws a `BrainError` (never resolves to a value outside
  * `EntailmentLabel`) on timeout, network error, non-2xx response, or an
  * unparseable/off-list response — the caller in `src/pipeline/index.ts` is
  * expected to catch it and fail open rather than silently treat a malformed
- * response as `contradict`.
+ * response as `contradict`. The thrown `BrainError.retryable` mirrors the
+ * underlying classified failure (design.md Decision #6: "Preserve original
+ * classified errors at feature boundaries") so the caller's fail-open
+ * telemetry retains the real cause instead of a generic flag.
  */
 export async function checkEntailment(
   existing: string,
   candidate: string,
   config: BrainConfig,
+  breaker?: CircuitBreaker,
+  metrics?: MetricsCollector,
+  logger?: EntailmentLogger,
 ): Promise<EntailmentLabel> {
-  const apiKey = process.env[config.pipeline.extraction_model_env];
-  if (!apiKey) {
-    throw internal(`Missing environment variable: ${config.pipeline.extraction_model_env}`);
-  }
-
   const timeoutMs = config.pipeline.contradiction_detection.timeout_ms;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const baseUrl = resolveLlmBaseUrl(config.llm?.base_url);
+  const retry = resolveLlmRetryConfig(config.llm?.retry);
 
+  const start = Date.now();
   try {
-    let response: Response;
-    try {
-      response = await fetch(CHAT_COMPLETIONS_URL, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: config.pipeline.extraction_model,
-          temperature: 0,
-          messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: `EXISTING memory: ${existing}\nCANDIDATE memory: ${candidate}` },
-          ],
-        }),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
-        throw internal(`Entailment check timed out after ${timeoutMs}ms`);
-      }
-      throw internal(`Entailment check request failed: ${(err as Error).message}`);
-    }
+    const apiKey = requireApiKey(config.pipeline.extraction_model_env, { fallbackToOpenAI: true });
 
-    if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw internal(`Entailment check API error ${response.status}: ${body.slice(0, 200)}`);
-    }
+    const label = await executeLlmRequest({
+      url: `${baseUrl}/chat/completions`,
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: {
+        model: config.pipeline.extraction_model,
+        temperature: 0,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: `EXISTING memory: ${existing}\nCANDIDATE memory: ${candidate}` },
+        ],
+      },
+      timeoutMs,
+      retry,
+      breaker,
+      useBreaker: breaker !== undefined,
+      errorPrefix: 'Entailment check',
+      parseResponse: async response => {
+        const raw = await extractChatMessageContent(response, 'Entailment check');
+        const normalized = raw.trim().toLowerCase();
+        const label = VALID_LABELS.find(candidateLabel => candidateLabel === normalized);
+        if (!label) {
+          throw new Error(`Entailment check returned an unrecognized label: ${JSON.stringify(normalized).slice(0, 100)}`);
+        }
+        return label;
+      },
+    });
 
-    let data: { choices?: Array<{ message?: { content?: string } }> };
-    try {
-      data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-    } catch (err) {
-      throw internal(`Entailment check returned unparseable JSON: ${(err as Error).message}`);
-    }
-
-    const raw = data.choices?.[0]?.message?.content?.trim().toLowerCase() ?? '';
-    const label = VALID_LABELS.find(candidateLabel => candidateLabel === raw);
-    if (!label) {
-      throw internal(`Entailment check returned an unrecognized label: ${JSON.stringify(raw).slice(0, 100)}`);
-    }
-
+    metrics?.incCounter('entailment_check_total', 1, { result: label });
     return label;
   } catch (err) {
+    if (err instanceof LlmRequestError) {
+      metrics?.incCounter('entailment_check_failed_total', 1, { code: err.code });
+      logger?.warn({
+        event: 'entailment_check_failed',
+        code: err.code,
+        retryable: err.retryable,
+        status: err.status,
+        error: err.message,
+      });
+      throw new BrainError('INTERNAL', `Entailment check failed: ${err.message}`, err.retryable);
+    }
     if (err instanceof BrainError) {
+      metrics?.incCounter('entailment_check_failed_total', 1, { code: err.code });
       throw err;
     }
+    metrics?.incCounter('entailment_check_failed_total', 1, { code: 'unknown' });
     throw internal(`Entailment check failed: ${(err as Error).message}`);
   } finally {
-    clearTimeout(timer);
+    metrics?.recordHistogram('entailment_check_ms', Date.now() - start);
+  }
+}
+
+/**
+ * Emits a structured startup warning when `contradiction_detection.enabled`
+ * is `true` but no usable API key resolves (extraction_model_env, falling
+ * back to OPENAI_API_KEY) — mirrors `warnIfExtractionDegraded`/
+ * `warnIfSummarizationDegraded`/`warnIfQueryExpansionDegraded`. Before this
+ * (task 3.2), a misconfigured contradiction-detection deployment surfaced
+ * only as a per-write `contradiction_check_degraded` warning on the first
+ * UPDATE-band candidate — a real but easy-to-miss signal buried in request
+ * logs rather than a one-time, actionable startup diagnostic.
+ */
+export function warnIfEntailmentDegraded(
+  config: BrainConfig,
+  logger: EntailmentLogger,
+): void {
+  if (!config.pipeline.contradiction_detection.enabled) return;
+
+  const key = resolveApiKey(config.pipeline.extraction_model_env, { fallbackToOpenAI: true });
+  if (!key) {
+    logger.warn({
+      event: 'entailment_degraded_startup',
+      reason: 'missing extraction provider credentials',
+    });
   }
 }

@@ -167,6 +167,26 @@ describe('LLMQueryExpansionProvider', () => {
     delete process.env.BHGBRAIN_EXTRACTION_API_KEY;
   });
 
+  // unify-llm-client-boundaries task 2.3: an HTTP failure now records exactly
+  // one breaker outcome for the whole `generateVariants()` call, including
+  // every internal retry attempt.
+  it('records a single breaker failure across a whole retried HTTP-error call', async () => {
+    process.env.BHGBRAIN_EXTRACTION_API_KEY = 'test-key';
+    const fetchMock = vi.fn(async () => chatResponse({ error: 'nope' }, 500));
+    vi.stubGlobal('fetch', fetchMock);
+    const breaker = {
+      execute: vi.fn(async <T>(fn: () => Promise<T>) => fn()),
+    } as unknown as import('../resilience/index.js').CircuitBreaker;
+
+    const provider = new LLMQueryExpansionProvider(createConfig(), breaker);
+    const result = await provider.generateVariants('q', 'paraphrase', 2, 3000);
+
+    expect(result).toEqual([]);
+    expect(breaker.execute).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+    delete process.env.BHGBRAIN_EXTRACTION_API_KEY;
+  });
+
   it('increments the degraded counter and logs on failure', async () => {
     process.env.BHGBRAIN_EXTRACTION_API_KEY = 'test-key';
     vi.stubGlobal('fetch', vi.fn(async () => chatResponse({ error: 'nope' }, 500)));

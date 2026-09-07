@@ -8,10 +8,11 @@ import { normalizeContent, computeChecksum, generateSummary, containsSecret, det
 import { extractAutoTags } from '../domain/auto-tag.js';
 import { summarizeContent } from '../domain/summarize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
-import { invalidInput, internal } from '../errors/index.js';
+import { invalidInput, internal, BrainError } from '../errors/index.js';
 import { checkEntailment } from './entailment.js';
 import { NoopExtractionProvider, type ExtractionProvider } from './extraction.js';
 import type { SummarizationProvider } from '../summarization/index.js';
+import type { CircuitBreaker } from '../resilience/index.js';
 
 interface MemoryCandidate {
   content: string;
@@ -50,6 +51,14 @@ export class WritePipeline {
     extraction?: ExtractionProvider,
     private metrics?: MetricsCollector,
     private summarizer?: SummarizationProvider,
+    // unify-llm-client-boundaries task 2.1: entailment now goes through the
+    // shared request executor's breaker integration like every other
+    // migrated chat feature. Optional/trailing so every existing call site
+    // that omits it keeps working with entailment behaving exactly as
+    // before (unbreakered — a failing entailment call still fails the
+    // individual `checkContradiction` call and open-fails, it just never
+    // trips a breaker).
+    private entailmentBreaker?: CircuitBreaker,
   ) {
     this.lifecycle = new MemoryLifecycleService(config);
     this.extraction = extraction ?? new NoopExtractionProvider();
@@ -84,6 +93,20 @@ export class WritePipeline {
     // leaving this parameter's behavior a no-op for them. See
     // add-memory-distillation.
     derived_from?: string[] | null;
+    // Reuses an already-computed embedding instead of calling
+    // `embedding.embed()` again — the batched-import path (`handleImport`,
+    // bound-corpus-scale-workflows task 3.2) embeds a whole chunk batch in
+    // one `embedBatch` round trip up front, then feeds each chunk's vector
+    // in here so `decide()`'s own embed call is skipped. Only honored when
+    // extraction resolves to exactly the single, unmodified `content` this
+    // vector was computed from (see below) — multi-candidate extraction (or
+    // any candidate whose content extraction rewrote) still embeds fresh,
+    // since the precomputed vector would no longer describe that candidate's
+    // actual text. A checksum-exact-duplicate candidate (Step 1 of
+    // `decide()`) never reaches the embedding step regardless, so this is
+    // simply unused (not wasted work beyond the one batched API call) on a
+    // NOOP outcome — see `decide()`'s dedup-before-embed ordering.
+    precomputedEmbedding?: number[];
   }): Promise<WriteResult[]> {
     const normalized = normalizeContent(input.content);
 
@@ -103,7 +126,15 @@ export class WritePipeline {
     for (const [index, candidate] of candidates.entries()) {
       attempted += 1;
       try {
-        const result = await this.decide(candidate, input);
+        // Safe to reuse the precomputed vector only when extraction left
+        // exactly one candidate whose content is byte-identical to what the
+        // vector was computed from — otherwise it describes different text.
+        const embeddingForCandidate = input.precomputedEmbedding !== undefined
+          && candidates.length === 1
+          && candidate.content === normalized
+          ? input.precomputedEmbedding
+          : undefined;
+        const result = await this.decide(candidate, input, embeddingForCandidate);
         results.push(result);
       } catch (err) {
         lastError = err;
@@ -195,6 +226,7 @@ export class WritePipeline {
       confidence?: number;
       derived_from?: string[] | null;
     },
+    precomputedEmbedding?: number[],
   ): Promise<WriteResult> {
     const checksum = computeChecksum(candidate.content);
     const now = new Date().toISOString();
@@ -237,7 +269,7 @@ export class WritePipeline {
     // `summarizeContent` itself never rejects (it catches internally and
     // falls back to the extractive tier).
     const [embedResult, summaryResult] = await Promise.allSettled([
-      this.embedding.embed(candidate.content),
+      precomputedEmbedding !== undefined ? Promise.resolve(precomputedEmbedding) : this.embedding.embed(candidate.content),
       summarizeContent(candidate.content, this.config, this.summarizer, this.logger),
     ]);
 
@@ -513,13 +545,30 @@ export class WritePipeline {
     }
 
     try {
-      const label = await checkEntailment(existing.content, candidateContent, this.config);
+      const label = await checkEntailment(
+        existing.content,
+        candidateContent,
+        this.config,
+        this.entailmentBreaker,
+        this.metrics,
+        this.logger,
+      );
       return label === 'contradict';
     } catch (err) {
+      // unify-llm-client-boundaries: `checkEntailment` now preserves the
+      // original classified failure's code/retryability on the thrown
+      // BrainError (design.md Decision #6) — surface both here so the
+      // fail-open telemetry retains the real cause, not just a message
+      // string (task 2.1: "verify fail-open behavior retains cause
+      // telemetry").
+      const code = err instanceof BrainError ? err.code : undefined;
+      const retryable = err instanceof BrainError ? err.retryable : undefined;
       this.logger?.warn({
         event: 'contradiction_check_degraded',
         namespace,
         collection,
+        code,
+        retryable,
         error: (err as Error).message,
       });
       return false;

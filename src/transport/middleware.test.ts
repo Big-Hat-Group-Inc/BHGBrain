@@ -14,7 +14,7 @@ vi.mock('node:crypto', async (importOriginal) => {
   };
 });
 
-type ResponseDouble = Pick<Response, 'status' | 'json' | 'setHeader'>;
+type ResponseDouble = Pick<Response, 'json' | 'setHeader'> & { status: (code: number) => ResponseDouble };
 
 function createResponseDouble(): ResponseDouble {
   const response: Partial<ResponseDouble> = {};
@@ -25,7 +25,29 @@ function createResponseDouble(): ResponseDouble {
 }
 
 describe('transport middleware hardening', () => {
-  it('bypasses auth for /health even when token is configured', () => {
+  // bound-qdrant-http-runtime task 2.1: the full diagnostic snapshot is
+  // exposed at `/health` and now requires auth like every other route —
+  // only `/health/ready` (the bounded readiness probe) stays exempt.
+  it('bypasses auth for /health/ready even when token is configured', () => {
+    process.env.BHGBRAIN_TOKEN = 'secret-token';
+
+    const logger = { warn: vi.fn() } as unknown as pino.Logger;
+    const config = {
+      transport: { http: { bearer_token_env: 'BHGBRAIN_TOKEN' } },
+    } as unknown as BrainConfig;
+    const middleware = createAuthMiddleware(config, logger);
+
+    const req = { path: '/health/ready', headers: {} } as unknown as Request;
+    const res = createResponseDouble() as unknown as Response;
+    const next = vi.fn() as unknown as NextFunction;
+
+    middleware(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it('requires auth for the full diagnostic /health snapshot when a token is configured', () => {
     process.env.BHGBRAIN_TOKEN = 'secret-token';
 
     const logger = { warn: vi.fn() } as unknown as pino.Logger;
@@ -40,8 +62,8 @@ describe('transport middleware hardening', () => {
 
     middleware(req, res, next);
 
-    expect(next).toHaveBeenCalledTimes(1);
-    expect(res.status).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(401);
   });
 
   it('authenticates a matching bearer token via constant-time comparison', () => {
@@ -141,28 +163,64 @@ describe('transport middleware hardening', () => {
     expect(metrics.incCounter).toHaveBeenCalledWith('bhgbrain_rate_limited_total');
   });
 
-  it('evicts expired buckets over time', () => {
-    const metrics = { setGauge: vi.fn(), incCounter: vi.fn() } as unknown as MetricsCollector;
-    const config = { security: { rate_limit_rpm: 100 } } as unknown as BrainConfig;
-    const middleware = createRateLimitMiddleware(config, undefined, metrics);
+  // bound-qdrant-http-runtime task 2.4: the sweep is now an independent
+  // timer (not opportunistically piggybacked on request arrival), so this
+  // exercises it via fake timers rather than mocking Date.now directly.
+  it('evicts expired buckets via the independent sweep timer', () => {
+    vi.useFakeTimers();
+    try {
+      const metricsDouble = { setGauge: vi.fn(), incCounter: vi.fn() };
+      const metrics = metricsDouble as unknown as MetricsCollector;
+      const config = { security: { rate_limit_rpm: 100, rate_limit_max_buckets: 10_000 } } as unknown as BrainConfig;
+      const middleware = createRateLimitMiddleware(config, undefined, metrics);
 
-    const now = vi.spyOn(Date, 'now');
-    now.mockReturnValue(0);
+      const req1 = { ip: '10.0.0.2', headers: {} } as unknown as Request;
+      const res1 = createResponseDouble() as unknown as Response;
+      middleware(req1, res1, vi.fn());
 
-    const req1 = { ip: '10.0.0.2', headers: {} } as unknown as Request;
+      // Past both the 60s bucket window and (at least once) the 30s sweep
+      // interval, with no further requests in between.
+      vi.advanceTimersByTime(65_000);
+
+      const req2 = { ip: '10.0.0.3', headers: {} } as unknown as Request;
+      const res2 = createResponseDouble() as unknown as Response;
+      middleware(req2, res2, vi.fn());
+
+      const lastGaugeCall = metricsDouble.setGauge.mock.calls[metricsDouble.setGauge.mock.calls.length - 1];
+      expect(lastGaugeCall[0]).toBe('bhgbrain_rate_limit_buckets');
+      expect(lastGaugeCall[1]).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // bound-qdrant-http-runtime task 2.4: fail-closed capacity policy.
+  it('fails closed with 429 for a new client once the bucket map is at capacity', () => {
+    const config = { security: { rate_limit_rpm: 100, rate_limit_max_buckets: 2 } } as unknown as BrainConfig;
+    const middleware = createRateLimitMiddleware(config);
+
+    const req1 = { ip: '10.2.0.1', headers: {} } as unknown as Request;
+    const req2 = { ip: '10.2.0.2', headers: {} } as unknown as Request;
+    const req3 = { ip: '10.2.0.3', headers: {} } as unknown as Request;
     const res1 = createResponseDouble() as unknown as Response;
-    middleware(req1, res1, vi.fn());
-
-    now.mockReturnValue(61_000);
-    const req2 = { ip: '10.0.0.3', headers: {} } as unknown as Request;
     const res2 = createResponseDouble() as unknown as Response;
+    const res3 = createResponseDouble() as unknown as Response;
+
+    middleware(req1, res1, vi.fn());
     middleware(req2, res2, vi.fn());
+    middleware(req3, res3, vi.fn());
 
-    const lastGaugeCall = metrics.setGauge.mock.calls[metrics.setGauge.mock.calls.length - 1];
-    expect(lastGaugeCall[0]).toBe('bhgbrain_rate_limit_buckets');
-    expect(lastGaugeCall[1]).toBe(1);
+    expect(res1.status).not.toHaveBeenCalled();
+    expect(res2.status).not.toHaveBeenCalled();
+    expect(res3.status).toHaveBeenCalledWith(429);
 
-    now.mockRestore();
+    // An already-bucketed client keeps working — capacity only blocks
+    // admitting a genuinely new identity.
+    const res1Again = createResponseDouble() as unknown as Response;
+    const nextAgain = vi.fn();
+    middleware(req1, res1Again, nextAgain);
+    expect(nextAgain).toHaveBeenCalledTimes(1);
+    expect(res1Again.status).not.toHaveBeenCalled();
   });
 
   it('fails closed with 400 when no client identity can be derived', () => {

@@ -103,6 +103,17 @@ describe('CleanupScheduler', () => {
     scheduler.stop();
   });
 
+  it('records an unarmed failed state when runtime scheduling cannot compute a run', () => {
+    const retention = { runGc: vi.fn() } as unknown as RetentionService;
+    const scheduler = new CleanupScheduler(
+      config({ cleanup_schedule: '0 0 31 2 *' }), retention, { info: vi.fn(), error: vi.fn() },
+    );
+
+    scheduler.start();
+
+    expect(scheduler.getState()).toMatchObject({ armed: false, failure: expect.stringContaining('Could not compute') });
+  });
+
   it('reschedules after a run fails so one bad tick does not end scheduled cleanup', async () => {
     const runGc = vi.fn(async () => {
       throw new Error('boom');

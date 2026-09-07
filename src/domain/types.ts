@@ -196,6 +196,13 @@ export interface BackupInfo {
   size_bytes: number;
   memory_count: number;
   created_at: string;
+  // true when this backup's metadata row has no corresponding file on disk
+  // any more (deleted outside BackupService, or a prior retention pass that
+  // couldn't remove the file but did clear the row would not reach this —
+  // this instead covers the file vanishing without metadata cleanup, e.g.
+  // manual deletion). `list()` never presents a missing artifact as valid.
+  // See make-backup-restore-transactional task 3.4.
+  missing: boolean;
 }
 
 export interface ComponentHealth {
@@ -222,6 +229,7 @@ export interface HealthSnapshot {
     embedding: ComponentHealth;
     vector_reconciliation: VectorReconciliationStatus;
     retention?: ComponentHealth;
+    schedulers?: ComponentHealth;
   };
   memory_count: number;
   db_size_bytes: number;
@@ -301,6 +309,11 @@ export interface LifecycleAuditDetails {
   // memory ids this distilled memory replaces (mirrors `derived_from` on the
   // record itself). See add-memory-distillation.
   derived_from?: string[];
+  // Present on a best-effort DELETE audit when a remote/local consistency
+  // compensation also fails. The primary error stays caller-visible while
+  // operators retain both causes in durable structured state.
+  consistency_error?: string;
+  compensation_error?: string;
 }
 
 export interface PaginatedResult<T> {

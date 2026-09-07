@@ -24,8 +24,14 @@ services:
     image: qdrant/qdrant:v1.12.4
     profiles:
       - self-hosted
+    # Loopback-only, matching the bhgbrain service's own default: Qdrant has no
+    # authentication configured in this stack, so publishing it on every
+    # interface would serve every stored vector (and its memory payload) to
+    # anyone on the LAN. Change to "6333:6333" only behind your own
+    # authenticated reverse proxy / firewall (align-runtime-entrypoint-contracts
+    # task 1.4).
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:

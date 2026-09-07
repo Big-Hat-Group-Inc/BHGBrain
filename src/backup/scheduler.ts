@@ -10,6 +10,12 @@ export interface CronSchedule {
   dayOfWeek: number[];
 }
 
+export interface SchedulerState {
+  armed: boolean;
+  last_run_at: string | null;
+  failure: string | null;
+}
+
 function parseCronPart(part: string, min: number, max: number): number[] {
   const [base, stepStr] = part.split('/');
   const step = stepStr !== undefined ? Number(stepStr) : 1;
@@ -145,6 +151,7 @@ export function nextRunAfter(schedule: CronSchedule, from: Date): Date {
 export class CleanupScheduler {
   private timer: NodeJS.Timeout | null = null;
   private stopped = true;
+  private state: SchedulerState = { armed: false, last_run_at: null, failure: null };
 
   constructor(
     private config: BrainConfig,
@@ -158,6 +165,7 @@ export class CleanupScheduler {
   start(): void {
     if (!this.config.retention.scheduled_cleanup_enabled) {
       this.logger?.info({ event: 'retention_scheduler_disabled' });
+      this.state = { ...this.state, armed: false, failure: null };
       return;
     }
     this.stopped = false;
@@ -166,10 +174,15 @@ export class CleanupScheduler {
 
   stop(): void {
     this.stopped = true;
+    this.state = { ...this.state, armed: false };
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+  }
+
+  getState(): SchedulerState {
+    return { ...this.state };
   }
 
   private scheduleNext(): void {
@@ -181,6 +194,7 @@ export class CleanupScheduler {
       const next = nextRunAfter(schedule, new Date());
       delayMs = Math.max(0, next.getTime() - Date.now());
     } catch (err) {
+      this.state = { ...this.state, armed: false, failure: (err as Error).message };
       this.logger?.error?.({
         event: 'retention_scheduler_invalid_cron',
         cleanup_schedule: this.config.retention.cleanup_schedule,
@@ -189,6 +203,7 @@ export class CleanupScheduler {
       return;
     }
 
+    this.state = { ...this.state, armed: true, failure: null };
     this.logger?.info({ event: 'retention_scheduler_next_run', delay_ms: delayMs });
     this.timer = setTimeout(() => {
       void this.runOnce();
@@ -197,9 +212,11 @@ export class CleanupScheduler {
   }
 
   private async runOnce(): Promise<void> {
+    this.state = { ...this.state, last_run_at: new Date().toISOString() };
     try {
       await this.retention.runGc();
     } catch (err) {
+      this.state = { ...this.state, failure: (err as Error).message };
       this.logger?.error?.({ event: 'retention_scheduler_run_failed', error: (err as Error).message });
     } finally {
       this.scheduleNext();
@@ -220,6 +237,7 @@ export class CleanupScheduler {
 export class DistillationScheduler {
   private timer: NodeJS.Timeout | null = null;
   private stopped = true;
+  private state: SchedulerState = { armed: false, last_run_at: null, failure: null };
 
   constructor(
     private config: BrainConfig,
@@ -233,6 +251,7 @@ export class DistillationScheduler {
   start(): void {
     if (!this.config.retention.distillation.enabled) {
       this.logger?.info({ event: 'distillation_scheduler_disabled' });
+      this.state = { ...this.state, armed: false, failure: null };
       return;
     }
     this.stopped = false;
@@ -241,10 +260,15 @@ export class DistillationScheduler {
 
   stop(): void {
     this.stopped = true;
+    this.state = { ...this.state, armed: false };
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+  }
+
+  getState(): SchedulerState {
+    return { ...this.state };
   }
 
   private scheduleNext(): void {
@@ -256,6 +280,7 @@ export class DistillationScheduler {
       const next = nextRunAfter(schedule, new Date());
       delayMs = Math.max(0, next.getTime() - Date.now());
     } catch (err) {
+      this.state = { ...this.state, armed: false, failure: (err as Error).message };
       this.logger?.error?.({
         event: 'distillation_scheduler_invalid_cron',
         schedule: this.config.retention.distillation.schedule,
@@ -264,6 +289,7 @@ export class DistillationScheduler {
       return;
     }
 
+    this.state = { ...this.state, armed: true, failure: null };
     this.logger?.info({ event: 'distillation_scheduler_next_run', delay_ms: delayMs });
     this.timer = setTimeout(() => {
       void this.runOnce();
@@ -272,9 +298,11 @@ export class DistillationScheduler {
   }
 
   private async runOnce(): Promise<void> {
+    this.state = { ...this.state, last_run_at: new Date().toISOString() };
     try {
       await this.distillation.runOnce();
     } catch (err) {
+      this.state = { ...this.state, failure: (err as Error).message };
       this.logger?.error?.({ event: 'distillation_scheduler_run_failed', error: (err as Error).message });
     } finally {
       this.scheduleNext();

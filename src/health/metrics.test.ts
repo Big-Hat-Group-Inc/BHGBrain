@@ -62,7 +62,7 @@ describe('MetricsCollector', () => {
         fallback_to_threshold_dedup: true,
       },
       auto_summarize: true,
-    };
+    } as unknown as BrainConfig;
   }
 
   it('emits histogram avg/count and percentile entries', () => {
