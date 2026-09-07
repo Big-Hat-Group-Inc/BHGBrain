@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, existsSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import { atomicWriteFileSync } from '../storage/sqlite.js';
+import type { LifecycleOperationToken } from '../storage/sqlite.js';
 import type { BackupInfo, RestoreResult, VectorReconciliationStatus } from '../domain/types.js';
 import { BrainError, invalidInput, internal } from '../errors/index.js';
 import type pino from 'pino';
@@ -16,14 +17,31 @@ import type pino from 'pino';
 // small and portable and avoids coupling the backup format to a specific
 // vector store's snapshot format; see openspec/changes/
 // bound-restore-reconciliation/design.md for the reasoning.
-const BACKUP_FORMAT_VERSION = 1;
+const BACKUP_FORMAT_VERSION = 2;
 
 interface BackupHeader {
   version: number;
   memory_count: number;
   checksum: string;
+  created_at?: string;
   embedding_model?: string;
   embedding_dimensions?: number;
+  header_checksum?: string;
+}
+
+function canonicalHeaderMetadata(header: Omit<BackupHeader, 'header_checksum'>): string {
+  return JSON.stringify({
+    version: header.version,
+    memory_count: header.memory_count,
+    checksum: header.checksum,
+    created_at: header.created_at ?? null,
+    embedding_model: header.embedding_model ?? null,
+    embedding_dimensions: header.embedding_dimensions ?? null,
+  });
+}
+
+function headerChecksum(header: Omit<BackupHeader, 'header_checksum'>): string {
+  return createHash('sha256').update(canonicalHeaderMetadata(header)).digest('hex');
 }
 
 export class BackupService {
@@ -33,6 +51,9 @@ export class BackupService {
   // restore lifecycle lock (or decided reconciliation needs no lock at all),
   // so the outer restore()'s finally block does not try to release it again.
   private restoreLockReleased = false;
+  private restoreLifecycleToken: LifecycleOperationToken | null = null;
+  private restoreLockPath: string | null = null;
+  private restoreLockDescriptor: number | null = null;
 
   // Bounds for the reconciliation pass that runs *after* the lifecycle lock
   // has been released, so a slow/hanging embedding provider blocks neither
@@ -63,14 +84,15 @@ export class BackupService {
       // Write backup as a simple format: JSON header + db data. This format
       // is intentionally SQLite-only (see the BACKUP_FORMAT_VERSION comment
       // above) — no vectors are included.
-      const header = JSON.stringify({
+      const unsignedHeader: Omit<BackupHeader, 'header_checksum'> = {
         version: BACKUP_FORMAT_VERSION,
         memory_count: memoryCount,
         checksum,
         created_at: new Date().toISOString(),
         embedding_model: this.config.embedding.model,
         embedding_dimensions: this.config.embedding.dimensions,
-      });
+      };
+      const header = JSON.stringify({ ...unsignedHeader, header_checksum: headerChecksum(unsignedHeader) });
 
       const headerBuf = Buffer.from(header, 'utf-8');
       const headerLen = Buffer.alloc(4);
@@ -116,9 +138,33 @@ export class BackupService {
       restoreGuardAcquired = true;
       this.logger?.info({ event: 'backup_restore_validate', path: backupPath });
       const data = readFileSync(backupPath);
+      if (data.length < 4) {
+        throw invalidInput('Backup integrity check failed: truncated header length');
+      }
       const headerLen = data.readUInt32LE(0);
+      if (headerLen === 0 || headerLen > data.length - 4) {
+        throw invalidInput('Backup integrity check failed: invalid header length');
+      }
       const headerJson = data.subarray(4, 4 + headerLen).toString('utf-8');
-      const header = JSON.parse(headerJson) as BackupHeader;
+      let header: BackupHeader;
+      try {
+        header = JSON.parse(headerJson) as BackupHeader;
+      } catch {
+        throw invalidInput('Backup integrity check failed: invalid JSON header');
+      }
+
+      if (header.version !== 1 && header.version !== BACKUP_FORMAT_VERSION) {
+        throw invalidInput(`Unsupported backup format version: ${header.version}`);
+      }
+      if (!Number.isSafeInteger(header.memory_count) || header.memory_count < 0 || typeof header.checksum !== 'string') {
+        throw invalidInput('Backup integrity check failed: invalid header metadata');
+      }
+      if (header.version === BACKUP_FORMAT_VERSION) {
+        const { header_checksum, ...unsignedHeader } = header;
+        if (typeof header_checksum !== 'string' || headerChecksum(unsignedHeader) !== header_checksum) {
+          throw invalidInput('Backup integrity check failed: header metadata checksum mismatch');
+        }
+      }
 
       const dbData = data.subarray(4 + headerLen);
       const checksum = createHash('sha256').update(dbData).digest('hex');
@@ -196,13 +242,16 @@ export class BackupService {
 
   private beginRestoreOperation(): void {
     if (this.restoreInProgress) {
-      throw invalidInput('Backup restore already in progress');
+      throw new BrainError('CONFLICT', 'Backup restore already in progress', true);
     }
 
     try {
-      this.storage.sqlite.beginLifecycleOperation('restore');
-    } catch {
-      throw invalidInput('Backup restore already in progress');
+      this.acquireRestoreDirectoryLock();
+      this.restoreLifecycleToken = this.storage.sqlite.beginLifecycleOperation('restore');
+    } catch (err) {
+      this.releaseRestoreDirectoryLock();
+      if (err instanceof BrainError) throw err;
+      throw new BrainError('CONFLICT', `Backup restore already in progress: ${(err as Error).message}`, true);
     }
 
     this.restoreInProgress = true;
@@ -217,9 +266,39 @@ export class BackupService {
     if (this.restoreLockReleased) return;
     this.restoreLockReleased = true;
     try {
-      this.storage.sqlite.endLifecycleOperation('restore');
+      this.storage.sqlite.endLifecycleOperation(this.restoreLifecycleToken!, 'restore');
+      this.restoreLifecycleToken = null;
     } finally {
       this.restoreInProgress = false;
+      this.releaseRestoreDirectoryLock();
+    }
+  }
+
+  private acquireRestoreDirectoryLock(): void {
+    const lockPath = join(this.config.data_dir!, '.restore.lock');
+    try {
+      this.restoreLockDescriptor = openSync(lockPath, 'wx', 0o600);
+      this.restoreLockPath = lockPath;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST') {
+        throw new BrainError('CONFLICT', 'Backup restore is already active for this data directory', true);
+      }
+      throw err;
+    }
+  }
+
+  private releaseRestoreDirectoryLock(): void {
+    const descriptor = this.restoreLockDescriptor;
+    const path = this.restoreLockPath;
+    this.restoreLockDescriptor = null;
+    this.restoreLockPath = null;
+    if (descriptor !== null) {
+      try {
+        closeSync(descriptor);
+      } finally {
+        if (path && existsSync(path)) unlinkSync(path);
+      }
     }
   }
 
@@ -244,7 +323,7 @@ export class BackupService {
         // drift detection still runs and self-heals any real mismatch.
         expectedEmbeddingModel: header.embedding_model ?? this.config.embedding.model,
         expectedEmbeddingDimensions: header.embedding_dimensions ?? this.config.embedding.dimensions,
-        allowDuringLifecycle: true,
+        lifecycleToken: this.restoreLifecycleToken!,
       });
     } catch (err) {
       this.endRestoreLifecycleLock();

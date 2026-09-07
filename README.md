@@ -486,6 +486,9 @@ The file is created automatically on first run with all defaults applied. Edit i
 
   // Search configuration
   "search": {
+    // Active results use the caller's limit. When include_archived is true,
+    // matching archive summaries are appended under this separate cap.
+    "archive_result_limit": 5,
     // Weights used for Reciprocal Rank Fusion (RRF) in hybrid mode
     // Must sum to 1.0
     "hybrid_weights": {

@@ -118,7 +118,9 @@ async function main() {
   logger.info({ event: 'startup', data_dir: config.data_dir });
 
   // Initialize storage
-  const sqlite = new SqliteStore(config.data_dir!);
+  const sqlite = new SqliteStore(config.data_dir!, {
+    busyTimeoutMs: config.storage.sqlite_busy_timeout_ms,
+  });
   await sqlite.init();
   // openspec/changes/upgrade-fulltext-to-fts5, task 3.3 (visibility half): a
   // structured log (in addition to the health `sqlite` component message) so the
@@ -245,8 +247,6 @@ async function main() {
   if (rerankHealthBreaker) {
     healthBreakers.rerank = rerankHealthBreaker;
   }
-  const healthService = new HealthService(storage, embedding, config, healthBreakers, logger);
-
   // Scheduled cleanup: same execution path as `bhgbrain gc`, run on
   // `retention.cleanup_schedule` for the lifetime of this long-running
   // process (both stdio and HTTP transports keep the process alive).
@@ -263,6 +263,17 @@ async function main() {
   const distillationService = new DistillationService(config, storage, pipeline, distillationLlmClient, logger, metrics);
   const distillationScheduler = new DistillationScheduler(config, distillationService, logger);
   distillationScheduler.start();
+
+  const healthService = new HealthService(
+    storage, embedding, config, healthBreakers, logger,
+    // A disabled schedule is intentionally unarmed. Only configured schedules
+    // participate in health, where an unarmed/failed state signals a real
+    // scheduling problem rather than an opted-out feature.
+    () => [
+      ...(config.retention.scheduled_cleanup_enabled ? [cleanupScheduler.getState()] : []),
+      ...(config.retention.distillation.enabled ? [distillationScheduler.getState()] : []),
+    ],
+  );
 
   const ctx: ToolContext = {
     config, storage, embedding, pipeline,

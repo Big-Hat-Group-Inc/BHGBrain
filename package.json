@@ -20,8 +20,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "eval": "tsx src/eval/run.ts",
-    "lint": "npm run lint:types && npm run lint:eslint",
+    "lint": "npm run lint:types && npm run lint:types:test && npm run lint:eslint",
     "lint:types": "tsc --noEmit",
+    "lint:types:test": "tsc --noEmit -p tsconfig.test.json",
     "lint:eslint": "eslint src",
     "prepublishOnly": "npm run build"
   },

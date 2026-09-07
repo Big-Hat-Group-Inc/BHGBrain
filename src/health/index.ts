@@ -17,6 +17,12 @@ interface SqliteStatsSnapshot {
   archivedCount: number;
 }
 
+interface SchedulerHealthState {
+  armed: boolean;
+  last_run_at: string | null;
+  failure: string | null;
+}
+
 export class HealthService {
   private cachedEmbeddingHealth: ComponentHealth | null = null;
   private cachedEmbeddingAt = 0;
@@ -40,6 +46,7 @@ export class HealthService {
     private config: BrainConfig,
     private breakers: Record<string, CircuitBreaker> = {},
     private logger?: pino.Logger,
+    private schedulerStates?: () => SchedulerHealthState[],
   ) {}
 
   async check(): Promise<HealthSnapshot> {
@@ -54,9 +61,10 @@ export class HealthService {
     // status and again for the reported stats block.
     const stats = this.getSqliteStats();
     const retentionOk = this.checkRetention(stats.countsByTier);
+    const schedulersOk = this.checkSchedulers();
     const vectorReconciliation = this.checkVectorReconciliation(stats.unsyncedVectors);
 
-    const overall = this.computeOverall(sqliteOk, qdrantOk, embeddingOk, vectorReconciliation, retentionOk);
+    const overall = this.computeOverall(sqliteOk, qdrantOk, embeddingOk, vectorReconciliation, retentionOk, schedulersOk);
 
     return {
       status: overall,
@@ -66,6 +74,7 @@ export class HealthService {
         embedding: embeddingOk,
         vector_reconciliation: vectorReconciliation,
         retention: retentionOk,
+        schedulers: schedulersOk,
       },
       memory_count: stats.memoryCount,
       db_size_bytes: stats.dbSizeBytes,
@@ -246,6 +255,15 @@ export class HealthService {
     return { status: 'healthy' };
   }
 
+  private checkSchedulers(): ComponentHealth {
+    const states = this.schedulerStates?.() ?? [];
+    const failed = states.find(state => state.failure !== null);
+    if (failed) return { status: 'degraded', message: failed.failure ?? 'Scheduler failed' };
+    const unarmed = states.find(state => !state.armed);
+    if (unarmed) return { status: 'degraded', message: 'A scheduler is not armed' };
+    return { status: 'healthy' };
+  }
+
   private checkVectorReconciliation(unsyncedVectors: number): VectorReconciliationStatus {
     // `getLifecycleOperation()`/`isBackgroundReconciliationActive()` are live
     // in-memory/single-row reads, so the "reconciling" transition is visible
@@ -297,6 +315,7 @@ export class HealthService {
     embedding: ComponentHealth,
     vectorReconciliation: VectorReconciliationStatus,
     retention: ComponentHealth,
+    schedulers: ComponentHealth,
   ): HealthStatus {
     if (sqlite.status === 'unhealthy') {
       return 'unhealthy';
@@ -309,6 +328,8 @@ export class HealthService {
       vectorReconciliation.status === 'unhealthy' ||
       retention.status === 'degraded' ||
       retention.status === 'unhealthy' ||
+      schedulers.status === 'degraded' ||
+      schedulers.status === 'unhealthy' ||
       Object.values(this.breakers).some(breaker => breaker.getState() === 'open')
     ) {
       return 'degraded';

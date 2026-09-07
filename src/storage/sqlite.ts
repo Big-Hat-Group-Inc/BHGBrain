@@ -1,6 +1,6 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import { readFileSync, writeFileSync, existsSync, renameSync, statSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, renameSync, statSync, unlinkSync, openSync, closeSync, fsyncSync, chmodSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type {
   MemoryRecord,
@@ -30,6 +30,15 @@ export type SqlParams = SqlValue[];
 type SqlRow = Record<string, SqlValue | undefined>;
 
 type MemoryRecordWithoutEmbedding = Omit<MemoryRecord, 'embedding'>;
+
+// The symbol is deliberately module-private: callers can hold a token that
+// `beginLifecycleOperation` returned, but cannot manufacture one accepted by
+// the store. The runtime identity check in `assertMutableAllowed` is the
+// authority boundary; the brand makes accidental misuse visible to TypeScript.
+declare const lifecycleOperationTokenBrand: unique symbol;
+export type LifecycleOperationToken = {
+  readonly [lifecycleOperationTokenBrand]: true;
+};
 
 export interface AccessUpdate {
   id: string;
@@ -82,17 +91,24 @@ export interface SqliteStorage {
   cancelDeferredFlush(): void;
   insertMemory(mem: MemoryRecordWithoutEmbedding): void;
   updateMemory(id: string, fields: Partial<MemoryRecordWithoutEmbedding>): void;
+  updateMemoryWithHistory(
+    id: string,
+    fields: Partial<MemoryRecordWithoutEmbedding>,
+    history?: { priorContent: string; revisedAt: string; audit: AuditEntry },
+  ): void;
   deleteMemory(id: string): boolean;
-  deleteMemoriesByIds(ids: string[]): number;
+  deleteMemoriesByIds(ids: string[], lifecycleToken?: LifecycleOperationToken): number;
+  stageDeletionIntent(ids: string[], options?: { lifecycleToken?: LifecycleOperationToken }): void;
+  clearDeletionIntent(ids: string[], options?: { lifecycleToken?: LifecycleOperationToken; vectorSynced?: boolean }): void;
   getMemoryById(id: string, includeArchived?: boolean): MemoryRecordWithoutEmbedding | null;
   getMemoryByChecksum(namespace: string, checksum: string, collection?: string): MemoryRecordWithoutEmbedding | null;
-  listMemories(namespace: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
-  listMemoriesInCollection(namespace: string, collection: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
+  listMemories(namespace: string, limit: number, cursor?: string, nowIso?: string): MemoryRecordWithoutEmbedding[];
+  listMemoriesInCollection(namespace: string, collection: string, limit: number, cursor?: string, nowIso?: string): MemoryRecordWithoutEmbedding[];
   listPinnedMemories(namespace: string): MemoryRecordWithoutEmbedding[];
   countPinnedMemories(namespace: string): number;
-  countMemories(namespace?: string): number;
-  countMemoriesInCollection(namespace: string, collection: string): number;
-  fullTextSearch(namespace: string, query: string, limit: number, collection?: string, filter?: RecallFilter): Array<{ id: string; rank: number }>;
+  countMemories(namespace?: string, nowIso?: string): number;
+  countMemoriesInCollection(namespace: string, collection: string, nowIso?: string): number;
+  fullTextSearch(namespace: string, query: string, limit: number, collection?: string, filter?: RecallFilter, nowIso?: string): Array<{ id: string; rank: number }>;
   markStale(memoryId: string): void;
   getStaleMemories(importanceBelow: number, limit: number): MemoryRecordWithoutEmbedding[];
   listStaleCandidateIds(cutoffIso: string): string[];
@@ -107,19 +123,29 @@ export interface SqliteStorage {
   ): void;
   markVectorSync(
     id: string, synced: boolean,
-    options?: { allowDuringLifecycle?: boolean; embeddingModel?: string | null },
+    options?: { lifecycleToken?: LifecycleOperationToken; embeddingModel?: string | null },
   ): void;
-  markVectorsSyncBatch(ids: string[], synced: boolean, options?: { allowDuringLifecycle?: boolean }): void;
-  markAllVectorsSyncState(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number;
+  markVectorSyncFailure(
+    id: string, error: string, permanent: boolean,
+    options?: { lifecycleToken?: LifecycleOperationToken },
+  ): void;
+  markVectorsSyncBatch(ids: string[], synced: boolean, options?: { lifecycleToken?: LifecycleOperationToken }): void;
+  markAllVectorsSyncState(synced: boolean, options?: { lifecycleToken?: LifecycleOperationToken }): number;
   recordAccessBatch(updates: AccessUpdate[]): void;
   listExpiredMemories(nowIso: string, tier?: RetentionTier): MemoryRecordWithoutEmbedding[];
+  listExpiredMemoriesPage(
+    nowIso: string, limit: number, cursor?: string, tier?: RetentionTier,
+  ): MemoryRecordWithoutEmbedding[];
+  countExpiredDeletableMemories(nowIso: string, tier?: RetentionTier): number;
   listReviewCandidates(nowIso: string, limit?: number): MemoryRecordWithoutEmbedding[];
   listReviewDue(namespace: string, before: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[];
   listExpiringMemories(nowIso: string, untilIso: string, limit: number): MemoryRecordWithoutEmbedding[];
   countExpiringMemories(nowIso: string, untilIso: string): number;
   countByTier(): Record<RetentionTier, number>;
   getTierStats(): TierStats[];
-  setRetentionDegraded(degraded: boolean, message?: string | null, completedAt?: string): void;
+  setRetentionDegraded(
+    degraded: boolean, message?: string | null, completedAt?: string, lifecycleToken?: LifecycleOperationToken,
+  ): void;
   getRetentionDegraded(): { degraded: boolean; message: string | null; last_success_at: string | null };
   recordDistillationRun(result: { distilled: number; skipped: number; degraded: boolean }, completedAt?: string): void;
   getDistillationState(): {
@@ -137,16 +163,17 @@ export interface SqliteStorage {
     activeIdentity: string, includeLegacy: boolean, limit: number, cursor?: string,
   ): MemoryRecordWithoutEmbedding[];
   listMemoryChecksums(): Array<{ id: string; checksum: string }>;
-  archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void;
+  archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string, lifecycleToken?: LifecycleOperationToken): void;
   listArchive(limit: number): ArchiveRecord[];
   searchArchive(query: string, limit: number): ArchiveRecord[];
   searchArchived(namespace: string, query: string, limit: number): ArchiveRecord[];
   getArchiveByMemoryId(memoryId: string): ArchiveRecord | null;
   deleteArchive(memoryId: string): void;
   insertRevision(memoryId: string, revision: number, content: string, updatedAt: string, updatedBy?: string): void;
+  insertNextRevision(memoryId: string, content: string, updatedAt: string, updatedBy?: string): number;
   listRevisions(memoryId: string): MemoryRevisionRecord[];
-  pruneAuditLog(maxEntries: number): number;
-  pruneRevisions(maxPerMemory: number): number;
+  pruneAuditLog(maxEntries: number, lifecycleToken?: LifecycleOperationToken): number;
+  pruneRevisions(maxPerMemory: number, lifecycleToken?: LifecycleOperationToken): number;
   addMemoryLink(
     namespace: string, fromId: string, toId: string, relation: MemoryLinkRelation, createdBy: string | null,
   ): { record: MemoryLinkRecord; created: boolean };
@@ -161,11 +188,12 @@ export interface SqliteStorage {
   listCategories(): CategoryRecord[];
   deleteCategory(name: string): boolean;
   createCollection(namespace: string, name: string, embeddingModel: string, embeddingDimensions: number): void;
+  updateAllCollectionEmbeddingIdentity(embeddingModel: string, embeddingDimensions: number): void;
   getCollection(namespace: string, name: string): CollectionRecord | null;
   listCollections(namespace?: string): Array<{ name: string; count: number }>;
   deleteCollection(namespace: string, name: string): boolean;
   deleteMemoriesInCollection(namespace: string, collection: string): { deleted: number; ids: string[] };
-  insertAudit(entry: AuditEntry): void;
+  insertAudit(entry: AuditEntry, lifecycleToken?: LifecycleOperationToken): void;
   listAudit(limit: number): AuditEntry[];
   recordFeedback(entry: RecallFeedbackEntry): void;
   insertBackupMeta(path: string, sizeBytes: number, memoryCount: number, checksum: string): void;
@@ -174,8 +202,8 @@ export interface SqliteStorage {
   getDatabasePath(): string;
   healthCheck(): boolean;
   close(): void;
-  beginLifecycleOperation(reason: string): void;
-  endLifecycleOperation(reason?: string): void;
+  beginLifecycleOperation(reason: string): LifecycleOperationToken;
+  endLifecycleOperation(lifecycleToken: LifecycleOperationToken, reason?: string): void;
   isLifecycleOperationInProgress(): boolean;
   getLifecycleOperation(): string | null;
   getMemoriesByIds(ids: string[]): MemoryRecordWithoutEmbedding[];
@@ -223,6 +251,8 @@ CREATE TABLE IF NOT EXISTS memories (
   stale INTEGER NOT NULL DEFAULT 0,
   archived INTEGER NOT NULL DEFAULT 0,
   vector_synced INTEGER NOT NULL DEFAULT 1,
+  vector_sync_error TEXT,
+  deletion_pending INTEGER NOT NULL DEFAULT 0,
   pinned INTEGER NOT NULL DEFAULT 0,
   device_id TEXT,
   embedding_model TEXT,
@@ -243,6 +273,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_expiry ON memories(decay_eligible, expir
 CREATE INDEX IF NOT EXISTS idx_memories_review_due ON memories(retention_tier, review_due);
 CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(archived);
 CREATE INDEX IF NOT EXISTS idx_memories_vector_synced ON memories(vector_synced);
+CREATE INDEX IF NOT EXISTS idx_memories_deletion_pending ON memories(deletion_pending);
 CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(namespace, pinned);
 
 -- trim-sqlite-query-and-health-overhead task 1.1: covering indexes for the
@@ -438,6 +469,7 @@ export class SqliteStore implements SqliteStorage {
   private db!: DatabaseSync;
   private dbPath: string;
   private lifecycleOperation: string | null = null;
+  private lifecycleToken: LifecycleOperationToken | null = null;
   // Startup FTS5 capability probe result (openspec/changes/upgrade-fulltext-to-fts5,
   // task 1.1; migrate-sqlite-to-native-engine task 1.7). `node:sqlite`'s bundled
   // SQLite build compiles in the `fts5` virtual table module, so this probes
@@ -461,8 +493,9 @@ export class SqliteStore implements SqliteStorage {
   // Dynamically assembled SQL (cursor/filter variants elsewhere in this file)
   // keeps using the prepare-per-call `execSql`/`queryAll`/`queryOne` path.
   private preparedStatements = new Map<string, StatementSync>();
+  private savepointSequence = 0;
 
-  constructor(private dataDir: string) {
+  constructor(private dataDir: string, private options: { busyTimeoutMs?: number } = {}) {
     this.dbPath = join(dataDir, 'brain.db');
   }
 
@@ -516,6 +549,38 @@ export class SqliteStore implements SqliteStorage {
   }
 
   /**
+   * Runs a local projection mutation inside a savepoint. Savepoints compose
+   * with callers that already own a transaction, unlike unconditional BEGIN.
+   * If cleanup itself fails, preserve the originating error and attach the
+   * cleanup failure for structured callers/tests instead of masking it.
+   */
+  private withSavepoint<T>(operation: string, work: () => T): T {
+    const name = `sp_${operation.replace(/[^a-z0-9_]/gi, '_')}_${++this.savepointSequence}`;
+    this.execSql(`SAVEPOINT ${name}`);
+    try {
+      const value = work();
+      this.execSql(`RELEASE ${name}`);
+      return value;
+    } catch (primary) {
+      let cleanupError: unknown;
+      try {
+        this.execSql(`ROLLBACK TO ${name}`);
+        this.execSql(`RELEASE ${name}`);
+      } catch (err) {
+        cleanupError = err;
+      }
+      if (cleanupError && primary instanceof Error) {
+        Object.defineProperty(primary, 'rollbackError', {
+          value: cleanupError,
+          enumerable: false,
+          configurable: true,
+        });
+      }
+      throw primary;
+    }
+  }
+
+  /**
    * Opens (creating if absent) `this.dbPath` directly with `DatabaseSync` — no
    * whole-file read — applies the WAL pragmas, runs column migrations and
    * `SCHEMA_SQL`, and re-probes FTS5 support. Shared by `init()`,
@@ -537,10 +602,13 @@ export class SqliteStore implements SqliteStorage {
     // design.md "Pragmas at open".
     this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec('PRAGMA synchronous = NORMAL');
+    const busyTimeoutMs = this.options.busyTimeoutMs ?? 5_000;
+    this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.min(60_000, Math.trunc(busyTimeoutMs)))}`);
     // Run column migrations BEFORE SCHEMA_SQL so new indexes (e.g. idx_memories_tier)
     // that reference retention_tier don't fail on an existing DB that predates the column.
     this.ensureMemoryColumns();
     this.db.exec(SCHEMA_SQL);
+    this.ensureArchiveIdentityConstraint();
     this.ftsAvailable = this.probeFts5Support();
     this.ensureFtsSchema();
   }
@@ -667,6 +735,34 @@ export class SqliteStore implements SqliteStorage {
     }
     if (existingIsFts5) {
       this.backfillFtsFromMemories('memories_fts');
+    }
+  }
+
+  /**
+   * Older databases permitted repeated archive rows for one active memory.
+   * Keep the latest archival record deterministically before installing the
+   * unique index, then make repeated archive attempts update that one record.
+   */
+  private ensureArchiveIdentityConstraint(): void {
+    this.execSql('BEGIN TRANSACTION');
+    try {
+      this.execSql(
+        `DELETE FROM memory_archive WHERE id IN (
+           SELECT id FROM (
+             SELECT id, ROW_NUMBER() OVER (
+               PARTITION BY memory_id ORDER BY expired_at DESC, id DESC
+             ) AS row_number
+             FROM memory_archive
+           ) WHERE row_number > 1
+         )`,
+      );
+      this.execSql(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_archive_memory_id_unique ON memory_archive(memory_id)`,
+      );
+      this.execSql('COMMIT');
+    } catch (err) {
+      this.execSql('ROLLBACK');
+      throw err;
     }
   }
 
@@ -816,7 +912,8 @@ export class SqliteStore implements SqliteStorage {
     const derivedFrom = mem.derived_from ?? null;
     const origin = mem.origin ? JSON.stringify(mem.origin) : null;
     const confidence = mem.confidence ?? 1.0;
-    this.execSql(
+    this.withSavepoint('insert_memory', () => {
+      this.execSql(
       `INSERT INTO memories (
         id, namespace, collection, type, category, content, summary, tags, source, checksum,
         importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
@@ -854,11 +951,12 @@ export class SqliteStore implements SqliteStorage {
         mem.updated_at,
         mem.last_accessed,
       ],
-    );
-    this.execSql(
+      );
+      this.execSql(
       `INSERT INTO memories_fts (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
       [mem.id, mem.namespace, mem.collection, mem.content, mem.summary, mem.tags.join(' ')],
-    );
+      );
+    });
   }
 
   upsertMemoryFromPayload(id: string, payload: Record<string, unknown>): boolean {
@@ -961,6 +1059,15 @@ export class SqliteStore implements SqliteStorage {
       ? JSON.stringify(payload.origin)
       : null;
     const confidence = typeof payload.confidence === 'number' ? payload.confidence : 1.0;
+    const reviewDue = typeof payload.review_due === 'string' ? payload.review_due : null;
+    const accessCount = typeof payload.access_count === 'number' && Number.isInteger(payload.access_count)
+      ? payload.access_count
+      : 0;
+    const lastAccessed = typeof payload.last_accessed === 'string' ? payload.last_accessed : now;
+    const lastOperation = typeof payload.last_operation === 'string' ? payload.last_operation : 'ADD';
+    const derivedFrom = Array.isArray(payload.derived_from)
+      ? payload.derived_from.filter((value): value is string => typeof value === 'string')
+      : null;
 
     // Handle expires_at which may be stored as epoch seconds in Qdrant
     let expiresAt: string | null = null;
@@ -976,13 +1083,14 @@ export class SqliteStore implements SqliteStorage {
         `INSERT INTO memories (
           id, namespace, collection, type, category, content, summary, tags, source, checksum,
           importance, retention_tier, expires_at, decay_eligible, review_due, access_count,
-          last_operation, merged_from, stale, archived, vector_synced, pinned, device_id, embedding_model, origin, confidence, created_at, updated_at, last_accessed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          last_operation, merged_from, derived_from, stale, archived, vector_synced, pinned, device_id, embedding_model, origin, confidence, created_at, updated_at, last_accessed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id, namespace, collection, type, category, content, summary,
           JSON.stringify(tags), source, checksum, importance, retentionTier,
-          expiresAt, decayEligible ? 1 : 0, null, 0,
-          'ADD', null, 0, 0, 1, pinned ? 1 : 0, deviceId, embeddingModel, origin, confidence, createdAt, now, now,
+          expiresAt, decayEligible ? 1 : 0, reviewDue, accessCount,
+          lastOperation, null, derivedFrom ? JSON.stringify(derivedFrom) : null, 0, 0, 1, pinned ? 1 : 0,
+          deviceId, embeddingModel, origin, confidence, createdAt, now, lastAccessed,
         ],
       );
       this.execSql(
@@ -1028,30 +1136,54 @@ export class SqliteStore implements SqliteStorage {
     }
     if (sets.length === 0) return;
     vals.push(id);
-    this.execSql(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, vals);
+    this.withSavepoint('update_memory', () => {
+      this.execSql(`UPDATE memories SET ${sets.join(', ')} WHERE id = ?`, vals);
 
-    if (fields.content || fields.summary || fields.tags || fields.archived) {
-      this.execSql(`DELETE FROM memories_fts WHERE id = ?`, [id]);
-      const mem = this.getMemoryById(id, true);
-      if (mem && !mem.archived) {
-        this.execSql(
-          `INSERT INTO memories_fts (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
-          [mem.id, mem.namespace, mem.collection, mem.content, mem.summary, mem.tags.join(' ')],
-        );
+      if ('content' in fields || 'summary' in fields || 'tags' in fields || 'archived' in fields) {
+        this.execSql(`DELETE FROM memories_fts WHERE id = ?`, [id]);
+        const mem = this.getMemoryById(id, true);
+        if (mem && !mem.archived) {
+          this.execSql(
+            `INSERT INTO memories_fts (id, namespace, collection, content, summary, tags) VALUES (?, ?, ?, ?, ?, ?)`,
+            [mem.id, mem.namespace, mem.collection, mem.content, mem.summary, mem.tags.join(' ')],
+          );
+        }
       }
-    }
+    });
+  }
+
+  /**
+   * Commits a T0 snapshot, its audit event, and the updated local projection
+   * as one local unit. The remote vector write is deliberately outside this
+   * savepoint; callers invoke this only after that write has been confirmed.
+   */
+  updateMemoryWithHistory(
+    id: string,
+    fields: Partial<MemoryRecordWithoutEmbedding>,
+    history?: { priorContent: string; revisedAt: string; audit: AuditEntry },
+  ): void {
+    this.assertMutableAllowed();
+    this.withSavepoint('update_memory_with_history', () => {
+      if (history) {
+        this.insertNextRevision(id, history.priorContent, history.revisedAt);
+        this.insertAudit(history.audit);
+      }
+      this.updateMemory(id, fields);
+    });
   }
 
   deleteMemory(id: string): boolean {
     this.assertMutableAllowed();
     const mem = this.getMemoryById(id, true);
     if (!mem) return false;
-    this.execSql(`DELETE FROM memories WHERE id = ?`, [id]);
-    this.execSql(`DELETE FROM memories_fts WHERE id = ?`, [id]);
-    // Cascade-clean edges (add-memory-links) so both `forget` and `review`'s
-    // `archive` action (which calls this same method after archiveMemory)
-    // never leave a memory_links row pointing at a now-missing memory.
-    this.execSql(`DELETE FROM memory_links WHERE from_id = ? OR to_id = ?`, [id, id]);
+    this.withSavepoint('delete_memory', () => {
+      this.execSql(`DELETE FROM memories WHERE id = ?`, [id]);
+      this.execSql(`DELETE FROM memories_fts WHERE id = ?`, [id]);
+      // Cascade-clean edges (add-memory-links) so both `forget` and `review`'s
+      // `archive` action (which calls this same method after archiveMemory)
+      // never leave a memory_links row pointing at a now-missing memory.
+      this.execSql(`DELETE FROM memory_links WHERE from_id = ? OR to_id = ?`, [id, id]);
+    });
     return true;
   }
 
@@ -1067,13 +1199,12 @@ export class SqliteStore implements SqliteStorage {
    * (mirroring `deleteMemory`) runs per chunk too, so a bulk delete never
    * leaves dangling edges the way the single-row path avoids.
    */
-  deleteMemoriesByIds(ids: string[]): number {
-    this.assertMutableAllowed();
+  deleteMemoriesByIds(ids: string[], lifecycleToken?: LifecycleOperationToken): number {
+    this.assertMutableAllowed(lifecycleToken);
     if (ids.length === 0) return 0;
     const CHUNK = 500;
     let deleted = 0;
-    this.execSql('BEGIN TRANSACTION');
-    try {
+    this.withSavepoint('delete_memories', () => {
       for (let i = 0; i < ids.length; i += CHUNK) {
         const chunk = ids.slice(i, i + CHUNK);
         const placeholders = chunk.map(() => '?').join(', ');
@@ -1082,18 +1213,45 @@ export class SqliteStore implements SqliteStorage {
         this.execSql(`DELETE FROM memories_fts WHERE id IN (${placeholders})`, chunk);
         this.execSql(`DELETE FROM memory_links WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})`, [...chunk, ...chunk]);
       }
-      this.execSql('COMMIT');
-    } catch (err) {
-      this.execSql('ROLLBACK');
-      throw err;
-    }
+    });
     return deleted;
+  }
+
+  /**
+   * Stages destructive work before any remote call. Pending rows stay in the
+   * authoritative database but are hidden from normal reads and excluded from
+   * vector re-upload until the operation is either finalized or cleared.
+   */
+  stageDeletionIntent(ids: string[], options?: { lifecycleToken?: LifecycleOperationToken }): void {
+    this.assertMutableAllowed(options?.lifecycleToken);
+    this.updateDeletionIntent(ids, true, false);
+  }
+
+  /** Clears a failed intent and retains vector drift for later repair. */
+  clearDeletionIntent(ids: string[], options?: { lifecycleToken?: LifecycleOperationToken; vectorSynced?: boolean }): void {
+    this.assertMutableAllowed(options?.lifecycleToken);
+    this.updateDeletionIntent(ids, false, options?.vectorSynced ?? false);
+  }
+
+  private updateDeletionIntent(ids: string[], pending: boolean, vectorSynced: boolean): void {
+    if (ids.length === 0) return;
+    const chunkSize = 500;
+    this.withSavepoint('deletion_intent', () => {
+      for (let i = 0; i < ids.length; i += chunkSize) {
+        const chunk = ids.slice(i, i + chunkSize);
+        const placeholders = chunk.map(() => '?').join(', ');
+        this.execSql(
+          `UPDATE memories SET deletion_pending = ?, vector_synced = ? WHERE id IN (${placeholders})`,
+          [pending ? 1 : 0, vectorSynced ? 1 : 0, ...chunk],
+        );
+      }
+    });
   }
 
   getMemoryById(id: string, includeArchived = false): MemoryRecordWithoutEmbedding | null {
     const sql = includeArchived
-      ? `SELECT * FROM memories WHERE id = ?`
-      : `SELECT * FROM memories WHERE id = ? AND archived = 0`;
+      ? `SELECT * FROM memories WHERE id = ? AND deletion_pending = 0`
+      : `SELECT * FROM memories WHERE id = ? AND archived = 0 AND deletion_pending = 0`;
     const row = this.queryOneCached(sql, [id]);
     return row ? this.rowToMemory(row) : null;
   }
@@ -1102,7 +1260,7 @@ export class SqliteStore implements SqliteStorage {
     // Exact dedup is scoped to the collection when one is given, so identical
     // content in a different collection is treated as a distinct memory rather
     // than a cross-collection NOOP.
-    let sql = `SELECT * FROM memories WHERE namespace = ? AND checksum = ? AND archived = 0`;
+    let sql = `SELECT * FROM memories WHERE namespace = ? AND checksum = ? AND archived = 0 AND deletion_pending = 0`;
     const params: SqlParams = [namespace, checksum];
     if (collection !== undefined) {
       sql += ` AND collection = ?`;
@@ -1113,9 +1271,9 @@ export class SqliteStore implements SqliteStorage {
     return row ? this.rowToMemory(row) : null;
   }
 
-  listMemories(namespace: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
-    let sql = `SELECT * FROM memories WHERE namespace = ? AND archived = 0`;
-    const params: SqlParams = [namespace];
+  listMemories(namespace: string, limit: number, cursor?: string, nowIso = new Date().toISOString()): MemoryRecordWithoutEmbedding[] {
+    let sql = `SELECT * FROM memories WHERE namespace = ? AND archived = 0 AND deletion_pending = 0 AND (expires_at IS NULL OR expires_at >= ?)`;
+    const params: SqlParams = [namespace, nowIso];
     if (cursor) {
       const sepIdx = cursor.indexOf('|');
       if (sepIdx !== -1) {
@@ -1133,9 +1291,9 @@ export class SqliteStore implements SqliteStorage {
     return this.queryMemories(sql, params);
   }
 
-  listMemoriesInCollection(namespace: string, collection: string, limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
-    let sql = `SELECT * FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`;
-    const params: SqlParams = [namespace, collection];
+  listMemoriesInCollection(namespace: string, collection: string, limit: number, cursor?: string, nowIso = new Date().toISOString()): MemoryRecordWithoutEmbedding[] {
+    let sql = `SELECT * FROM memories WHERE namespace = ? AND collection = ? AND archived = 0 AND deletion_pending = 0 AND (expires_at IS NULL OR expires_at >= ?)`;
+    const params: SqlParams = [namespace, collection, nowIso];
     if (cursor) {
       const sepIdx = cursor.indexOf('|');
       if (sepIdx !== -1) {
@@ -1160,32 +1318,32 @@ export class SqliteStore implements SqliteStorage {
    */
   listPinnedMemories(namespace: string): MemoryRecordWithoutEmbedding[] {
     return this.queryMemories(
-      `SELECT * FROM memories WHERE namespace = ? AND archived = 0 AND pinned = 1 ORDER BY updated_at DESC`,
+      `SELECT * FROM memories WHERE namespace = ? AND archived = 0 AND deletion_pending = 0 AND pinned = 1 ORDER BY updated_at DESC`,
       [namespace],
     );
   }
 
   countPinnedMemories(namespace: string): number {
     const row = this.queryOne(
-      `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND archived = 0 AND pinned = 1`,
+      `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND archived = 0 AND deletion_pending = 0 AND pinned = 1`,
       [namespace],
     );
     return row ? this.getNumber(row, 'cnt') : 0;
   }
 
-  countMemories(namespace?: string): number {
+  countMemories(namespace?: string, nowIso = new Date().toISOString()): number {
     const sql = namespace
-      ? `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND archived = 0`
-      : `SELECT COUNT(*) as cnt FROM memories WHERE archived = 0`;
-    const params: SqlParams = namespace ? [namespace] : [];
+      ? `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND archived = 0 AND deletion_pending = 0 AND (expires_at IS NULL OR expires_at >= ?)`
+      : `SELECT COUNT(*) as cnt FROM memories WHERE archived = 0 AND deletion_pending = 0 AND (expires_at IS NULL OR expires_at >= ?)`;
+    const params: SqlParams = namespace ? [namespace, nowIso] : [nowIso];
     const row = this.queryOneCached(sql, params);
     return row ? this.getNumber(row, 'cnt') : 0;
   }
 
-  countMemoriesInCollection(namespace: string, collection: string): number {
+  countMemoriesInCollection(namespace: string, collection: string, nowIso = new Date().toISOString()): number {
     const row = this.queryOne(
-      `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND collection = ? AND archived = 0`,
-      [namespace, collection],
+      `SELECT COUNT(*) as cnt FROM memories WHERE namespace = ? AND collection = ? AND archived = 0 AND deletion_pending = 0 AND (expires_at IS NULL OR expires_at >= ?)`,
+      [namespace, collection, nowIso],
     );
     return row ? this.getNumber(row, 'cnt') : 0;
   }
@@ -1197,13 +1355,13 @@ export class SqliteStore implements SqliteStorage {
    * with a deterministic id tie-break — the contract hybrid RRF consumes
    * (task 3.2) — so callers never need to know which path ran.
    */
-  fullTextSearch(namespace: string, query: string, limit: number, collection?: string, filter?: RecallFilter): Array<{ id: string; rank: number }> {
+  fullTextSearch(namespace: string, query: string, limit: number, collection?: string, filter?: RecallFilter, nowIso = new Date().toISOString()): Array<{ id: string; rank: number }> {
     const terms = SqliteStore.splitQueryTerms(query);
     if (terms.length === 0) return [];
 
     return this.ftsAvailable
-      ? this.fullTextSearchFts5(namespace, terms, limit, collection, filter)
-      : this.fullTextSearchLike(namespace, terms, limit, collection, filter);
+      ? this.fullTextSearchFts5(namespace, terms, limit, collection, filter, nowIso)
+      : this.fullTextSearchLike(namespace, terms, limit, collection, filter, nowIso);
   }
 
   /**
@@ -1219,7 +1377,7 @@ export class SqliteStore implements SqliteStorage {
    * working (task 3.2).
    */
   private fullTextSearchFts5(
-    namespace: string, terms: string[], limit: number, collection?: string, filter?: RecallFilter,
+    namespace: string, terms: string[], limit: number, collection?: string, filter?: RecallFilter, nowIso?: string,
   ): Array<{ id: string; rank: number }> {
     const matchExpr = SqliteStore.buildFts5MatchExpression(terms);
     const conditions = ['t.namespace = ?', 'memories_fts MATCH ?'];
@@ -1249,11 +1407,13 @@ export class SqliteStore implements SqliteStorage {
       conditions.push('m.created_at <= ?');
       params.push(filter.before);
     }
+    conditions.push('(m.expires_at IS NULL OR m.expires_at >= ?)');
+    params.push(nowIso ?? new Date().toISOString());
     params.push(limit);
 
     const sql = `
       SELECT t.id AS id, bm25(memories_fts, 1.0, 2.0, 2.0) AS score
-      FROM memories_fts t JOIN memories m ON m.id = t.id AND m.archived = 0
+      FROM memories_fts t JOIN memories m ON m.id = t.id AND m.archived = 0 AND m.deletion_pending = 0
       WHERE ${conditions.join(' AND ')}
       ORDER BY score ASC, t.id ASC
       LIMIT ?
@@ -1269,7 +1429,14 @@ export class SqliteStore implements SqliteStorage {
    * definition so their tokenization can never drift apart.
    */
   private static splitQueryTerms(query: string): string[] {
-    return query.toLowerCase().split(/\s+/).filter(Boolean);
+    // Keep only indexable Unicode word runs. Punctuation and emoji alone must
+    // not become backend syntax or wildcard patterns, while ordinary words
+    // adjacent to punctuation remain searchable.
+    return query.toLocaleLowerCase().match(/[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)*/gu) ?? [];
+  }
+
+  private static escapeLike(term: string): string {
+    return term.replace(/[\\%_]/g, '\\$&');
   }
 
   /**
@@ -1295,19 +1462,20 @@ export class SqliteStore implements SqliteStorage {
    * runs when `ftsAvailable` is `false`.
    */
   private fullTextSearchLike(
-    namespace: string, terms: string[], limit: number, collection?: string, filter?: RecallFilter,
+    namespace: string, terms: string[], limit: number, collection?: string, filter?: RecallFilter, nowIso?: string,
   ): Array<{ id: string; rank: number }> {
-    const conditions = terms.map(() => `(LOWER(f.content) LIKE ? OR LOWER(f.summary) LIKE ? OR LOWER(f.tags) LIKE ?)`);
-    const params: SqlParams = [namespace];
+    const conditions = terms.map(() => `(LOWER(f.content) LIKE ? ESCAPE '\\' OR LOWER(f.summary) LIKE ? ESCAPE '\\' OR LOWER(f.tags) LIKE ? ESCAPE '\\')`);
+    const params: SqlParams = [];
 
-    let collectionJoin = ' JOIN memories m ON f.id = m.id AND m.archived = 0';
+    let collectionJoin = ' JOIN memories m ON f.id = m.id AND m.archived = 0 AND m.deletion_pending = 0';
     if (collection) {
       collectionJoin += ` AND m.collection = ?`;
       params.push(collection);
     }
+    params.push(namespace);
 
     for (const term of terms) {
-      const like = `%${term}%`;
+      const like = `%${SqliteStore.escapeLike(term)}%`;
       params.push(like, like, like);
     }
 
@@ -1339,6 +1507,8 @@ export class SqliteStore implements SqliteStorage {
       conditions.push('m.created_at <= ?');
       params.push(filter.before);
     }
+    conditions.push('(m.expires_at IS NULL OR m.expires_at >= ?)');
+    params.push(nowIso ?? new Date().toISOString());
 
     // Over-fetch a bounded candidate pool so the relevance ranker below has rows to
     // order; the matching predicate is non-sargable LIKE, so keep the cap modest.
@@ -1442,41 +1612,54 @@ export class SqliteStore implements SqliteStorage {
 
   markVectorSync(
     id: string, synced: boolean,
-    options?: { allowDuringLifecycle?: boolean; embeddingModel?: string | null },
+    options?: { lifecycleToken?: LifecycleOperationToken; embeddingModel?: string | null },
   ): void {
-    if (!options?.allowDuringLifecycle) {
-      this.assertMutableAllowed();
-    }
-    // `embeddingModel` is set in the same statement (rather than a separate
-    // updateMemory call) so a re-embed running during a restore lifecycle
-    // window (allowDuringLifecycle: true) can stamp the new identity without
-    // tripping assertMutableAllowed, which updateMemory always enforces.
+    this.assertMutableAllowed(options?.lifecycleToken);
+    // `embeddingModel` is set in the same statement so lifecycle-owned vector
+    // reconciliation can stamp the new identity without widening the general
+    // update API's mutation permissions.
     if (options && 'embeddingModel' in options) {
       this.execSql(
-        `UPDATE memories SET vector_synced = ?, embedding_model = ? WHERE id = ?`,
+        `UPDATE memories SET vector_synced = ?, vector_sync_error = NULL, embedding_model = ? WHERE id = ?`,
         [synced ? 1 : 0, options.embeddingModel ?? null, id],
       );
     } else {
-      this.execSql(`UPDATE memories SET vector_synced = ? WHERE id = ?`, [synced ? 1 : 0, id]);
+      this.execSql(
+        `UPDATE memories SET vector_synced = ?, vector_sync_error = CASE WHEN ? THEN NULL ELSE vector_sync_error END WHERE id = ?`,
+        [synced ? 1 : 0, synced ? 1 : 0, id],
+      );
     }
   }
 
-  markVectorsSyncBatch(ids: string[], synced: boolean, options?: { allowDuringLifecycle?: boolean }): void {
-    if (!options?.allowDuringLifecycle) {
-      this.assertMutableAllowed();
-    }
-    if (ids.length === 0) return;
-    const placeholders = ids.map(() => '?').join(', ');
+  markVectorSyncFailure(
+    id: string, error: string, permanent: boolean,
+    options?: { lifecycleToken?: LifecycleOperationToken },
+  ): void {
+    this.assertMutableAllowed(options?.lifecycleToken);
     this.execSql(
-      `UPDATE memories SET vector_synced = ? WHERE id IN (${placeholders})`,
-      [synced ? 1 : 0, ...ids],
+      `UPDATE memories SET vector_synced = 0, vector_sync_error = ? WHERE id = ?`,
+      [`${permanent ? 'permanent' : 'transient'}:${error.slice(0, 500)}`, id],
     );
   }
 
-  markAllVectorsSyncState(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number {
-    if (!options?.allowDuringLifecycle) {
-      this.assertMutableAllowed();
-    }
+  markVectorsSyncBatch(ids: string[], synced: boolean, options?: { lifecycleToken?: LifecycleOperationToken }): void {
+    this.assertMutableAllowed(options?.lifecycleToken);
+    if (ids.length === 0) return;
+    const chunkSize = 500;
+    this.withSavepoint('mark_vectors_sync_batch', () => {
+      for (let i = 0; i < ids.length; i += chunkSize) {
+        const chunk = ids.slice(i, i + chunkSize);
+        const placeholders = chunk.map(() => '?').join(', ');
+        this.execSql(
+          `UPDATE memories SET vector_synced = ? WHERE id IN (${placeholders})`,
+          [synced ? 1 : 0, ...chunk],
+        );
+      }
+    });
+  }
+
+  markAllVectorsSyncState(synced: boolean, options?: { lifecycleToken?: LifecycleOperationToken }): number {
+    this.assertMutableAllowed(options?.lifecycleToken);
     const affected = synced ? this.countUnsyncedVectors() : this.countMemories();
     if (affected === 0) {
       return 0;
@@ -1497,32 +1680,40 @@ export class SqliteStore implements SqliteStorage {
     // re-parsing the SQL string per row (matching prior per-row SET-shape
     // behavior exactly). Reused directly (not through `execSql`) because the
     // whole point is compiling the statement once for the loop, not once per row.
-    const stmt = this.db.prepare(
-      `UPDATE memories SET
-        access_count = ?,
-        last_accessed = ?,
-        expires_at = CASE WHEN ? THEN ? ELSE expires_at END,
-        retention_tier = CASE WHEN ? THEN ? ELSE retention_tier END,
-        review_due = CASE WHEN ? THEN ? ELSE review_due END
-      WHERE id = ?`,
-    );
-    for (const update of updates) {
-      const expiresChanged = update.expires_at !== undefined;
-      const tierChanged = !!update.retention_tier;
-      const reviewChanged = update.review_due !== undefined;
-      const params: SqlParams = [
-        update.access_count,
-        update.last_accessed,
-        expiresChanged ? 1 : 0,
-        expiresChanged ? (update.expires_at as string | null) : null,
-        tierChanged ? 1 : 0,
-        tierChanged ? (update.retention_tier as string) : null,
-        reviewChanged ? 1 : 0,
-        reviewChanged ? (update.review_due as string | null) : null,
-        update.id,
-      ];
-      stmt.run(...params);
-    }
+    this.withSavepoint('record_access_batch', () => {
+      const stmt = this.db.prepare(
+        `UPDATE memories SET
+          access_count = ?,
+          last_accessed = ?,
+          expires_at = CASE WHEN ? THEN ? ELSE expires_at END,
+          retention_tier = CASE WHEN ? THEN ? ELSE retention_tier END,
+          review_due = CASE WHEN ? THEN ? ELSE review_due END
+        WHERE id = ?`,
+      );
+      for (const update of updates) {
+        const expiresChanged = update.expires_at !== undefined;
+        const tierChanged = !!update.retention_tier;
+        const reviewChanged = update.review_due !== undefined;
+        const params: SqlParams = [
+          update.access_count,
+          update.last_accessed,
+          expiresChanged ? 1 : 0,
+          expiresChanged ? (update.expires_at as string | null) : null,
+          tierChanged ? 1 : 0,
+          tierChanged ? (update.retention_tier as string) : null,
+          reviewChanged ? 1 : 0,
+          reviewChanged ? (update.review_due as string | null) : null,
+          update.id,
+        ];
+        stmt.run(...params);
+      }
+      // Access-driven retention/review changes affect Qdrant filtering and
+      // ranking metadata. Search uses this SQLite-only hot path, so leave an
+      // explicit repair marker instead of silently serving stale payloads.
+      const ids = updates.map(update => update.id);
+      const placeholders = ids.map(() => '?').join(', ');
+      this.execSql(`UPDATE memories SET vector_synced = 0 WHERE id IN (${placeholders})`, ids);
+    });
   }
 
   listExpiredMemories(nowIso: string, tier?: RetentionTier): MemoryRecordWithoutEmbedding[] {
@@ -1531,6 +1722,52 @@ export class SqliteStore implements SqliteStorage {
       : `SELECT * FROM memories WHERE archived = 0 AND decay_eligible = 1 AND expires_at IS NOT NULL AND expires_at < ? ORDER BY expires_at ASC`;
     const params: SqlParams = tier ? [nowIso, tier] : [nowIso];
     return this.queryMemories(sql, params);
+  }
+
+  /**
+   * Keyset-paged GC selection. Direct retention deletion is limited to T2/T3;
+   * T1 is surfaced through the review queue and T0 is never expiration-deleted.
+   */
+  listExpiredMemoriesPage(
+    nowIso: string, limit: number, cursor?: string, tier?: RetentionTier,
+  ): MemoryRecordWithoutEmbedding[] {
+    if (tier === 'T0' || tier === 'T1') return [];
+    let sql = `SELECT * FROM memories
+       WHERE archived = 0 AND decay_eligible = 1 AND expires_at IS NOT NULL AND expires_at < ?`;
+    const params: SqlParams = [nowIso];
+    if (tier) {
+      sql += ` AND retention_tier = ?`;
+      params.push(tier);
+    } else {
+      sql += ` AND retention_tier IN ('T2', 'T3')`;
+    }
+    if (cursor) {
+      const separator = cursor.indexOf('|');
+      if (separator !== -1) {
+        const expiresAt = cursor.slice(0, separator);
+        const id = cursor.slice(separator + 1);
+        sql += ` AND (expires_at > ? OR (expires_at = ? AND id > ?))`;
+        params.push(expiresAt, expiresAt, id);
+      }
+    }
+    sql += ` ORDER BY expires_at ASC, id ASC LIMIT ?`;
+    params.push(limit);
+    return this.queryMemories(sql, params);
+  }
+
+  countExpiredDeletableMemories(nowIso: string, tier?: RetentionTier): number {
+    if (tier === 'T0' || tier === 'T1') return 0;
+    let sql = `SELECT COUNT(*) AS count FROM memories
+       WHERE archived = 0 AND decay_eligible = 1 AND expires_at IS NOT NULL AND expires_at < ?`;
+    const params: SqlParams = [nowIso];
+    if (tier) {
+      sql += ` AND retention_tier = ?`;
+      params.push(tier);
+    } else {
+      sql += ` AND retention_tier IN ('T2', 'T3')`;
+    }
+    const row = this.queryOne(sql, params);
+    return row ? this.getNumber(row, 'count') : 0;
   }
 
   /**
@@ -1612,8 +1849,10 @@ export class SqliteStore implements SqliteStorage {
   // (`degraded = false`); a degraded call leaves it untouched so it keeps
   // reflecting the last time cleanup actually completed cleanly — the basis
   // for the `cleanup_lag_seconds` health signal.
-  setRetentionDegraded(degraded: boolean, message: string | null = null, completedAt?: string): void {
-    this.assertMutableAllowed();
+  setRetentionDegraded(
+    degraded: boolean, message: string | null = null, completedAt?: string, lifecycleToken?: LifecycleOperationToken,
+  ): void {
+    this.assertMutableAllowed(lifecycleToken);
     const degradedInt = degraded ? 1 : 0;
     const now = completedAt ?? new Date().toISOString();
     this.execSql(
@@ -1704,7 +1943,7 @@ export class SqliteStore implements SqliteStorage {
   }
 
   listMemoriesNeedingVectorSync(limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
-    let sql = `SELECT * FROM memories WHERE archived = 0 AND vector_synced = 0`;
+    let sql = `SELECT * FROM memories WHERE archived = 0 AND deletion_pending = 0 AND vector_synced = 0`;
     const params: SqlParams = [];
     if (cursor) {
       const sepIdx = cursor.indexOf('|');
@@ -1805,11 +2044,19 @@ export class SqliteStore implements SqliteStorage {
     return rows.map(row => ({ id: this.getString(row, 'id'), checksum: this.getString(row, 'checksum') }));
   }
 
-  archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string): void {
-    this.assertMutableAllowed();
+  archiveMemory(memory: MemoryRecordWithoutEmbedding, expiredAt: string, lifecycleToken?: LifecycleOperationToken): void {
+    this.assertMutableAllowed(lifecycleToken);
     this.execSql(
       `INSERT INTO memory_archive (memory_id, summary, tier, namespace, created_at, expired_at, access_count, tags)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(memory_id) DO UPDATE SET
+         summary = excluded.summary,
+         tier = excluded.tier,
+         namespace = excluded.namespace,
+         created_at = excluded.created_at,
+         expired_at = excluded.expired_at,
+         access_count = excluded.access_count,
+         tags = excluded.tags`,
       [
         memory.id,
         memory.summary,
@@ -1862,8 +2109,8 @@ export class SqliteStore implements SqliteStorage {
       params.push(namespace);
     }
     for (const term of terms) {
-      conditions.push(`(LOWER(summary) LIKE ? OR LOWER(tags) LIKE ?)`);
-      const like = `%${term}%`;
+      conditions.push(`(LOWER(summary) LIKE ? ESCAPE '\\' OR LOWER(tags) LIKE ? ESCAPE '\\')`);
+      const like = `%${SqliteStore.escapeLike(term)}%`;
       params.push(like, like);
     }
     params.push(limit);
@@ -1891,6 +2138,27 @@ export class SqliteStore implements SqliteStorage {
       `INSERT INTO memory_revisions (memory_id, revision, content, updated_at, updated_by) VALUES (?, ?, ?, ?, ?)`,
       [memoryId, revision, content, updatedAt, updatedBy ?? null],
     );
+  }
+
+  /**
+   * Allocates the next history sequence from the persisted maximum, rather
+   * than the retained row count. Pruning old revisions therefore cannot make
+   * a later update reuse an existing revision number. This store owns one
+   * synchronous SQLite handle, so the read and insert cannot interleave with
+   * another local writer between these statements.
+   */
+  insertNextRevision(memoryId: string, content: string, updatedAt: string, updatedBy?: string): number {
+    this.assertMutableAllowed();
+    const row = this.queryOne(
+      `SELECT COALESCE(MAX(revision), 0) + 1 AS next_revision FROM memory_revisions WHERE memory_id = ?`,
+      [memoryId],
+    );
+    const revision = row ? this.getNumber(row, 'next_revision') : 1;
+    this.execSql(
+      `INSERT INTO memory_revisions (memory_id, revision, content, updated_at, updated_by) VALUES (?, ?, ?, ?, ?)`,
+      [memoryId, revision, content, updatedAt, updatedBy ?? null],
+    );
+    return revision;
   }
 
   listRevisions(memoryId: string): MemoryRevisionRecord[] {
@@ -2042,6 +2310,17 @@ export class SqliteStore implements SqliteStorage {
     );
   }
 
+  /** Updates collection metadata only after a full vector migration converges. */
+  updateAllCollectionEmbeddingIdentity(embeddingModel: string, embeddingDimensions: number): void {
+    this.assertMutableAllowed();
+    this.withSavepoint('update_collection_embedding_identity', () => {
+      this.execSql(
+        `UPDATE collections SET embedding_model = ?, embedding_dimensions = ?`,
+        [embeddingModel, embeddingDimensions],
+      );
+    });
+  }
+
   getCollection(namespace: string, name: string): CollectionRecord | null {
     const row = this.queryOne(`SELECT * FROM collections WHERE namespace = ? AND name = ?`, [namespace, name]);
     if (!row) return null;
@@ -2079,18 +2358,18 @@ export class SqliteStore implements SqliteStorage {
       return { deleted: 0, ids: [] };
     }
 
-    this.execSql(`DELETE FROM memories_fts WHERE namespace = ? AND id IN (SELECT id FROM memories WHERE namespace = ? AND collection = ?)`, [
-      namespace,
-      namespace,
-      collection,
-    ]);
-    this.execSql(`DELETE FROM memories WHERE namespace = ? AND collection = ?`, [namespace, collection]);
+    this.withSavepoint('delete_collection_memories', () => {
+      const placeholders = ids.map(() => '?').join(', ');
+      this.execSql(`DELETE FROM memories_fts WHERE id IN (${placeholders})`, ids);
+      this.execSql(`DELETE FROM memory_links WHERE from_id IN (${placeholders}) OR to_id IN (${placeholders})`, [...ids, ...ids]);
+      this.execSql(`DELETE FROM memories WHERE id IN (${placeholders})`, ids);
+    });
 
     return { deleted: ids.length, ids };
   }
 
-  insertAudit(entry: AuditEntry): void {
-    this.assertMutableAllowed();
+  insertAudit(entry: AuditEntry, lifecycleToken?: LifecycleOperationToken): void {
+    this.assertMutableAllowed(lifecycleToken);
     this.execSql(
       `INSERT INTO audit_log (id, timestamp, namespace, operation, memory_id, client_id, details) VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [entry.id, entry.timestamp, entry.namespace, entry.operation, entry.memory_id, entry.client_id, entry.details ?? null],
@@ -2106,8 +2385,8 @@ export class SqliteStore implements SqliteStorage {
    * is included as a tie-break so rows sharing a `timestamp` still resolve
    * to a stable "keep" set across repeated calls.
    */
-  pruneAuditLog(maxEntries: number): number {
-    this.assertMutableAllowed();
+  pruneAuditLog(maxEntries: number, lifecycleToken?: LifecycleOperationToken): number {
+    this.assertMutableAllowed(lifecycleToken);
     const result = this.db.prepare(
       `DELETE FROM audit_log WHERE id NOT IN (
          SELECT id FROM audit_log ORDER BY timestamp DESC, id DESC LIMIT ?
@@ -2125,8 +2404,8 @@ export class SqliteStore implements SqliteStorage {
    * DESC` and the `memory://{id}/revisions` resource it backs are unaffected
    * — pruning only removes rows from the tail of that ordering.
    */
-  pruneRevisions(maxPerMemory: number): number {
-    this.assertMutableAllowed();
+  pruneRevisions(maxPerMemory: number, lifecycleToken?: LifecycleOperationToken): number {
+    this.assertMutableAllowed(lifecycleToken);
     const result = this.db.prepare(
       `DELETE FROM memory_revisions WHERE id IN (
          SELECT id FROM (
@@ -2234,19 +2513,26 @@ export class SqliteStore implements SqliteStorage {
     this.preparedStatements.clear();
   }
 
-  beginLifecycleOperation(reason: string): void {
+  beginLifecycleOperation(reason: string): LifecycleOperationToken {
     if (this.lifecycleOperation) {
       throw new Error(`Storage lifecycle operation already in progress: ${this.lifecycleOperation}`);
     }
     this.cancelDeferredFlush();
     this.lifecycleOperation = reason;
+    const token = Object.freeze({}) as LifecycleOperationToken;
+    this.lifecycleToken = token;
+    return token;
   }
 
-  endLifecycleOperation(reason?: string): void {
+  endLifecycleOperation(lifecycleToken: LifecycleOperationToken, reason?: string): void {
+    if (lifecycleToken !== this.lifecycleToken) {
+      throw new Error('Lifecycle operation ownership token is invalid');
+    }
     if (reason && this.lifecycleOperation !== reason) {
       throw new Error(`Mismatched lifecycle operation end: expected ${this.lifecycleOperation ?? 'none'}, got ${reason}`);
     }
     this.lifecycleOperation = null;
+    this.lifecycleToken = null;
   }
 
   isLifecycleOperationInProgress(): boolean {
@@ -2259,11 +2545,23 @@ export class SqliteStore implements SqliteStorage {
 
   getMemoriesByIds(ids: string[]): MemoryRecordWithoutEmbedding[] {
     if (ids.length === 0) return [];
-    const placeholders = ids.map(() => '?').join(', ');
-    return this.queryMemories(
-      `SELECT * FROM memories WHERE archived = 0 AND id IN (${placeholders})`,
-      ids,
-    );
+    const chunkSize = 500;
+    const byId = new Map<string, MemoryRecordWithoutEmbedding>();
+    for (let i = 0; i < ids.length; i += chunkSize) {
+      const chunk = ids.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => '?').join(', ');
+      for (const memory of this.queryMemories(
+        `SELECT * FROM memories WHERE archived = 0 AND deletion_pending = 0 AND id IN (${placeholders})`,
+        chunk,
+      )) {
+        byId.set(memory.id, memory);
+      }
+    }
+    // Preserve caller order where it matters to a batched operation.
+    return ids.flatMap(id => {
+      const memory = byId.get(id);
+      return memory ? [memory] : [];
+    });
   }
 
   listMemoryIdsInCollection(namespace: string, collection: string): string[] {
@@ -2467,6 +2765,8 @@ export class SqliteStore implements SqliteStorage {
       { name: 'review_due', sql: `ALTER TABLE memories ADD COLUMN review_due TEXT` },
       { name: 'archived', sql: `ALTER TABLE memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0` },
       { name: 'vector_synced', sql: `ALTER TABLE memories ADD COLUMN vector_synced INTEGER NOT NULL DEFAULT 1` },
+      { name: 'vector_sync_error', sql: `ALTER TABLE memories ADD COLUMN vector_sync_error TEXT` },
+      { name: 'deletion_pending', sql: `ALTER TABLE memories ADD COLUMN deletion_pending INTEGER NOT NULL DEFAULT 0` },
       { name: 'device_id', sql: `ALTER TABLE memories ADD COLUMN device_id TEXT` },
       { name: 'embedding_model', sql: `ALTER TABLE memories ADD COLUMN embedding_model TEXT` },
       { name: 'pinned', sql: `ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0` },
@@ -2482,8 +2782,8 @@ export class SqliteStore implements SqliteStorage {
     }
   }
 
-  private assertMutableAllowed(): void {
-    if (this.lifecycleOperation) {
+  private assertMutableAllowed(lifecycleToken?: LifecycleOperationToken): void {
+    if (this.lifecycleOperation && lifecycleToken !== this.lifecycleToken) {
       throw new Error(`Storage lifecycle operation in progress: ${this.lifecycleOperation}`);
     }
   }
@@ -2531,8 +2831,46 @@ export class SqliteStore implements SqliteStorage {
   }
 }
 
-export function atomicWriteFileSync(targetPath: string, data: Buffer): void {
-  const tmpPath = `${targetPath}.tmp`;
-  writeFileSync(tmpPath, data);
-  renameSync(tmpPath, targetPath);
+export function atomicWriteFileSync(targetPath: string, data: Buffer | string): void {
+  const tmpPath = `${targetPath}.${randomUUID()}.tmp`;
+  let renamed = false;
+  try {
+    // An exclusive unique temp file prevents one interrupted writer from
+    // deleting or replacing another writer's staged artifact. 0600 keeps
+    // backups, database images, and credentials out of other local accounts.
+    writeFileSync(tmpPath, data, { mode: 0o600, flag: 'wx' });
+    const fileDescriptor = openSync(tmpPath, 'r');
+    try {
+      fsyncSync(fileDescriptor);
+    } finally {
+      closeSync(fileDescriptor);
+    }
+    renameSync(tmpPath, targetPath);
+    renamed = true;
+    chmodSync(targetPath, 0o600);
+
+    // Filesystems that do not support syncing a directory (notably some
+    // Windows filesystems) report EINVAL/EPERM; rename remains the strongest
+    // available atomic guarantee there. Propagate all other failures.
+    const directoryDescriptor = openSync(dirname(targetPath), 'r');
+    try {
+      try {
+        fsyncSync(directoryDescriptor);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EINVAL' && code !== 'EPERM' && code !== 'ENOTSUP') throw err;
+      }
+    } finally {
+      closeSync(directoryDescriptor);
+    }
+  } finally {
+    if (!renamed && existsSync(tmpPath)) {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        // Preserve the original writer failure; a unique stale temp file is
+        // harmless and cannot be mistaken for a committed artifact.
+      }
+    }
+  }
 }

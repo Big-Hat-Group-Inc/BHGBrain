@@ -250,9 +250,9 @@ describe('SearchService', () => {
     const { service, storage } = createSearchService({
       memories,
       fulltextResults: [
-        { id: 'mem-3', rank: -3 },
-        { id: 'mem-1', rank: -2 },
-        { id: 'mem-2', rank: -1 },
+        { id: 'mem-3', rank: 3 },
+        { id: 'mem-1', rank: 2 },
+        { id: 'mem-2', rank: 1 },
       ],
     });
     // Deliberately return rows in ascending-id order — the opposite of the
@@ -263,6 +263,7 @@ describe('SearchService', () => {
 
     const results = await service.search('hello', 'global', undefined, 'fulltext', 10);
     expect(results.map(r => r.id)).toEqual(['mem-3', 'mem-1', 'mem-2']);
+    expect(results.map(r => r.fulltext_score)).toEqual([1, 0.5, 0]);
   });
 
   // add-review-and-archive-recall
@@ -291,6 +292,16 @@ describe('SearchService', () => {
     expect(archivedResult.summary).toBe('an archived summary');
     expect(archivedResult.tags).toEqual(['old']);
     expect(storage.sqlite.recordAccessBatch).toHaveBeenCalledWith([expect.objectContaining({ id: 'mem-1' })]);
+  });
+
+  it('uses the separate archive result budget after active results fill their limit', async () => {
+    const { service, storage } = createSearchService();
+    const searchArchived = vi.fn(() => []);
+    (storage.sqlite as unknown as { searchArchived: typeof searchArchived }).searchArchived = searchArchived;
+
+    await service.search('hello', 'global', undefined, 'fulltext', 1, undefined, undefined, true);
+
+    expect(searchArchived).toHaveBeenCalledWith('global', 'hello', 5);
   });
 
   it('excludes archived matches by default', async () => {
@@ -377,6 +388,15 @@ describe('SearchService', () => {
 
     const results = await service.search('hello', 'global', undefined, 'semantic', 10);
     expect(results).toHaveLength(0);
+  });
+
+  it('drops an expired Qdrant-only fallback result', async () => {
+    const { service, storage } = createSearchService({ memories: new Map() });
+    storage.qdrant.search.mockResolvedValue([
+      { id: 'expired-cross-device', score: 0.5, payload: { content: 'expired', expires_at: 1 } },
+    ]);
+
+    await expect(service.search('hello', 'global', undefined, 'semantic', 10)).resolves.toEqual([]);
   });
 
   // add-memory-provenance-metadata, task 8.6
@@ -1553,6 +1573,19 @@ describe('SearchService', () => {
       const results = [fakeResult('a', 0.99), fakeResult('b', 0.01)];
       const reranked = await service.rerank('q', results, 20);
       expect(reranked.map(r => r.id)).toEqual(['b', 'a']);
+    });
+
+    it('keeps evaluated rerank candidates ahead of a higher-scoring out-of-pool result', async () => {
+      const rerankProvider = {
+        provider: 'openai',
+        score: vi.fn(async () => new Map([['a', 0.1], ['b', 0.2]])),
+      };
+      const { service } = createSearchService({ rerankProvider });
+      const reranked = await service.rerank('q', [
+        fakeResult('a', 0.9), fakeResult('b', 0.8), fakeResult('c', 0.99),
+      ], 2);
+
+      expect(reranked.map(r => r.id)).toEqual(['b', 'a', 'c']);
     });
 
     it('degrades to the pre-rerank list, counts, and logs on provider failure', async () => {

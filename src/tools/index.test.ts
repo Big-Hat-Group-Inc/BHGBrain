@@ -655,7 +655,7 @@ describe('consolidate tool', () => {
     expect(storage.logAudit).toHaveBeenCalledWith('ARCHIVE', S1, 'global', 'c1', expect.objectContaining({
       details: expect.objectContaining({ action: 'consolidate', merged_into: T }),
     }));
-    expect(result).toEqual({ target_id: T, merged: [S1], failed: [] });
+    expect(result).toEqual({ target_id: T, merged: [S1], failed: [], failures: [] });
   });
 
   it('merge appends to an existing merged_from rather than overwriting it', async () => {
@@ -673,7 +673,7 @@ describe('consolidate tool', () => {
     }));
   });
 
-  it('merge rejects an unknown source id with NOT_FOUND and archives nothing', async () => {
+  it('reports an unknown source with a structured outcome and archives nothing', async () => {
     const { ctx, storage } = createCtx();
     (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
       id === T ? baseMemory({ id: T }) : null);
@@ -681,9 +681,10 @@ describe('consolidate tool', () => {
 
     const result = await handleTool(ctx, 'consolidate', {
       action: 'merge', target_id: T, source_ids: [S1],
-    }, 'c1') as BrainErrorEnvelope;
+    }, 'c1') as { target_id: string; merged: string[]; failed: string[]; failures: Array<{ id: string; stage: string; code: string }> };
 
-    expect(result.error.code).toBe('NOT_FOUND');
+    expect(result).toEqual(expect.objectContaining({ target_id: T, merged: [], failed: [S1] }));
+    expect(result.failures).toEqual([{ id: S1, stage: 'lookup', code: 'NOT_FOUND', message: expect.any(String) }]);
     expect(storage.sqlite.archiveMemory).not.toHaveBeenCalled();
   });
 
@@ -750,8 +751,29 @@ describe('consolidate tool', () => {
 
     expect(result.merged).toEqual([S2]);
     expect(result.failed).toEqual([S1]);
+    expect(result.failures).toEqual([expect.objectContaining({ id: S1, stage: 'delete', code: 'DELETE_FAILED' })]);
+    expect(storage.updateMemory).toHaveBeenCalledWith(T, expect.objectContaining({ merged_from: S2 }));
     expect(storage.sqlite.deleteArchive).toHaveBeenCalledWith(S1);
     expect(storage.sqlite.deleteArchive).not.toHaveBeenCalledWith(S2);
+  });
+
+  it('reports and logs lifecycle-locked source failures distinctly', async () => {
+    const { ctx, storage } = createCtx();
+    (storage.sqlite.getMemoryById as ReturnType<typeof vi.fn>).mockImplementation((id: string) =>
+      id === T ? baseMemory({ id: T }) : id === S1 ? baseMemory({ id: S1 }) : null);
+    (storage.sqlite.archiveMemory as ReturnType<typeof vi.fn>)
+      .mockImplementation(() => { throw new Error('Storage lifecycle operation in progress: restore'); });
+
+    const result = await handleTool(ctx, 'consolidate', {
+      action: 'merge', target_id: T, source_ids: [S1],
+    }, 'c1') as { merged: string[]; failed: string[]; failures: Array<{ id: string; stage: string; code: string }> };
+
+    expect(result.merged).toEqual([]);
+    expect(result.failed).toEqual([S1]);
+    expect(result.failures).toEqual([expect.objectContaining({ id: S1, stage: 'archive', code: 'LIFECYCLE_LOCKED' })]);
+    expect(ctx.logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+      event: 'consolidation_source_failed', id: S1, code: 'LIFECYCLE_LOCKED',
+    }));
   });
 });
 
@@ -1987,6 +2009,17 @@ describe('handleRecall follow_links (add-memory-links)', () => {
 
     expect(result.results).toHaveLength(1);
     expect(result.results.every(r => !r.linked_from)).toBe(true);
+  });
+
+  it('skips an expired linked neighbor', async () => {
+    searchMock.mockResolvedValue([makeResult({ id: 'base-1' })]);
+    listMemoryLinksMock.mockReturnValue([
+      { id: 1, namespace: 'global', from_id: 'base-1', to_id: 'expired-neighbor', relation: 'refines', created_at: 'a', created_by: null, direction: 'outgoing' },
+    ]);
+    getMemoryByIdMock.mockReturnValue({ ...makeMemory('expired-neighbor'), expires_at: '2020-01-01T00:00:00.000Z' });
+
+    const result = await handleTool(ctx, 'recall', { query: 'q', limit: 5, follow_links: true }, 'c1') as { results: SearchResult[] };
+    expect(result.results).toHaveLength(1);
   });
 });
 

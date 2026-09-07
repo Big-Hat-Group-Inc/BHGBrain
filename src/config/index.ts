@@ -1,7 +1,9 @@
 import { z } from 'zod';
-import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
+import { parseCronExpression, nextRunAfter } from '../backup/scheduler.js';
+import { atomicWriteFileSync } from '../storage/sqlite.js';
 
 const DEVICE_ID_RE = /^[a-zA-Z0-9._-]{1,64}$/;
 
@@ -99,6 +101,11 @@ const ConfigSchema = z.object({
     external_url: z.string().nullable().default(null),
     api_key_env: z.string().nullable().default(null),
   }).prefault({}),
+  storage: z.object({
+    // A bounded wait lets short-lived CLI/server writer overlap settle without
+    // turning a stuck external writer into an unbounded request stall.
+    sqlite_busy_timeout_ms: z.number().int().min(0).max(60_000).default(5_000),
+  }).prefault({}),
   transport: z.object({
     http: z.object({
       enabled: z.boolean().default(true),
@@ -162,6 +169,10 @@ const ConfigSchema = z.object({
     archive_before_delete: z.boolean().default(true),
     cleanup_schedule: z.string().default('0 2 * * *'),
     scheduled_cleanup_enabled: z.boolean().default(true),
+    // One GC pass is deliberately bounded so a large expired corpus advances
+    // across scheduler ticks without monopolising the lifecycle operation.
+    cleanup_batch_size: z.number().int().min(1).max(1000).default(200),
+    cleanup_max_duration_ms: z.number().int().min(1_000).max(300_000).default(30_000),
     pre_expiry_warning_days: z.number().int().nonnegative().default(7),
     compaction_deleted_threshold: z.number().min(0).max(1).default(0.10),
     // Bounds on the two insert-only history tables, enforced by `runGc`'s
@@ -246,6 +257,9 @@ const ConfigSchema = z.object({
     }).prefault({}),
   }).prefault({}),
   search: z.object({
+    // Active results retain the caller's limit. Archived matches are an
+    // explicitly additive, separately bounded appendix when requested.
+    archive_result_limit: z.number().int().min(1).max(50).default(5),
     hybrid_weights: z.object({
       semantic: z.number().min(0).max(1).default(0.7),
       fulltext: z.number().min(0).max(1).default(0.3),
@@ -434,6 +448,22 @@ const ConfigSchema = z.object({
   // regardless of `pipeline.summarization_enabled`. See
   // improve-memory-summarization.
   auto_summarize: z.boolean().default(true),
+}).superRefine((config, ctx) => {
+  const schedules: Array<{ path: ['retention', 'cleanup_schedule'] | ['retention', 'distillation', 'schedule']; value: string }> = [
+    { path: ['retention', 'cleanup_schedule'], value: config.retention.cleanup_schedule },
+    { path: ['retention', 'distillation', 'schedule'], value: config.retention.distillation.schedule },
+  ];
+  for (const schedule of schedules) {
+    try {
+      nextRunAfter(parseCronExpression(schedule.value), new Date());
+    } catch (err) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: schedule.path,
+        message: `Invalid satisfiable cron expression: ${(err as Error).message}`,
+      });
+    }
+  }
 });
 
 export type BrainConfig = z.infer<typeof ConfigSchema>;
@@ -587,6 +617,6 @@ export function ensureDataDir(config: BrainConfig): void {
   // performs no write, so user formatting/comments in config.json survive
   // and startup avoids a needless disk write.
   if (!configFileExisted || config.device.id !== previousDeviceId) {
-    writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
+    atomicWriteFileSync(configPath, JSON.stringify(config, null, 2));
   }
 }

@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { SqliteStore } from './sqlite.js';
+import type { LifecycleOperationToken } from './sqlite.js';
 import { QdrantStore } from './qdrant.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MemoryRecord, MemoryOrigin, WriteOperation, AuditEntry, LifecycleAuditDetails } from '../domain/types.js';
@@ -27,6 +28,8 @@ export interface VectorDriftReconciliationOutcome {
 export interface ReconcileVectorsResult {
   reconciled: number;
   remaining: number;
+  failed: number;
+  permanentFailures: number;
   // true when the timeout or batch cap stopped the run before every unsynced
   // memory was processed; callers should treat `remaining > 0` as "resume me".
   boundReached: boolean;
@@ -180,7 +183,7 @@ export class StorageManager {
     newVector?: number[],
   ): Promise<void> {
     const existing = this.sqlite.getMemoryById(id);
-    if (!existing) throw internal(`Memory ${id} not found for update`);
+    if (!existing) throw notFound(`Memory ${id} not found for update`);
 
     if (newVector) {
       this.ensureEmbeddingIdentityCompatible();
@@ -192,33 +195,35 @@ export class StorageManager {
       ? { ...fields, embedding_model: this.embedding.identity }
       : fields;
 
-    // Snapshot fields that will change for rollback
-    const rollbackFields: Partial<MemoryRecordWithoutEmbedding> = {};
-    for (const key of Object.keys(effectiveFields) as Array<keyof MemoryRecordWithoutEmbedding>) {
-      const currentValue = existing[key];
-      assignRollbackField(rollbackFields, key, currentValue);
-    }
-
-    if (existing.retention_tier === 'T0' && fields.content && fields.content !== existing.content) {
-      const revisedAt = new Date().toISOString();
-      this.sqlite.insertRevision(id, this.sqlite.listRevisions(id).length + 1, existing.content, revisedAt);
-      this.logAudit('REVISE', id, existing.namespace, 'system', {
-        flush: false,
-        details: {
-          memory_id: id,
-          prior_tier: existing.retention_tier,
-          new_tier: fields.retention_tier ?? existing.retention_tier,
-          actor: 'system',
+    const revisedAt = new Date().toISOString();
+    const history = existing.retention_tier === 'T0' && fields.content !== undefined && fields.content !== existing.content
+      ? {
+        priorContent: existing.content,
+        revisedAt,
+        audit: {
+          id: uuidv4(),
           timestamp: revisedAt,
-          action: 'revise',
+          namespace: existing.namespace,
+          operation: 'REVISE' as const,
+          memory_id: id,
+          client_id: 'system',
+          details: JSON.stringify({
+            memory_id: id,
+            prior_tier: existing.retention_tier,
+            new_tier: fields.retention_tier ?? existing.retention_tier,
+            actor: 'system',
+            timestamp: revisedAt,
+            action: 'revise',
+          }),
         },
-      });
-    }
-
-    this.sqlite.updateMemory(id, effectiveFields);
+      }
+      : undefined;
 
     if (newVector) {
       try {
+        // Qdrant is a rebuildable projection. Writing it first means a failed
+        // vector request cannot create a durable T0 revision/audit record for
+        // a content change that never became visible to retrieval.
         await this.qdrant.upsert(
           existing.namespace,
           existing.collection,
@@ -230,12 +235,28 @@ export class StorageManager {
             collection: existing.collection,
           }),
         );
+        this.commitUpdateWithHistory(id, effectiveFields, history);
         this.sqlite.markVectorSync(id, true);
       } catch (err) {
-        this.sqlite.updateMemory(id, rollbackFields);
+        // If Qdrant succeeded but local commit failed, leave the authoritative
+        // row untouched and mark it for a repair pass. No rollback revision is
+        // written, so history cannot claim a change that never committed.
+        try {
+          this.sqlite.markVectorSync(id, false);
+        } catch {
+          // The primary vector/local failure remains the caller-visible error.
+        }
+        this.sqlite.flushIfDirty();
+        throw internal(`Qdrant or local update failed; SQLite remains authoritative and requires reconciliation: ${(err as Error).message}`);
+      }
+    } else {
+      this.commitUpdateWithHistory(id, effectiveFields, history);
+      try {
+        await this.refreshVectorPayload({ ...existing, ...effectiveFields, collection: existing.collection });
+      } catch (err) {
         this.sqlite.markVectorSync(id, false);
         this.sqlite.flushIfDirty();
-        throw internal(`Qdrant update failed, rolled back SQLite: ${(err as Error).message}`);
+        throw internal(`Metadata update persisted locally but vector payload refresh requires reconciliation: ${(err as Error).message}`);
       }
     }
 
@@ -292,26 +313,39 @@ export class StorageManager {
     return updated;
   }
 
-  async deleteMemory(id: string, options?: { flush?: boolean }): Promise<boolean> {
+  async deleteMemory(id: string, options?: { flush?: boolean; lifecycleToken?: LifecycleOperationToken }): Promise<boolean> {
     const mem = this.sqlite.getMemoryById(id);
     if (!mem) return false;
+    this.stageDeletionIntent([id], options?.lifecycleToken);
     try {
       await this.qdrant.delete(mem.namespace, mem.collection, id);
     } catch (err) {
+      this.clearFailedDeletionIntent([id], options?.lifecycleToken, mem, err);
       throw internal(`Qdrant delete failed: ${(err as Error).message}`);
     }
-    const deleted = this.sqlite.deleteMemory(id);
+    let deleted: number;
+    try {
+      deleted = this.deleteStagedMemories([id], options?.lifecycleToken);
+    } catch (err) {
+      // Vector cleanup was confirmed, so keep the local tombstone pending
+      // rather than reviving a row that now has no vector.
+      this.recordConsistencyEvent(mem, err, undefined, options?.lifecycleToken);
+      throw internal(`SQLite delete failed after Qdrant cleanup; deletion remains pending: ${(err as Error).message}`);
+    }
     if (options?.flush !== false) {
       this.sqlite.flushIfDirty();
     }
-    return deleted;
+    return deleted > 0;
   }
 
   async deleteMemories(
     memories: Array<Pick<MemoryRecord, 'id' | 'namespace' | 'collection'>>,
-    options?: { flush?: boolean },
+    options?: { flush?: boolean; lifecycleToken?: LifecycleOperationToken },
   ): Promise<DeleteMemoriesResult> {
     if (memories.length === 0) return { deleted: 0, unreconciled: [], degraded: false };
+
+    const allIds = memories.map(memory => memory.id);
+    this.stageDeletionIntent(allIds, options?.lifecycleToken);
 
     const grouped = new Map<string, string[]>();
     for (const memory of memories) {
@@ -336,9 +370,10 @@ export class StorageManager {
       try {
         await this.qdrant.deleteMany(namespace!, collection!, ids);
         for (const id of ids) confirmed.add(id);
-      } catch {
+      } catch (primary) {
         unreconciled.push(...ids);
-        this.sqlite.markVectorsSyncBatch(ids, false);
+        const sample = memories.find(memory => memory.id === ids[0]);
+        this.clearFailedDeletionIntent(ids, options?.lifecycleToken, sample, primary);
       }
     }
 
@@ -346,12 +381,157 @@ export class StorageManager {
     // task 2.2) instead of a per-row `deleteMemory` loop — no per-row existence
     // probe, and `deleteMemoriesByIds` already scopes cleanly to the confirmed set.
     const confirmedIds = memories.map(m => m.id).filter(id => confirmed.has(id));
-    const deleted = this.sqlite.deleteMemoriesByIds(confirmedIds);
+    let deleted = 0;
+    if (confirmedIds.length > 0) {
+      try {
+        deleted = this.deleteStagedMemories(confirmedIds, options?.lifecycleToken);
+      } catch (err) {
+        const sample = memories.find(memory => memory.id === confirmedIds[0]);
+        this.recordConsistencyEvent(sample, err, undefined, options?.lifecycleToken);
+        throw internal(`SQLite delete failed after Qdrant cleanup; confirmed deletions remain pending: ${(err as Error).message}`);
+      }
+    }
 
     if (options?.flush !== false) {
       this.sqlite.flushIfDirty();
     }
     return { deleted, unreconciled, degraded: unreconciled.length > 0 };
+  }
+
+  private stageDeletionIntent(ids: string[], lifecycleToken?: LifecycleOperationToken): void {
+    const sqlite = this.sqlite as SqliteStore & {
+      stageDeletionIntent?: (ids: string[], options?: { lifecycleToken?: LifecycleOperationToken }) => void;
+    };
+    if (sqlite.stageDeletionIntent) {
+      if (lifecycleToken) sqlite.stageDeletionIntent(ids, { lifecycleToken });
+      else sqlite.stageDeletionIntent(ids);
+      return;
+    }
+    // Lightweight test/legacy doubles lack the new intent API. Preserve the
+    // pre-existing visible degraded marker while production stores always use
+    // the durable pending state above.
+    if (lifecycleToken) this.sqlite.markVectorsSyncBatch(ids, false, { lifecycleToken });
+    else this.sqlite.markVectorsSyncBatch(ids, false);
+  }
+
+  private deleteStagedMemories(ids: string[], lifecycleToken?: LifecycleOperationToken): number {
+    return lifecycleToken
+      ? this.sqlite.deleteMemoriesByIds(ids, lifecycleToken)
+      : this.sqlite.deleteMemoriesByIds(ids);
+  }
+
+  private clearFailedDeletionIntent(
+    ids: string[], lifecycleToken: LifecycleOperationToken | undefined,
+    memory: Pick<MemoryRecord, 'id' | 'namespace'> | undefined,
+    primary: unknown,
+  ): void {
+    try {
+      const sqlite = this.sqlite as SqliteStore & {
+        clearDeletionIntent?: (ids: string[], options?: { lifecycleToken?: LifecycleOperationToken; vectorSynced?: boolean }) => void;
+      };
+      if (sqlite.clearDeletionIntent) {
+        if (lifecycleToken) sqlite.clearDeletionIntent(ids, { lifecycleToken, vectorSynced: false });
+        else sqlite.clearDeletionIntent(ids, { vectorSynced: false });
+      } else if (lifecycleToken) {
+        this.sqlite.markVectorsSyncBatch(ids, false, { lifecycleToken });
+      } else {
+        this.sqlite.markVectorsSyncBatch(ids, false);
+      }
+    } catch (compensation) {
+      this.recordConsistencyEvent(memory, primary, compensation, lifecycleToken);
+    }
+  }
+
+  private recordConsistencyEvent(
+    memory: Pick<MemoryRecord, 'id' | 'namespace'> | undefined,
+    primary: unknown,
+    compensation: unknown,
+    lifecycleToken?: LifecycleOperationToken,
+  ): void {
+    if (!memory) return;
+    try {
+      this.logAudit('DELETE', memory.id, memory.namespace, 'system', {
+        flush: false,
+        lifecycleToken,
+        details: {
+          memory_id: memory.id,
+          prior_tier: null,
+          new_tier: null,
+          actor: 'system',
+          timestamp: new Date().toISOString(),
+          action: 'delete',
+          consistency_error: primary instanceof Error ? primary.message : String(primary),
+          compensation_error: compensation instanceof Error ? compensation.message : compensation === undefined ? undefined : String(compensation),
+        },
+      });
+    } catch {
+      // An audit failure is itself best-effort and must never mask the primary
+      // deletion or compensation failure.
+    }
+  }
+
+  private commitUpdateWithHistory(
+    id: string,
+    fields: Partial<MemoryRecordWithoutEmbedding>,
+    history: Parameters<SqliteStore['updateMemoryWithHistory']>[2],
+  ): void {
+    const sqlite = this.sqlite as SqliteStore & {
+      updateMemoryWithHistory?: SqliteStore['updateMemoryWithHistory'];
+    };
+    if (sqlite.updateMemoryWithHistory) {
+      sqlite.updateMemoryWithHistory(id, fields, history);
+      return;
+    }
+    // Test/legacy-double compatibility only. Real stores use the atomic
+    // method above; retaining this fallback keeps external mock consumers from
+    // breaking while they migrate their SQLite adapter.
+    if (history) {
+      this.sqlite.insertNextRevision(id, history.priorContent, history.revisedAt);
+      this.sqlite.insertAudit(history.audit);
+    }
+    this.sqlite.updateMemory(id, fields);
+  }
+
+  private async refreshVectorPayload(memory: MemoryRecordWithoutEmbedding): Promise<void> {
+    const qdrant = this.qdrant as QdrantStore & {
+      updatePayload?: (
+        namespace: string, collection: string, id: string, payload: Record<string, unknown>,
+      ) => Promise<void>;
+    };
+    if (!qdrant.updatePayload) {
+      // External adapters compiled against the former QdrantStore surface
+      // cannot refresh in-place. Marking drift gives the existing bounded
+      // reconciler a safe recovery route until they implement updatePayload.
+      this.sqlite.markVectorSync(memory.id, false);
+      return;
+    }
+    await qdrant.updatePayload(
+      memory.namespace,
+      memory.collection,
+      memory.id,
+      toQdrantPayload(memory),
+    );
+  }
+
+  private markVectorFailure(
+    id: string,
+    message: string,
+    permanent: boolean,
+    lifecycleToken?: LifecycleOperationToken,
+  ): void {
+    const sqlite = this.sqlite as SqliteStore & {
+      markVectorSyncFailure?: (
+        id: string, error: string, permanent: boolean,
+        options?: { lifecycleToken?: LifecycleOperationToken },
+      ) => void;
+    };
+    if (sqlite.markVectorSyncFailure) {
+      if (lifecycleToken) sqlite.markVectorSyncFailure(id, message, permanent, { lifecycleToken });
+      else sqlite.markVectorSyncFailure(id, message, permanent);
+      return;
+    }
+    if (lifecycleToken) this.sqlite.markVectorSync(id, false, { lifecycleToken });
+    else this.sqlite.markVectorSync(id, false);
   }
 
   countMemoriesInCollection(namespace: string, collection: string): number {
@@ -410,7 +590,7 @@ export class StorageManager {
     await this.sqlite.activateDatabaseImage(image);
   }
 
-  markAllMemoriesVectorSync(synced: boolean, options?: { allowDuringLifecycle?: boolean }): number {
+  markAllMemoriesVectorSync(synced: boolean, options?: { lifecycleToken?: LifecycleOperationToken }): number {
     const affected = this.sqlite.markAllVectorsSyncState(synced, options);
     this.sqlite.flushIfDirty();
     return affected;
@@ -523,7 +703,7 @@ export class StorageManager {
   async detectAndMarkVectorDrift(options: {
     expectedEmbeddingModel: string;
     expectedEmbeddingDimensions: number;
-    allowDuringLifecycle?: boolean;
+    lifecycleToken?: LifecycleOperationToken;
   }): Promise<VectorDriftReconciliationOutcome> {
     const modelChanged = options.expectedEmbeddingModel !== this.embedding.model
       || options.expectedEmbeddingDimensions !== this.embedding.dimensions;
@@ -531,7 +711,7 @@ export class StorageManager {
     if (modelChanged) {
       await this.clearManagedVectors();
       const driftedCount = this.markAllMemoriesVectorSync(false, {
-        allowDuringLifecycle: options.allowDuringLifecycle,
+        lifecycleToken: options.lifecycleToken,
       });
       return { mode: 'full-rebuild', driftedCount };
     }
@@ -550,7 +730,7 @@ export class StorageManager {
       // pass, instead of being destroyed up front on what may be a
       // transient read failure.
       const driftedCount = this.markAllMemoriesVectorSync(false, {
-        allowDuringLifecycle: options.allowDuringLifecycle,
+        lifecycleToken: options.lifecycleToken,
       });
       return { mode: 'full-rebuild', driftedCount };
     }
@@ -562,7 +742,7 @@ export class StorageManager {
 
     if (driftedIds.length > 0) {
       this.sqlite.markVectorsSyncBatch(driftedIds, false, {
-        allowDuringLifecycle: options.allowDuringLifecycle,
+        lifecycleToken: options.lifecycleToken,
       });
       this.sqlite.flushIfDirty();
     }
@@ -576,7 +756,7 @@ export class StorageManager {
   async reconcileVectorsFromSqlite(
     options?: {
       batchSize?: number;
-      allowDuringLifecycle?: boolean;
+      lifecycleToken?: LifecycleOperationToken;
       // Bounds so a slow/hanging embedding provider cannot hold this loop
       // open indefinitely. When either bound is hit, the method returns with
       // `boundReached: true` and `remaining > 0`; a later call resumes from
@@ -589,6 +769,8 @@ export class StorageManager {
     const startedAt = Date.now();
     let cursor: string | undefined;
     let reconciled = 0;
+    let failed = 0;
+    let permanentFailures = 0;
     let batches = 0;
     let boundReached = false;
 
@@ -607,22 +789,24 @@ export class StorageManager {
         break;
       }
 
-      for (const memory of memories) {
-        this.ensureCollectionCompatible(memory.namespace, memory.collection);
-      }
       this.ensureEmbeddingIdentityCompatible();
 
-      const vectors = await this.embedding.embedBatch(memories.map(memory => memory.content));
+      let vectors: Array<number[] | undefined>;
+      try {
+        vectors = await this.embedding.embedBatch(memories.map(memory => memory.content));
+      } catch {
+        // A batch-level provider rejection can hide which item is poisonous.
+        // Retry each item below so one malformed/too-large record cannot keep
+        // later IDs in this page from reconciling.
+        vectors = new Array(memories.length).fill(undefined);
+      }
 
       for (const [index, memory] of memories.entries()) {
-        const vector = vectors[index];
-        if (!vector) {
-          this.sqlite.flushIfDirty();
-          throw internal(`Missing embedding vector for memory ${memory.id}`);
-        }
-
-        const stamped = { ...memory, embedding_model: this.embedding.identity };
         try {
+          this.ensureCollectionCompatible(memory.namespace, memory.collection);
+          const vector = vectors[index] ?? await this.embedding.embed(memory.content);
+          if (!vector) throw new Error('Embedding provider returned no vector');
+          const stamped = { ...memory, embedding_model: this.embedding.identity };
           await this.qdrant.upsert(
             stamped.namespace,
             stamped.collection,
@@ -631,19 +815,15 @@ export class StorageManager {
             toQdrantPayload(stamped),
           );
           this.sqlite.markVectorSync(memory.id, true, {
-            allowDuringLifecycle: options?.allowDuringLifecycle,
+            lifecycleToken: options?.lifecycleToken,
             embeddingModel: stamped.embedding_model,
           });
           reconciled++;
         } catch (err) {
-          // Durability is bounded at batch granularity, not per item: this
-          // flush persists every mark completed so far in *this* batch (plus
-          // any prior batches) so a hard crash right after this point loses
-          // at most the remainder of the in-flight batch. Restart resumes
-          // from `listMemoriesNeedingVectorSync`, and `upsert`/`markVectorSync`
-          // are both idempotent, so replaying the lost slice is always safe.
-          this.sqlite.flushIfDirty();
-          throw err;
+          failed++;
+          const permanent = isPermanentVectorFailure(err);
+          if (permanent) permanentFailures++;
+          this.markVectorFailure(memory.id, (err as Error).message, permanent, options?.lifecycleToken);
         }
       }
 
@@ -657,7 +837,13 @@ export class StorageManager {
       cursor = `${last.created_at}|${last.id}`;
     }
 
-    return { reconciled, remaining: this.sqlite.countUnsyncedVectors(), boundReached };
+    return {
+      reconciled,
+      remaining: this.sqlite.countUnsyncedVectors(),
+      failed,
+      permanentFailures,
+      boundReached,
+    };
   }
 
   /**
@@ -748,10 +934,18 @@ export class StorageManager {
     }
 
     const remaining = this.sqlite.countMemoriesWithStaleEmbeddingStamp(activeIdentity, includeLegacy);
+    const totalRemaining = this.sqlite.countMemoriesWithStaleEmbeddingStamp(activeIdentity, true);
     let converged = false;
-    if (remaining === 0) {
+    if (remaining === 0 && totalRemaining === 0) {
       // Completed convergence (within the requested scope) clears the
-      // mismatch condition immediately, without requiring a restart.
+      // mismatch condition immediately, without requiring a restart. Update
+      // collection metadata in the same local mutation only after every
+      // vector, including legacy unstamped rows, has reached the active
+      // identity so it never authorizes a mixed-model collection.
+      const sqlite = this.sqlite as SqliteStore & {
+        updateAllCollectionEmbeddingIdentity?: (embeddingModel: string, embeddingDimensions: number) => void;
+      };
+      sqlite.updateAllCollectionEmbeddingIdentity?.(this.embedding.model, this.embedding.dimensions);
       this.sqlite.setExpectedEmbeddingIdentity(activeIdentity);
       converged = true;
     }
@@ -764,7 +958,7 @@ export class StorageManager {
     memoryId: string,
     namespace: string,
     clientId = 'unknown',
-    options?: { flush?: boolean; details?: LifecycleAuditDetails },
+    options?: { flush?: boolean; details?: LifecycleAuditDetails; lifecycleToken?: LifecycleOperationToken },
   ): void {
     const entry: AuditEntry = {
       id: uuidv4(),
@@ -775,7 +969,11 @@ export class StorageManager {
       client_id: clientId,
       details: options?.details ? JSON.stringify(options.details) : undefined,
     };
-    this.sqlite.insertAudit(entry);
+    if (options?.lifecycleToken) {
+      this.sqlite.insertAudit(entry, options.lifecycleToken);
+    } else {
+      this.sqlite.insertAudit(entry);
+    }
     if (options?.flush !== false) {
       this.sqlite.flushIfDirty();
     }
@@ -811,12 +1009,16 @@ export class StorageManager {
 export { SqliteStore } from './sqlite.js';
 export { QdrantStore } from './qdrant.js';
 
-function assignRollbackField<K extends keyof MemoryRecordWithoutEmbedding>(
-  target: Partial<MemoryRecordWithoutEmbedding>,
-  key: K,
-  value: MemoryRecordWithoutEmbedding[K],
-): void {
-  target[key] = value;
+function isPermanentVectorFailure(error: unknown): boolean {
+  const candidate = error as { status?: unknown; statusCode?: unknown; message?: unknown };
+  const status = typeof candidate.status === 'number'
+    ? candidate.status
+    : typeof candidate.statusCode === 'number'
+      ? candidate.statusCode
+      : undefined;
+  if (status !== undefined) return status >= 400 && status < 500 && status !== 408 && status !== 429;
+  const message = typeof candidate.message === 'string' ? candidate.message.toLowerCase() : String(error).toLowerCase();
+  return /invalid|malformed|too (long|large)|content policy|unsupported input/.test(message);
 }
 
 function toQdrantPayload(
@@ -824,7 +1026,7 @@ function toQdrantPayload(
     MemoryRecordWithoutEmbedding,
     'type' | 'tags' | 'collection' | 'content' | 'summary' | 'category' | 'source' |
     'importance' | 'retention_tier' | 'decay_eligible' | 'expires_at' | 'created_at' | 'checksum' | 'pinned' |
-    'confidence'
+    'confidence' | 'review_due' | 'access_count' | 'last_accessed' | 'last_operation' | 'derived_from'
   > & { device_id?: string | null; embedding_model?: string | null; origin?: MemoryOrigin | null },
 ): Record<string, unknown> {
   return {
@@ -857,5 +1059,10 @@ function toQdrantPayload(
     // same as `tags`, since Qdrant payloads are JSON-native.
     origin: mem.origin ?? null,
     confidence: mem.confidence,
+    review_due: mem.review_due ?? null,
+    access_count: mem.access_count,
+    last_accessed: mem.last_accessed,
+    last_operation: mem.last_operation,
+    derived_from: mem.derived_from ?? null,
   };
 }

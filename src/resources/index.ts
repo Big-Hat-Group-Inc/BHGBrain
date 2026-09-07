@@ -25,13 +25,9 @@ export class ResourceHandler {
     this.lifecycle = new MemoryLifecycleService(config);
   }
 
-  // T0/T1 stay visible regardless of transient expiry (matches the search and
-  // recall retrieval paths); only expired, decay-eligible T2/T3 memories are
-  // excluded from resource reads. Closes the drift where `memory://list` and
-  // `memory://{id}` read SQLite directly with no expiry filtering, leaking
-  // memories that `search`/`recall` already exclude.
+  // Every active read surface uses the lifecycle deadline itself. Tier affects
+  // how a deadline is assigned, never whether a passed deadline is visible.
   private isExpiredForResource(mem: Pick<MemoryRecord, 'retention_tier' | 'expires_at'>): boolean {
-    if (mem.retention_tier === 'T0' || mem.retention_tier === 'T1') return false;
     return this.lifecycle.isExpired(mem.expires_at, new Date());
   }
 
@@ -118,19 +114,16 @@ export class ResourceHandler {
     limit: number,
     cursor?: string,
   ): PaginatedResult<Omit<MemoryRecord, 'embedding'>> {
-    const items = this.storage.sqlite.listMemories(namespace, limit + 1, cursor);
+    const nowIso = new Date().toISOString();
+    const items = this.storage.sqlite.listMemories(namespace, limit + 1, cursor, nowIso);
     const hasMore = items.length > limit;
     const page = hasMore ? items.slice(0, limit) : items;
-    // Cursor continuation is positional (based on the raw, unfiltered page),
-    // so it stays correct even though expired T2/T3 memories are dropped
-    // from what's actually returned below.
     const lastItem = page[page.length - 1];
     const nextCursor = hasMore && lastItem ? `${lastItem.created_at}|${lastItem.id}` : null;
-    const total = this.storage.sqlite.countMemories(namespace);
-    const visiblePage = page.filter(mem => !this.isExpiredForResource(mem));
+    const total = this.storage.sqlite.countMemories(namespace, nowIso);
 
     return {
-      items: visiblePage,
+      items: page,
       cursor: nextCursor,
       total_results: total,
       truncated: hasMore,
@@ -279,7 +272,9 @@ export class ResourceHandler {
     let pinnedAppended = 0;
     let pinnedTotal = 0;
     if (this.config.auto_inject.pinned_enabled) {
-      const pinnedMemories = this.storage.sqlite.listPinnedMemories(namespace);
+      const pinnedMemories = this.storage.sqlite
+        .listPinnedMemories(namespace)
+        .filter(mem => !this.isExpiredForResource(mem));
       pinnedTotal = pinnedMemories.length;
       for (const mem of pinnedMemories) {
         if (totalChars >= budgetChars) break;
@@ -316,7 +311,9 @@ export class ResourceHandler {
       const nonPinned = candidates.filter(mem => !pinnedIds.has(mem.id));
       memories = dedup_suppression ? this.suppressNearDuplicates(nonPinned) : nonPinned;
     } else {
-      memories = this.storage.sqlite.listMemories(namespace, topK).filter(mem => !pinnedIds.has(mem.id));
+      memories = this.storage.sqlite
+        .listMemories(namespace, topK)
+        .filter(mem => !pinnedIds.has(mem.id));
     }
     let candidatesAppended = 0;
 
@@ -396,7 +393,8 @@ export class ResourceHandler {
       return parsedLimit;
     }
     const cursor = url.searchParams.get('cursor') ?? undefined;
-    const items = this.storage.sqlite.listMemoriesInCollection(namespace, path, parsedLimit + 1, cursor);
+    const nowIso = new Date().toISOString();
+    const items = this.storage.sqlite.listMemoriesInCollection(namespace, path, parsedLimit + 1, cursor, nowIso);
     const hasMore = items.length > parsedLimit;
     const page = hasMore ? items.slice(0, parsedLimit) : items;
     const lastItem = page[page.length - 1];
@@ -406,7 +404,7 @@ export class ResourceHandler {
       namespace,
       memories: page,
       cursor: nextCursor,
-      total_results: this.storage.sqlite.countMemoriesInCollection(namespace, path),
+      total_results: this.storage.sqlite.countMemoriesInCollection(namespace, path, nowIso),
       truncated: hasMore,
     };
   }

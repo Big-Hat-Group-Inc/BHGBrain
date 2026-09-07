@@ -1,0 +1,338 @@
+# BHGBrain Code Audit Prompt
+# Focus (in priority order): reliability & error handling > logging & observability > performance > application design
+# Mode: AUDIT ONLY. Do not modify source files. Produce a report.
+
+## 1. Role
+
+You are a senior reliability-focused TypeScript/Node.js reviewer auditing BHGBrain, a persistent
+vector-backed memory server for MCP clients. Your job is to find defects and design weaknesses that would
+cause data loss, silent divergence between the two stores, unavailability, unbounded resource growth, or
+operator blindness in production. Rate and rank them so the maintainer can fix the most dangerous first.
+
+You audit; you do not fix. The only file you create is the report described in §8.
+
+## 2. Repository facts (trust these; verify anything else)
+
+- Node >= 22, ESM (`.js` import extensions), TypeScript `strict`, Express 5, MCP SDK (Streamable HTTP at
+  `/mcp` plus stdio), Pino logging, Zod 4 config, Vitest. `npm run lint` = `tsc --noEmit` + `eslint src`.
+- Storage is dual-store: SQLite via `node:sqlite` `DatabaseSync` (SYNCHRONOUS API on the event loop, WAL,
+  `synchronous=NORMAL`, FTS5) for metadata/fulltext, and Qdrant (`@qdrant/js-client-rest` ~1.19, `query`
+  API) for vectors. `StorageManager` (`src/storage/index.ts`) coordinates them. A `vector_synced` column
+  marks rows whose vector is known to be missing/stale; `repair`/reconciliation replays them.
+- Embeddings: OpenAI or Azure Foundry (`src/embedding/`). A missing key yields a `DegradedEmbeddingProvider`
+  and the server still starts. Several other outbound LLM calls exist: extraction, query expansion, rerank,
+  summarization, entailment, distillation.
+- Circuit breakers (`src/resilience/circuit-breaker.ts`) wrap embedding and some Qdrant calls.
+- Two entry points: server `src/index.ts` (`main()`), CLI `src/cli/index.ts` (`createContext()`), which
+  wire the app separately.
+- Module map with sizes (largest first): `src/storage/sqlite.ts` 2538 lines, `src/tools/index.ts` 1270,
+  `src/storage/index.ts` 861, `src/search/index.ts` 790, `src/pipeline/index.ts` 688,
+  `src/storage/qdrant.ts` 670, `src/config/index.ts` 592, `src/cli/index.ts` 498,
+  `src/resources/index.ts` 431, `src/backup/retention.ts` 428, `src/backup/index.ts` 370,
+  `src/index.ts` 349, `src/health/index.ts` 341, `src/backup/scheduler.ts` 283,
+  `src/transport/http.ts` 278, `src/transport/middleware.ts` 221, `src/transport/mcp-http.ts` 150.
+- Error model: a single `BrainError` class plus factories in `src/errors/index.ts`; `handleTool` in
+  `src/tools/index.ts` converts every thrown error into a JSON error envelope.
+- Non-authoritative material: `codeaudit/`, `Research/`, `temp_stage/`, `checklist.md`, `ROADMAP.md`.
+  Prefer code and `openspec/changes/archive/*/` (design intent of already-landed changes).
+
+## 3. How to work
+
+1. Read `CLAUDE.md` and `AGENTS.md` first. Run `npm run lint && npm test` once to establish a baseline;
+   record pass/fail counts in the report header. Do not "fix" failing tests.
+2. Read the hot modules in this order: `src/storage/index.ts`, `src/storage/sqlite.ts`,
+   `src/storage/qdrant.ts`, `src/index.ts`, `src/transport/*.ts`, `src/tools/index.ts`,
+   `src/health/*.ts`, `src/backup/*.ts`, `src/search/index.ts`, `src/pipeline/*.ts`, `src/embedding/*.ts`,
+   `src/config/index.ts`, `src/cli/index.ts`. Skim the rest.
+3. For each lead in §5, open the cited code and decide: CONFIRMED (you read the code and can describe the
+   failure), REFUTED (explain why, one line), or OUT OF SCOPE. Line numbers in §5 were accurate at the time
+   of writing but may have drifted; search by symbol name if a line does not match.
+4. Then hunt for issues NOT listed in §5 using the checklists in §4. Unlisted findings are the most
+   valuable part of this audit.
+5. Before asserting a behaviour, grep for it. Never invent line numbers. Cite `path:line` or
+   `path:startLine-endLine` for every finding.
+6. Before calling something a bug, check `openspec/changes/archive/` for a proposal that made that
+   trade-off deliberately (e.g. `migrate-sqlite-to-native-engine` made `flushIfDirty()` a no-op on
+   purpose). A deliberate trade-off can still be a finding if it leaves a real gap, but say so.
+7. Every finding needs: a concrete failure scenario (inputs/state -> wrong outcome), why it matters, and a
+   specific recommended fix. Findings with no scenario are not findings.
+8. Prefer depth over breadth: 25 well-evidenced findings beat 80 speculative ones.
+
+## 4. Audit dimensions and checklists
+
+### A. Reliability & error handling (weight: highest)
+
+Dual-store consistency
+- For every path that writes/updates/deletes a memory or collection, determine the SQLite/Qdrant ordering,
+  what happens if step 2 fails, whether compensation exists, and whether the divergence is VISIBLE
+  (flagged via `vector_synced`, logged, metered) or SILENT.
+- Are audit rows, revision rows, and archive rows rolled back along with the primary row on compensation?
+- Is there any path that deletes a vector and then fails to delete the row (or vice versa) while leaving
+  `vector_synced=true`?
+- Reconciliation (`reconcileVectorsFromSqlite`, `detectAndMarkVectorDrift`, `reembedMismatchedVectors`,
+  `repair` tool): does one bad item abort the run? Are runs bounded in time and count? Can a transient
+  Qdrant error trigger a whole-corpus rebuild?
+
+SQLite transactional integrity
+- Which multi-statement operations run inside BEGIN/COMMIT and which do not? Single-row insert/update/delete
+  touch `memories`, `memories_fts`, and `memory_links` as separate statements; assess partial-failure
+  outcomes (FTS row without memory row, orphan links, search returning ghosts).
+- `flushIfDirty()`/`scheduleDeferredFlush()` are intentional no-ops; `flush()` runs a PASSIVE checkpoint.
+  Does shutdown call something that actually persists, and is `synchronous=NORMAL` acceptable for the
+  durability the README promises? State the actual guarantee.
+- Since `DatabaseSync` is synchronous, identify any long-running SQL that blocks the event loop while HTTP
+  requests are pending (bulk deletes, VACUUM INTO, checkpoint TRUNCATE, whole-file rewrites).
+
+Error handling discipline
+- Enumerate every bare `catch {}` / `catch (e) {}` with no log or metric in non-test `src/`. Rate each.
+- Enumerate functions that return `null`/`false`/`0`/`[]` on failure instead of throwing, and decide
+  whether callers can distinguish "empty" from "failed".
+- Is any error (auth, network, permission) misread as "does not exist" and used to trigger a create?
+- Does any compensation/rollback path mask the original error if the rollback itself throws?
+- Are `unhandledRejection` / `uncaughtException` handled at process level? What happens to in-flight
+  writes and open SQLite handles if a fire-and-forget promise rejects?
+- Is the `CircuitOpenError` mapped to a meaningful client status/code, or to a generic retryable INTERNAL?
+
+External calls (embedding + every LLM client)
+- For each outbound `fetch`: timeout (AbortController)? retry with backoff? 429 vs 5xx vs 4xx handled
+  distinctly? response shape validated? malformed JSON handled? request size bounded? concurrency capped?
+- Is retry-on-429 with `Retry-After` honoured anywhere? Are recursive retries bounded?
+- Which calls are inside a circuit breaker and which bypass it? Does a breaker wrap each retry attempt
+  (inflating failure counts)?
+
+Startup, shutdown, lifecycle
+- Startup with Qdrant down, with embedding key missing, with corrupt `config.json`, with a locked SQLite
+  file, with EADDRINUSE: which of these are fatal, which degrade, which are silent?
+- Is there an `error` listener on `listen()`? Is `closeAllConnections()` used so keep-alive sockets do
+  not hold shutdown open until the hard deadline? Is the shutdown deadline honoured with a non-zero exit
+  code when forced?
+- Enumerate every `setTimeout`/`setInterval`; for each: unref'd? cleared on shutdown? can an exception in
+  the callback stop future runs permanently (e.g. invalid cron expression)? does a run longer than the
+  interval skip ticks silently?
+- MCP session manager (`src/transport/mcp-http.ts`): idle timeout? max sessions? cleanup of throwaway
+  transports created for sessionless POSTs? What is the per-session memory footprint and how long can an
+  abandoned session live?
+- Backup: is `create()` protected by the lifecycle lock? Can `memory_count` in the header disagree with
+  the VACUUM image so that a valid backup later fails its own restore cross-check? Are temp files
+  fsynced and named uniquely? Is the header length bounds-checked before allocation? After the image is
+  swapped, is there any rollback if a later step throws?
+- Retention GC: does it load ALL expired rows unbounded? Does a failure leave an archive row AND a live
+  row?
+
+### B. Logging & observability
+
+- Logger construction (`src/health/logger.ts`): does stdio mode always log to stderr (stdout would corrupt
+  the MCP stream)? Check both the server and the CLI paths.
+- Are errors logged with the error object/stack (Pino `err` serializer) or only `message`? Count the
+  sites that log stack traces.
+- Redaction: which paths are redacted, are they case-sensitive, are wildcards present for nested
+  `token`/`api_key`/`authorization`, does any helper leak token prefixes/suffixes, is any redaction helper
+  defined but never used?
+- Correlation: is there a request id or session id propagated to tool/storage logs (child loggers)? If
+  not, can an operator tie a Qdrant failure log line to the tool call that caused it?
+- Field consistency: is the error carried as `error` in some events and `message` in others? Do any
+  events spread arbitrary objects into the log record?
+- Level correctness: are any failures logged at `info` (check `RetentionService`'s logger interface)?
+  Is the degraded-write path logged and metered at all?
+- Circuit breaker transitions: are open/half-open/close events logged?
+- Health (`src/health/index.ts`, `GET /health`): which components are probed live on every request, with
+  what timeout and caching? Is `/health` rate-limited or authenticated? Does it return HTTP 200 for
+  `degraded` (so the Docker HEALTHCHECK passes with Qdrant fully down)? Does the body leak raw exception
+  messages, provider/model strings, DB sizes to unauthenticated callers?
+- Metrics (`src/health/metrics.ts`): default disabled; label cardinality unbounded (user-controlled
+  `namespace` label)? `_count` semantics vs Prometheus counter semantics? Are failures counted with a
+  status label on ALL counters, not just the latency histogram?
+- `console.*` usage outside the CLI and eval runner.
+
+### C. Performance
+
+- Synchronous SQLite work per request: N un-batched UPDATEs in `recordAccessBatch` per search; per-write
+  `getCollection` in `ensureCollectionCompatible`; per-item `getCollection` inside reconcile batches.
+- Unbounded queries: `listMemoryChecksums`, `listMemoryIds`, `listExpiredMemories`, `listPinnedMemories`,
+  stale-access scan, `scrollAll` (accumulates every Qdrant point into RAM, with vectors for distillation).
+- N+1: `follow_links` expansion in recall, `repair --from-qdrant` per-point lookups, per-id loops in
+  tools.
+- Search fan-out: recall with no `collection` issues one Qdrant query per collection with full `limit`.
+- Missing indexes: `memories(namespace, collection)`, `embedding_model` for re-embed scans. Check each
+  hot WHERE clause against the declared indexes in `src/storage/sqlite.ts`.
+- Cold-start cost: first write per collection after restart pays `getCollection` + ~7 `createPayloadIndex`
+  calls; `ensuredCollections` memo is process-local.
+- Embedding batching: does the OpenAI provider honour `embedding.max_batch_inputs` or send the whole
+  array? Query-embedding LRU cache: bounded, keyed by identity, no TTL. Fan-out over query variants
+  with no concurrency cap. MMR is O(n^2).
+- Percentile computation sorts the full reservoir on every scrape.
+- Rate-limit buckets: reclaimed lazily on request traffic only.
+
+### D. Application design & maintainability
+
+- God modules and long functions (`handleReview` ~175 lines, `handleRepair` ~149, `handleRecall` ~141,
+  `hybridSearch` ~104). Recommend extraction boundaries, not rewrites.
+- Tool registry: a 16-case `switch` in `dispatch()`, a separate schema array in `src/tools/schemas.ts`,
+  and README tables can drift. Is there a test that asserts the three agree?
+- Duplicated policy: three Zod-to-`invalidInput` converters; two `isErrorEnvelope` helpers with different
+  strictness; six hardcoded `https://api.openai.com/v1` base URLs; duplicated credential fallback logic
+  (two sites omit the `OPENAI_API_KEY` fallback); repeated gauge/notify boilerplate in tool handlers.
+- Success-shaped failures: `POST /tool/:name` returns HTTP 200 for error envelopes while `/resource` maps
+  status codes; MCP `ReadResource` has no `isError`; `buildToolCallResponse` flags an error by presence
+  of an `error` key only.
+- Config: `loadConfig` has no try/catch around `JSON.parse`/`ConfigSchema.parse` (raw ZodError as the
+  startup report); env overrides applied AFTER validation are never re-validated (port range, URLs);
+  `config.json` written non-atomically without restrictive mode; env-injected values (which can contain
+  credentials in a Qdrant URL) are persisted back to disk; schema is not `.strict()` so unknown keys are
+  silently dropped and written back stripped.
+- CLI/server divergence: `createContext()` wires no summarization, expansion, or rerank providers and
+  skips the `warnIf*Degraded` checks; error envelopes are printed and the process exits 0.
+- Type-only import cycles (`tools/import.ts` <-> `tools/index.ts`, `pipeline/distillation.ts` <->
+  `pipeline/index.ts`).
+- Tooling gaps: ESLint enforces a single rule and has no `parserOptions.project`, so
+  `no-floating-promises`/`no-misused-promises` cannot run; tests are excluded from `tsc`; Vitest has no
+  coverage thresholds and no `coverage` script; `noUncheckedIndexedAccess` and friends are off.
+- Test gaps: no tests for `src/index.ts` (all wiring), `src/errors/index.ts`, `src/transport/mcp-http.ts`;
+  `forget` and `backup` are never invoked through `handleTool` in tests; the Qdrant fake in `src/eval/`
+  is unused by production-path tests.
+
+## 5. Verified leads (confirm, rate, or refute each)
+
+Reliability
+R1. No `process.on('unhandledRejection')` or `uncaughtException` anywhere in `src/`; several `void`-ed
+    promises exist (`src/index.ts` shutdown, scheduler `runOnce`, background reconcile).
+R2. `insertMemory`, `updateMemory`, `deleteMemory`, `deleteMemoriesInCollection` in `src/storage/sqlite.ts`
+    issue multiple statements with no enclosing transaction (contrast `hydrateBatch`,
+    `deleteMemoriesByIds`, FTS migration, which are wrapped).
+R3. `StorageManager.deleteMemory` deletes the Qdrant vector first, then SQLite; a SQLite failure leaves a
+    row with `vector_synced=true` and no vector: silent drift.
+R4. `StorageManager.deleteMemories` swallows `qdrant.deleteMany` failure in a bare `catch {}` with no log
+    (it does mark `vector_synced=false`). Caller in `src/backup/retention.ts` writes the archive row
+    BEFORE the delete, so an unreconciled id has both an archive row and a live row.
+R5. `updateMemory` compensation replays field snapshots on Qdrant failure but does not roll back the T0
+    revision row or the REVISE audit entry; a throwing rollback masks the original error.
+R6. `detectAndMarkVectorDrift` treats an unreadable Qdrant (`catch {}`, unlogged) as "mark everything
+    unsynced"; `qdrant.ts` `ensureCollection` treats any `getCollection` error as "collection missing"
+    and calls `createCollection`.
+R7. `reconcileVectorsFromSqlite` aborts the entire run on a single upsert failure (`throw err`).
+R8. `src/pipeline/distillation-llm.ts` `request()` is the only outbound LLM `fetch` with no
+    AbortController/timeout. Every LLM client except embedding has zero retry and collapses 429/5xx/4xx
+    into one generic `Error`.
+R9. Qdrant calls NOT wrapped by the breaker: `deleteMany` (the GC path), `ensureCollection` internals,
+    `healthCheck`, `getCollectionInfo`, `deleteCollection`, `createSnapshot`, `listAllCollections`,
+    `scrollAll`, `scrollCollection`. Breaker-open maps to a retryable INTERNAL envelope, not 503.
+R10. `McpSessionManager` (`src/transport/mcp-http.ts`): sessions Map pruned only on client-initiated
+     close; no idle timeout, no cap, no sweep; a throwaway `StreamableHTTPServerTransport` is created for
+     each sessionless non-initialize POST and never closed.
+R11. `src/index.ts`: no `error` listener on `listen()`; `httpServer.closeAllConnections()` never called;
+     the shutdown flush calls are `flushIfDirty()` no-ops (verify whether a real `flush()`/`close()`
+     runs before exit).
+R12. `src/backup/scheduler.ts`: an invalid cron expression logs and returns without re-arming or marking
+     stopped; the scheduler silently dies for the process lifetime with nothing in `/health`.
+     Background-reconcile retry timer in `src/backup/index.ts` is unref'd but never cancelled on shutdown.
+R13. `BackupService.create()` takes no lifecycle lock; `countMemories()` runs separately from
+     `VACUUM INTO`, so the header count can disagree with the image and fail restore's own cross-check.
+     `atomicWriteFileSync` (`src/storage/sqlite.ts`) does temp+rename with no fsync and a fixed `.tmp`
+     suffix. Restore reads a 4-byte header length with no bounds check before `subarray`/`JSON.parse`.
+     No backup-file retention/pruning exists anywhere.
+R14. `RetentionService.runGc` loads all expired rows via `listExpiredMemories` with no LIMIT and no time
+     budget.
+R15. `loadConfig` in `src/config/index.ts`: raw `JSON.parse` and `ConfigSchema.parse` with no formatting;
+     `applyEnvOverrides` runs after validation; `ensureDataDir` does a plain `writeFileSync` of the
+     env-mutated config.
+
+Logging & observability
+L1. Pino logger built with no `err` serializer, no base fields, no child loggers; stack traces logged at
+    exactly one site (`src/transport/http.ts` error middleware). Everything else logs `message` only.
+L2. Redaction paths are case-sensitive and narrow; `redactToken` leaks first/last 4 chars; `redactContent`
+    is exported but never called.
+L3. `RetentionService` logger type only requires `info`, so GC failures (`retention_gc_archive_failed`,
+    `retention_gc_delete_failed`, degraded catch-all) are logged at `info`.
+L4. No request id anywhere; `session_id` appears only in `mcp-http.ts` logs, never in tool logs.
+L5. `GET /health` is registered before auth, rate limit, and size limit; it runs an uncached, untimed
+    live Qdrant `query` per request; returns HTTP 200 for `degraded` (Dockerfile HEALTHCHECK keys on
+    `r.ok`); body includes raw exception messages, tier counts, DB size, breaker states, and the
+    configured provider/model strings.
+L6. `MetricsCollector` maps are keyed by name+labels with no cardinality cap; `{ namespace }` label is
+    user-controlled. `_count` is a rolling window size typed as a counter. `bhgbrain_tool_calls_total`
+    has no status label.
+L7. Circuit breaker state transitions emit no log events.
+L8. Docker entrypoint prints the generated bearer token in cleartext to stderr; `docker-compose.yml`
+    publishes Qdrant 6333 on all interfaces while the app binds loopback only.
+
+Performance
+P1. `recordAccessBatch`: N individual UPDATEs per search with no transaction.
+P2. `ensureCollectionCompatible` does a SQLite `getCollection` on every write and on every item in every
+    reconcile batch.
+P3. `scrollAll` accumulates every point of a collection in memory; used by bootstrap, checksum collection
+    (every collection), and distillation clustering with `withVector=true`.
+P4. Unbounded SELECTs: `listMemoryChecksums`, `listMemoryIds`, `listExpiredMemories`,
+    `listPinnedMemories`, stale-access scan, `listMemoryIdsInCollection`.
+P5. `follow_links` recall expansion and `repair --from-qdrant` are N+1.
+P6. Recall without `collection` fans out one Qdrant query per collection at full `limit`, then merges.
+P7. OpenAI embedding provider ignores `embedding.max_batch_inputs` (Azure chunks; OpenAI sends the whole
+    array).
+P8. No index on `memories(namespace, collection)` alone; no index on `embedding_model` for re-embed
+    scans.
+P9. `Promise.all` over query variants with no concurrency cap; MMR O(n^2); percentile sort per scrape.
+
+Design
+D1. `dispatch()` switch, `MCP_TOOL_DEFINITIONS`, and README tool tables are three unlinked lists.
+D2. Three copies of Zod->`invalidInput`; two `isErrorEnvelope` implementations with different strictness;
+    six hardcoded OpenAI base URLs; inconsistent API-key fallback (`entailment.ts`, `summarization/index.ts`
+    omit the `OPENAI_API_KEY` fallback).
+D3. `POST /tool/:name` returns HTTP 200 for error envelopes; MCP `ReadResource` never sets `isError`.
+D4. CLI `createContext()` diverges from server `main()` (missing providers and degraded-state warnings);
+    CLI exits 0 after printing an error envelope; fatal handler prints raw stack.
+D5. Sort comparators in `hybridSearch`, rerank, and `mergeVariantResults` have no tiebreaker
+    (non-deterministic order for equal scores).
+D6. Magic numbers: `RRF_K = 60`, `/10` fulltext normalisation (duplicated), `limit * 2` five times, `40`
+    cap, `.slice(0, 200)` in six LLM clients.
+D7. Tooling: single ESLint rule, no type-aware linting, tests excluded from `tsc`, no coverage
+    thresholds; no tests for `src/index.ts`, `src/errors/index.ts`, `src/transport/mcp-http.ts`;
+    `forget`/`backup` untested via `handleTool`.
+
+## 6. Severity, confidence, effort rubric
+
+Severity
+- Critical: data loss or silent permanent divergence between stores under a plausible single failure;
+  remote unauthenticated impact; process crash from ordinary input.
+- High: unavailability or unbounded resource growth under realistic load/outage; operator cannot detect a
+  real failure; durability weaker than documented.
+- Medium: degraded correctness or observability under specific conditions; performance issue that scales
+  with corpus size; design flaw that will produce bugs on the next change.
+- Low: maintainability, consistency, minor inefficiency, test gaps with no known live impact.
+- Info: observations, positive notes, deliberate trade-offs worth documenting.
+
+Confidence: High (read the code path end to end and can name the failing input), Medium (mechanism clear,
+trigger conditions partly assumed), Low (plausible, not traced).
+
+Effort: S (< 1 hour, localised), M (half day, one module), L (multi-module or needs a migration).
+
+## 7. Rules
+
+- Do not modify any file under `src/`, `openspec/`, or docs. Do not run `npm version`, commit, or push.
+- No fabricated line numbers. If you cannot find it, say so.
+- Cite the archived OpenSpec proposal when a behaviour is a documented trade-off, and still rate the gap.
+- Distinguish "silent" from "visible" degradation explicitly in every dual-store finding.
+- If lint or tests fail at baseline, report it under Info and continue.
+- Keep positive findings brief; the maintainer needs the risk list.
+
+## 8. Output
+
+Write ONE report to `codeaudit/full-audit-<YYYY-MM-DD-HH-mm>.md` with these sections, in order:
+
+1. Header: date, commit hash (`git rev-parse --short HEAD`), package version, baseline lint/test result,
+   files reviewed.
+2. Executive summary (<= 200 words): overall posture, top 3 risks, headline counts C/H/M/L/Info.
+3. Findings overview table: `# | Severity | Confidence | Effort | Dimension | Location | Summary`,
+   sorted by severity then confidence. Dimension is one of: Reliability, Error handling, Logging,
+   Observability, Performance, Design, Testing, Security (only when incidental to the above).
+4. Lead disposition table: every §5 id (R1..R15, L1..L8, P1..P9, D1..D7) with CONFIRMED / REFUTED /
+   OUT OF SCOPE and the finding number it became, or one line of reasoning.
+5. Detailed findings grouped by dimension. Each entry:
+   `### [Severity · Confidence · Effort] Title — path:line`
+   **Issue:** what the code does. **Failure scenario:** concrete inputs/state -> outcome.
+   **Why it matters:** impact. **Recommendation:** specific fix, naming the function/module to change.
+6. Cross-cutting themes (<= 6 bullets).
+7. Quick wins: S-effort items with High/Medium severity.
+8. Recommended order of work: numbered, grouped into "this week / this month / later".
+9. Appendix: every bare `catch {}` site; every `setTimeout`/`setInterval` site with its cleanup status;
+   every outbound `fetch` with timeout/retry/status-handling columns.
+
+Do not print the findings again in chat; summarise the top 5 and give the report path.

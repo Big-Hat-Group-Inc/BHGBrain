@@ -206,6 +206,7 @@ async function handleRecall(
 ): Promise<{ results: SearchResult[] }> {
   const input = parseInput(RecallInputSchema, args);
   logCtx.namespace = input.namespace;
+  const lifecycle = new MemoryLifecycleService(ctx.config);
 
   // Push type/tags/after/before down into the store instead of discovering the
   // mismatch only after `limit` candidates are already spent
@@ -319,7 +320,7 @@ async function handleRecall(
       // Default (non-archived-only) lookup: a link to a now-archived memory
       // contributes nothing recallable, so it is silently skipped.
       const neighborMem = ctx.storage.sqlite.getMemoryById(otherId);
-      if (!neighborMem) continue;
+      if (!neighborMem || lifecycle.isExpired(neighborMem.expires_at, new Date())) continue;
 
       appendedIds.add(otherId);
       neighbors.push({
@@ -781,6 +782,33 @@ interface ConsolidateCluster {
   suggested_target: string;
 }
 
+interface ConsolidationSourceFailure {
+  id: string;
+  stage: 'lookup' | 'archive' | 'delete';
+  code: 'NOT_FOUND' | 'LIFECYCLE_LOCKED' | 'ARCHIVE_FAILED' | 'DELETE_FAILED';
+  message: string;
+}
+
+function consolidationFailure(
+  id: string,
+  stage: ConsolidationSourceFailure['stage'],
+  error: unknown,
+): ConsolidationSourceFailure {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    id,
+    stage,
+    code: /Storage lifecycle operation in progress/.test(message)
+      ? 'LIFECYCLE_LOCKED'
+      : stage === 'archive'
+        ? 'ARCHIVE_FAILED'
+        : stage === 'delete'
+          ? 'DELETE_FAILED'
+          : 'NOT_FOUND',
+    message,
+  };
+}
+
 // Closes the read-side gap write-time dedup leaves open for imports and
 // degraded-window writes (add-duplicate-cluster-consolidation): `list`
 // discovers clusters of near-duplicate *existing* memories via bounded,
@@ -884,7 +912,7 @@ async function handleConsolidateList(
 
 async function handleConsolidateMerge(
   ctx: ToolContext, input: ConsolidateInput, clientId: string,
-): Promise<{ target_id: string; merged: string[]; failed: string[] }> {
+): Promise<{ target_id: string; merged: string[]; failed: string[]; failures: ConsolidationSourceFailure[] }> {
   const targetId = input.target_id!;
   const sourceIds = input.source_ids!;
 
@@ -898,6 +926,7 @@ async function handleConsolidateMerge(
   // rather than rejected, so a retried merge over a partially-completed
   // attempt is safe (spec: "Retrying a partially completed merge").
   const liveSources: Array<Omit<MemoryRecord, 'embedding'>> = [];
+  const failures: ConsolidationSourceFailure[] = [];
   for (const id of sourceIds) {
     const mem = ctx.storage.sqlite.getMemoryById(id);
     if (mem) {
@@ -909,47 +938,49 @@ async function handleConsolidateMerge(
       }
       liveSources.push(mem);
     } else if (!ctx.storage.sqlite.getArchiveByMemoryId(id)) {
-      throw notFound(`Source memory ${id} not found`);
+      failures.push({
+        id,
+        stage: 'lookup',
+        code: 'NOT_FOUND',
+        message: `Source memory ${id} not found`,
+      });
     }
     // else: already archived — skipped (idempotent retry).
   }
 
   if (liveSources.length === 0) {
-    return { target_id: targetId, merged: [], failed: [] };
+    for (const failure of failures) {
+      ctx.logger.warn({ event: 'consolidation_source_failed', target_id: targetId, ...failure });
+    }
+    return { target_id: targetId, merged: [], failed: failures.map(failure => failure.id), failures };
   }
-
-  const unionTags = new Set(target.tags);
-  for (const s of liveSources) for (const t of s.tags) unionTags.add(t);
-  const maxImportance = Math.max(target.importance, ...liveSources.map(s => s.importance));
-  const mergedFromIds = liveSources.map(s => s.id);
-  const mergedFrom = target.merged_from
-    ? `${target.merged_from},${mergedFromIds.join(',')}`
-    : mergedFromIds.join(',');
 
   // Metadata-only update: no newVector, so the target's content/embedding
   // are left untouched (spec: "target's content and embedding SHALL remain
   // unchanged").
-  await ctx.storage.updateMemory(targetId, {
-    tags: [...unionTags],
-    importance: maxImportance,
-    merged_from: mergedFrom,
-    updated_at: new Date().toISOString(),
-  });
-
   const merged: string[] = [];
-  const failed: string[] = [];
   for (const source of liveSources) {
     const nowIso = new Date().toISOString();
-    ctx.storage.sqlite.archiveMemory(source, nowIso);
+    try {
+      ctx.storage.sqlite.archiveMemory(source, nowIso);
+    } catch (err) {
+      failures.push(consolidationFailure(source.id, 'archive', err));
+      continue;
+    }
     try {
       await ctx.storage.deleteMemory(source.id);
-    } catch {
+    } catch (err) {
       // Vector/SQLite removal failed: undo the archive row so the source
       // isn't left both archived and live (same rollback `review`'s
       // `archive` action uses).
-      ctx.storage.sqlite.deleteArchive(source.id);
-      ctx.storage.sqlite.flushIfDirty();
-      failed.push(source.id);
+      const failure = consolidationFailure(source.id, 'delete', err);
+      try {
+        ctx.storage.sqlite.deleteArchive(source.id);
+        ctx.storage.sqlite.flushIfDirty();
+      } catch (rollbackError) {
+        failure.message += `; archive rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+      }
+      failures.push(failure);
       continue;
     }
 
@@ -967,9 +998,32 @@ async function handleConsolidateMerge(
     merged.push(source.id);
   }
 
+  if (merged.length > 0) {
+    const mergedSources = liveSources.filter(source => merged.includes(source.id));
+    const unionTags = new Set(target.tags);
+    for (const source of mergedSources) for (const tag of source.tags) unionTags.add(tag);
+    const maxImportance = Math.max(target.importance, ...mergedSources.map(source => source.importance));
+    const mergedFrom = target.merged_from
+      ? `${target.merged_from},${merged.join(',')}`
+      : merged.join(',');
+
+    // No new vector is produced. The target keeps its content and embedding,
+    // while its lineage records only source transitions that completed.
+    await ctx.storage.updateMemory(targetId, {
+      tags: [...unionTags],
+      importance: maxImportance,
+      merged_from: mergedFrom,
+      updated_at: new Date().toISOString(),
+    });
+  }
+
+  for (const failure of failures) {
+    ctx.logger.warn({ event: 'consolidation_source_failed', target_id: targetId, ...failure });
+  }
+
   ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());
 
-  return { target_id: targetId, merged, failed };
+  return { target_id: targetId, merged, failed: failures.map(failure => failure.id), failures };
 }
 
 async function handleCollections(

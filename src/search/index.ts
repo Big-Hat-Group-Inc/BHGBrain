@@ -35,6 +35,14 @@ function isRetentionTier(value: unknown): value is RetentionTier {
   return typeof value === 'string' && (RETENTION_TIERS as readonly string[]).includes(value);
 }
 
+function narrowExpiry(value: unknown): string | null {
+  if (typeof value === 'string' && !Number.isNaN(Date.parse(value))) return value;
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return new Date(value * 1000).toISOString();
+  }
+  return null;
+}
+
 // A malformed/absent `origin` payload field narrows to `null` — "unknown",
 // not an error, matching `SqliteStore.parseOrigin`'s fail-soft posture. See
 // add-memory-provenance-metadata.
@@ -243,8 +251,17 @@ export class SearchService {
       }
     }
     return Array.from(merged.values())
-      .sort((a, b) => b.score - a.score)
+      .sort((a, b) => (b.score - a.score) || a.id.localeCompare(b.id))
       .slice(0, limit);
+  }
+
+  private static normalizeFulltextScores(items: Array<{ rank: number }>): number[] {
+    if (items.length === 0) return [];
+    const ranks = items.map(item => item.rank);
+    const low = Math.min(...ranks);
+    const high = Math.max(...ranks);
+    if (high === low) return items.map(() => 1);
+    return ranks.map(rank => (rank - low) / (high - low));
   }
 
   async search(
@@ -314,7 +331,7 @@ export class SearchService {
 
       if (includeArchived) {
         const archivedMatches = this.storage.sqlite
-          .searchArchived(namespace, query, limit)
+          .searchArchived(namespace, query, this.config.search.archive_result_limit ?? 5)
           .map(archiveRecordToSearchResult);
         results = [...results, ...archivedMatches];
       }
@@ -392,9 +409,10 @@ export class SearchService {
     const ftsResults = filter
       ? this.storage.sqlite.fullTextSearch(namespace, query, limit, collection, filter)
       : this.storage.sqlite.fullTextSearch(namespace, query, limit, collection);
+    const normalizedScores = SearchService.normalizeFulltextScores(ftsResults);
     return this.buildSearchResults(
-      ftsResults.map(r => {
-        const normalizedScore = Math.min(1, Math.abs(r.rank) / 10);
+      ftsResults.map((r, index) => {
+        const normalizedScore = normalizedScores[index]!;
         return {
           id: r.id,
           score: normalizedScore,
@@ -469,6 +487,7 @@ export class SearchService {
 
     // Build RRF fusion
     const itemMap = new Map<string, RankedItem>();
+    const normalizedFulltextScores = SearchService.normalizeFulltextScores(fulltextItems);
 
     semanticItems.forEach((item, idx) => {
       const existing = itemMap.get(item.id) ?? { id: item.id };
@@ -481,7 +500,7 @@ export class SearchService {
     fulltextItems.forEach((item, idx) => {
       const existing = itemMap.get(item.id) ?? { id: item.id };
       existing.fulltextRank = idx + 1;
-      existing.fulltextScore = Math.min(1, Math.abs(item.rank) / 10);
+      existing.fulltextScore = normalizedFulltextScores[idx]!;
       itemMap.set(item.id, existing);
     });
 
@@ -499,7 +518,7 @@ export class SearchService {
       };
     });
 
-    scored.sort((a, b) => b.rrfScore - a.rrfScore);
+    scored.sort((a, b) => (b.rrfScore - a.rrfScore) || a.id.localeCompare(b.id));
 
     return this.buildSearchResults(
       scored.slice(0, limit).map(item => ({
@@ -598,7 +617,7 @@ export class SearchService {
           }
         }
         const value = lambda * relevance - (1 - lambda) * maxSim;
-        if (value > bestValue) {
+        if (value > bestValue || (value === bestValue && candidate.id.localeCompare(remaining[bestIdx]!.id) < 0)) {
           bestValue = value;
           bestIdx = i;
         }
@@ -615,9 +634,9 @@ export class SearchService {
   // of `results` (already composite/MMR-ranked) against `query`, replacing
   // `score` (never `semantic_score`, so `min_score` filtering stays
   // unaffected) for every candidate the provider actually scored, and
-  // re-sorts the *full* list by the resulting `score` descending. Candidates
-  // outside the pool, or omitted from a partial provider response, keep
-  // their pre-rerank `score` and no `rerank_score` — never dropped.
+  // re-sorts only the evaluated pool. Candidates outside the pool retain
+  // their existing relative order after it, because an LLM judgment and a
+  // composite score are different scales and must never compete numerically.
   //
   // Mirrors `hybridSearch`'s embedding-degradation shape
   // (`src/search/index.ts:345-357`): any provider failure (network error,
@@ -635,12 +654,20 @@ export class SearchService {
         query,
         pool.map(r => ({ id: r.id, text: r.content })),
       );
-      const rerankedPool = pool.map(r => {
+      const rerankedPool = pool.map((r, index) => {
         const score = scores.get(r.id);
-        if (score === undefined) return r;
-        return { ...r, score, rerank_score: score };
+        return { result: score === undefined ? r : { ...r, score, rerank_score: score }, index };
       });
-      return [...rerankedPool, ...rest].sort((a, b) => b.score - a.score);
+      rerankedPool.sort((a, b) => {
+        const aScored = a.result.rerank_score !== undefined;
+        const bScored = b.result.rerank_score !== undefined;
+        if (aScored !== bScored) return aScored ? -1 : 1;
+        if (aScored && bScored) {
+          return (b.result.rerank_score! - a.result.rerank_score!) || a.result.id.localeCompare(b.result.id);
+        }
+        return a.index - b.index;
+      });
+      return [...rerankedPool.map(item => item.result), ...rest];
     } catch (err) {
       this.metrics?.incCounter('search_rerank_degraded');
       this.logger?.warn({
@@ -705,7 +732,7 @@ export class SearchService {
     // (a lower-relevance, high-importance/high-access/fresh memory can now
     // outrank a higher-relevance stale one), so results must be re-sorted here
     // rather than trusting the order the mode implementations produced.
-    searchResults.sort((a, b) => b.score - a.score);
+    searchResults.sort((a, b) => (b.score - a.score) || a.id.localeCompare(b.id));
 
     if (accessUpdates.length > 0) {
       this.storage.sqlite.recordAccessBatch(accessUpdates);
@@ -727,6 +754,8 @@ export class SearchService {
   ): SearchResult | null {
     const content = narrowString(payload.content);
     if (content === undefined) return null;
+    const expiresAt = narrowExpiry(payload.expires_at);
+    if (this.lifecycle.isExpired(expiresAt, new Date(nowIso))) return null;
     return {
       id: item.id,
       content,
@@ -737,8 +766,8 @@ export class SearchService {
       semantic_score: item.semantic_score,
       fulltext_score: item.fulltext_score,
       retention_tier: isRetentionTier(payload.retention_tier) ? payload.retention_tier : 'T2',
-      expires_at: null,
-      expiring_soon: false,
+      expires_at: expiresAt,
+      expiring_soon: this.lifecycle.isExpiringSoon(expiresAt, new Date(nowIso)),
       device_id: narrowString(payload.device_id) ?? null,
       created_at: narrowString(payload.created_at) ?? nowIso,
       last_accessed: nowIso,

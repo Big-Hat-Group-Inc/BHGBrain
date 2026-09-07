@@ -37,6 +37,14 @@ describe('loadConfig Azure embedding validation', () => {
     return path;
   }
 
+  it('rejects malformed and unsatisfiable retention schedules with their exact paths', () => {
+    const malformed = writeConfig({ retention: { cleanup_schedule: 'not a cron' } });
+    expect(() => loadConfig(malformed)).toThrow(/"cleanup_schedule"/);
+
+    const unsatisfiable = writeConfig({ retention: { distillation: { schedule: '0 0 31 2 *' } } });
+    expect(() => loadConfig(unsatisfiable)).toThrow(/"distillation"[\s\S]*"schedule"/);
+  });
+
   it('loads valid Azure embedding config with defaults applied', () => {
     const configPath = writeConfig({
       embedding: {

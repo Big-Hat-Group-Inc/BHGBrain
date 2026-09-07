@@ -194,7 +194,7 @@ describe('resource pagination bounds', () => {
     expect(result.error.code).toBe('NOT_FOUND');
   });
 
-  it('keeps an expired T1 memory visible through memory://{id} (only T2/T3 are filtered)', async () => {
+  it('excludes an expired T1 memory through memory://{id}', async () => {
     const expiredT1 = {
       id: '550e8400-e29b-41d4-a716-446655440003',
       namespace: 'global',
@@ -222,12 +222,11 @@ describe('resource pagination bounds', () => {
       { check: async () => ({ status: 'healthy' }) } as HealthService,
     );
 
-    const result = await handler.handle(`memory://${expiredT1.id}`) as { id?: string; error?: unknown };
-    expect(result.error).toBeUndefined();
-    expect(result.id).toBe(expiredT1.id);
+    const result = await handler.handle(`memory://${expiredT1.id}`) as ResourceResult;
+    expect(result.error.code).toBe('NOT_FOUND');
   });
 
-  it('excludes expired T2/T3 memories from a memory://list page', async () => {
+  it('asks storage for an expiry-eligible memory://list page', async () => {
     const active = {
       id: '550e8400-e29b-41d4-a716-446655440004',
       namespace: 'global',
@@ -241,16 +240,13 @@ describe('resource pagination bounds', () => {
       decay_eligible: true,
       created_at: '2026-01-01T00:00:00.000Z',
     };
-    const expired = {
-      ...active,
-      id: '550e8400-e29b-41d4-a716-446655440005',
-      retention_tier: 'T3',
-      expires_at: '2020-01-01T00:00:00.000Z',
-    };
     const storage = {
       sqlite: {
-        listMemories: (_ns: string, limit: number) => [active, expired].slice(0, limit),
-        countMemories: () => 2,
+        listMemories: (_ns: string, limit: number, _cursor?: string, nowIso?: string) => {
+          expect(nowIso).toEqual(expect.any(String));
+          return [active].slice(0, limit);
+        },
+        countMemories: () => 1,
       },
     } as unknown as StorageManager;
     const config = { defaults: { namespace: 'global' } } as unknown as BrainConfig;
@@ -562,6 +558,20 @@ describe('inject pinning (add-inject-pinning)', () => {
     expect(result.memories_count).toBe(2);
     // Pinned content appears first in the assembled block.
     expect(result.content.indexOf('critical pinned fact')).toBeLessThan(result.content.indexOf('recent unrelated memory'));
+  });
+
+  it('does not inject a pinned memory whose lifecycle deadline has passed', async () => {
+    const storage = makeStorage({
+      listPinnedMemories: () => [{
+        ...mkPinned('expired-pin', 'expired pinned fact'), retention_tier: 'T2',
+        expires_at: '2020-01-01T00:00:00.000Z',
+      }],
+    });
+    const handler = new ResourceHandler(baseConfig, storage, {} as SearchService, healthy);
+
+    const result = await handler.handle('memory://inject') as InjectResult;
+    expect(result.content).not.toContain('expired pinned fact');
+    expect(result.memories_count).toBe(0);
   });
 
   it('hinted inject includes pinned memories ahead of relevance, even when unmatched (5.6)', async () => {

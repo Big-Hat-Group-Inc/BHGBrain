@@ -17,6 +17,7 @@ type MockSqliteStore = SqliteStore & {
   markVectorsSyncBatch: ReturnType<typeof vi.fn>;
   listRevisions: ReturnType<typeof vi.fn>;
   insertRevision: ReturnType<typeof vi.fn>;
+  insertNextRevision: ReturnType<typeof vi.fn>;
   insertAudit: ReturnType<typeof vi.fn>;
   deleteMemoriesByIds: ReturnType<typeof vi.fn>;
   listMemoryIds: ReturnType<typeof vi.fn>;
@@ -106,6 +107,7 @@ function createMockSqlite(): MockSqliteStore {
     }),
     listRevisions: vi.fn(() => []),
     insertRevision: vi.fn(),
+    insertNextRevision: vi.fn(),
     insertAudit: vi.fn(),
     getCollection: vi.fn(() => ({ name: 'general', namespace: 'global', embedding_model: 'test', embedding_dimensions: 3 })),
     createCollection: vi.fn(),
@@ -308,8 +310,8 @@ describe('StorageManager cross-store consistency', () => {
     });
   });
 
-  describe('updateMemory rollback', () => {
-    it('rolls back SQLite update when Qdrant upsert fails', async () => {
+  describe('updateMemory projection failure', () => {
+    it('does not change SQLite when Qdrant upsert fails', async () => {
       const sqlite = createMockSqlite();
       const qdrant = createMockQdrant(false);
       const embedding = createMockEmbedding();
@@ -323,16 +325,11 @@ describe('StorageManager cross-store consistency', () => {
 
       await expect(
         storage.updateMemory('mem-1', { importance: 0.9, tags: ['b'] }, [4, 5, 6]),
-      ).rejects.toThrow('Qdrant update failed, rolled back SQLite');
+      ).rejects.toThrow('SQLite remains authoritative and requires reconciliation');
 
-      // SQLite updateMemory should have been called twice: once for update, once for rollback
-      expect(sqlite.updateMemory).toHaveBeenCalledTimes(2);
-      // Second call should restore original values, including the
-      // pre-update embedding_model stamp — the earlier `writeMemory` call
-      // already stamped it with the active identity, so rollback restores
-      // that same value (it was never actually changed by this attempt).
-      const rollbackCall = sqlite.updateMemory.mock.calls[1];
-      expect(rollbackCall[1]).toEqual({ importance: 0.5, tags: ['a'], embedding_model: 'openai/test@3' });
+      // The vector projection is attempted before the local update, so no
+      // rollback write (and no phantom history) is necessary on failure.
+      expect(sqlite.updateMemory).not.toHaveBeenCalled();
     });
   });
 
@@ -363,7 +360,7 @@ describe('StorageManager cross-store consistency', () => {
 
       await storage.updateMemory('mem-1', { content: 'revised content' });
 
-      expect(sqlite.insertRevision).toHaveBeenCalledWith('mem-1', 1, 'test content', expect.any(String));
+      expect(sqlite.insertNextRevision).toHaveBeenCalledWith('mem-1', 'test content', expect.any(String));
       expect(sqlite.insertAudit).toHaveBeenCalledWith(expect.objectContaining({
         operation: 'REVISE',
         memory_id: 'mem-1',
@@ -383,7 +380,7 @@ describe('StorageManager cross-store consistency', () => {
 
       await storage.updateMemory('mem-1', { content: 'revised content' });
 
-      expect(sqlite.insertRevision).not.toHaveBeenCalled();
+      expect(sqlite.insertNextRevision).not.toHaveBeenCalled();
       expect(sqlite.insertAudit).not.toHaveBeenCalledWith(expect.objectContaining({ operation: 'REVISE' }));
     });
   });
@@ -406,8 +403,8 @@ describe('StorageManager cross-store consistency', () => {
       expect(embedding.embed).toHaveBeenCalledWith('original content');
       // updateMemory's own T0-content-change gate is what appends the
       // pre-revert content as a new history entry (append-only, not rewritten).
-      expect(sqlite.insertRevision).toHaveBeenCalledTimes(1);
-      expect(sqlite.insertRevision).toHaveBeenCalledWith('mem-1', 2, 'test content', expect.any(String));
+      expect(sqlite.insertNextRevision).toHaveBeenCalledTimes(1);
+      expect(sqlite.insertNextRevision).toHaveBeenCalledWith('mem-1', 'test content', expect.any(String));
       expect(sqlite.insertAudit).toHaveBeenCalledWith(expect.objectContaining({
         operation: 'REVISE',
         memory_id: 'mem-1',
@@ -444,7 +441,7 @@ describe('StorageManager cross-store consistency', () => {
 
       await expect(storage.revertMemory('mem-1', 1, 'client-x')).rejects.toMatchObject({ code: 'EMBEDDING_UNAVAILABLE' });
       expect(sqlite.updateMemory).not.toHaveBeenCalled();
-      expect(sqlite.insertRevision).not.toHaveBeenCalled();
+      expect(sqlite.insertNextRevision).not.toHaveBeenCalled();
       expect(sqlite.insertAudit).not.toHaveBeenCalled();
     });
 
@@ -536,7 +533,7 @@ describe('StorageManager cross-store consistency', () => {
         allowDuringLifecycle: undefined,
         embeddingModel: 'openai/test@3',
       });
-      expect(result).toEqual({ reconciled: 2, remaining: 0, boundReached: false });
+      expect(result).toEqual({ reconciled: 2, remaining: 0, failed: 0, permanentFailures: 0, boundReached: false });
     });
 
     it('flushes completed reconciliation progress before returning a later failure', async () => {
@@ -562,15 +559,11 @@ describe('StorageManager cross-store consistency', () => {
         .mockRejectedValueOnce(new Error('Qdrant unavailable'))
         .mockResolvedValueOnce(undefined);
 
-      await expect(storage.reconcileVectorsFromSqlite({ batchSize: 2 })).rejects.toThrow('Qdrant unavailable');
-      expect(sqlite.flushIfDirty).toHaveBeenCalledTimes(1);
+      const result = await storage.reconcileVectorsFromSqlite({ batchSize: 2 });
+      // A transient failure is recorded and the later page still completes.
+      expect(result).toEqual({ reconciled: 2, remaining: 0, failed: 1, permanentFailures: 0, boundReached: false });
+      expect(sqlite.flushIfDirty).toHaveBeenCalledTimes(2);
       expect(sqlite.getMemoryById('mem-a')?.vector_synced).toBe(true);
-      expect(sqlite.getMemoryById('mem-b')?.vector_synced).toBe(false);
-      expect(sqlite.countUnsyncedVectors()).toBe(1);
-
-      const retryResult = await storage.reconcileVectorsFromSqlite({ batchSize: 2 });
-
-      expect(retryResult).toEqual({ reconciled: 1, remaining: 0, boundReached: false });
       expect(sqlite.getMemoryById('mem-b')?.vector_synced).toBe(true);
     });
 

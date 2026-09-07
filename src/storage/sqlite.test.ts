@@ -50,6 +50,15 @@ describe('SqliteStore', () => {
     expect(retrieved!.tags).toEqual(mem.tags);
   });
 
+  it('sets the configured bounded SQLite busy timeout at open', async () => {
+    const configured = new SqliteStore(tempDir, { busyTimeoutMs: 321 });
+    await configured.init();
+    const db = (configured as unknown as { db: DatabaseSync }).db;
+    const row = db.prepare('PRAGMA busy_timeout').get() as { timeout: number };
+    expect(row.timeout).toBe(321);
+    configured.close();
+  });
+
   // add-memory-distillation, task 7.2: derived_from round-trips through
   // insert/rowToMemory (null for an ordinary write, populated array for a
   // distillation write) and through updateMemory's special-cased column.
@@ -88,6 +97,17 @@ describe('SqliteStore', () => {
     expect(store.getMemoryById(mem.id)).toBeNull();
   });
 
+  it('stages deletion intents as hidden, recoverable vector drift', () => {
+    const mem = sampleMemory();
+    store.insertMemory(mem);
+
+    store.stageDeletionIntent([mem.id]);
+    expect(store.getMemoryById(mem.id)).toBeNull();
+
+    store.clearDeletionIntent([mem.id], { vectorSynced: false });
+    expect(store.getMemoryById(mem.id)).toEqual(expect.objectContaining({ id: mem.id, vector_synced: false }));
+  });
+
   // openspec/changes/upgrade-fulltext-to-fts5, task 1.1, flipped by
   // migrate-sqlite-to-native-engine task 4.1: the startup FTS5 capability
   // probe. This is a canary, not just a smoke test — `node:sqlite`'s bundled
@@ -117,6 +137,47 @@ describe('SqliteStore', () => {
     const list = store.listMemories('global', 10);
     expect(list[0]!.id).toBe(mem2.id);
     expect(list[1]!.id).toBe(mem1.id);
+  });
+
+  it('uses one expiry boundary before list, collection, count, and full-text limits', () => {
+    const now = '2026-09-06T12:00:00.000Z';
+    const expired = {
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000011', checksum: 'expired',
+      content: 'eligibility needle', summary: 'expired', collection: 'work',
+      expires_at: '2026-09-06T11:59:59.999Z', created_at: '2026-09-06T11:00:00.000Z',
+    };
+    const atBoundary = {
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000012', checksum: 'boundary',
+      content: 'eligibility needle', summary: 'boundary', collection: 'work',
+      expires_at: now, created_at: '2026-09-06T10:00:00.000Z',
+    };
+    store.insertMemory(expired);
+    store.insertMemory(atBoundary);
+
+    expect(store.listMemories('global', 10, undefined, now).map(mem => mem.id)).toEqual([atBoundary.id]);
+    expect(store.listMemoriesInCollection('global', 'work', 10, undefined, now).map(mem => mem.id)).toEqual([atBoundary.id]);
+    expect(store.countMemories('global', now)).toBe(1);
+    expect(store.countMemoriesInCollection('global', 'work', now)).toBe(1);
+    expect(store.fullTextSearch('global', 'eligibility', 10, undefined, undefined, now).map(result => result.id))
+      .toEqual([atBoundary.id]);
+  });
+
+  it('selects equal-ranked full-text candidates in stable memory-id order', () => {
+    const first = {
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000021', checksum: 'tie-a',
+      content: 'stable ranking phrase', summary: 'same',
+    };
+    const second = {
+      ...sampleMemory(), id: '00000000-0000-0000-0000-000000000022', checksum: 'tie-b',
+      content: 'stable ranking phrase', summary: 'same',
+    };
+    store.insertMemory(second);
+    store.insertMemory(first);
+
+    const once = store.fullTextSearch('global', 'stable ranking phrase', 1);
+    const again = store.fullTextSearch('global', 'stable ranking phrase', 1);
+    expect(once.map(result => result.id)).toEqual([first.id]);
+    expect(again).toEqual(once);
   });
 
   it('updates memory fields', () => {
@@ -317,14 +378,14 @@ describe('SqliteStore', () => {
       const mem = sampleMemory();
       store.insertMemory(mem);
       store.flush();
-      store.beginLifecycleOperation('restore');
+      const lifecycleToken = store.beginLifecycleOperation('restore');
 
       expect(() => store.recordFeedback({
         memory_id: mem.id, namespace: 'global', query: null, score: null, useful: true,
         client_id: 'c1', created_at: new Date().toISOString(),
       })).toThrow(/lifecycle operation/);
 
-      store.endLifecycleOperation('restore');
+      store.endLifecycleOperation(lifecycleToken, 'restore');
     });
   });
 
@@ -496,14 +557,14 @@ describe('SqliteStore', () => {
     store.insertMemory(mem);
     store.flush();
 
-    store.beginLifecycleOperation('restore');
+    const lifecycleToken = store.beginLifecycleOperation('restore');
     expect(() => store.setCategory('Blocked', 'custom', 'nope')).toThrow('lifecycle operation');
 
     const before = store.getMemoryById(mem.id)!;
     store.touchMemory(mem.id);
     const after = store.getMemoryById(mem.id)!;
     expect(after.access_count).toBe(before.access_count);
-    store.endLifecycleOperation('restore');
+    store.endLifecycleOperation(lifecycleToken, 'restore');
   });
 
   // -- Restore/flush race coverage (real SqliteStore, not mocked) --
@@ -529,7 +590,7 @@ describe('SqliteStore', () => {
       // Mirrors BackupService.beginRestoreOperation(): acquiring the restore
       // lifecycle lock must cancel the pending timer synchronously, before any
       // restored bytes are written to disk.
-      store.beginLifecycleOperation('restore');
+      const lifecycleToken = store.beginLifecycleOperation('restore');
 
       // Simulate the restore write: different bytes land on disk directly
       // (bypassing this store's flush()), exactly as atomicWriteFileSync does
@@ -555,7 +616,7 @@ describe('SqliteStore', () => {
 
       // The real reload path: reads afterward observe the restored dataset.
       await store.reloadFromDisk();
-      store.endLifecycleOperation('restore');
+      store.endLifecycleOperation(lifecycleToken, 'restore');
 
       expect(store.getMemoryById(mem.id)).toBeNull();
       expect(store.getMemoryById(restoredMem.id)).not.toBeNull();
@@ -569,7 +630,7 @@ describe('SqliteStore', () => {
     store.insertMemory(mem);
     store.flush();
 
-    store.beginLifecycleOperation('restore');
+    const lifecycleToken = store.beginLifecycleOperation('restore');
     const reloadPromise = store.reloadFromDisk();
 
     // While the reload is in flight -- mirroring the window between
@@ -581,7 +642,7 @@ describe('SqliteStore', () => {
     expect(() => store.insertMemory({ ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440098', checksum: 'racer' })).toThrow(/lifecycle operation/);
 
     await reloadPromise;
-    store.endLifecycleOperation('restore');
+    store.endLifecycleOperation(lifecycleToken, 'restore');
 
     // Guard lifted once the lifecycle operation ends.
     expect(() => store.markStale(mem.id)).not.toThrow();
@@ -1017,6 +1078,30 @@ describe('SqliteStore', () => {
     ]);
   });
 
+  it('keyset-pages expired T2/T3 memories in deterministic expiry and id order', () => {
+    const expiresAt = '2026-01-01T00:00:00.000Z';
+    for (const id of ['00000000-0000-0000-0000-0000000000e3', '00000000-0000-0000-0000-0000000000e1', '00000000-0000-0000-0000-0000000000e2']) {
+      store.insertMemory({
+        ...sampleMemory(), id, checksum: id, retention_tier: 'T2', expires_at: expiresAt, decay_eligible: true,
+      });
+    }
+    store.insertMemory({
+      ...sampleMemory(), id: '00000000-0000-0000-0000-0000000000e4', checksum: 't1',
+      retention_tier: 'T1', expires_at: expiresAt, decay_eligible: true,
+    });
+
+    const page1 = store.listExpiredMemoriesPage('2026-02-01T00:00:00.000Z', 2);
+    const cursor = `${page1[1]!.expires_at}|${page1[1]!.id}`;
+    const page2 = store.listExpiredMemoriesPage('2026-02-01T00:00:00.000Z', 2, cursor);
+
+    expect(page1.map(memory => memory.id)).toEqual([
+      '00000000-0000-0000-0000-0000000000e1',
+      '00000000-0000-0000-0000-0000000000e2',
+    ]);
+    expect(page2.map(memory => memory.id)).toEqual(['00000000-0000-0000-0000-0000000000e3']);
+    expect(store.countExpiredDeletableMemories('2026-02-01T00:00:00.000Z')).toBe(3);
+  });
+
   it('searchArchived matches retained summary/tags and scopes to the given namespace', () => {
     const mem = { ...sampleMemory(), namespace: 'global', retention_tier: 'T2' as const };
     store.archiveMemory({ ...mem, summary: 'a note about kubernetes', tags: ['ops'] }, '2026-01-01T00:00:00.000Z');
@@ -1034,6 +1119,40 @@ describe('SqliteStore', () => {
 
     const noMatch = store.searchArchived('global', 'nonexistent-term', 10);
     expect(noMatch).toEqual([]);
+  });
+
+  it('converges repeated archive attempts to one current archive record', () => {
+    const mem = { ...sampleMemory(), retention_tier: 'T2' as const };
+    store.archiveMemory({ ...mem, summary: 'first summary', tags: ['first'] }, '2026-01-01T00:00:00.000Z');
+    store.archiveMemory({ ...mem, summary: 'replacement summary', tags: ['replacement'] }, '2026-02-01T00:00:00.000Z');
+
+    expect(store.countArchivedMemories()).toBe(1);
+    expect(store.getArchiveByMemoryId(mem.id)).toMatchObject({
+      memory_id: mem.id,
+      summary: 'replacement summary',
+      expired_at: '2026-02-01T00:00:00.000Z',
+      tags: ['replacement'],
+    });
+  });
+
+  it('deduplicates legacy archive rows before installing the archive identity index', async () => {
+    const internal = store as unknown as { db: DatabaseSync };
+    internal.db.exec('DROP INDEX idx_memory_archive_memory_id_unique');
+    const insert = internal.db.prepare(
+      `INSERT INTO memory_archive (memory_id, summary, tier, namespace, created_at, expired_at, access_count, tags)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    insert.run('legacy-archive', 'older', 'T2', 'global', '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z', 1, '[]');
+    insert.run('legacy-archive', 'newer', 'T2', 'global', '2026-01-01T00:00:00.000Z', '2026-02-02T00:00:00.000Z', 2, '[]');
+    store.close();
+
+    store = new SqliteStore(tempDir);
+    await store.init();
+
+    expect(store.countArchivedMemories()).toBe(1);
+    expect(store.getArchiveByMemoryId('legacy-archive')).toMatchObject({
+      summary: 'newer', expired_at: '2026-02-02T00:00:00.000Z', access_count: 2,
+    });
   });
 
   it('searchArchived matches multi-word queries whose terms are non-contiguous in the summary', () => {
@@ -1079,6 +1198,20 @@ describe('SqliteStore', () => {
     // Regression: the old `LIKE '%%'` shape matched every archived row.
     expect(store.searchArchived('global', '', 10)).toEqual([]);
     expect(store.searchArchived('global', '   ', 10)).toEqual([]);
+  });
+
+  it('does not let archive LIKE wildcards enumerate unrelated rows', () => {
+    const mem = { ...sampleMemory(), namespace: 'global', retention_tier: 'T2' as const };
+    store.archiveMemory({ ...mem, summary: 'alpha only', tags: [] }, '2026-01-01T00:00:00.000Z');
+    store.archiveMemory(
+      { ...mem, id: '00000000-0000-0000-0000-0000000000ac', summary: 'bravo only', tags: [] },
+      '2026-01-02T00:00:00.000Z',
+    );
+
+    expect(store.searchArchived('global', '%', 10)).toEqual([]);
+    expect(store.searchArchived('global', '_', 10)).toEqual([]);
+    expect(store.searchArchived('global', '😀', 10)).toEqual([]);
+    expect(store.searchArchived('global', 'alpha!!!', 10).map(row => row.memory_id)).toEqual([mem.id]);
   });
 
   it('searchArchive (CLI, namespace-agnostic) tokenizes the same way', () => {
@@ -1760,6 +1893,17 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
     it('returns 0 for an empty id list', () => {
       expect(store.deleteMemoriesByIds([])).toBe(0);
     });
+
+    it('chunks corpus-sized ID state updates below SQLite parameter limits', () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      const ids = Array.from({ length: 32_767 }, (_, index) => `bulk-${index}`);
+      ids[32_766] = mem.id;
+
+      expect(() => store.markVectorsSyncBatch(ids, false)).not.toThrow();
+      expect(store.getMemoryById(mem.id)!.vector_synced).toBe(false);
+      expect(store.getMemoriesByIds(ids)).toEqual([expect.objectContaining({ id: mem.id })]);
+    });
   });
 
   describe('listMemoryIds', () => {
@@ -1865,7 +2009,7 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
       store.getMemoryById(mem.id);
       store.getMemoryById(mem.id);
 
-      const getMemoryByIdSql = 'SELECT * FROM memories WHERE id = ? AND archived = 0';
+      const getMemoryByIdSql = 'SELECT * FROM memories WHERE id = ? AND archived = 0 AND deletion_pending = 0';
       const prepareCallsForThisSql = prepareSpy.mock.calls.filter(call => call[0] === getMemoryByIdSql);
       expect(prepareCallsForThisSql).toHaveLength(1);
       prepareSpy.mockRestore();
@@ -1940,6 +2084,18 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
       const remainingA = store.listRevisions('mem-a').map(r => r.revision).sort((a, b) => a - b);
       expect(remainingA).toEqual([4, 5]);
       expect(store.listRevisions('mem-b')).toHaveLength(1);
+    });
+
+    it('allocates the next revision from the persisted maximum after pruning', () => {
+      for (let r = 1; r <= 5; r++) {
+        store.insertRevision('mem-a', r, `content v${r}`, new Date().toISOString());
+      }
+      store.pruneRevisions(2);
+
+      const next = store.insertNextRevision('mem-a', 'content v6', new Date().toISOString());
+
+      expect(next).toBe(6);
+      expect(store.listRevisions('mem-a').map(row => row.revision).sort((a, b) => a - b)).toEqual([4, 5, 6]);
     });
   });
 });

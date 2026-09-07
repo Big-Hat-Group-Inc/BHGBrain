@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -12,7 +12,7 @@ import { embeddingUnavailable } from '../errors/index.js';
 function makeBackupFile(
   dir: string,
   payload: Buffer,
-  headerOverrides?: Partial<{ memory_count: number; embedding_model: string; embedding_dimensions: number }>,
+  headerOverrides?: Partial<{ version: number; memory_count: number; embedding_model: string; embedding_dimensions: number }>,
 ): string {
   const checksum = createHash('sha256').update(payload).digest('hex');
   const header = Buffer.from(JSON.stringify({
@@ -47,6 +47,75 @@ async function flushMicrotasks(times = 3): Promise<void> {
 }
 
 describe('BackupService restore activation', () => {
+  it('creates a v2 backup as a restrictive committed artifact without staging leftovers', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
+    mkdirSync(join(tempDir, 'backups'));
+    const storage = {
+      sqlite: {
+        exportData: vi.fn(() => Buffer.from('sqlite-image')),
+        countMemories: vi.fn(() => 3),
+        insertBackupMeta: vi.fn(),
+        flushIfDirty: vi.fn(),
+      },
+    } as unknown as StorageManager;
+
+    const result = await new BackupService(createConfig(tempDir), storage).create();
+    const image = readFileSync(result.path);
+    const headerLength = image.readUInt32LE(0);
+    const header = JSON.parse(image.subarray(4, 4 + headerLength).toString('utf8')) as Record<string, unknown>;
+
+    expect(header).toEqual(expect.objectContaining({
+      version: 2, memory_count: 3, checksum: expect.any(String), header_checksum: expect.any(String),
+    }));
+    expect(statSync(result.path).mode & 0o077).toBe(0);
+    expect(readdirSync(join(tempDir, 'backups')).filter(name => name.endsWith('.tmp'))).toEqual([]);
+    expect(storage.sqlite.insertBackupMeta).toHaveBeenCalledWith(
+      result.path, image.length, 3, expect.any(String),
+    );
+
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('rejects a v2 header metadata mutation before activation', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
+    const payload = Buffer.from('body');
+    const checksum = createHash('sha256').update(payload).digest('hex');
+    const header = Buffer.from(JSON.stringify({
+      version: 2, memory_count: 1, checksum, created_at: '2026-01-01T00:00:00.000Z',
+      embedding_model: 'test-model', embedding_dimensions: 3, header_checksum: 'tampered',
+    }));
+    const length = Buffer.alloc(4);
+    length.writeUInt32LE(header.length);
+    const backupPath = join(tempDir, 'tampered-v2.bhgb');
+    writeFileSync(backupPath, Buffer.concat([length, header, payload]));
+    const storage = {
+      sqlite: { beginLifecycleOperation: vi.fn(), endLifecycleOperation: vi.fn() },
+      activateSqliteImage: vi.fn(),
+    } as unknown as StorageManager;
+
+    await expect(new BackupService(createConfig(tempDir), storage).restore(backupPath))
+      .rejects.toThrow('header metadata checksum mismatch');
+    expect(storage.activateSqliteImage).not.toHaveBeenCalled();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('rejects an unsupported backup version before activation', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
+    const backupPath = makeBackupFile(tempDir, Buffer.from('not-used'), { version: 99 });
+    const storage = {
+      sqlite: {
+        beginLifecycleOperation: vi.fn(), endLifecycleOperation: vi.fn(),
+        countMemories: vi.fn(), countUnsyncedVectors: vi.fn(),
+      },
+      activateSqliteImage: vi.fn(),
+    } as unknown as StorageManager;
+
+    await expect(new BackupService(createConfig(tempDir), storage).restore(backupPath))
+      .rejects.toThrow('Unsupported backup format version: 99');
+    expect(storage.activateSqliteImage).not.toHaveBeenCalled();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
   it('reloads sqlite and reports reconciled when there is no vector drift', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
     const payload = Buffer.from('db-bytes-1');
@@ -81,13 +150,13 @@ describe('BackupService restore activation', () => {
       },
     });
     expect(storage.sqlite.beginLifecycleOperation).toHaveBeenCalledWith('restore');
-    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith('restore');
+    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith(undefined, 'restore');
     expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledTimes(1);
     expect(storage.activateSqliteImage).toHaveBeenCalledTimes(1);
     expect(storage.detectAndMarkVectorDrift).toHaveBeenCalledWith({
       expectedEmbeddingModel: 'test-model',
       expectedEmbeddingDimensions: 3,
-      allowDuringLifecycle: true,
+      lifecycleToken: undefined,
     });
     expect(storage.reconcileVectorsFromSqlite).not.toHaveBeenCalled();
     expect(storage.setBackgroundReconciliationActive).not.toHaveBeenCalled();
@@ -179,7 +248,7 @@ describe('BackupService restore activation', () => {
     expect(storage.detectAndMarkVectorDrift).toHaveBeenCalledWith({
       expectedEmbeddingModel: 'old-model',
       expectedEmbeddingDimensions: 1536,
-      allowDuringLifecycle: true,
+      lifecycleToken: undefined,
     });
     expect(result.vector_reconciliation).toEqual({
       status: 'degraded',
@@ -348,7 +417,7 @@ describe('BackupService restore activation', () => {
 
     await expect(service.restore(backupPath)).rejects.toThrow('activation failed');
     expect(logger.error).toHaveBeenCalled();
-    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith('restore');
+    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith(undefined, 'restore');
 
     rmSync(tempDir, { recursive: true, force: true });
   });
@@ -431,12 +500,12 @@ describe('BackupService restore activation', () => {
     // The vector reconciliation pass never starts, and the lifecycle lock is
     // still released so a later restore attempt is not blocked forever.
     expect(storage.detectAndMarkVectorDrift).not.toHaveBeenCalled();
-    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith('restore');
+    expect(storage.sqlite.endLifecycleOperation).toHaveBeenCalledWith(undefined, 'restore');
 
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('serializes concurrent restore requests', async () => {
+  it('rejects an overlapping restore from another service with a retryable conflict', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
     const payload = Buffer.from('db-bytes-3');
     const backupPath = makeBackupFile(tempDir, payload, { memory_count: 1 });
@@ -460,11 +529,12 @@ describe('BackupService restore activation', () => {
 
     const config = createConfig(tempDir);
     const service = new BackupService(config, storage);
+    const otherService = new BackupService(config, storage);
 
     const first = service.restore(backupPath);
-    const second = service.restore(backupPath);
+    const second = otherService.restore(backupPath);
 
-    await expect(second).rejects.toThrow('already in progress');
+    await expect(second).rejects.toMatchObject({ code: 'CONFLICT', retryable: true });
 
     resolveReload?.();
     await first;

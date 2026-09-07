@@ -538,4 +538,16 @@ describe('HealthService', () => {
       expect(result.components.embedding.status).toBe('degraded');
     });
   });
+
+  it('degrades health when an injected scheduler reports a failure', async () => {
+    const health = new HealthService(
+      createStorage(), createEmbedding(true), createConfig(), {}, undefined,
+      () => [{ armed: false, last_run_at: null, failure: 'timer registration failed' }],
+    );
+
+    const result = await health.check();
+
+    expect(result.status).toBe('degraded');
+    expect(result.components.schedulers).toEqual({ status: 'degraded', message: 'timer registration failed' });
+  });
 });

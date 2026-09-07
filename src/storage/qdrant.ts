@@ -7,6 +7,17 @@ import type { RecallFilter } from '../domain/types.js';
 
 const COLLECTION_PREFIX = 'bhgbrain_';
 
+const REQUIRED_PAYLOAD_INDEXES: ReadonlyArray<{ field_name: string; field_schema: 'keyword' | 'bool' | 'integer' | 'datetime' }> = [
+  { field_name: 'namespace', field_schema: 'keyword' },
+  { field_name: 'type', field_schema: 'keyword' },
+  { field_name: 'tags', field_schema: 'keyword' },
+  { field_name: 'retention_tier', field_schema: 'keyword' },
+  { field_name: 'decay_eligible', field_schema: 'bool' },
+  { field_name: 'expires_at', field_schema: 'integer' },
+  { field_name: 'device_id', field_schema: 'keyword' },
+  { field_name: 'created_at', field_schema: 'datetime' },
+];
+
 // Only `.`/`_`/`-` plus alphanumerics may appear in an encoded segment. Raw
 // `namespace` (`^[a-zA-Z0-9/-]{1,200}$`) and `collection`/`category.name`
 // (`^[a-zA-Z0-9-]{1,100}$`, `CollectionNameSchema`) inputs never contain `.`
@@ -138,43 +149,16 @@ export class QdrantStore {
           distance: 'Cosine',
         },
       });
-      await this.client.createPayloadIndex(name, {
-        field_name: 'namespace',
-        field_schema: 'keyword',
-      });
-      await this.client.createPayloadIndex(name, {
-        field_name: 'type',
-        field_schema: 'keyword',
-      });
-      await this.client.createPayloadIndex(name, {
-        field_name: 'retention_tier',
-        field_schema: 'keyword',
-      });
-      await this.client.createPayloadIndex(name, {
-        field_name: 'decay_eligible',
-        field_schema: 'bool',
-      });
-      await this.client.createPayloadIndex(name, {
-        field_name: 'expires_at',
-        field_schema: 'integer',
-      });
       created = true;
     }
 
-    // Ensured unconditionally (not just on first create) so that collections
-    // created before device provenance shipped — the exact post-upgrade,
-    // multi-device Qdrant Cloud scenario this feature targets — still get the
-    // index. Idempotent: a second call against an already-indexed collection
-    // is a tolerated no-op.
-    await this.ensureDeviceIdIndex(name);
-
-    // Same retroactive-indexing rationale as `ensureDeviceIdIndex`: collections
-    // created before add-time-scoped-recall shipped still get the `created_at`
-    // datetime index so `after`/`before` range filters run indexed rather than
-    // linearly scanned. Unindexed range filtering is still correct (Qdrant
-    // filters on unindexed fields, just slower), so this is a performance
-    // addition, not a correctness dependency.
-    await this.ensureCreatedAtIndex(name);
+    // Always verify every filterable field, including on collections that
+    // existed before a particular index was introduced. The collection is
+    // memoized only after all calls complete, so a partial failure retries on
+    // the next use instead of becoming a permanent half-configured state.
+    for (const index of REQUIRED_PAYLOAD_INDEXES) {
+      await this.ensurePayloadIndex(name, index);
+    }
 
     // Only memoized once the *entire* sequence above has succeeded — a
     // partial failure (e.g. an index call rejecting) must not be memoized,
@@ -191,26 +175,12 @@ export class QdrantStore {
     this.collectionListCache = null;
   }
 
-  private async ensureDeviceIdIndex(name: string): Promise<void> {
+  private async ensurePayloadIndex(
+    name: string,
+    index: { field_name: string; field_schema: 'keyword' | 'bool' | 'integer' | 'datetime' },
+  ): Promise<void> {
     try {
-      await this.client.createPayloadIndex(name, {
-        field_name: 'device_id',
-        field_schema: 'keyword',
-      });
-    } catch (err) {
-      if (this.isAlreadyExistsError(err)) {
-        return;
-      }
-      throw err;
-    }
-  }
-
-  private async ensureCreatedAtIndex(name: string): Promise<void> {
-    try {
-      await this.client.createPayloadIndex(name, {
-        field_name: 'created_at',
-        field_schema: 'datetime',
-      });
+      await this.client.createPayloadIndex(name, index);
     } catch (err) {
       if (this.isAlreadyExistsError(err)) {
         return;
@@ -249,6 +219,24 @@ export class QdrantStore {
         await this.ensureCollection(namespace, collection);
         await this.client.upsert(name, { wait: true, points });
       }
+    });
+  }
+
+  /** Refreshes filter/ranking metadata without changing an embedding. */
+  async updatePayload(
+    namespace: string,
+    collection: string,
+    id: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    await this.executeWithBreaker(async () => {
+      const name = this.collectionName(namespace, collection);
+      await this.ensureCollection(namespace, collection);
+      await this.client.setPayload(name, {
+        wait: true,
+        points: [id],
+        payload: { ...payload, namespace },
+      });
     });
   }
 

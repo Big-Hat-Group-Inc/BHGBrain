@@ -662,13 +662,13 @@ describe('QdrantStore ensured-collection memoization (cut-embedding-and-qdrant-r
 
     await store.upsert('global', 'general', 'id-1', [1, 2, 3], { content: 'a' });
     expect(getCollection).toHaveBeenCalledTimes(1);
-    expect(createPayloadIndex).toHaveBeenCalledTimes(2); // device_id + created_at (collection already existed)
+    expect(createPayloadIndex).toHaveBeenCalledTimes(8); // every filterable field (collection already existed)
 
     await store.upsert('global', 'general', 'id-2', [4, 5, 6], { content: 'b' });
 
     // No further ensure round trips against the now-warm collection.
     expect(getCollection).toHaveBeenCalledTimes(1);
-    expect(createPayloadIndex).toHaveBeenCalledTimes(2);
+    expect(createPayloadIndex).toHaveBeenCalledTimes(8);
     expect(upsert).toHaveBeenCalledTimes(2);
   });
 
