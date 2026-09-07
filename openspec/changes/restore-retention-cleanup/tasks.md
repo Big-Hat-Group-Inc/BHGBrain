@@ -17,4 +17,4 @@
 - [x] 3.1 Validate retention and distillation cron expressions for syntax and satisfiability and verify invalid configuration identifies the exact field.
 - [x] 3.2 Track scheduler armed, last-run, and failure state in health and verify an injected scheduling failure degrades health.
 - [x] 3.3 Raise cleanup failure logs to warn or error with structured causes and verify log-capture tests distinguish failed, degraded, and successful runs.
-- [ ] 3.4 Add a real-SQLite end-to-end GC test covering archive, vector delete, local delete, pruning, and `last_success_at`, then run `npm run lint`, targeted retention tests, and `npm run build`.
+- [x] 3.4 Add a real-SQLite end-to-end GC test covering archive, vector delete, local delete, pruning, and `last_success_at`, then run `npm run lint`, targeted retention tests, and `npm run build`.

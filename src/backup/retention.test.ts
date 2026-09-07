@@ -6,7 +6,9 @@ import { SqliteStore } from '../storage/sqlite.js';
 import { RetentionService } from './retention.js';
 import { vi } from 'vitest';
 import type { BrainConfig } from '../config/index.js';
-import type { StorageManager } from '../storage/index.js';
+import { StorageManager } from '../storage/index.js';
+import type { QdrantStore } from '../storage/qdrant.js';
+import type { EmbeddingProvider } from '../embedding/index.js';
 
 describe('RetentionService', () => {
   let sqlite: SqliteStore;
@@ -36,9 +38,18 @@ describe('RetentionService', () => {
       source: 'cli' as const,
       checksum: id,
       importance: 0.2,
+      retention_tier: 'T0' as const,
+      expires_at: null,
+      decay_eligible: false,
+      review_due: null,
       access_count: 0,
       last_operation: 'ADD' as const,
       merged_from: null,
+      archived: false,
+      vector_synced: true,
+      pinned: false,
+      origin: null,
+      confidence: 1,
       created_at: '2026-01-01T00:00:00.000Z',
       updated_at: '2026-01-01T00:00:00.000Z',
       last_accessed: lastAccessed,
@@ -151,6 +162,69 @@ describe('RetentionService', () => {
     expect(sqlite.getArchiveByMemoryId(expired.id)).toMatchObject({ memory_id: expired.id });
     expect(sqlite.listAudit(10).map(entry => entry.operation).sort()).toEqual(['ARCHIVE', 'FORGET']);
     expect(sqlite.listRevisions(expired.id).map(row => row.revision)).toEqual([2]);
+    expect(sqlite.getRetentionDegraded()).toMatchObject({ degraded: false, last_success_at: expect.any(String) });
+  });
+
+  // Task 3.4: a genuine end-to-end pass through the REAL StorageManager (not a
+  // hand-rolled `deleteMemories` stub) against the REAL SqliteStore, so the
+  // actual vector-delete call (`qdrant.deleteMany`), the actual local SQLite
+  // delete (`deleteMemoriesByIds`), history pruning, and `last_success_at` are
+  // all exercised through the production code path in one pass.
+  it('runs a full end-to-end GC pass through the real StorageManager: archive, vector delete, local delete, pruning, last_success_at', async () => {
+    const expired = {
+      ...memory('e2e-expired', '2025-01-01T00:00:00.000Z'),
+      retention_tier: 'T2' as const,
+      expires_at: '2025-02-01T00:00:00.000Z',
+      decay_eligible: true,
+    };
+    sqlite.insertMemory(expired);
+    sqlite.insertRevision(expired.id, 1, 'revision one', '2026-09-05T00:00:00.000Z');
+    sqlite.insertRevision(expired.id, 2, 'revision two', '2026-09-06T00:00:00.000Z');
+    sqlite.insertAudit({
+      id: 'e2e-preexisting-audit', timestamp: '2026-09-05T00:00:00.000Z', namespace: 'global',
+      operation: 'ADD', memory_id: expired.id, client_id: 'test',
+    });
+
+    const qdrant = {
+      deleteMany: vi.fn(async () => {}),
+      getCollectionInfo: vi.fn(async () => ({ points_count: 0 })),
+      compact: vi.fn(async () => {}),
+    } as unknown as QdrantStore;
+    const embedding = {
+      provider: 'openai',
+      model: 'test',
+      dimensions: 3,
+      identity: 'openai/test@3',
+      embed: vi.fn(async () => [1, 2, 3]),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => [1, 2, 3])),
+      healthCheck: vi.fn(async () => true),
+    } as unknown as EmbeddingProvider;
+    const storage = new StorageManager(sqlite, qdrant, embedding);
+
+    const config = {
+      retention: {
+        archive_before_delete: true,
+        pre_expiry_warning_days: 7,
+        compaction_deleted_threshold: 1,
+        audit_log_max_entries: 2,
+        revisions_per_memory_max: 1,
+      },
+    } as unknown as BrainConfig;
+
+    const result = await new RetentionService(config, storage, { info: vi.fn() }).runGc();
+
+    expect(result).toMatchObject({ archived: 1, deleted: 1, degraded: false, audit_pruned: 1, revisions_pruned: 1 });
+    // Vector delete: the real StorageManager.deleteMemories called the real
+    // qdrant client's deleteMany for this memory's namespace/collection.
+    expect(qdrant.deleteMany).toHaveBeenCalledWith('global', 'general', [expired.id]);
+    // Local delete: the real SQLite row is gone.
+    expect(sqlite.getMemoryById(expired.id)).toBeNull();
+    // Archive: a durable archive row exists for the deleted memory.
+    expect(sqlite.getArchiveByMemoryId(expired.id)).toMatchObject({ memory_id: expired.id });
+    // Pruning: audit_log and memory_revisions were trimmed to their caps.
+    expect(sqlite.listAudit(10).map(entry => entry.operation).sort()).toEqual(['ARCHIVE', 'FORGET']);
+    expect(sqlite.listRevisions(expired.id).map(row => row.revision)).toEqual([2]);
+    // last_success_at: recorded on the real retention_state row for a clean run.
     expect(sqlite.getRetentionDegraded()).toMatchObject({ degraded: false, last_success_at: expect.any(String) });
   });
 
