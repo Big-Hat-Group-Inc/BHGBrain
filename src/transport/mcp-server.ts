@@ -27,7 +27,7 @@ import { handleTool, type ToolContext } from '../tools/index.js';
 import { MCP_TOOL_DEFINITIONS, MCP_TOOL_NAMES } from '../tools/schemas.js';
 import { MCP_PROMPT_DEFINITIONS, handleGetPrompt } from '../prompts/index.js';
 import { buildToolCallResponse, isErrorEnvelope } from './mcp-response.js';
-import type { WriteResult } from '../domain/types.js';
+import type { WriteResult, ErrorCode as DomainErrorCode } from '../domain/types.js';
 import { PACKAGE_VERSION } from '../version.js';
 
 // Single source of truth for the MCP `serverInfo.version` field, kept in
@@ -36,6 +36,29 @@ import { PACKAGE_VERSION } from '../version.js';
 // drifted from the real package version; reading it at startup means a
 // version bump needs no code edit).
 export const MCP_SERVER_VERSION = PACKAGE_VERSION;
+
+/**
+ * Maps a classified `ErrorCode` (domain/types.ts) to the MCP protocol error
+ * code that best conveys the same failure over `ReadResourceRequestSchema`
+ * (task 2.3) — mirrors the REST `ERROR_STATUS` mapping in
+ * src/errors/index.ts, just targeting the MCP SDK's own error enum instead
+ * of an HTTP status.
+ */
+function mcpErrorCodeFor(code: DomainErrorCode): number {
+  switch (code) {
+    case 'INVALID_INPUT':
+      return ErrorCode.InvalidParams;
+    case 'NOT_FOUND':
+      return ErrorCode.InvalidRequest;
+    case 'AUTH_REQUIRED':
+    case 'RATE_LIMITED':
+    case 'CONFLICT':
+    case 'EMBEDDING_UNAVAILABLE':
+    case 'INTERNAL':
+    default:
+      return ErrorCode.InternalError;
+  }
+}
 
 /**
  * `remember`'s handler returns `WriteResult | WriteResult[]` (single object
@@ -116,6 +139,18 @@ export function buildMcpServer(ctx: ToolContext, resources: ResourceHandler): Se
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const { uri } = request.params;
     const result = await resources.handle(uri);
+    // `ResourceHandler.handle` reports failures (unknown scheme, malformed
+    // URI, not found, ...) by *returning* an error-envelope object rather
+    // than throwing (see resources/index.ts) — the REST `/resource` route
+    // already maps that shape to an HTTP status. Over MCP, the equivalent
+    // native failure signal is a protocol-level error, not `contents`
+    // holding the JSON-stringified envelope as if it were successful data;
+    // without this, a NOT_FOUND resource read looked identical to a
+    // successful one to an MCP client (align-runtime-entrypoint-contracts
+    // task 2.3).
+    if (isErrorEnvelope(result)) {
+      throw new McpError(mcpErrorCodeFor(result.error.code), result.error.message);
+    }
     return {
       contents: [{
         uri,

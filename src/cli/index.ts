@@ -4,23 +4,34 @@ import { Command } from 'commander';
 import { fileURLToPath } from 'node:url';
 import { realpathSync } from 'node:fs';
 import { loadFileConfig, deriveRuntimeConfig, ensureDataDir } from '../config/index.js';
-import { SqliteStore } from '../storage/sqlite.js';
-import { QdrantStore } from '../storage/qdrant.js';
-import { StorageManager } from '../storage/index.js';
-import { createEmbeddingProvider, getEmbeddingBreakerKey } from '../embedding/index.js';
-import { WritePipeline } from '../pipeline/index.js';
-import { createExtractionProvider } from '../pipeline/extraction.js';
-import { SearchService } from '../search/index.js';
-import { BackupService } from '../backup/index.js';
-import { HealthService } from '../health/index.js';
 import { RetentionService } from '../backup/retention.js';
 import { DistillationService } from '../pipeline/distillation.js';
 import { DistillationLLMClient } from '../pipeline/distillation-llm.js';
-import { MetricsCollector } from '../health/metrics.js';
 import { createLogger } from '../health/logger.js';
 import { PACKAGE_VERSION } from '../version.js';
-import { CircuitBreaker } from '../resilience/index.js';
 import { handleTool, type ToolContext } from '../tools/index.js';
+import { isErrorEnvelope } from '../errors/index.js';
+import { buildToolContext } from '../context.js';
+
+/**
+ * `handleTool` never throws — a classified failure comes back as an
+ * `{ error: {...} }` envelope, same as the REST/MCP paths (see
+ * src/tools/index.ts) — so every CLI command built on it must check for
+ * that shape itself; otherwise a failed operation (a missing id, a bad
+ * path, ...) prints the error body and still exits 0, indistinguishable
+ * from success to a calling script
+ * (align-runtime-entrypoint-contracts task 2.2: "CLI sets a non-zero exit
+ * code after printing the envelope"). Pretty-prints `result` exactly as
+ * every command already did, and additionally sets `process.exitCode = 1`
+ * when it is an error envelope — `process.exitCode` (not `process.exit()`)
+ * so any pending stdout write still flushes before the process exits.
+ */
+function printToolResult(result: unknown): void {
+  console.log(JSON.stringify(result, null, 2));
+  if (isErrorEnvelope(result)) {
+    process.exitCode = 1;
+  }
+}
 
 async function createContext(): Promise<ToolContext> {
   // Same split as src/index.ts's main(): persist device-id resolution only
@@ -32,32 +43,22 @@ async function createContext(): Promise<ToolContext> {
   const config = deriveRuntimeConfig(fileConfig);
   const logger = createLogger(config);
 
-  const sqlite = new SqliteStore(config.data_dir!);
-  await sqlite.init();
-
-  const breakerOptions = {
-    failureThreshold: config.resilience.circuit_breaker.failure_threshold,
-    openWindowMs: config.resilience.circuit_breaker.open_window_ms,
-    halfOpenProbeCount: config.resilience.circuit_breaker.half_open_probe_count,
-  };
-  const embeddingBreaker = new CircuitBreaker(breakerOptions);
-  const qdrantBreaker = new CircuitBreaker(breakerOptions);
-  const extractionBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
-  const metrics = new MetricsCollector(config);
-  const qdrant = new QdrantStore(config, qdrantBreaker, logger);
-  const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
-  const extraction = createExtractionProvider(config, { breaker: extractionBreaker, metrics, logger });
-  const storage = new StorageManager(sqlite, qdrant, embedding, undefined, config);
-
-  const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics);
-  const searchService = new SearchService(config, storage, embedding, metrics, logger);
-  const backupService = new BackupService(config, storage, logger);
-  const healthService = new HealthService(storage, embedding, config, {
-    [getEmbeddingBreakerKey(config.embedding.provider)]: embeddingBreaker,
-    qdrant: qdrantBreaker,
-  }, logger);
-
-  return { config, storage, embedding, pipeline, search: searchService, backup: backupService, health: healthService, metrics, logger };
+  // Built through the same composition root the MCP server uses
+  // (align-runtime-entrypoint-contracts task 2.1) — see src/context.ts.
+  // Before this, the CLI hand-built a structurally different, narrower
+  // graph: no metrics on QdrantStore, no query-expansion/rerank providers,
+  // WritePipeline/SearchService built with fewer arguments (silently
+  // dropping contradiction detection and reranking regardless of
+  // configuration), the default SQLite busy-timeout instead of
+  // `storage.sqlite_busy_timeout_ms`, and no Qdrant hydration bootstrap at
+  // all — so `bhgbrain search`/`bhgbrain list`/etc. could silently behave
+  // differently, and see different data, than the same tool invoked over
+  // MCP.
+  // schedulersManaged: false — the CLI is a one-shot process that never
+  // calls .start() on the returned schedulers, so HealthService must not
+  // report their unarmed state as degraded (see BuildToolContextOptions).
+  const { ctx } = await buildToolContext(config, logger, { schedulersManaged: false });
+  return ctx;
 }
 
 export function createProgram(createContextImpl: typeof createContext = createContext): Command {
@@ -103,7 +104,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
         }
         if (data.results.length === 0) console.log('No results.');
       } else {
-        console.log(JSON.stringify(result, null, 2));
+        printToolResult(result);
       }
       ctx.storage.sqlite.close();
     });
@@ -116,6 +117,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
       const mem = ctx.storage.sqlite.getMemoryById(id);
       if (!mem) {
         console.error(`Memory ${id} not found.`);
+        process.exitCode = 1;
       } else {
         console.log(JSON.stringify(mem, null, 2));
       }
@@ -128,7 +130,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .action(async (id) => {
       const ctx = await createContextImpl();
       const result = await handleTool(ctx, 'forget', { id });
-      console.log(JSON.stringify(result, null, 2));
+      printToolResult(result);
       ctx.storage.sqlite.close();
     });
 
@@ -140,7 +142,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .action(async () => {
       const ctx = await createContextImpl();
       const result = await handleTool(ctx, 'category', { action: 'list' });
-      console.log(JSON.stringify(result, null, 2));
+      printToolResult(result);
       ctx.storage.sqlite.close();
     });
 
@@ -150,7 +152,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .action(async (name) => {
       const ctx = await createContextImpl();
       const result = await handleTool(ctx, 'category', { action: 'get', name });
-      console.log(JSON.stringify(result, null, 2));
+      printToolResult(result);
       ctx.storage.sqlite.close();
     });
 
@@ -173,7 +175,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
         return;
       }
       const result = await handleTool(ctx, 'category', { action: 'set', name, slot: opts.slot, content });
-      console.log(JSON.stringify(result, null, 2));
+      printToolResult(result);
       ctx.storage.sqlite.close();
     });
 
@@ -185,7 +187,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .action(async () => {
       const ctx = await createContextImpl();
       const result = await handleTool(ctx, 'backup', { action: 'create' });
-      console.log(JSON.stringify(result, null, 2));
+      printToolResult(result);
       ctx.storage.sqlite.close();
     });
 
@@ -195,7 +197,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .action(async () => {
       const ctx = await createContextImpl();
       const result = await handleTool(ctx, 'backup', { action: 'list' });
-      console.log(JSON.stringify(result, null, 2));
+      printToolResult(result);
       ctx.storage.sqlite.close();
     });
 
@@ -205,7 +207,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .action(async (path) => {
       const ctx = await createContextImpl();
       const result = await handleTool(ctx, 'backup', { action: 'restore', path });
-      console.log(JSON.stringify(result, null, 2));
+      printToolResult(result);
       ctx.storage.sqlite.close();
     });
 
@@ -218,7 +220,15 @@ export function createProgram(createContextImpl: typeof createContext = createCo
     .action(async (opts) => {
       const args = opts.stdio ? ['--stdio'] : [];
       const { execFileSync } = await import('node:child_process');
-      execFileSync(process.execPath, [new URL('../index.js', import.meta.url).pathname, ...args], { stdio: 'inherit' });
+      // fileURLToPath, not `.pathname` (align-runtime-entrypoint-contracts
+      // task 3.4): a file: URL's `.pathname` is URL-encoded and, on Windows,
+      // keeps a leading slash before the drive letter (e.g. `/C:/...`) — a
+      // path Node's own child_process/fs calls do not accept. fileURLToPath
+      // applies the platform-correct decode (percent-escaped spaces, `%23`,
+      // etc.) and drive-letter handling, matching the conversion isMainModule
+      // below already uses for the same reason.
+      const entryPath = fileURLToPath(new URL('../index.js', import.meta.url));
+      execFileSync(process.execPath, [entryPath, ...args], { stdio: 'inherit' });
     });
 
   serverCmd
@@ -422,7 +432,7 @@ export function createProgram(createContextImpl: typeof createContext = createCo
           batch_size: parseInt(opts.batchSize, 10),
           dry_run: Boolean(opts.dryRun),
         });
-        console.log(JSON.stringify(result, null, 2));
+        printToolResult(result);
         ctx.storage.sqlite.close();
         return;
       }

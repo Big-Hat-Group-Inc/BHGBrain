@@ -1,5 +1,7 @@
 /** MCP CallTool response shaping, extracted so it can be unit-tested directly. */
 
+import { isErrorEnvelope } from '../errors/index.js';
+
 export interface McpToolResponse {
   content: Array<{ type: 'text'; text: string }>;
   isError?: true;
@@ -9,9 +11,13 @@ export interface McpToolResponse {
   [key: string]: unknown;
 }
 
-export function isErrorEnvelope(value: unknown): value is { error: unknown } {
-  return value != null && typeof value === 'object' && 'error' in value;
-}
+// Re-exported so existing callers importing isErrorEnvelope from this module
+// keep working — the actual (strict) definition now lives in
+// src/errors/index.ts, shared with the REST and CLI adapters
+// (align-runtime-entrypoint-contracts task 2.2; design.md decision 3:
+// "Key-presence-only predicates ... were rejected" — this module's own prior
+// `'error' in value` check was exactly that anti-pattern).
+export { isErrorEnvelope };
 
 /**
  * Builds the MCP CallTool response from a tool handler result. Successful,

@@ -1040,6 +1040,8 @@ repair 工具：
 
 **注意**：在内容存入 Qdrant 功能添加之前存储的记忆（1.3 之前）在 Qdrant payload 中没有内容，无法通过 repair 恢复。这些条目只有元数据（标签、类型、重要性）能保留。
 
+**每次启动都会自动 hydrate，且可断点续传。** 相同的恢复逻辑也会在每次服务器启动时自动运行（不仅限于 `repair --from-qdrant`），其范围以每个 Qdrant 集合为单位，而不是依据本地记忆数量来判断：每个集合的结果都会持久记录在本地 SQLite 中（`complete` 或 `failed`），因此某个集合 hydration 失败（一次瞬时的网络/Qdrant 故障，而非单点数据问题——参见上方注意事项）会在*下一次*启动时重试，而不会因为更早的某个集合已成功 hydrate 就永久掩盖这次失败。已记录为 `complete` 的集合会在自动路径中被跳过（不会重新扫描），因此一个已完全 hydrate 的存储在每次启动时只需付出一次廉价的 Qdrant 集合列表调用，而非完整重新扫描——相比之下，`bhgbrain repair --from-qdrant` 无论已记录的状态如何，始终会对每个集合做一次完整重新扫描，因为该命令本身就是一次刻意发起的恢复请求。`health://status` 的 `components.bootstrap_hydration` 会在任意集合被记录为 `failed` 期间报告 `"degraded"` 并指出该集合，因此卡住的集合无需查看日志即可发现。
+
 ### 嵌入模型迁移
 
 每个向量在写入时都会打上带提供方限定的身份标记 —
@@ -2380,7 +2382,8 @@ bhgbrain health
     "sqlite": { "status": "healthy" },
     "qdrant": { "status": "healthy" },
     "embedding": { "status": "healthy" },
-    "retention": { "status": "healthy" }
+    "retention": { "status": "healthy" },
+    "bootstrap_hydration": { "status": "healthy" }
   },
   "memory_count": 1234,
   "db_size_bytes": 8388608,
@@ -2405,9 +2408,11 @@ bhgbrain health
 
 当运行中的 SQLite 编译版本没有 `fts5` 模块时，`components.sqlite` 仍保持 `"healthy"`，但会附带一条 `message`：全文搜索此时运行的是旧版基于 `LIKE` 的匹配器（参见[全文搜索](#全文搜索)），而不是 FTS5/BM25 索引。启动时也会记录一次相应日志（`event: "fts5_unavailable"`）。
 
+当有任意 Qdrant 集合在本设备的 bootstrap hydration 状态中被持久记录为 `"failed"` 时，`components.bootstrap_hydration` 会变为 `"degraded"`（并在 `message` 中指出受影响的集合）——即某次向量到 SQLite 的 hydration 过程对该集合遇到了错误（一次瞬时的网络/Qdrant 故障，而非单点数据问题），且尚未重试成功。一旦之后的某次 hydration（下一次进程启动，或 `bhgbrain repair --from-qdrant`）成功 hydrate 该集合，状态就会恢复为 `"healthy"`。参见[修复与恢复](#修复与恢复)。
+
 **整体状态逻辑：**
 - `unhealthy`——如果 SQLite 或 Qdrant 不健康
-- `degraded`——如果嵌入已降级/不健康，或保留系统已降级（超容量或向量未同步）
+- `degraded`——如果嵌入已降级/不健康，或保留系统已降级（超容量或向量未同步），或某个 bootstrap hydration 集合已降级（hydration 失败，等待重试）
 - `healthy`——所有组件均健康
 
 **组件状态：**
@@ -2418,6 +2423,7 @@ bhgbrain health
 | `qdrant` | 有限范围的只读向量查询成功（空结果或尚未创建的集合也视为健康） | — | 向量查询本身失败，即使服务器可达 |
 | `embedding` | 嵌入 API 调用成功 | 缺少凭据或无法访问 | — |
 | `retention` | 所有预算在限制内，无未同步向量 | 预算超出或未同步向量 > 0 | — |
+| `bootstrap_hydration` | 每个已发现的 Qdrant 集合都已 hydrate（或尚不存在任何集合） | 至少一个集合 hydration 失败，正等待重试 | — |
 
 **HTTP 状态码（`GET /health`）：**
 - `200`——对于 `healthy` 和 `degraded`

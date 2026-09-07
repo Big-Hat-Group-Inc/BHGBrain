@@ -453,6 +453,59 @@ describe('BackupService restore activation', () => {
     }
   });
 
+  it('stop() cancels a pending background-reconciliation retry timer so it never fires against a closed store (align-runtime-entrypoint-contracts task 3.3)', async () => {
+    vi.useFakeTimers();
+    try {
+      const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
+      const payload = Buffer.from('db-bytes-stop');
+      const backupPath = makeBackupFile(tempDir, payload, { memory_count: 4 });
+
+      const storage = {
+        sqlite: {
+          beginLifecycleOperation: vi.fn(),
+          endLifecycleOperation: vi.fn(),
+          getDatabasePath: vi.fn(() => join(tempDir, 'brain.db')),
+          countMemories: vi.fn(() => 4),
+          countUnsyncedVectors: vi.fn(() => 4),
+        },
+        activateSqliteImage: vi.fn(async () => {}),
+        detectAndMarkVectorDrift: vi.fn(async () => ({ mode: 'partial-drift', driftedCount: 4 })),
+        // Always reports remaining work, so an uncancelled timer would keep retrying.
+        reconcileVectorsFromSqlite: vi.fn(async () => ({ reconciled: 0, remaining: 4, boundReached: true })),
+        setBackgroundReconciliationActive: vi.fn(),
+      } as unknown as StorageManager;
+
+      const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger;
+      const config = createConfig(tempDir);
+      const service = new BackupService(config, storage, logger);
+
+      await service.restore(backupPath);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(storage.reconcileVectorsFromSqlite).toHaveBeenCalledTimes(1);
+
+      // Simulate process shutdown: stop() runs (per createShutdown in
+      // src/index.ts) before sqlite.close() — the pending retry timer
+      // scheduled by the first attempt above must never fire afterward.
+      service.stop();
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(storage.reconcileVectorsFromSqlite).toHaveBeenCalledTimes(1);
+
+      rmSync(tempDir, { recursive: true, force: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stop() is safe to call when no reconciliation was ever scheduled', () => {
+    const config = { data_dir: '/tmp' } as unknown as BrainConfig;
+    const storage = {} as unknown as StorageManager;
+    const service = new BackupService(config, storage);
+
+    expect(() => service.stop()).not.toThrow();
+    expect(() => service.stop()).not.toThrow();
+  });
+
   it('reports pending vector reconciliation when drift detection fails after activation', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-backup-test-'));
     const payload = Buffer.from('db-bytes-pending');

@@ -53,8 +53,8 @@ describe('MCP_TOOL_DEFINITIONS (task 2.1)', () => {
     }
   });
 
-  it('forget, collections, category, backup, and revisions declare destructiveHint: true', () => {
-    for (const name of ['forget', 'collections', 'category', 'backup', 'revisions']) {
+  it('forget, collections, category, backup, revisions, and bootstrap declare destructiveHint: true', () => {
+    for (const name of ['forget', 'collections', 'category', 'backup', 'revisions', 'bootstrap']) {
       const tool = MCP_TOOL_DEFINITIONS.find(t => t.name === name)!;
       expect(tool.annotations.destructiveHint, `${name} should be destructiveHint: true`).toBe(true);
     }

@@ -1114,6 +1114,21 @@ The repair tool:
 
 **Note**: Memories stored before the content-in-Qdrant feature was added (pre-1.3) do not have content in their Qdrant payload and cannot be recovered via repair. Only metadata (tags, type, importance) survives for those entries.
 
+**Automatic hydration on every startup, resumably.** The same recovery also runs
+automatically on every server startup (not just `repair --from-qdrant`), scoped per
+Qdrant collection rather than gated on the local memory count: each collection's
+outcome is durably recorded (`complete` or `failed`) in local SQLite, so a collection
+that fails to hydrate (a transient network/Qdrant error, not a per-point data issue —
+see the note above) is retried on the *next* startup instead of a successfully-hydrated
+earlier collection permanently masking the failure. A collection already recorded
+`complete` is skipped (not rescrolled) on the automatic path, so a fully-hydrated store
+pays only for a cheap Qdrant collection-list call on every boot, not a full rescan —
+`bhgbrain repair --from-qdrant`, in contrast, always does a full rescan of every
+collection regardless of recorded state, since that command is itself a deliberate
+recovery request. `health://status`'s `components.bootstrap_hydration` reports
+`"degraded"` for as long as any collection is recorded `failed`, naming it, so a stuck
+collection is visible without reading logs.
+
 ### Embedding Model Migration
 
 Every vector is stamped at write time with a provider-qualified identity —
@@ -2491,7 +2506,8 @@ Returns a `HealthSnapshot` from `GET /health`:
     "sqlite": { "status": "healthy" },
     "qdrant": { "status": "healthy" },
     "embedding": { "status": "healthy" },
-    "retention": { "status": "healthy" }
+    "retention": { "status": "healthy" },
+    "bootstrap_hydration": { "status": "healthy" }
   },
   "memory_count": 1234,
   "db_size_bytes": 8388608,
@@ -2520,9 +2536,11 @@ Returns a `HealthSnapshot` from `GET /health`:
 
 `components.sqlite` stays `"healthy"` but carries a `message` when the running SQLite build has no `fts5` module: fulltext search runs on the legacy `LIKE`-based matcher (see [Fulltext Search](#fulltext-search)) rather than an FTS5/BM25 index. This is also logged once at startup (`event: "fts5_unavailable"`).
 
+`components.bootstrap_hydration` goes `"degraded"` (naming the affected collection(s) in `message`) while any Qdrant collection is durably recorded `"failed"` in this device's bootstrap hydration state — i.e. a vector-to-SQLite hydration pass hit an error (a transient network/Qdrant failure, not a per-point data issue) for that collection and has not yet successfully retried it. It clears back to `"healthy"` once a later hydration pass (the next process startup, or `bhgbrain repair --from-qdrant`) successfully hydrates that collection. See [Repair and Recovery](#repair-and-recovery).
+
 **Overall status logic:**
 - `unhealthy` - if SQLite or Qdrant is unhealthy
-- `degraded` - if embedding is degraded/unhealthy, OR retention is degraded (over capacity or unsynced vectors)
+- `degraded` - if embedding is degraded/unhealthy, OR retention is degraded (over capacity or unsynced vectors), OR a bootstrap hydration collection is degraded (failed and awaiting retry)
 - `healthy` - all components are healthy
 
 **Component statuses:**
@@ -2533,6 +2551,7 @@ Returns a `HealthSnapshot` from `GET /health`:
 | `qdrant` | A bounded, read-only vector query succeeds (an empty result or a not-yet-created collection both count as healthy) | - | The vector query itself fails, even while the server is reachable |
 | `embedding` | Embed API call succeeds | Missing credentials or unreachable | - |
 | `retention` | All budgets within limits, no unsynced vectors | Budget exceeded OR unsynced vectors > 0 | - |
+| `bootstrap_hydration` | Every discovered Qdrant collection is hydrated (or none exist yet) | At least one collection failed to hydrate and is awaiting retry | - |
 
 **Circuit breakers:** The `circuitBreakers` object reports the state of each external dependency breaker (`closed`, `open`, or `half-open`). When a breaker is `open`, requests to that dependency are short-circuited with a `CircuitOpenError` until the open window elapses and a half-open probe succeeds. Configure thresholds in `resilience.circuit_breaker` (see [Configuration](#configuration)).
 

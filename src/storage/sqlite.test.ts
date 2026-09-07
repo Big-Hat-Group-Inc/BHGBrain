@@ -1412,6 +1412,70 @@ describe('SqliteStore embedding provenance', () => {
   });
 });
 
+// align-runtime-entrypoint-contracts task 3.1
+describe('SqliteStore bootstrap hydration state', () => {
+  let store: SqliteStore;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-'));
+    store = new SqliteStore(tempDir);
+    await store.init();
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a fresh store has no recorded hydration state', () => {
+    expect(store.getBootstrapHydrationState()).toEqual([]);
+  });
+
+  it('setBootstrapCollectionComplete records a complete row with the hydrated count', () => {
+    store.setBootstrapCollectionComplete('bhgbrain_global_general', 4);
+    const state = store.getBootstrapHydrationState();
+    expect(state).toHaveLength(1);
+    expect(state[0]).toMatchObject({
+      collection_name: 'bhgbrain_global_general',
+      status: 'complete',
+      hydrated_count: 4,
+      last_error: null,
+    });
+  });
+
+  it('setBootstrapCollectionFailed records a failed row with the error message', () => {
+    store.setBootstrapCollectionFailed('bhgbrain_global_general', 'Qdrant connection reset');
+    const state = store.getBootstrapHydrationState();
+    expect(state).toHaveLength(1);
+    expect(state[0]).toMatchObject({
+      collection_name: 'bhgbrain_global_general',
+      status: 'failed',
+      hydrated_count: 0,
+      last_error: 'Qdrant connection reset',
+    });
+  });
+
+  it('a later call for the same collection overwrites its prior status (upsert, not append)', () => {
+    store.setBootstrapCollectionFailed('bhgbrain_global_general', 'transient error');
+    store.setBootstrapCollectionComplete('bhgbrain_global_general', 3);
+
+    const state = store.getBootstrapHydrationState();
+    expect(state).toHaveLength(1);
+    expect(state[0]).toMatchObject({ status: 'complete', hydrated_count: 3, last_error: null });
+  });
+
+  it('tracks multiple collections independently', () => {
+    store.setBootstrapCollectionComplete('bhgbrain_global_general', 2);
+    store.setBootstrapCollectionFailed('bhgbrain_global_notes', 'timeout');
+
+    const state = store.getBootstrapHydrationState();
+    expect(state).toHaveLength(2);
+    expect(state).toContainEqual(expect.objectContaining({ collection_name: 'bhgbrain_global_general', status: 'complete' }));
+    expect(state).toContainEqual(expect.objectContaining({ collection_name: 'bhgbrain_global_notes', status: 'failed' }));
+  });
+});
+
 // add-memory-provenance-metadata, task 8.4
 describe('SqliteStore origin/confidence (add-memory-provenance-metadata)', () => {
   let store: SqliteStore;

@@ -504,6 +504,27 @@ CREATE TABLE IF NOT EXISTS embedding_state (
   updated_at TEXT NOT NULL
 );
 
+-- Per-Qdrant-collection durable progress for bootstrapFromQdrant's
+-- vector-to-SQLite hydration (align-runtime-entrypoint-contracts task 3.1):
+-- previously hydration tracked no state at all, so one collection's scroll
+-- failing mid-run aborted every remaining collection for that pass, and the
+-- automatic startup hook only ever ran while countMemories() === 0 — a
+-- non-zero local row count (even from just one successfully-hydrated
+-- collection) permanently suppressed retrying the rest. Recording status
+-- per collection lets bootstrapFromQdrant skip already-'complete'
+-- collections on a later call (cheap: it still lists collections, just
+-- doesn't rescroll ones already done) while resuming exactly the
+-- 'failed'/never-attempted ones — on a later process startup or an explicit
+-- repair --from-qdrant call, until every discovered collection converges
+-- to 'complete'. See design.md decision 2.
+CREATE TABLE IF NOT EXISTS bootstrap_hydration_state (
+  collection_name TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK (status IN ('complete', 'failed')),
+  hydrated_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+
 -- Directed, typed edges between memories (add-memory-links). A brand-new
 -- table, not a column on memories, so a plain CREATE TABLE IF NOT EXISTS
 -- covers existing databases on next startup with no ALTER TABLE step.
@@ -2272,6 +2293,61 @@ export class SqliteStore implements SqliteStorage {
          cursor_offset = ?3,
          updated_at = ?4`,
       [namespace, collection, offset, new Date().toISOString()],
+    );
+  }
+
+  /**
+   * Durable per-collection bootstrap hydration progress
+   * (align-runtime-entrypoint-contracts task 3.1). `getBootstrapHydrationState`
+   * returns the persisted status for every Qdrant collection this device has
+   * previously attempted to hydrate from — `bootstrapFromQdrant` (see
+   * storage/index.ts) consults it to skip collections already recorded
+   * 'complete' and to retry ones recorded 'failed' (or never attempted at
+   * all) on a later call.
+   */
+  getBootstrapHydrationState(): Array<{
+    collection_name: string;
+    status: 'complete' | 'failed';
+    hydrated_count: number;
+    last_error: string | null;
+    updated_at: string;
+  }> {
+    const rows = this.queryAll(`SELECT collection_name, status, hydrated_count, last_error, updated_at FROM bootstrap_hydration_state`);
+    return rows.map(row => ({
+      collection_name: this.getString(row, 'collection_name'),
+      status: this.getString(row, 'status') as 'complete' | 'failed',
+      hydrated_count: this.getNumber(row, 'hydrated_count'),
+      last_error: this.getNullableString(row, 'last_error'),
+      updated_at: this.getString(row, 'updated_at'),
+    }));
+  }
+
+  /** Records that `collectionName` finished hydrating cleanly this pass. */
+  setBootstrapCollectionComplete(collectionName: string, hydratedCount: number): void {
+    this.assertMutableAllowed();
+    this.execSql(
+      `INSERT INTO bootstrap_hydration_state (collection_name, status, hydrated_count, last_error, updated_at)
+       VALUES (?1, 'complete', ?2, NULL, ?3)
+       ON CONFLICT(collection_name) DO UPDATE SET
+         status = 'complete', hydrated_count = ?2, last_error = NULL, updated_at = ?3`,
+      [collectionName, hydratedCount, new Date().toISOString()],
+    );
+  }
+
+  /**
+   * Records that `collectionName` failed to hydrate this pass — a later
+   * `bootstrapFromQdrant` call (next startup, or an explicit
+   * `repair --from-qdrant`) retries it instead of treating an earlier
+   * unrelated collection's success as "hydration is done".
+   */
+  setBootstrapCollectionFailed(collectionName: string, error: string): void {
+    this.assertMutableAllowed();
+    this.execSql(
+      `INSERT INTO bootstrap_hydration_state (collection_name, status, hydrated_count, last_error, updated_at)
+       VALUES (?1, 'failed', 0, ?2, ?3)
+       ON CONFLICT(collection_name) DO UPDATE SET
+         status = 'failed', last_error = ?2, updated_at = ?3`,
+      [collectionName, error, new Date().toISOString()],
     );
   }
 

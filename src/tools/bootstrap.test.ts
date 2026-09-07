@@ -112,7 +112,7 @@ describe('bootstrap tool', () => {
 
       // Reset section 1
       const resetResult = await handleTool(ctx, 'bootstrap', {
-        action: 'reset', section: 1,
+        action: 'reset', section: 1, confirm: 'RESET',
       }) as Record<string, unknown>;
 
       expect(resetResult.memories_removed).toBe(1);
@@ -127,7 +127,7 @@ describe('bootstrap tool', () => {
       await handleTool(ctx, 'bootstrap', { action: 'start' });
 
       const resetResult = await handleTool(ctx, 'bootstrap', {
-        action: 'reset', section: 1,
+        action: 'reset', section: 1, confirm: 'RESET',
       }) as Record<string, unknown>;
 
       expect(resetResult.memories_removed).toBe(0);
@@ -146,7 +146,7 @@ describe('bootstrap tool', () => {
       });
 
       const resetResult = await handleTool(ctx, 'bootstrap', {
-        action: 'reset', section: 1,
+        action: 'reset', section: 1, confirm: 'RESET',
       }) as Record<string, unknown>;
 
       expect(resetResult.error).toBeDefined();
@@ -161,7 +161,7 @@ describe('bootstrap tool', () => {
 
       // Retrying reset (now that deletes succeed) clears it normally.
       const retryResult = await handleTool(ctx, 'bootstrap', {
-        action: 'reset', section: 1,
+        action: 'reset', section: 1, confirm: 'RESET',
       }) as Record<string, unknown>;
       expect(retryResult.memories_removed).toBe(2);
     });
@@ -172,7 +172,7 @@ describe('bootstrap tool', () => {
         action: 'submit', section: 1, answers: 'Old answer.',
       });
       await handleTool(ctx, 'bootstrap', {
-        action: 'reset', section: 1,
+        action: 'reset', section: 1, confirm: 'RESET',
       });
 
       // Re-submit
@@ -182,6 +182,59 @@ describe('bootstrap tool', () => {
 
       expect(result.submitted).toBe(1);
       expect(result.memories_stored).toBe(1);
+    });
+  });
+
+  describe('reset requires explicit confirmation (align-runtime-entrypoint-contracts task 2.4)', () => {
+    it('rejects reset with no confirm field and deletes nothing', async () => {
+      await handleTool(ctx, 'bootstrap', { action: 'start' });
+      await handleTool(ctx, 'bootstrap', {
+        action: 'submit', section: 1, answers: 'Jane Doe, CTO.',
+      });
+
+      const result = await handleTool(ctx, 'bootstrap', {
+        action: 'reset', section: 1,
+      }) as Record<string, unknown>;
+
+      expect(result.error).toMatchObject({ code: 'INVALID_INPUT' });
+      expect(deleteMemory).not.toHaveBeenCalled();
+
+      const status = await handleTool(ctx, 'bootstrap', { action: 'status' }) as Record<string, unknown>;
+      const sections = status.sections as Array<Record<string, unknown>>;
+      expect(sections.find(s => s.section === 1)?.status).toBe('complete');
+    });
+
+    it('rejects reset with a wrong confirm value and deletes nothing', async () => {
+      await handleTool(ctx, 'bootstrap', { action: 'start' });
+      await handleTool(ctx, 'bootstrap', {
+        action: 'submit', section: 1, answers: 'Jane Doe, CTO.',
+      });
+
+      const result = await handleTool(ctx, 'bootstrap', {
+        action: 'reset', section: 1, confirm: 'yes please',
+      }) as Record<string, unknown>;
+
+      expect(result.error).toMatchObject({ code: 'INVALID_INPUT' });
+      expect(deleteMemory).not.toHaveBeenCalled();
+
+      const status = await handleTool(ctx, 'bootstrap', { action: 'status' }) as Record<string, unknown>;
+      const sections = status.sections as Array<Record<string, unknown>>;
+      expect(sections.find(s => s.section === 1)?.status).toBe('complete');
+    });
+
+    it('accepts reset with the exact confirm token', async () => {
+      await handleTool(ctx, 'bootstrap', { action: 'start' });
+      await handleTool(ctx, 'bootstrap', {
+        action: 'submit', section: 1, answers: 'Jane Doe, CTO.',
+      });
+
+      const result = await handleTool(ctx, 'bootstrap', {
+        action: 'reset', section: 1, confirm: 'RESET',
+      }) as Record<string, unknown>;
+
+      expect(result.error).toBeUndefined();
+      expect(result.memories_removed).toBe(1);
+      expect(deleteMemory).toHaveBeenCalledTimes(1);
     });
   });
 

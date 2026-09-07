@@ -69,6 +69,19 @@ export class BackupService {
   private static readonly BACKGROUND_RECONCILE_MAX_RETRIES = 3;
   private static readonly BACKGROUND_RECONCILE_RETRY_DELAY_MS = 5_000;
 
+  // Tracked lifecycle for the background-reconciliation retry timer
+  // (align-runtime-entrypoint-contracts task 3.3; design.md decision 5:
+  // "backup retries and other timers have stop() methods" — untracked
+  // fire-and-forget retry timers were rejected). Previously this retry
+  // timer was a bare, unreferenced setTimeout with no way to cancel it:
+  // a pending retry could fire after `stop()` (called from process shutdown
+  // ahead of `sqlite.close()`) and touch a store that is being or has
+  // already been closed. `stopped` additionally short-circuits an
+  // in-flight (already-fired, still-running) reconciliation pass from
+  // scheduling a further retry once shutdown has begun.
+  private pendingRetryTimer: NodeJS.Timeout | null = null;
+  private stopped = false;
+
   constructor(
     private config: BrainConfig,
     private storage: StorageManager,
@@ -564,11 +577,13 @@ export class BackupService {
   // whether another restore or an explicit repair, simply picks up the
   // remaining unsynced set).
   private scheduleBackgroundReconciliation(attempt = 1): void {
+    if (this.stopped) return;
     this.storage.setBackgroundReconciliationActive(true);
     void this.runBackgroundReconciliation(attempt);
   }
 
   private async runBackgroundReconciliation(attempt: number): Promise<void> {
+    if (this.stopped) return;
     try {
       const result = await this.storage.reconcileVectorsFromSqlite({
         batchSize: 100,
@@ -612,10 +627,26 @@ export class BackupService {
       this.storage.setBackgroundReconciliationActive(false);
       return;
     }
-    const timer = setTimeout(() => {
+    if (this.stopped) return;
+    this.pendingRetryTimer = setTimeout(() => {
+      this.pendingRetryTimer = null;
       this.scheduleBackgroundReconciliation(attempt + 1);
     }, BackupService.BACKGROUND_RECONCILE_RETRY_DELAY_MS);
-    timer.unref?.();
+    this.pendingRetryTimer.unref?.();
+  }
+
+  /**
+   * Cancels any pending background-reconciliation retry timer and prevents
+   * further retries from being scheduled. Idempotent. Callers (process
+   * shutdown — see src/index.ts's createShutdown) MUST call this before
+   * `sqlite.close()` so a retry can never fire against a closed store.
+   */
+  stop(): void {
+    this.stopped = true;
+    if (this.pendingRetryTimer) {
+      clearTimeout(this.pendingRetryTimer);
+      this.pendingRetryTimer = null;
+    }
   }
 
   private toPendingVectorReconciliation(

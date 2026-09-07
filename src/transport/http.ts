@@ -17,8 +17,7 @@ import {
 import { McpSessionManager } from './mcp-http.js';
 import type { MetricEntry } from '../health/metrics.js';
 import type pino from 'pino';
-import { BrainError } from '../errors/index.js';
-import type { ErrorCode } from '../domain/types.js';
+import { BrainError, ERROR_STATUS, isErrorEnvelope } from '../errors/index.js';
 
 // Prometheus text-exposition label-value escaping: backslash, then quote,
 // then newline (order matters so a literal backslash isn't re-escaped).
@@ -60,34 +59,12 @@ export interface HttpServerHandle {
   mcpSessions: McpSessionManager;
 }
 
-// Status codes consistent with the choices already made in middleware.ts
-// (401/400/429/413) and mcp-http.ts (404), extended to cover the rest of the
-// `ErrorCode` union so no BrainError falls through to the generic 500 branch.
-const ERROR_STATUS: Record<ErrorCode, number> = {
-  INVALID_INPUT: 400,
-  NOT_FOUND: 404,
-  CONFLICT: 409,
-  AUTH_REQUIRED: 401,
-  RATE_LIMITED: 429,
-  EMBEDDING_UNAVAILABLE: 503,
-  INTERNAL: 500,
-};
-
-/**
- * `ResourceHandler.handle` reports failures (unknown scheme, malformed URI —
- * task 3.2) by *returning* an envelope object rather than throwing, since it
- * is also reached from stdio and `/mcp`, which have no HTTP status to set.
- * The `/resource` route below is the one caller that does have a status
- * line, so it detects that shape here and maps it, rather than always
- * answering 200 for a request that actually failed.
- */
-function isErrorEnvelope(value: unknown): value is { error: { code: ErrorCode; message: string; retryable: boolean } } {
-  if (typeof value !== 'object' || value === null) return false;
-  const err = (value as { error?: unknown }).error;
-  if (typeof err !== 'object' || err === null) return false;
-  const code = (err as { code?: unknown }).code;
-  return typeof code === 'string' && code in ERROR_STATUS;
-}
+// `ERROR_STATUS` (401/400/429/413 consistent with the choices already made
+// in middleware.ts, and mcp-http.ts's 404) and `isErrorEnvelope` now live in
+// src/errors/index.ts — the one shared definition every transport adapter
+// (REST here, MCP in mcp-response.ts/mcp-server.ts, CLI in cli/index.ts)
+// imports, instead of each transport carrying its own copy
+// (align-runtime-entrypoint-contracts task 2.2).
 
 /**
  * Terminal 4-arg Express error middleware — registered last, after every
@@ -149,6 +126,36 @@ export function applyHttpServerTimeouts(httpServer: HttpServer, config: BrainCon
   httpServer.keepAliveTimeout = config.transport.http.keep_alive_timeout_ms;
   httpServer.headersTimeout = config.transport.http.headers_timeout_ms;
   httpServer.requestTimeout = config.transport.http.request_timeout_ms;
+}
+
+/**
+ * Binds `app` to `host`/`port` and resolves once the listener is actually
+ * ready, rejecting instead of throwing an unhandled `'error'` event if the
+ * bind itself fails (most commonly `EADDRINUSE`) — plain `app.listen(...)`
+ * returns synchronously before the bind outcome is known, so a caller could
+ * only find out about a failed bind by also attaching its own `'error'`
+ * listener, which src/index.ts previously did not do at all: an
+ * unhandled `'error'` event on an `EventEmitter` throws, crashing the
+ * process without a structured log or any chance to close already-opened
+ * resources (sqlite, breakers, ...). Callers should `await` this before
+ * starting any background scheduler, so background work never starts
+ * against a server that never actually came up
+ * (align-runtime-entrypoint-contracts task 3.2).
+ */
+export function listenAsync(app: express.Express, port: number, host: string): Promise<HttpServer> {
+  return new Promise((resolve, reject) => {
+    const server = app.listen(port, host);
+    const onError = (err: Error): void => {
+      server.removeListener('listening', onListening);
+      reject(err);
+    };
+    const onListening = (): void => {
+      server.removeListener('error', onError);
+      resolve(server);
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+  });
 }
 
 /**
@@ -267,7 +274,24 @@ export function createHttpServer(
     // `add-operations-security-reliability` audit follow-up 2026-06-05,
     // task 4.4.
     const clientId = deriveTrustedClientId(req) ?? 'http-client';
+    // req.params.name is passed straight into handleTool with no allowlist
+    // of its own — REST intentionally has no separate tool-name registry
+    // that could drift from dispatch's own switch in tools/index.ts (see
+    // schemas.test.ts's "no separate allowlist" parity test). An unknown
+    // name already reaches dispatch's `default: throw invalidInput(...)`
+    // and comes back as an INVALID_INPUT envelope; the isErrorEnvelope
+    // check below is what makes that a proper non-2xx status instead of
+    // always answering 200 (align-runtime-entrypoint-contracts task 2.2/2.3).
     const result = await handleTool(ctx, req.params.name, req.body, clientId);
+    // handleTool never throws (BrainError and unexpected errors are both
+    // caught and returned as an envelope — see src/tools/index.ts), so every
+    // tool failure must be mapped to its HTTP status here explicitly; without
+    // this check every classified failure (NOT_FOUND, CONFLICT, ...)
+    // previously answered 200 (align-runtime-entrypoint-contracts task 2.2).
+    if (isErrorEnvelope(result)) {
+      res.status(ERROR_STATUS[result.error.code]).json(result);
+      return;
+    }
     res.json(result);
   });
 

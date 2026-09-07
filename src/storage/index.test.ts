@@ -33,6 +33,10 @@ type MockQdrantStore = QdrantStore & {
 
 function createMockSqlite(): MockSqliteStore {
   const memoryStore = new Map<string, StoredMemory>();
+  const bootstrapHydrationState = new Map<string, {
+    collection_name: string; status: 'complete' | 'failed'; hydrated_count: number;
+    last_error: string | null; updated_at: string;
+  }>();
 
   return {
     getMemoryById: vi.fn((id: string) => memoryStore.get(id) ?? null),
@@ -141,6 +145,19 @@ function createMockSqlite(): MockSqliteStore {
     setExpectedEmbeddingIdentity: vi.fn(),
     countMemoriesWithStaleEmbeddingStamp: vi.fn(() => 0),
     listMemoriesWithStaleEmbeddingStamp: vi.fn(() => []),
+    getBootstrapHydrationState: vi.fn(() => Array.from(bootstrapHydrationState.values())),
+    setBootstrapCollectionComplete: vi.fn((collectionName: string, hydratedCount: number) => {
+      bootstrapHydrationState.set(collectionName, {
+        collection_name: collectionName, status: 'complete', hydrated_count: hydratedCount,
+        last_error: null, updated_at: new Date().toISOString(),
+      });
+    }),
+    setBootstrapCollectionFailed: vi.fn((collectionName: string, error: string) => {
+      bootstrapHydrationState.set(collectionName, {
+        collection_name: collectionName, status: 'failed', hydrated_count: 0,
+        last_error: error, updated_at: new Date().toISOString(),
+      });
+    }),
   } as unknown as MockSqliteStore;
 }
 
@@ -954,6 +971,107 @@ describe('StorageManager cross-store consistency', () => {
 
       expect(total).toBe(2);
       expect(sqlite.hydrateBatch).toHaveBeenCalledTimes(1);
+    });
+
+    // align-runtime-entrypoint-contracts task 3.1
+    describe('resumable per-collection hydration', () => {
+      it('records a failing collection as failed, continues to the remaining collections, and still returns their hydrated count', async () => {
+        const sqlite = createMockSqlite();
+        const qdrant = createMockQdrant(false);
+        const embedding = createMockEmbedding();
+        const storage = new StorageManager(sqlite, qdrant, embedding);
+
+        (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => [
+          'bhgbrain_global_broken',
+          'bhgbrain_global_general',
+        ]);
+        (qdrant as unknown as Record<string, unknown>).scrollAll = vi.fn(async (name: string) => {
+          if (name === 'bhgbrain_global_broken') {
+            throw new Error('Qdrant connection reset');
+          }
+          return [{ id: 'p1', payload: { content: 'c1' } }];
+        });
+        const logger = { info: vi.fn(), warn: vi.fn() };
+
+        const total = await storage.bootstrapFromQdrant(logger);
+
+        // The later, healthy collection still hydrates despite the earlier
+        // one throwing — a per-collection failure never aborts the whole run.
+        expect(total).toBe(1);
+        expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
+          event: 'bootstrap_hydration_failed',
+          collection: 'bhgbrain_global_broken',
+        }));
+
+        const state = sqlite.getBootstrapHydrationState();
+        expect(state).toContainEqual(expect.objectContaining({
+          collection_name: 'bhgbrain_global_broken', status: 'failed',
+        }));
+        expect(state).toContainEqual(expect.objectContaining({
+          collection_name: 'bhgbrain_global_general', status: 'complete', hydrated_count: 1,
+        }));
+      });
+
+      it('a non-zero local row count from an earlier collection does not suppress retrying a later one that previously failed', async () => {
+        const sqlite = createMockSqlite();
+        const qdrant = createMockQdrant(false);
+        const embedding = createMockEmbedding();
+        const storage = new StorageManager(sqlite, qdrant, embedding);
+
+        (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => [
+          'bhgbrain_global_general',
+          'bhgbrain_global_broken',
+        ]);
+        let brokenAttempts = 0;
+        (qdrant as unknown as Record<string, unknown>).scrollAll = vi.fn(async (name: string) => {
+          if (name === 'bhgbrain_global_broken') {
+            brokenAttempts++;
+            if (brokenAttempts === 1) throw new Error('transient failure');
+            return [{ id: 'p2', payload: { content: 'c2' } }];
+          }
+          return [{ id: 'p1', payload: { content: 'c1' } }];
+        });
+
+        // First pass: general hydrates (local row count now > 0), broken fails.
+        const firstTotal = await storage.bootstrapFromQdrant(undefined, { skipCompleted: true });
+        expect(firstTotal).toBe(1);
+        expect(sqlite.countMemories()).toBeGreaterThan(0);
+
+        // Second pass (mirrors a later process startup): general is already
+        // 'complete' and is skipped entirely (no second scrollAll call for
+        // it); broken is retried and this time succeeds.
+        const secondTotal = await storage.bootstrapFromQdrant(undefined, { skipCompleted: true });
+        expect(secondTotal).toBe(1);
+        expect(brokenAttempts).toBe(2);
+
+        const generalScrollCalls = (qdrant.scrollAll as ReturnType<typeof vi.fn>).mock.calls
+          .filter(call => call[0] === 'bhgbrain_global_general');
+        expect(generalScrollCalls).toHaveLength(1);
+
+        const state = sqlite.getBootstrapHydrationState();
+        expect(state).toContainEqual(expect.objectContaining({
+          collection_name: 'bhgbrain_global_broken', status: 'complete',
+        }));
+      });
+
+      it('without skipCompleted, an already-complete collection is rescanned (repair --from-qdrant behavior is unchanged)', async () => {
+        const sqlite = createMockSqlite();
+        const qdrant = createMockQdrant(false);
+        const embedding = createMockEmbedding();
+        const storage = new StorageManager(sqlite, qdrant, embedding);
+
+        (qdrant as unknown as Record<string, unknown>).listAllCollections = vi.fn(async () => ['bhgbrain_global_general']);
+        (qdrant as unknown as Record<string, unknown>).scrollAll = vi.fn(async () => [{ id: 'p1', payload: { content: 'c1' } }]);
+
+        await storage.bootstrapFromQdrant(undefined, { skipCompleted: true });
+        expect(qdrant.scrollAll).toHaveBeenCalledTimes(1);
+
+        // No skipCompleted (repair's own call site never passes it) — the
+        // already-'complete' collection is scanned again, exactly like
+        // before durable per-collection state existed.
+        await storage.bootstrapFromQdrant();
+        expect(qdrant.scrollAll).toHaveBeenCalledTimes(2);
+      });
     });
   });
 

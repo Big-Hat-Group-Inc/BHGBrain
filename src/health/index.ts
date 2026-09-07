@@ -129,8 +129,11 @@ export class HealthService {
     const retentionOk = this.checkRetention(stats.countsByTier);
     const schedulersOk = this.checkSchedulers();
     const vectorReconciliation = this.checkVectorReconciliation(stats.unsyncedVectors);
+    const bootstrapHydrationOk = this.checkBootstrapHydration();
 
-    const overall = this.computeOverall(sqliteOk, qdrantOk, embeddingOk, vectorReconciliation, retentionOk, schedulersOk);
+    const overall = this.computeOverall(
+      sqliteOk, qdrantOk, embeddingOk, vectorReconciliation, retentionOk, schedulersOk, bootstrapHydrationOk,
+    );
 
     return {
       status: overall,
@@ -141,6 +144,7 @@ export class HealthService {
         vector_reconciliation: vectorReconciliation,
         retention: retentionOk,
         schedulers: schedulersOk,
+        bootstrap_hydration: bootstrapHydrationOk,
       },
       memory_count: stats.memoryCount,
       db_size_bytes: stats.dbSizeBytes,
@@ -336,6 +340,27 @@ export class HealthService {
     return { status: 'healthy' };
   }
 
+  /**
+   * Reports 'degraded' while any Qdrant collection is durably recorded
+   * 'failed' in bootstrap_hydration_state — resumable hydration (task 3.1)
+   * means a failed collection is retried on a later
+   * bootstrapFromQdrant call rather than aborting the whole run, but until
+   * that retry actually converges the collection to 'complete', health
+   * should visibly reflect that this device's local SQLite copy may still
+   * be missing memories the rest of the fleet already has.
+   */
+  private checkBootstrapHydration(): ComponentHealth {
+    const state = this.storage.sqlite.getBootstrapHydrationState();
+    const failed = state.filter(row => row.status === 'failed');
+    if (failed.length > 0) {
+      return {
+        status: 'degraded',
+        message: `${failed.length} Qdrant collection(s) failed to hydrate and will be retried: ${failed.map(f => f.collection_name).join(', ')}`,
+      };
+    }
+    return { status: 'healthy' };
+  }
+
   private checkVectorReconciliation(unsyncedVectors: number): VectorReconciliationStatus {
     // `getLifecycleOperation()`/`isBackgroundReconciliationActive()` are live
     // in-memory/single-row reads, so the "reconciling" transition is visible
@@ -388,6 +413,7 @@ export class HealthService {
     vectorReconciliation: VectorReconciliationStatus,
     retention: ComponentHealth,
     schedulers: ComponentHealth,
+    bootstrapHydration: ComponentHealth,
   ): HealthStatus {
     if (sqlite.status === 'unhealthy') {
       return 'unhealthy';
@@ -402,6 +428,8 @@ export class HealthService {
       retention.status === 'unhealthy' ||
       schedulers.status === 'degraded' ||
       schedulers.status === 'unhealthy' ||
+      bootstrapHydration.status === 'degraded' ||
+      bootstrapHydration.status === 'unhealthy' ||
       Object.values(this.breakers).some(breaker => breaker.getState() === 'open')
     ) {
       return 'degraded';

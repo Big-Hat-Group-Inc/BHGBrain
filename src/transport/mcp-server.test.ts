@@ -77,6 +77,28 @@ describe('buildMcpServer', () => {
     await server.close();
   });
 
+  it('converts a resource read error envelope into an MCP protocol error, not a successful contents read (task 2.3)', async () => {
+    const { buildMcpServer } = await import('./mcp-server.js');
+    const ctx = {} as ToolContext;
+    const handle = vi.fn(async () => ({ error: { code: 'NOT_FOUND', message: 'Memory abc not found', retryable: false } }));
+    const resources = { handle } as unknown as ResourceHandler;
+
+    const server = buildMcpServer(ctx, resources);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test-client', version: '0.0.0' });
+
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    await expect(client.readResource({ uri: 'memory://abc' }))
+      .rejects.toMatchObject({ message: expect.stringContaining('Memory abc not found') });
+
+    await client.close();
+    await server.close();
+  });
+
   it('rejects an unknown tool name as a JSON-RPC InvalidParams protocol error, not an isError tool result (task 3.1/3.2)', async () => {
     const { buildMcpServer } = await import('./mcp-server.js');
     const ctx = {} as ToolContext;

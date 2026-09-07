@@ -1123,6 +1123,8 @@ L'outil de réparation :
 
 **Note** : Les souvenirs stockés avant l'ajout de la fonctionnalité de contenu dans Qdrant (pré-1.3) n'ont pas de contenu dans leur charge utile Qdrant et ne peuvent pas être récupérés via l'outil de réparation. Seules les métadonnées (tags, type, importance) subsistent pour ces entrées.
 
+**Hydratation automatique à chaque démarrage, reprenable.** La même récupération s'exécute aussi automatiquement à chaque démarrage du serveur (pas seulement via `repair --from-qdrant`), délimitée par collection Qdrant plutôt que conditionnée au nombre local de souvenirs : le résultat de chaque collection est durablement enregistré (`complete` ou `failed`) dans le SQLite local, de sorte qu'une collection dont l'hydratation échoue (une panne réseau/Qdrant transitoire, pas un problème de données par point — voir la note ci-dessus) est retentée au démarrage *suivant*, plutôt qu'une collection antérieure hydratée avec succès ne masque définitivement l'échec. Une collection déjà enregistrée `complete` est ignorée (non réanalysée) sur le chemin automatique, de sorte qu'un stockage entièrement hydraté ne coûte qu'un appel de listage de collections Qdrant bon marché à chaque démarrage, pas une réanalyse complète — `bhgbrain repair --from-qdrant`, en revanche, effectue toujours une réanalyse complète de chaque collection quel que soit l'état enregistré, puisque cette commande est elle-même une demande de récupération délibérée. `components.bootstrap_hydration` de `health://status` signale `"degraded"` tant qu'une collection est enregistrée `failed`, en la nommant, de sorte qu'une collection bloquée soit visible sans consulter les journaux.
+
 ### Migration du modèle d'embedding
 
 Chaque vecteur est estampillé à l'écriture avec une identité qualifiée par
@@ -2529,7 +2531,8 @@ Renvoie un `HealthSnapshot` depuis `GET /health` :
     "sqlite": { "status": "healthy" },
     "qdrant": { "status": "healthy" },
     "embedding": { "status": "healthy" },
-    "retention": { "status": "healthy" }
+    "retention": { "status": "healthy" },
+    "bootstrap_hydration": { "status": "healthy" }
   },
   "memory_count": 1234,
   "db_size_bytes": 8388608,
@@ -2554,9 +2557,11 @@ Renvoie un `HealthSnapshot` depuis `GET /health` :
 
 `components.sqlite` reste `"healthy"` mais porte un `message` lorsque la version de SQLite en cours d'exécution n'a pas de module `fts5` : la recherche plein texte s'exécute alors avec l'ancien comparateur basé sur `LIKE` (voir [Recherche plein texte](#recherche-plein-texte)) plutôt qu'un index FTS5/BM25. Ceci est également journalisé une fois au démarrage (`event: "fts5_unavailable"`).
 
+`components.bootstrap_hydration` passe à `"degraded"` (en nommant la ou les collections concernées dans `message`) tant qu'une collection Qdrant est durablement enregistrée `"failed"` dans l'état d'hydratation de bootstrap de cet appareil — c'est-à-dire qu'une passe d'hydratation vecteur-vers-SQLite a rencontré une erreur (un échec réseau/Qdrant transitoire, pas un problème de données par point) pour cette collection et n'a pas encore été réessayée avec succès. Il revient à `"healthy"` dès qu'une passe d'hydratation ultérieure (le prochain démarrage du processus, ou `bhgbrain repair --from-qdrant`) hydrate cette collection avec succès. Voir [Réparation et récupération](#réparation-et-récupération).
+
 **Logique de statut global :**
 - `unhealthy` — si SQLite ou Qdrant est défaillant
-- `degraded` — si l'embedding est dégradé/défaillant, OU si la rétention est dégradée (surcapacité ou vecteurs non synchronisés)
+- `degraded` — si l'embedding est dégradé/défaillant, OU si la rétention est dégradée (surcapacité ou vecteurs non synchronisés), OU si une collection d'hydratation de bootstrap est dégradée (échouée et en attente de réessai)
 - `healthy` — tous les composants sont sains
 
 **Statuts des composants :**
@@ -2567,6 +2572,7 @@ Renvoie un `HealthSnapshot` depuis `GET /health` :
 | `qdrant` | Une requête vectorielle bornée et en lecture seule réussit (un résultat vide ou une collection pas encore créée comptent aussi comme sains) | — | La requête vectorielle elle-même échoue, même si le serveur est joignable |
 | `embedding` | L'appel API d'intégration réussit | Identifiants manquants ou injoignable | — |
 | `retention` | Tous les budgets dans les limites, aucun vecteur non synchronisé | Budget dépassé OU vecteurs non synchronisés > 0 | — |
+| `bootstrap_hydration` | Chaque collection Qdrant découverte est hydratée (ou aucune n'existe encore) | Au moins une collection a échoué à s'hydrater et attend un réessai | — |
 
 **Codes de statut HTTP (`GET /health`) :**
 - `200` pour `healthy` et `degraded`

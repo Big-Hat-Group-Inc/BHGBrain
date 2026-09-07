@@ -3,30 +3,13 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
 import { loadFileConfig, deriveRuntimeConfig, ensureDataDir } from './config/index.js';
-import { SqliteStore } from './storage/sqlite.js';
-import { QdrantStore } from './storage/qdrant.js';
-import { StorageManager } from './storage/index.js';
-import { createEmbeddingProvider, getEmbeddingBreakerKey, warnIfEmbeddingDegraded } from './embedding/index.js';
-import { WritePipeline } from './pipeline/index.js';
-import { createExtractionProvider, warnIfExtractionDegraded } from './pipeline/extraction.js';
-import { warnIfEntailmentDegraded } from './pipeline/entailment.js';
-import { createSummarizationProvider, warnIfSummarizationDegraded } from './summarization/index.js';
-import { SearchService } from './search/index.js';
-import { createQueryExpansionProvider, warnIfQueryExpansionDegraded } from './search/query-expansion.js';
-import { resolveRerankBootstrap } from './rerank/index.js';
-import { BackupService } from './backup/index.js';
-import { RetentionService } from './backup/retention.js';
-import { CleanupScheduler, DistillationScheduler } from './backup/scheduler.js';
-import { DistillationService } from './pipeline/distillation.js';
-import { DistillationLLMClient, warnIfDistillationDegraded } from './pipeline/distillation-llm.js';
-import { HealthService } from './health/index.js';
-import { MetricsCollector } from './health/metrics.js';
+import type { SqliteStore } from './storage/sqlite.js';
+import type { CleanupScheduler, DistillationScheduler } from './backup/scheduler.js';
+import type { BackupService } from './backup/index.js';
 import { createLogger } from './health/logger.js';
-import { CircuitBreaker } from './resilience/index.js';
-import { ResourceHandler } from './resources/index.js';
-import type { ToolContext } from './tools/index.js';
-import { createHttpServer, applyHttpServerTimeouts } from './transport/http.js';
+import { createHttpServer, applyHttpServerTimeouts, listenAsync } from './transport/http.js';
 import { buildMcpServer } from './transport/mcp-server.js';
+import { buildToolContext } from './context.js';
 import type pino from 'pino';
 
 /** Milliseconds a shutdown drain is given before the hard deadline forces exit. */
@@ -37,6 +20,11 @@ interface ShutdownDeps {
   sqlite: SqliteStore;
   cleanupScheduler: CleanupScheduler;
   distillationScheduler: DistillationScheduler;
+  // Cancels BackupService's pending background-reconciliation retry timer
+  // (align-runtime-entrypoint-contracts task 3.3) — stopped here, alongside
+  // the two schedulers above, and always before sqlite.close() below, so a
+  // pending retry can never fire against a closed store.
+  backupService: BackupService;
   transport: 'http' | 'stdio';
   /**
    * Transport-specific drain step: for HTTP, close live MCP sessions then the
@@ -52,20 +40,29 @@ interface ShutdownDeps {
  * "Stdio parity"). Ordering: (1) synchronous `flushIfDirty()` immediately —
  * cheap when clean, caps the loss window before the async drain can hang;
  * (2) the transport-specific drain (session/listener or MCP server close);
- * (3) stop the lifecycle-timer schedulers; (4) `sqlite.close()` (cancels the
- * deferred-flush timer, flushes if dirty, checkpoints WAL, closes); (5) exit
- * 0. A 10 s unref'd hard deadline runs in parallel: if the drain hasn't
- * finished by then, it logs `shutdown_timeout`, flushes synchronously one
- * last time, and exits non-zero so orchestrators can tell a forced shutdown
- * from a clean one.
+ * (3) stop the lifecycle-timer schedulers and the backup retry timer; (4)
+ * `sqlite.close()` (cancels the deferred-flush timer, flushes if dirty,
+ * checkpoints WAL, closes); (5) exit. A 10 s unref'd hard deadline runs in
+ * parallel: if the drain hasn't finished by then, it logs
+ * `shutdown_timeout`, flushes synchronously one last time, and exits
+ * non-zero so orchestrators can tell a forced shutdown from a clean one.
+ *
+ * The returned function's second parameter distinguishes a graceful signal
+ * (SIGINT/SIGTERM/transport-close — exits 0) from a fatal condition (a
+ * post-bind listener error, an unhandled rejection, an uncaught exception —
+ * align-runtime-entrypoint-contracts task 3.2/3.3) which still runs the
+ * exact same bounded drain/cleanup sequence but exits non-zero, so an
+ * orchestrator can tell "shut down because it was asked to" from "shut down
+ * because something broke".
  */
-function createShutdown(deps: ShutdownDeps): (signal: string) => void {
+function createShutdown(deps: ShutdownDeps): (signal: string, opts?: { fatal?: boolean }) => void {
   let shuttingDown = false;
 
-  return (signal: string) => {
+  return (signal: string, opts?: { fatal?: boolean }) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    deps.logger.info({ event: 'shutdown_start', signal, transport: deps.transport });
+    const exitCode = opts?.fatal ? 1 : 0;
+    deps.logger.info({ event: 'shutdown_start', signal, transport: deps.transport, fatal: Boolean(opts?.fatal) });
 
     const deadline = setTimeout(() => {
       deps.logger.error({ event: 'shutdown_timeout', signal, transport: deps.transport });
@@ -93,20 +90,67 @@ function createShutdown(deps: ShutdownDeps): (signal: string) => void {
       } finally {
         deps.cleanupScheduler.stop();
         deps.distillationScheduler.stop();
+        deps.backupService.stop();
         try {
           deps.sqlite.close();
         } catch (err) {
           deps.logger.error({ event: 'shutdown_close_failed', error: (err as Error).message });
         }
         clearTimeout(deadline);
-        deps.logger.info({ event: 'shutdown_complete', signal, transport: deps.transport });
-        process.exit(0);
+        deps.logger.info({ event: 'shutdown_complete', signal, transport: deps.transport, exit_code: exitCode });
+        process.exit(exitCode);
       }
     })();
   };
 }
 
+/**
+ * Registered before anything else in main() so an unhandled rejection or
+ * uncaught exception during the earliest part of startup (before storage,
+ * the logger, or the full shutdown machinery exist) still logs and exits
+ * non-zero instead of Node's default opaque crash
+ * (align-runtime-entrypoint-contracts task 3.3). Replaced by
+ * `installFatalProcessHandlers` below once the real shutdown path is ready,
+ * so a fatal event later in the process's life goes through the full
+ * bounded drain instead of this bare `process.exit(1)`.
+ */
+function installBootstrapFatalHandlers(): void {
+  process.on('unhandledRejection', (reason) => {
+    console.error('Fatal unhandledRejection during startup:', reason);
+    process.exit(1);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error('Fatal uncaughtException during startup:', err);
+    process.exit(1);
+  });
+}
+
+/**
+ * Upgrades process-level fatal-event handling from the early
+ * `installBootstrapFatalHandlers` bare handlers to the full structured
+ * shutdown path, once `shutdown` (and everything it depends on — sqlite,
+ * the schedulers, the transport drain) actually exists
+ * (align-runtime-entrypoint-contracts task 3.3). Replaces rather than adds
+ * a second pair of listeners, so exactly one handler ever reacts to a given
+ * fatal event.
+ */
+function installFatalProcessHandlers(logger: pino.Logger, shutdown: (signal: string, opts?: { fatal?: boolean }) => void): void {
+  process.removeAllListeners('unhandledRejection');
+  process.removeAllListeners('uncaughtException');
+  process.on('unhandledRejection', (reason) => {
+    const err = reason instanceof Error ? reason : new Error(String(reason));
+    logger.error({ event: 'unhandled_rejection', error: err.message, stack: err.stack });
+    shutdown('unhandledRejection', { fatal: true });
+  });
+  process.on('uncaughtException', (err) => {
+    logger.error({ event: 'uncaught_exception', error: err.message, stack: err.stack });
+    shutdown('uncaughtException', { fatal: true });
+  });
+}
+
 async function main() {
+  installBootstrapFatalHandlers();
+
   const args = process.argv.slice(2);
   const isStdio = args.includes('--stdio');
   const configPath = args.find(a => a.startsWith('--config='))?.split('=')[1];
@@ -124,181 +168,14 @@ async function main() {
   const logger = createLogger(config, isStdio ? process.stderr : undefined);
   logger.info({ event: 'startup', data_dir: config.data_dir });
 
-  // Initialize storage
-  const sqlite = new SqliteStore(config.data_dir!, {
-    busyTimeoutMs: config.storage.sqlite_busy_timeout_ms,
-  });
-  await sqlite.init();
-  // openspec/changes/upgrade-fulltext-to-fts5, task 3.3 (visibility half): a
-  // structured log (in addition to the health `sqlite` component message) so the
-  // legacy-fulltext-fallback condition is visible in logs without polling /health.
-  if (!sqlite.isFts5Available()) {
-    logger.warn({
-      event: 'fts5_unavailable',
-      message: 'SQLite build has no fts5 module; fulltext search is running the legacy LIKE-based matcher.',
-    });
-  }
-
-  const breakerOptions = {
-    failureThreshold: config.resilience.circuit_breaker.failure_threshold,
-    openWindowMs: config.resilience.circuit_breaker.open_window_ms,
-    halfOpenProbeCount: config.resilience.circuit_breaker.half_open_probe_count,
-  };
-  const embeddingBreakerKey = getEmbeddingBreakerKey(config.embedding.provider);
-  const embeddingBreaker = new CircuitBreaker({ ...breakerOptions, key: embeddingBreakerKey, logger });
-  const qdrantBreaker = new CircuitBreaker({ ...breakerOptions, key: 'qdrant', logger });
-  // Not included in HealthService's `breakers` record below (see
-  // add-multi-candidate-extraction design.md): extraction is a best-effort
-  // enhancement with a fully-functional fallback, so an open extraction
-  // breaker should not degrade the server's aggregate health status. It
-  // still gets `logger` so state transitions are visible in structured logs.
-  const extractionBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
-  // Independent breaker instance (own failure/half-open state) sharing the
-  // `extraction` label with `extractionBreaker`: both wrap chat-completion
-  // calls against the same `pipeline.extraction_model`/`extraction_model_env`
-  // credential (add-multi-query-expansion design.md "Phase 2 client shape"),
-  // but a failing paraphrase/HyDE call must not trip the breaker guarding the
-  // write-pipeline's extraction call, or vice versa.
-  const queryExpansionBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
-  // Same rationale/independent-instance pattern as `queryExpansionBreaker`
-  // (unify-llm-client-boundaries task 2.1): contradiction detection reuses
-  // `pipeline.extraction_model`/`extraction_model_env` credentials, so it
-  // shares the `extraction` label for reporting, but a failing entailment
-  // call must not trip the breaker guarding multi-candidate extraction, or
-  // vice versa. Not included in `healthBreakers` below — same best-effort/
-  // fail-open rationale as extraction/summarization/query expansion.
-  const entailmentBreaker = new CircuitBreaker({ ...breakerOptions, key: 'extraction', logger });
-  // Always constructed (cheap, stateless until used) so it exists regardless
-  // of `search.rerank.enabled`, mirroring `embeddingBreaker`/`qdrantBreaker`
-  // (add-opt-in-rerank-stage design.md "Bootstrap wiring"). Only added to
-  // `HealthService`'s breakers map below when a live provider is actually
-  // constructed, so `health://status` reports it exactly when reranking is
-  // configured.
-  const rerankBreaker = new CircuitBreaker({ ...breakerOptions, key: 'rerank', logger });
-  // Not included in HealthService's `breakers` record below, same rationale
-  // as `extractionBreaker`/`summarizationBreaker`: distillation is off by
-  // default and, when enabled, a failing LLM call degrades that scheduled
-  // job's own result (surfaced via `retention.distillation` health), not the
-  // server's aggregate health status. See add-memory-distillation.
-  const distillationBreaker = new CircuitBreaker({ ...breakerOptions, key: 'distillation', logger });
-  const metrics = new MetricsCollector(config);
-  const qdrant = new QdrantStore(config, qdrantBreaker, logger, metrics);
-  const embedding = createEmbeddingProvider(config, { breaker: embeddingBreaker, metrics });
-  warnIfEmbeddingDegraded(embedding, config, logger);
-  const extraction = createExtractionProvider(config, { breaker: extractionBreaker, metrics, logger });
-  warnIfExtractionDegraded(extraction, config, logger);
-  // Not included in HealthService's `breakers` record below, same rationale as
-  // `extractionBreaker`: summarization is a best-effort enhancement with a
-  // fully-functional (extractive) fallback, so an open breaker here should
-  // not degrade the server's aggregate health status.
-  const summarizationBreaker = config.pipeline.summarization_enabled
-    ? new CircuitBreaker({ ...breakerOptions, key: 'summarization', logger })
-    : undefined;
-  const summarization = createSummarizationProvider(config, { breaker: summarizationBreaker, metrics });
-  warnIfSummarizationDegraded(summarization, config, logger);
-  // Not included in HealthService's `breakers` record below, same rationale as
-  // `extractionBreaker`/`summarizationBreaker`: query expansion phase 2 is a
-  // best-effort enhancement — search degrades to phase-1 variants on any
-  // failure — so an open breaker here should not degrade the server's
-  // aggregate health status.
-  const queryExpansion = createQueryExpansionProvider(config, { breaker: queryExpansionBreaker, metrics, logger });
-  warnIfQueryExpansionDegraded(queryExpansion, config, logger);
-  warnIfEntailmentDegraded(config, logger);
-  // Only instantiated when reranking is opted in (add-opt-in-rerank-stage):
-  // stock installs never construct a `RerankProvider`, so `SearchService`
-  // gets `undefined` and `recall` stays byte-for-byte unchanged. Enabling it
-  // with a missing/invalid `search.rerank.model_env` value falls back to the
-  // degraded provider (logged below) rather than crashing startup. Extracted
-  // to `resolveRerankBootstrap` (task 5.6) so this wiring is unit-testable
-  // without instantiating the rest of `main()`'s dependency graph.
-  const { rerank, healthBreaker: rerankHealthBreaker } = resolveRerankBootstrap(config, {
-    breaker: rerankBreaker,
-    metrics,
-    logger,
-  });
-  const storage = new StorageManager(sqlite, qdrant, embedding, metrics, config, summarization);
-
-  // Bootstrap: hydrate SQLite from Qdrant if this is a new device
-  try {
-    const memoryCount = sqlite.countMemories();
-    if (memoryCount === 0) {
-      logger.info({ event: 'bootstrap', message: '[bootstrap] SQLite empty, checking Qdrant for existing memories' });
-      const hydrated = await storage.bootstrapFromQdrant(logger);
-      if (hydrated > 0) {
-        logger.info({ event: 'bootstrap', message: `[bootstrap] hydrated ${hydrated} memories from Qdrant` });
-      }
-    }
-  } catch (err) {
-    logger.warn({ event: 'bootstrap_error', message: `[bootstrap] failed to hydrate from Qdrant: ${(err as Error).message}` });
-  }
-
-  // Embedding provenance: if the store already adopted an expected identity
-  // and it differs from the active configuration, log it loudly at startup
-  // (rather than only surfacing it lazily on the next health poll or write
-  // attempt) — see embedding-provenance.
-  const expectedEmbeddingIdentity = storage.getExpectedEmbeddingIdentity();
-  if (expectedEmbeddingIdentity && expectedEmbeddingIdentity !== embedding.identity) {
-    logger.warn({
-      event: 'embedding_identity_mismatch',
-      expected_identity: expectedEmbeddingIdentity,
-      active_identity: embedding.identity,
-      refuse_writes: config.embedding.refuse_writes_on_model_mismatch,
-      message: `Embedding identity changed: store expects "${expectedEmbeddingIdentity}" but active ` +
-        `configuration is "${embedding.identity}". Run the repair tool with mode: "re-embed" to migrate.`,
-    });
-  }
-
-  // Initialize services
-  const pipeline = new WritePipeline(config, storage, embedding, logger, extraction, metrics, summarization, entailmentBreaker);
-  const searchService = new SearchService(config, storage, embedding, metrics, logger, queryExpansion, rerank);
-  const backupService = new BackupService(config, storage, logger);
-  const healthBreakers: Record<string, CircuitBreaker> = {
-    [embeddingBreakerKey]: embeddingBreaker,
-    qdrant: qdrantBreaker,
-  };
-  // Reported in `health://status` only when a live (non-degraded) rerank
-  // provider was actually constructed, so an open breaker here degrades
-  // aggregate health precisely when reranking is configured and failing —
-  // not on every stock install where reranking is off.
-  if (rerankHealthBreaker) {
-    healthBreakers.rerank = rerankHealthBreaker;
-  }
-  // Scheduled cleanup: same execution path as `bhgbrain gc`, run on
-  // `retention.cleanup_schedule` for the lifetime of this long-running
-  // process (both stdio and HTTP transports keep the process alive).
-  const retentionService = new RetentionService(config, storage, logger, metrics);
-  const cleanupScheduler = new CleanupScheduler(config, retentionService, logger);
-  cleanupScheduler.start();
-
-  // Scheduled distillation: clusters related T2/T3 episodic memories and
-  // consolidates each qualifying cluster into one T1 semantic memory. Off by
-  // default (`retention.distillation.enabled: false`); the scheduler itself
-  // is a no-op start() when disabled, mirroring `cleanupScheduler` above. See
-  // add-memory-distillation.
-  const distillationLlmClient = new DistillationLLMClient(config, distillationBreaker, metrics);
-  const distillationService = new DistillationService(config, storage, pipeline, distillationLlmClient, logger, metrics);
-  const distillationScheduler = new DistillationScheduler(config, distillationService, logger);
-  distillationScheduler.start();
-  warnIfDistillationDegraded(config, logger);
-
-  const healthService = new HealthService(
-    storage, embedding, config, healthBreakers, logger,
-    // A disabled schedule is intentionally unarmed. Only configured schedules
-    // participate in health, where an unarmed/failed state signals a real
-    // scheduling problem rather than an opted-out feature.
-    () => [
-      ...(config.retention.scheduled_cleanup_enabled ? [cleanupScheduler.getState()] : []),
-      ...(config.retention.distillation.enabled ? [distillationScheduler.getState()] : []),
-    ],
-  );
-
-  const ctx: ToolContext = {
-    config, storage, embedding, pipeline,
-    search: searchService, backup: backupService,
-    health: healthService, metrics, logger,
-  };
-
-  const resources = new ResourceHandler(config, storage, searchService, healthService);
+  // Every provider, breaker, storage layer, and service the tool/resource
+  // graph needs is assembled by the one composition root shared with the
+  // CLI entrypoint (align-runtime-entrypoint-contracts task 2.1) — see
+  // src/context.ts for what this builds and why it is not built inline
+  // here anymore.
+  const { ctx, resources, cleanupScheduler, distillationScheduler } = await buildToolContext(config, logger);
+  const sqlite = ctx.storage.sqlite;
+  const backupService = ctx.backup;
 
   if (isStdio || !config.transport.http.enabled) {
     // MCP stdio transport
@@ -321,11 +198,16 @@ async function main() {
       sqlite,
       cleanupScheduler,
       distillationScheduler,
+      backupService,
       transport: 'stdio',
       drain: async () => {
         await server.close();
       },
     });
+    // Upgrades the bare startup-time handlers installed by
+    // installBootstrapFatalHandlers() to the full bounded shutdown path,
+    // now that it exists (task 3.3).
+    installFatalProcessHandlers(logger, shutdown);
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     server.onclose = () => shutdown('transport-close');
@@ -333,16 +215,44 @@ async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
     logger.info({ event: 'connected', transport: 'stdio' });
+
+    // Background schedulers start only once the transport that keeps this
+    // process alive is actually connected (task 3.2) — mirrors the HTTP
+    // branch below, which waits on a successful listener bind.
+    cleanupScheduler.start();
+    distillationScheduler.start();
   } else {
     // HTTP transport — also serves real MCP (Streamable HTTP) at /mcp
     // alongside the REST convenience endpoints.
     const { app, mcpSessions } = createHttpServer(config, ctx, resources, logger);
     const { host, port } = config.transport.http;
 
-    const httpServer = app.listen(port, host, () => {
-      logger.info({ event: 'listening', transport: 'http', host, port });
-      console.log(`BHGBrain server listening on http://${host}:${port}`);
-    });
+    // Awaited, not fire-and-forget: a bind failure (most commonly
+    // EADDRINUSE) previously surfaced only as an unhandled 'error' event —
+    // an opaque crash with no structured log and no chance to close
+    // already-opened resources. Failing startup cleanly here, before any
+    // scheduler or signal handler exists, means there is nothing further to
+    // tear down beyond sqlite itself (align-runtime-entrypoint-contracts
+    // task 3.2).
+    let httpServer;
+    try {
+      httpServer = await listenAsync(app, port, host);
+    } catch (err) {
+      const nodeErr = err as NodeJS.ErrnoException;
+      logger.error({
+        event: 'listen_failed', transport: 'http', host, port,
+        error: nodeErr.message, code: nodeErr.code,
+      });
+      try {
+        sqlite.close();
+      } catch (closeErr) {
+        logger.error({ event: 'listen_failed_close_failed', error: (closeErr as Error).message });
+      }
+      process.exit(1);
+      return;
+    }
+    logger.info({ event: 'listening', transport: 'http', host, port });
+    console.log(`BHGBrain server listening on http://${host}:${port}`);
 
     // Socket timeouts: Node's own defaults (5 s keep-alive, 300 s request,
     // 60 s headers) are wrong for this deployment shape — see
@@ -360,14 +270,31 @@ async function main() {
       sqlite,
       cleanupScheduler,
       distillationScheduler,
+      backupService,
       transport: 'http',
       drain: async () => {
         await mcpSessions.closeAll();
         await new Promise<void>((resolve) => httpServer.close(() => resolve()));
       },
     });
+    // Upgrades the bare startup-time handlers to the full bounded shutdown
+    // path now that it exists (task 3.3).
+    installFatalProcessHandlers(logger, shutdown);
+    // A listener error *after* a successful bind (e.g. a transient EMFILE
+    // while accepting a connection) is rarer but still a real "listener
+    // error" the spec requires structured, bounded handling for — routed
+    // through the same fatal shutdown path (task 3.2).
+    httpServer.on('error', (err: NodeJS.ErrnoException) => {
+      logger.error({ event: 'http_listener_error', error: err.message, code: err.code });
+      shutdown('http_listener_error', { fatal: true });
+    });
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+    // Background schedulers start only once the listener has actually bound
+    // (task 3.2) — never speculatively before bind is confirmed.
+    cleanupScheduler.start();
+    distillationScheduler.start();
   }
 }
 

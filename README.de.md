@@ -1117,6 +1117,8 @@ Das repair-Tool:
 
 **Hinweis**: Erinnerungen, die vor dem Feature Content-in-Qdrant gespeichert wurden (vor 1.3), haben keinen Inhalt in ihrem Qdrant-Payload und können nicht über repair wiederhergestellt werden. Nur Metadaten (Tags, Typ, Wichtigkeit) bleiben für diese Einträge erhalten.
 
+**Automatische Hydration bei jedem Start, wiederaufnehmbar.** Dieselbe Wiederherstellung läuft auch automatisch bei jedem Serverstart ab (nicht nur bei `repair --from-qdrant`), pro Qdrant-Collection statt an die lokale Erinnerungsanzahl gekoppelt: Das Ergebnis jeder Collection wird dauerhaft in der lokalen SQLite-Datenbank festgehalten (`complete` oder `failed`), sodass eine Collection, deren Hydration fehlschlägt (ein vorübergehender Netzwerk-/Qdrant-Fehler, kein Datenproblem einzelner Punkte — siehe Hinweis oben), beim *nächsten* Start erneut versucht wird, statt dass eine zuvor erfolgreich hydrierte Collection den Fehler dauerhaft verdeckt. Eine bereits als `complete` verzeichnete Collection wird beim automatischen Pfad übersprungen (nicht erneut durchlaufen), sodass ein vollständig hydrierter Speicher bei jedem Start nur einen günstigen Qdrant-Collection-Listenaufruf kostet, keinen vollständigen erneuten Scan — `bhgbrain repair --from-qdrant` führt dagegen immer einen vollständigen erneuten Scan jeder Collection durch, unabhängig vom verzeichneten Status, da dieser Befehl selbst eine bewusste Wiederherstellungsanfrage ist. `health://status`s `components.bootstrap_hydration` meldet `"degraded"`, solange eine Collection als `failed` verzeichnet ist, und benennt sie, sodass eine hängengebliebene Collection ohne Log-Analyse sichtbar ist.
+
 ### Migration des Einbettungsmodells
 
 Jeder Vektor wird beim Schreiben mit einer anbieterqualifizierten Identität versehen —
@@ -2512,7 +2514,8 @@ Gibt einen `HealthSnapshot` von `GET /health` zurück:
     "sqlite": { "status": "healthy" },
     "qdrant": { "status": "healthy" },
     "embedding": { "status": "healthy" },
-    "retention": { "status": "healthy" }
+    "retention": { "status": "healthy" },
+    "bootstrap_hydration": { "status": "healthy" }
   },
   "memory_count": 1234,
   "db_size_bytes": 8388608,
@@ -2541,9 +2544,11 @@ Gibt einen `HealthSnapshot` von `GET /health` zurück:
 
 `components.sqlite` bleibt `"healthy"`, führt aber eine `message`, wenn das laufende SQLite-Build kein `fts5`-Modul besitzt: Die Volltextsuche läuft dann über den alten `LIKE`-basierten Matcher (siehe [Volltextsuche](#volltextsuche)) statt über einen FTS5/BM25-Index. Dies wird auch einmalig beim Start protokolliert (`event: "fts5_unavailable"`).
 
+`components.bootstrap_hydration` wird `"degraded"` (mit Nennung der betroffenen Collection(s) in `message`), solange eine Qdrant-Collection im dauerhaften Hydration-Status dieses Geräts als `"failed"` verzeichnet ist — d. h. ein Vektor-zu-SQLite-Hydration-Durchlauf ist für diese Collection auf einen Fehler gestoßen (ein vorübergehender Netzwerk-/Qdrant-Fehler, kein Datenproblem einzelner Punkte) und wurde noch nicht erfolgreich wiederholt. Der Status wechselt zurück auf `"healthy"`, sobald ein späterer Hydration-Durchlauf (der nächste Prozessstart oder `bhgbrain repair --from-qdrant`) diese Collection erfolgreich hydriert. Siehe [Reparatur und Wiederherstellung](#reparatur-und-wiederherstellung).
+
 **Gesamtstatus-Logik:**
 - `unhealthy` — wenn SQLite oder Qdrant fehlerhaft ist
-- `degraded` — wenn Einbettung degradiert/fehlerhaft ist, ODER Aufbewahrung degradiert ist (über Kapazität oder nicht synchronisierte Vektoren)
+- `degraded` — wenn Einbettung degradiert/fehlerhaft ist, ODER Aufbewahrung degradiert ist (über Kapazität oder nicht synchronisierte Vektoren), ODER eine Bootstrap-Hydration-Collection degradiert ist (fehlgeschlagen und auf Wiederholung wartend)
 - `healthy` — alle Komponenten sind gesund
 
 **Komponentenstatus:**
@@ -2554,6 +2559,7 @@ Gibt einen `HealthSnapshot` von `GET /health` zurück:
 | `qdrant` | Eine begrenzte, lesende Vektorabfrage ist erfolgreich (ein leeres Ergebnis oder eine noch nicht angelegte Collection gelten ebenfalls als gesund) | — | Die Vektorabfrage selbst schlägt fehl, auch wenn der Server erreichbar ist |
 | `embedding` | Embed-API-Aufruf erfolgreich | Fehlende Anmeldedaten oder nicht erreichbar | — |
 | `retention` | Alle Budgets innerhalb der Limits, keine nicht synchronisierten Vektoren | Budget überschritten ODER nicht synchronisierte Vektoren > 0 | — |
+| `bootstrap_hydration` | Jede entdeckte Qdrant-Collection ist hydriert (oder es existiert noch keine) | Mindestens eine Collection konnte nicht hydriert werden und wartet auf Wiederholung | — |
 
 **Circuit-Breaker:** Das `circuitBreakers`-Objekt meldet den Zustand jedes Unterbrechers für externe Abhängigkeiten (`closed`, `open` oder `half-open`). Ist ein Breaker `open`, werden Anfragen an diese Abhängigkeit bis zum Ablauf des Öffnungsfensters und einer erfolgreichen Half-Open-Probe mit einem `CircuitOpenError` kurzgeschlossen. Schwellenwerte werden über `resilience.circuit_breaker` konfiguriert (siehe [Konfiguration](#konfiguration)).
 

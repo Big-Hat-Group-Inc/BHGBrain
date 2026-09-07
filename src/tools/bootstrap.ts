@@ -5,11 +5,23 @@ import { BootstrapSessionManager } from '../bootstrap/session.js';
 import { BOOTSTRAP_SECTIONS, TOTAL_SECTIONS, getSectionByNumber } from '../bootstrap/sections.js';
 import { invalidInput } from '../errors/index.js';
 
+// Reset permanently deletes every memory tracked for the section (see
+// handleReset) — an exact confirmation token is required so a caller can
+// never trigger that deletion by omission or a typo'd/guessed value
+// (align-runtime-entrypoint-contracts task 2.4). The MCP SDK cannot express
+// a per-action destructive annotation, so the whole `bootstrap` tool is
+// marked destructiveHint: true in schemas.ts instead (design.md decision 6).
+export const BOOTSTRAP_RESET_CONFIRMATION = 'RESET' as const;
+
 export const BootstrapInputSchema = z.object({
   action: z.enum(['start', 'submit', 'status', 'reset']),
   section: z.number().int().min(1).max(TOTAL_SECTIONS).optional(),
   answers: z.string().min(1).max(500000).optional(),
   namespace: z.string().regex(/^[a-zA-Z0-9/-]{1,200}$/).default('profile'),
+  // Required, and must equal BOOTSTRAP_RESET_CONFIRMATION exactly, for
+  // action: "reset". Absent/wrong values are rejected before anything is
+  // read or deleted (see handleReset).
+  confirm: z.string().optional(),
 }).strict();
 
 export type BootstrapInput = z.infer<typeof BootstrapInputSchema>;
@@ -183,6 +195,15 @@ function handleStatus(sessionMgr: BootstrapSessionManager, namespace: string) {
 }
 
 async function handleReset(ctx: ToolContext, sessionMgr: BootstrapSessionManager, input: BootstrapInput) {
+  // Destructive-action confirmation gate (align-runtime-entrypoint-contracts
+  // task 2.4): checked first, before any lookup or deletion, so an omitted
+  // or wrong confirmation value leaves storage completely untouched.
+  if (input.confirm !== BOOTSTRAP_RESET_CONFIRMATION) {
+    throw invalidInput(
+      `reset is destructive and permanently deletes the section's memories. Pass confirm: "${BOOTSTRAP_RESET_CONFIRMATION}" to proceed.`,
+    );
+  }
+
   if (!input.section) {
     throw invalidInput('section is required for reset action');
   }

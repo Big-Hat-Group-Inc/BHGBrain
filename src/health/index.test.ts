@@ -117,6 +117,7 @@ describe('HealthService', () => {
         getDistillationState: vi.fn(() => ({
           last_run_at: null, last_run_degraded: false, distilled_total: 0, skipped_total: 0,
         })),
+        getBootstrapHydrationState: vi.fn(() => []),
       },
       qdrant: {
         healthCheck: vi.fn(async () => true),
@@ -568,6 +569,35 @@ describe('HealthService', () => {
 
     expect(result.status).toBe('degraded');
     expect(result.components.schedulers).toEqual({ status: 'degraded', message: 'timer registration failed' });
+  });
+
+  // align-runtime-entrypoint-contracts task 3.1
+  describe('bootstrap_hydration component', () => {
+    it('reports healthy when no collection has ever been recorded', async () => {
+      const storage = createStorage();
+      storage.sqlite.getBootstrapHydrationState = vi.fn(() => []);
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+
+      const result = await health.check();
+
+      expect(result.status).toBe('healthy');
+      expect(result.components.bootstrap_hydration).toEqual({ status: 'healthy' });
+    });
+
+    it('degrades overall health when a collection is recorded failed, naming it in the message', async () => {
+      const storage = createStorage();
+      storage.sqlite.getBootstrapHydrationState = vi.fn(() => [
+        { collection_name: 'bhgbrain_global_general', status: 'complete' as const, hydrated_count: 4, last_error: null, updated_at: 'now' },
+        { collection_name: 'bhgbrain_global_broken', status: 'failed' as const, hydrated_count: 0, last_error: 'timeout', updated_at: 'now' },
+      ]);
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+
+      const result = await health.check();
+
+      expect(result.status).toBe('degraded');
+      expect(result.components.bootstrap_hydration?.status).toBe('degraded');
+      expect(result.components.bootstrap_hydration?.message).toContain('bhgbrain_global_broken');
+    });
   });
 
   // bound-qdrant-http-runtime task 2.1: liveness/readiness/diagnostics split.

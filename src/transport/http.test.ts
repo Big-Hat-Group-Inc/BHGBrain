@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
+import express from 'express';
+import type { Server as HttpServer } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { BrainConfig } from '../config/index.js';
 
@@ -296,6 +298,41 @@ describe('createHttpServer', () => {
     expect(resourceResponse.status).toBe(200);
     expect(resourceResponse.body).toEqual({ resource: true });
     expect(resourcesHandle).toHaveBeenCalledWith('memory://list');
+  });
+
+  it('maps a classified tool failure to its HTTP status instead of always answering 200 (task 2.2)', async () => {
+    // mockResolvedValueOnce, not mockResolvedValue: this mock is shared
+    // module-wide across every test in this file (no per-test reset), so a
+    // persistent override would leak into later tests expecting a
+    // successful response.
+    handleToolMock.mockResolvedValueOnce({ error: { code: 'NOT_FOUND', message: 'Memory abc not found', retryable: false } });
+    const { app } = await buildApp(createConfig(false, true));
+
+    const res = await request(app)
+      .post('/tool/forget')
+      .set('Content-Type', 'application/json')
+      .set('Authorization', 'Bearer secret-token')
+      .send({ id: '00000000-0000-0000-0000-000000000000' });
+
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: { code: 'NOT_FOUND', message: 'Memory abc not found', retryable: false } });
+  });
+
+  it('maps a resource read error envelope to its HTTP status on GET /resource (task 2.2)', async () => {
+    const resourcesHandle = vi.fn(async () => ({
+      error: { code: 'NOT_FOUND', message: 'Memory xyz not found', retryable: false },
+    }));
+    const { app } = await buildApp(createConfig(false, true), {
+      resources: { handle: resourcesHandle },
+    });
+
+    const res = await request(app)
+      .get('/resource')
+      .query({ uri: 'memory://xyz' })
+      .set('Authorization', 'Bearer secret-token');
+
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ error: { code: 'NOT_FOUND' } });
   });
 
   it('serves metrics only when enabled', async () => {
@@ -936,6 +973,37 @@ describe('createHttpServer /mcp routes', () => {
         closeSpy.mockRestore();
       }
     });
+  });
+});
+
+describe('listenAsync (align-runtime-entrypoint-contracts task 3.2)', () => {
+  let servers: HttpServer[] = [];
+
+  afterEach(async () => {
+    await Promise.all(servers.map(s => new Promise<void>((resolve) => s.close(() => resolve()))));
+    servers = [];
+  });
+
+  it('resolves with a listening server once the bind succeeds', async () => {
+    const { listenAsync } = await import('./http.js');
+    const app = express();
+
+    const server = await listenAsync(app, 0, '127.0.0.1');
+    servers.push(server);
+
+    expect(server.listening).toBe(true);
+  });
+
+  it('rejects (instead of throwing an unhandled error event) when the port is already in use', async () => {
+    const { listenAsync } = await import('./http.js');
+    const first = await listenAsync(express(), 0, '127.0.0.1');
+    servers.push(first);
+    const address = first.address();
+    const port = typeof address === 'object' && address ? address.port : undefined;
+    expect(port).toBeDefined();
+
+    await expect(listenAsync(express(), port!, '127.0.0.1'))
+      .rejects.toMatchObject({ code: 'EADDRINUSE' });
   });
 });
 });

@@ -230,6 +230,13 @@ export interface HealthSnapshot {
     vector_reconciliation: VectorReconciliationStatus;
     retention?: ComponentHealth;
     schedulers?: ComponentHealth;
+    // Reports 'degraded' while any Qdrant collection is recorded 'failed' in
+    // bootstrap_hydration_state — i.e. this device's vector-to-SQLite
+    // hydration has not yet converged for every discovered collection — and
+    // 'healthy' otherwise (including when hydration has never recorded any
+    // state at all, e.g. a fresh install with no Qdrant collections yet).
+    // See align-runtime-entrypoint-contracts task 3.1.
+    bootstrap_hydration?: ComponentHealth;
   };
   memory_count: number;
   db_size_bytes: number;
