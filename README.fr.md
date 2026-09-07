@@ -472,6 +472,10 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
 
   // Configuration de la recherche
   "search": {
+    // Les résultats actifs utilisent la limite de l'appelant. Quand
+    // include_archived vaut true, les résumés archivés correspondants sont
+    // ajoutés sous ce plafond distinct.
+    "archive_result_limit": 5,
     // Poids utilisés pour la Reciprocal Rank Fusion (RRF) en mode hybride
     // Doit totaliser 1.0
     "hybrid_weights": {

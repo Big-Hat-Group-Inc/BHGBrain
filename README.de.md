@@ -469,6 +469,10 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
 
   // Suchkonfiguration
   "search": {
+    // Aktive Ergebnisse nutzen das vom Aufrufer angegebene Limit. Wenn
+    // include_archived true ist, werden passende Archiv-Zusammenfassungen
+    // zusätzlich bis zu dieser separaten Obergrenze angehängt.
+    "archive_result_limit": 5,
     // Gewichtungen für Reciprocal Rank Fusion (RRF) im Hybrid-Modus
     // Müssen sich zu 1.0 summieren
     "hybrid_weights": {

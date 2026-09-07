@@ -17,4 +17,4 @@
 
 - [x] 3.1 Finalize `merged_from` from per-source success/pending/failure outcomes and verify partial deletion does not claim a fully completed merge.
 - [x] 3.2 Log and return structured per-source consolidation failures and verify Qdrant, lifecycle-lock, and not-found causes remain distinguishable.
-- [ ] 3.3 Add cross-surface retrieval fixtures and run targeted search/resource/tool tests, `npm run eval`, `npm run lint`, `npm test`, and `npm run build`; record relevance changes for review.
+- [x] 3.3 Add cross-surface retrieval fixtures and run targeted search/resource/tool tests, `npm run eval`, `npm run lint`, `npm test`, and `npm run build`; record relevance changes for review.

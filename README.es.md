@@ -471,6 +471,10 @@ El archivo se crea automáticamente en el primer arranque con todos los valores 
 
   // Configuración de búsqueda
   "search": {
+    // Los resultados activos usan el límite del llamador. Cuando
+    // include_archived es true, los resúmenes archivados coincidentes se
+    // añaden bajo este límite independiente.
+    "archive_result_limit": 5,
     // Pesos usados para Reciprocal Rank Fusion (RRF) en modo híbrido
     // Deben sumar 1.0
     "hybrid_weights": {

@@ -86,6 +86,31 @@ describe('MemoryLifecycleService', () => {
     });
   });
 
+  // fix-retrieval-consistency, task 1.1/3.3: `isExpired` is the shared
+  // clock-aware predicate every read surface (storage queries, linked
+  // neighbors, pinned/inject candidates, payload fallbacks) is built on top
+  // of (see src/storage/retrieval-eligibility.cross-surface.test.ts for the
+  // multi-surface tie); pin down its own boundary directly here.
+  describe('isExpired', () => {
+    const now = new Date('2026-09-06T12:00:00.000Z');
+
+    it('is never expired when expires_at is null', () => {
+      expect(service.isExpired(null, now)).toBe(false);
+    });
+
+    it('is not expired exactly at the clock boundary', () => {
+      expect(service.isExpired('2026-09-06T12:00:00.000Z', now)).toBe(false);
+    });
+
+    it('is expired one millisecond past the boundary', () => {
+      expect(service.isExpired('2026-09-06T11:59:59.999Z', now)).toBe(true);
+    });
+
+    it('is not expired for a future timestamp', () => {
+      expect(service.isExpired('2026-09-07T00:00:00.000Z', now)).toBe(false);
+    });
+  });
+
   describe('nextExpiryForAccess', () => {
     const now = new Date('2026-06-05T00:00:00.000Z');
 

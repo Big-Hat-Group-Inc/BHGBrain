@@ -451,6 +451,9 @@ BHGBrain 从以下位置加载配置文件：
 
   // 搜索配置
   "search": {
+    // 活跃结果使用调用方指定的 limit。当 include_archived 为 true 时，
+    // 匹配的归档摘要会在这一独立上限内追加返回。
+    "archive_result_limit": 5,
     // 混合模式下互惠排名融合（RRF）的权重
     // 权重之和必须为 1.0
     "hybrid_weights": {
