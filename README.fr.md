@@ -349,6 +349,18 @@ Le fichier est créé automatiquement au premier démarrage avec toutes les vale
     "pin_limit_per_namespace": 20
   },
 
+  // Rétention des fichiers de sauvegarde (distincte de la `retention` de mémoire ci-dessous)
+  "backup": {
+    "retention": {
+      // Conserver au plus autant de sauvegardes ; les plus anciennes au-delà
+      // de ce nombre sont supprimées après chaque `backup create` réussi. null désactive cette limite.
+      "max_count": 30,
+      // Supprimer les sauvegardes de plus de ce nombre de jours, indépendamment du nombre.
+      // null désactive cette limite.
+      "max_age_days": 90
+    }
+  },
+
   // Paramètres de rétention et du cycle de vie de la mémoire
   "retention": {
     // Jours sans accès après lesquels un souvenir devient candidat à la péremption
@@ -2242,29 +2254,38 @@ sequenceDiagram
     rect rgb(230, 245, 230)
         Note over C,FS: CREATE BACKUP
         C->>S: backup create
-        S->>DB: Export full database
-        DB-->>S: Raw DB bytes
-        S->>S: Compute SHA-256 checksum
-        S->>S: Build JSON header<br/>(version, count, checksum)
-        S->>FS: Atomic write .bhgb file<br/>(write-to-temp-then-rename)
+        S->>DB: VACUUM INTO a scratch export file
+        S->>FS: Stream-hash the export (bounded memory)
+        S->>S: Build JSON header<br/>(version, count, checksum, header_checksum)
+        S->>FS: Stream header + export into a unique temp file,<br/>fsync, rename into place (backups/)
         FS-->>S: Success
+        S->>S: Prune backups over count/age bounds
         S-->>C: path, size, memory_count
     end
 
     rect rgb(230, 235, 250)
         Note over C,FS: RESTORE BACKUP
         C->>S: backup restore (path)
-        S->>FS: Read .bhgb file
-        FS-->>S: Header + DB bytes
-        S->>S: Validate SHA-256 checksum
-        alt Checksum mismatch
-            S-->>C: ❌ INVALID_INPUT
+        S->>S: Acquire cross-process restore lock
+        S->>FS: Read .bhgb file; verify header_checksum + body checksum
+        alt Checksum or version invalid
+            S-->>C: ❌ INVALID_INPUT (live database untouched)
         else Checksum valid
-            S->>FS: Atomic write to data dir<br/>(write-to-temp-then-rename)
-            S->>DB: Hot-reload in-memory SQLite
-            S->>DB: Run schema migrations
-            DB-->>S: Ready
-            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+            S->>FS: Write candidate to a scratch file;<br/>open it, run integrity_check + schema/count checks
+            alt Candidate fails validation
+                S-->>C: ❌ live database untouched
+            else Candidate valid
+                S->>DB: Checkpoint + close live connection
+                S->>FS: Rename live db aside (pre-restore-*),<br/>rename candidate into place
+                S->>DB: Reopen; re-verify record count
+                alt Activation or post-activation check fails
+                    S->>FS: Rename pre-restore image back; reopen
+                    S-->>C: ❌ prior database restored and active
+                else Activation succeeds
+                    S->>S: Reconcile vectors: stream drift + surplus scan,<br/>prune vector-only orphans
+                    S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+                end
+            end
         end
     end
 ```
@@ -2280,7 +2301,7 @@ Ou via CLI :
 bhgbrain backup create
 ```
 
-Les sauvegardes capturent l'intégralité de la base de données SQLite (tous les souvenirs, catégories, collections, journal d'audit, révisions et enregistrements d'archive) en tant que fichier `.bhgb` unique dans le sous-répertoire `backups/` de votre répertoire de données.
+Les sauvegardes capturent l'intégralité de la base de données SQLite (tous les souvenirs, catégories, collections, journal d'audit, révisions et enregistrements d'archive) en tant que fichier `.bhgb` unique dans le sous-répertoire `backups/` de votre répertoire de données. La création diffuse (stream) l'export de la base de données à travers le hachage et l'écriture disque — la mémoire de pointe reste bornée à un petit nombre fixe de blocs quelle que soit la taille de la base de données, plutôt que de conserver tout l'export en mémoire à la fois.
 
 **Format de fichier de sauvegarde :**
 ```
@@ -2289,24 +2310,44 @@ Les sauvegardes capturent l'intégralité de la base de données SQLite (tous le
 [octets restants : export de la base de données SQLite]
 ```
 
-L'en-tête JSON contient :
+L'en-tête JSON (format version 2) contient :
 ```json
 {
-  "version": 1,
+  "version": 2,
   "memory_count": 1234,
   "checksum": "<sha256 des données db>",
   "created_at": "2026-03-15T12:00:00Z",
   "embedding_model": "text-embedding-3-small",
-  "embedding_dimensions": 1536
+  "embedding_dimensions": 1536,
+  "header_checksum": "<sha256 des champs canoniques ci-dessus>"
 }
 ```
 
-**Ce qui n'est PAS dans la sauvegarde :**
-- Les données vectorielles Qdrant **ne sont pas** incluses. Après la restauration depuis une sauvegarde, les collections Qdrant doivent être reconstruites en ré-intégrant le contenu. En attendant, la recherche plein texte fonctionne mais pas la recherche sémantique.
+`header_checksum` authentifie les champs de l'en-tête eux-mêmes (afin qu'un `memory_count`/`checksum`/champs d'embedding falsifiés soient rejetés avant que la restauration ne leur fasse confiance pour quoi que ce soit de destructeur) et est vérifié en plus de la somme de contrôle du corps. Les sauvegardes version 1 (sans `header_checksum`) restent lisibles via un analyseur de compatibilité qui ne fait jamais confiance de manière destructrice à leurs champs non authentifiés ; toute autre version est rejetée avec `INVALID_INPUT` avant que la restauration ne touche la base de données active.
 
-**Intégrité de la sauvegarde :** Une somme de contrôle SHA-256 des données de la base de données est stockée dans l'en-tête et vérifiée lors de la restauration. Si le fichier est corrompu, la restauration échoue avec `INVALID_INPUT: Backup integrity check failed`. Une fois la base de données restaurée activée, son nombre de mémoires est également comparé à `memory_count` dans l'en-tête ; en cas d'écart, la restauration échoue avec `INTERNAL` (journalisé comme `backup_restore_count_mismatch`) plutôt que de renvoyer une réponse réussie sur des données silencieusement erronées.
+**Ce qui n'est PAS dans la sauvegarde :**
+- Les données vectorielles Qdrant **ne sont pas** incluses. Après la restauration depuis une sauvegarde, les vecteurs sont réconciliés par rapport à la dérive (voir ci-dessous) plutôt que d'être inclus dans l'archive — cela garde les sauvegardes petites et portables.
+
+**Intégrité de la sauvegarde :** la somme de contrôle SHA-256 du corps et le `header_checksum` propre à l'en-tête sont tous deux vérifiés avant qu'un champ de l'en-tête ne soit utilisé de manière destructrice. Un fichier corrompu ou tronqué, ou dont l'en-tête a été falsifié indépendamment du corps, fait échouer la restauration avec `INVALID_INPUT` avant que la base de données active ne soit touchée.
+
+**Validation durable :** les fichiers de sauvegarde (et l'image de base de données restaurée) sont écrits dans un fichier temporaire unique avec des permissions restrictives `0600`, synchronisés (`fsync`), renommés à leur emplacement final, et le répertoire contenant est également synchronisé (`fsync`) lorsque le système de fichiers le prend en charge — un crash du processus ou de l'hôte après que la création de la sauvegarde a signalé un succès ne laisse jamais un fichier partiel à son emplacement final, et une écriture interrompue n'écrase jamais le fichier temporaire en cours d'un autre écrivain.
 
 Les **métadonnées de sauvegarde** sont suivies dans la table SQLite `backup_metadata` pour que `backup list` puisse retourner des informations sur les sauvegardes historiques.
+
+**Rétention des fichiers de sauvegarde :** après chaque `backup create` réussi, les sauvegardes dépassant le nombre ou l'âge configurés sont supprimées (fichier et ligne de métadonnées ensemble). Se configure via `backup.retention` dans `config.json` :
+
+```json
+{
+  "backup": {
+    "retention": {
+      "max_count": 30,
+      "max_age_days": 90
+    }
+  }
+}
+```
+
+L'une ou l'autre des deux bornes suffit à elle seule à faire supprimer une sauvegarde ; réglez une borne sur `null` pour la désactiver (mettre les deux à `null` désactive entièrement la rétention — non recommandé, car le stockage des sauvegardes croît alors sans limite et proportionnellement à la taille de la base de données). Une sauvegarde dont la suppression de fichier échoue est laissée dans les métadonnées afin que la passe suivante la retente, plutôt que d'en perdre la trace. Une sauvegarde hors bornes dont le fichier a déjà disparu voit sa ligne de métadonnées obsolète nettoyée et est signalée séparément d'une suppression réelle. `backup list` signale également (`missing: true`) toute sauvegarde dont le fichier a disparu mais dont la ligne de métadonnées n'a pas encore été nettoyée, plutôt que de la présenter comme restaurable.
 
 ### Lister les sauvegardes
 
@@ -2322,7 +2363,8 @@ Renvoie :
       "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
@@ -2338,20 +2380,19 @@ Renvoie :
 ```
 
 **Processus de restauration :**
-1. Valider l'existence du fichier et la correspondance de la somme de contrôle d'intégrité.
-
-2. Écrire atomiquement la base de données SQLite intégrée dans le répertoire de données (écriture-vers-temp-puis-renommage).
-3. Recharger à chaud la base de données SQLite en mémoire depuis le fichier restauré sans redémarrer le processus.
-4. Exécuter les migrations de schéma sur la base de données rechargée pour assurer la compatibilité ascendante.
-5. Réconcilier les vecteurs par rapport à la dérive (drift) réelle (voir ci-dessous) et renvoyer `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
+1. Acquérir le verrou de restauration inter-processus (voir ci-dessous) et valider que le fichier existe, que sa version de format est prise en charge, et que les sommes de contrôle de l'en-tête et du corps correspondent toutes deux.
+2. Écrire la base de données candidate dans un fichier temporaire et la valider *avant* de toucher la base de données active : l'ouvrir, exécuter `PRAGMA integrity_check`, confirmer que le schéma est lisible, et confirmer que son nombre d'enregistrements correspond à `memory_count` de l'en-tête. Un candidat qui échoue à l'une de ces vérifications laisse la base de données active totalement intacte.
+3. Faire un checkpoint et fermer la connexion active, renommer le fichier de base de données active *à l'écart* vers un chemin de pré-restauration unique (non écrasé sur place), renommer le candidat validé à sa place, et rouvrir.
+4. Revérifier le nombre d'enregistrements de la base de données rouverte. Si l'activation ou cette vérification post-activation échoue, l'image de pré-restauration est renommée à sa place d'origine et rouverte — la restauration laisse toujours une base de données fonctionnelle, active et rouverte, jamais une base à moitié échangée ou corrompue.
+5. Réconcilier les vecteurs par rapport à la dérive réelle et au surplus exclusivement vectoriel (voir ci-dessous) et renvoyer `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
 
 **La restauration est en direct :** La base de données restaurée est immédiatement active. Il n'est pas nécessaire de redémarrer le serveur. La réponse inclut `metadata_activated: true` pour le confirmer.
 
-**Vérification du nombre de mémoires après activation :** Une sauvegarde étant un export octet pour octet de la base de données SQLite, le nombre de mémoires après activation doit correspondre exactement à `memory_count` de l'en-tête. Sinon, la restauration lève `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` et journalise un événement `backup_restore_count_mismatch` — l'appel ne renvoie pas de réponse réussie.
+**Garantie de retour arrière (rollback) :** un échec de restauration signalé — qu'il provienne de la validation pré-activation, de l'échange de fichiers actif/candidat, ou de la vérification du nombre d'enregistrements post-activation — laisse toujours la base de données précédente récupérable et rouverte, jamais une base de données manquante, à moitié écrite ou silencieusement erronée. Le message d'erreur indique explicitement si la base de données précédente a été restaurée (`"...the prior database was restored and is active"`) ou n'a jamais été touchée (`"...before any change to the active database"`).
 
-**La réconciliation des vecteurs ne porte que sur la dérive réelle et est bornée.** La restauration ne vide pas et ne réintègre pas inconditionnellement l'intégralité du corpus : elle compare la somme de contrôle du contenu de chaque mémoire restaurée au vecteur déjà stocké dans Qdrant et ne marque pour un nouvel embedding que les mémoires nouvelles ou dont le contenu a changé. Si le modèle/les dimensions d'embedding ont changé depuis la création de la sauvegarde, ou si l'état de Qdrant ne peut pas être lu, la restauration bascule à la place sur une reconstruction complète. Une fois cette vérification de dérive terminée, le verrou de cycle de vie de la restauration est libéré — `vector_reconciliation.state` vaut `"reconciled"` immédiatement si rien n'a dérivé, ou `"reconciling"` si le réembedding du sous-ensemble en dérive se poursuit dans une tâche d'arrière-plan bornée (un délai d'expiration et un plafond de lots par passage, avec des relances automatiques) après que l'appel a déjà renvoyé sa réponse. Interrogez `health://status` (`components.vector_reconciliation`) pour suivre son achèvement.
+**Exclusion inter-processus :** un fichier de verrou exclusif (`<data_dir>/.restore.lock`) est maintenu pendant toute la restauration, et chaque mutation SQLite (dans ce processus ou un autre) le vérifie — une restauration qui se chevauche depuis un autre appel CLI ou processus serveur, ou une écriture ordinaire entrant en conflit avec une restauration active, échoue visiblement avec un `CONFLICT` réessayable (`"Backup restore is already active for this data directory"` ou `"Storage lifecycle operation in progress: restore (held by another process)"`) plutôt que d'écrire dans une image de base de données sur le point d'être renommée ou remplacée.
 
-**Protection contre les restaurations simultanées :** Si une restauration est déjà en cours, les demandes de restauration ultérieures renvoient `INVALID_INPUT: Backup restore already in progress`. Ce verrou ne couvre que l'activation des métadonnées et la vérification de dérive, pas le réembedding en arrière-plan, il est donc libéré rapidement même pour une restauration volumineuse.
+**La réconciliation des vecteurs ne porte que sur la dérive réelle, est bornée et bidirectionnelle.** La restauration ne vide pas et ne réintègre pas inconditionnellement l'intégralité du corpus : elle parcourt en flux chaque collection Qdrant gérée une seule fois (sans jamais mettre en mémoire tampon une collection entière) et compare la somme de contrôle de chaque point à la ligne SQLite restaurée, ne marquant pour un nouvel embedding que les mémoires nouvelles ou dont le contenu a changé. Elle identifie également le **surplus exclusivement vectoriel** — des points Qdrant sans aucune ligne correspondante dans l'image SQLite restaurée, laissés derrière lorsque la sauvegarde leur est antérieure — et les supprime par lots bornés, limités aux points propres de cet appareil (ou aux points hérités antérieurs au marquage par appareil) afin que le repli de recherche inter-appareils légitime d'un autre appareil ne soit jamais touché. Un point en surplus dont la suppression échoue est laissé comme travail orphelin réessayable et maintient `vector_reconciliation` dégradé plutôt que d'être faussement signalé comme sain, de sorte qu'il ne peut jamais réapparaître dans `recall` comme un repli de charge utile n'expirant jamais. Lorsque le modèle/les dimensions d'embedding ont changé depuis la création de la sauvegarde, la restauration bascule à la place sur une reconstruction complète ; lorsque l'état de Qdrant ne peut simplement pas être *lu* (une panne transitoire, pas un changement de modèle), elle réintègre le corpus de manière conservatrice sans rien effacer, et cela est signalé comme sa propre cause `inspection-failed` plutôt que faussement étiqueté comme un changement de modèle. Une fois cette vérification terminée, le verrou de restauration est libéré — `vector_reconciliation.state` vaut `"reconciled"` immédiatement si rien n'a dérivé et qu'aucun surplus ne subsiste, ou `"reconciling"` si le réembedding du sous-ensemble en dérive se poursuit dans une tâche d'arrière-plan bornée (un délai d'expiration et un plafond de lots par passage, avec des relances automatiques) ou si un surplus non nettoyé subsiste comme travail réessayable, après que l'appel a déjà renvoyé sa réponse. Interrogez `health://status` (`components.vector_reconciliation`) pour suivre son achèvement.
 
 ---
 
@@ -3317,9 +3358,11 @@ Créer, lister ou restaurer des sauvegardes de mémoire.
   "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
   "size_bytes": 2048576,
   "memory_count": 1234,
-  "created_at": "2026-03-15T12:00:00Z"
+  "created_at": "2026-03-15T12:00:00Z",
+  "missing": false
 }
 ```
+La rétention des fichiers de sauvegarde (`backup.retention.max_count`/`max_age_days`) s'exécute automatiquement après chaque `create` réussi — voir [Création d'une sauvegarde](#création-dune-sauvegarde).
 
 **Sortie `list` :**
 ```json
@@ -3329,11 +3372,13 @@ Créer, lister ou restaurer des sauvegardes de mémoire.
       "path": "...",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
 ```
+`missing: true` signale une sauvegarde dont la ligne de métadonnées n'a plus de fichier correspondant sur disque, plutôt que de la présenter comme restaurable.
 
 **Sortie `restore` :**
 ```json
@@ -3348,7 +3393,7 @@ Créer, lister ou restaurer des sauvegardes de mémoire.
   }
 }
 ```
-`vector_reconciliation.state` vaut `"reconciled"` quand aucun vecteur n'a réellement dérivé (rien à réintégrer), ou `"reconciling"` tant qu'une tâche d'arrière-plan bornée réintègre le sous-ensemble en dérive ou manquant. Voir [Restauration depuis une sauvegarde](#restauration-depuis-une-sauvegarde).
+`vector_reconciliation.state` vaut `"reconciled"` quand aucun vecteur n'a réellement dérivé, qu'aucun surplus exclusivement vectoriel ne subsiste, et que rien n'a besoin d'être réintégré ; `"reconciling"` tant qu'une tâche d'arrière-plan bornée réintègre le sous-ensemble en dérive ou manquant, ou qu'un surplus non nettoyé subsiste comme travail réessayable ; `"pending"` si la détection de dérive/surplus elle-même n'a pas pu aboutir. Voir [Restauration depuis une sauvegarde](#restauration-depuis-une-sauvegarde).
 
 ---
 
@@ -4024,9 +4069,9 @@ La sauvegarde est stockée dans le répertoire de données (`%LOCALAPPDATA%\BHGB
 
 `backup.restore` recharge l'état SQLite en cours d'exécution avant de renvoyer le succès. Les réponses de restauration incluent `metadata_activated: true` lorsque les données restaurées sont immédiatement actives. Il n'est pas nécessaire de redémarrer le serveur.
 
-La restauration acquiert un verrou de sécurité (`beginRestoreOperation()`) qui ne bloque les écritures concurrentes que le temps que SQLite soit activé et que les vecteurs restaurés soient vérifiés pour dérive par rapport à Qdrant. Les vecteurs ne sont **pas** vidés et réintégrés inconditionnellement : seules les mémoires dont la somme de contrôle du contenu diffère de Qdrant (ou en est absente) sont marquées pour un nouvel embedding, de sorte qu'une restauration sans dérive s'achève sans même appeler le fournisseur d'embeddings. Si le modèle/les dimensions d'embedding ont changé depuis la prise de la sauvegarde, ou si l'état de Qdrant ne peut pas être lu, la restauration bascule à la place sur une reconstruction complète.
+La restauration acquiert un verrou de sécurité (`beginRestoreOperation()`, en plus du fichier de verrou inter-processus `.restore.lock` et de la propre vérification de verrou de chaque mutation — voir [Restauration depuis une sauvegarde](#restauration-depuis-une-sauvegarde)) qui bloque les écritures concurrentes pendant que le candidat est validé dans une copie temporaire, que les fichiers de base de données actif/candidat sont échangés, et que les vecteurs restaurés sont vérifiés pour dérive et surplus par rapport à Qdrant. Les vecteurs ne sont **pas** vidés et réintégrés inconditionnellement : seules les mémoires dont la somme de contrôle du contenu diffère de Qdrant (ou en est absente) sont marquées pour un nouvel embedding, de sorte qu'une restauration sans dérive s'achève sans même appeler le fournisseur d'embeddings. Si le modèle/les dimensions d'embedding ont changé depuis la prise de la sauvegarde, la restauration bascule à la place sur une reconstruction complète ; si l'état de Qdrant ne peut simplement pas être lu (une panne transitoire), elle réintègre le corpus de manière conservatrice sans rien effacer, et cela est signalé comme sa propre cause `inspection-failed` plutôt que faussement étiqueté comme un changement de modèle.
 
-Une fois la vérification de dérive terminée, le verrou est libéré — le réembedding du sous-ensemble en dérive (le cas échéant) s'exécute dans une tâche d'arrière-plan bornée (un délai d'expiration et un plafond de lots par passage) au lieu de retenir l'appel de restauration ou de bloquer les autres écritures pendant sa durée. Il relance automatiquement avec un backoff en cas d'échec transitoire ; s'il ne rattrape jamais complètement son retard, `health://status` continue de signaler `vector_reconciliation.state: "pending"` (ou `"reconciling"` pendant qu'un passage est en cours) plutôt que de laisser silencieusement la recherche sémantique vide. La progression est vidée sur disque par lot, de sorte qu'un plantage brutal pendant la réconciliation ne perd au plus qu'un lot de travail — au redémarrage, on reprend en toute sécurité à partir de l'ensemble non synchronisé restant grâce à un ré-upsert idempotent.
+Une fois la vérification de dérive/surplus terminée, le verrou est libéré — le réembedding du sous-ensemble en dérive (le cas échéant) s'exécute dans une tâche d'arrière-plan bornée (un délai d'expiration et un plafond de lots par passage) au lieu de retenir l'appel de restauration ou de bloquer les autres écritures pendant sa durée. Il relance automatiquement avec un backoff en cas d'échec transitoire ; s'il ne rattrape jamais complètement son retard, `health://status` continue de signaler `vector_reconciliation.state: "pending"` (ou `"reconciling"` pendant qu'un passage est en cours) plutôt que de laisser silencieusement la recherche sémantique vide. La progression est vidée sur disque par lot, de sorte qu'un plantage brutal pendant la réconciliation ne perd au plus qu'un lot de travail — au redémarrage, on reprend en toute sécurité à partir de l'ensemble non synchronisé restant grâce à un ré-upsert idempotent. La suppression du surplus exclusivement vectoriel (points sans ligne restaurée en SQLite) s'exécute de manière synchrone dans le cadre de la vérification de dérive/surplus elle-même, par lots bornés ; un lot dont la suppression échoue maintient `vector_reconciliation` dégradé avec le nombre restant plutôt que d'être faussement signalé comme sain malgré un travail orphelin non résolu.
 
 ### Renforcement HTTP
 

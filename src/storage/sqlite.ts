@@ -1,5 +1,9 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
-import { readFileSync, writeFileSync, existsSync, renameSync, statSync, unlinkSync, openSync, closeSync, fsyncSync, chmodSync } from 'node:fs';
+import {
+  readFileSync, writeFileSync, existsSync, renameSync, statSync, unlinkSync, openSync, closeSync, fsyncSync,
+  chmodSync, createWriteStream,
+} from 'node:fs';
+import type { WriteStream } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type {
@@ -81,10 +85,19 @@ export interface BootstrapSectionRow {
   updated_at: string;
 }
 
+export interface ActivateDatabaseImageOptions {
+  // When set, the candidate image's `memories` row count is checked, once
+  // pre-activation in a scratch copy and once more post-activation against
+  // the live reopened database, against this value. A mismatch at either
+  // point rolls back to the preserved pre-restore image instead of leaving
+  // a partially-activated or unverifiable database live.
+  expectedMemoryCount?: number;
+}
+
 export interface SqliteStorage {
   init(): Promise<void>;
   reloadFromDisk(): Promise<void>;
-  activateDatabaseImage(image: Buffer): Promise<void>;
+  activateDatabaseImage(image: Buffer, options?: ActivateDatabaseImageOptions): Promise<void>;
   flush(): void;
   flushIfDirty(): void;
   scheduleDeferredFlush(): void;
@@ -198,7 +211,9 @@ export interface SqliteStorage {
   recordFeedback(entry: RecallFeedbackEntry): void;
   insertBackupMeta(path: string, sizeBytes: number, memoryCount: number, checksum: string): void;
   listBackups(): Array<{ path: string; size_bytes: number; memory_count: number; created_at: string }>;
+  deleteBackupMeta(path: string): void;
   exportData(): Buffer;
+  exportDataToFile(): { path: string; sizeBytes: number };
   getDatabasePath(): string;
   healthCheck(): boolean;
   close(): void;
@@ -630,29 +645,200 @@ export class SqliteStore implements SqliteStorage {
   }
 
   /**
-   * Activates a full replacement database image (a restored backup): closes
-   * the live connection, removes any stale `-wal`/`-shm` sidecars so they
-   * cannot be replayed against the new image, atomically writes `image` onto
-   * `brain.db`, then reopens. Closing before overwriting is required on
-   * Windows, where renaming onto a file with an open native handle fails
-   * (EPERM) — harmless under the old memory-only sql.js engine, but required
-   * here. See design.md "Restore must close-before-overwrite" and
-   * migrate-sqlite-to-native-engine task 2.1.
+   * Activates a full replacement database image (a restored backup) as a
+   * validated, rollback-capable swap:
+   *
+   *   1. Write `image` to a unique scratch file and validate it (openable,
+   *      `PRAGMA integrity_check`, schema readable, record count matches
+   *      `options.expectedMemoryCount` if given) *before* touching the live
+   *      database at all — a corrupt or incompatible candidate never
+   *      destroys the recoverable prior store.
+   *   2. Checkpoint and close the live connection (required on Windows,
+   *      where renaming onto a file with an open native handle fails EPERM —
+   *      harmless under the old memory-only sql.js engine, but required
+   *      here; see design.md "Restore must close-before-overwrite" and
+   *      migrate-sqlite-to-native-engine task 2.1), then rename it *aside*
+   *      to a unique pre-restore path instead of overwriting it directly.
+   *   3. Rename the validated candidate into place and reopen.
+   *   4. Re-verify the reopened live database's record count. Any failure
+   *      from step 2 onward rolls back: the pre-restore image is renamed
+   *      back into place and reopened, so a failed restore always leaves a
+   *      working database, never a half-swapped or corrupt one.
+   *
+   * See openspec/changes/make-backup-restore-transactional (tasks 2.1, 2.3).
    */
-  async activateDatabaseImage(image: Buffer): Promise<void> {
+  async activateDatabaseImage(image: Buffer, options?: ActivateDatabaseImageOptions): Promise<void> {
     this.cancelDeferredFlush();
+    // One "now" for both the pre-activation scratch check and the
+    // post-activation live check, so a memory that expires mid-activation
+    // cannot make the two checks disagree with each other.
+    const nowIso = new Date().toISOString();
+
+    const scratchPath = `${this.dbPath}.restore-scratch-${randomUUID()}`;
+    atomicWriteFileSync(scratchPath, image);
+    try {
+      this.validateCandidateImage(scratchPath, nowIso, options?.expectedMemoryCount);
+    } catch (err) {
+      this.cleanupFileBestEffort(scratchPath);
+      throw err;
+    }
+
     if (this.db) {
+      try {
+        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      } catch {
+        // Best-effort: an unhealthy live connection still needs to close so
+        // the file below can be renamed aside; the scratch image was already
+        // validated independently of whatever state the live handle is in.
+      }
       this.db.close();
     }
     this.removeStaleSidecarFiles();
-    atomicWriteFileSync(this.dbPath, image);
-    this.openDatabase();
+
+    const preRestorePath = `${this.dbPath}.pre-restore-${randomUUID()}`;
+    let liveRenamedAside = false;
+    try {
+      if (existsSync(this.dbPath)) {
+        renameSync(this.dbPath, preRestorePath);
+        liveRenamedAside = true;
+      }
+      renameSync(scratchPath, this.dbPath);
+    } catch (err) {
+      if (liveRenamedAside) {
+        try {
+          renameSync(preRestorePath, this.dbPath);
+        } catch {
+          // The original file could not be moved back; openDatabase() below
+          // will surface the resulting state (missing/locked file) loudly
+          // rather than silently continuing on a database that may not
+          // exist at `dbPath`.
+        }
+      }
+      this.cleanupFileBestEffort(scratchPath);
+      this.openDatabase();
+      throw new Error(`Database activation failed, prior database restored: ${(err as Error).message}`);
+    }
+
+    try {
+      this.openDatabase();
+      if (options?.expectedMemoryCount !== undefined) {
+        const actual = this.countMemories(undefined, nowIso);
+        if (actual !== options.expectedMemoryCount) {
+          throw new Error(
+            `Activated database has ${actual} memories, expected ${options.expectedMemoryCount}`,
+          );
+        }
+      }
+    } catch (err) {
+      // Post-activation validation failed: roll back to the preserved
+      // pre-restore image rather than leaving the unverifiable candidate live.
+      if (this.db) {
+        try {
+          this.db.close();
+        } catch {
+          // Best-effort close before discarding this handle.
+        }
+      }
+      this.removeStaleSidecarFiles();
+      this.cleanupFileBestEffort(this.dbPath);
+      if (liveRenamedAside) {
+        renameSync(preRestorePath, this.dbPath);
+      }
+      this.openDatabase();
+      throw new Error(`Database activation failed, prior database restored: ${(err as Error).message}`);
+    }
+
+    // Success: the pre-restore image is no longer needed.
+    if (liveRenamedAside) {
+      this.cleanupFileBestEffort(preRestorePath);
+    }
   }
 
-  /** Removes any `-wal`/`-shm` sidecars next to `dbPath`, if present. */
-  private removeStaleSidecarFiles(): void {
-    for (const suffix of ['-wal', '-shm']) {
-      const sidecar = `${this.dbPath}${suffix}`;
+  /**
+   * Opens `path` as an independent scratch `DatabaseSync` handle (never
+   * touching `this.db`) and validates it is a usable candidate database:
+   * openable, passes `PRAGMA integrity_check`, has a readable `memories`
+   * schema, and — when `expectedMemoryCount` is given — its row count
+   * matches. Throws descriptively on the first failure; always closes the
+   * scratch handle.
+   */
+  private validateCandidateImage(path: string, nowIso: string, expectedMemoryCount?: number): void {
+    let scratchDb: DatabaseSync;
+    try {
+      scratchDb = new DatabaseSync(path);
+    } catch (err) {
+      throw new Error(`Candidate database is not a valid SQLite file: ${(err as Error).message}`);
+    }
+
+    try {
+      let integrityRows: SqlRow[];
+      try {
+        integrityRows = scratchDb.prepare('PRAGMA integrity_check').all().map(row => this.getRow(row));
+      } catch (err) {
+        throw new Error(`Candidate database failed integrity check: ${(err as Error).message}`);
+      }
+      const integrityResult = integrityRows[0]?.integrity_check;
+      if (integrityResult !== 'ok') {
+        const detail = integrityRows.map(row => String(row.integrity_check)).join('; ') || 'unknown error';
+        throw new Error(`Candidate database failed integrity check: ${detail}`);
+      }
+
+      let countRow: SqlRow | undefined;
+      try {
+        // A v1-format (or otherwise older) candidate's `memories` table may
+        // predate columns this build's live schema has since added, so the
+        // filter clause is built from whichever of `archived`/
+        // `deletion_pending`/`expires_at` actually exist here — matching
+        // `countMemories()`'s current filter when the schema is current,
+        // degrading gracefully to a plain row count on an older one, rather
+        // than failing every legacy restore on a missing-column error.
+        const columns = new Set(
+          scratchDb.prepare('PRAGMA table_info(memories)').all().map(row => this.getString(this.getRow(row), 'name')),
+        );
+        const conditions: string[] = [];
+        const params: SqlParams = [];
+        if (columns.has('archived')) conditions.push('archived = 0');
+        if (columns.has('deletion_pending')) conditions.push('deletion_pending = 0');
+        if (columns.has('expires_at')) {
+          conditions.push('(expires_at IS NULL OR expires_at >= ?)');
+          params.push(nowIso);
+        }
+        const where = conditions.length > 0 ? ` WHERE ${conditions.join(' AND ')}` : '';
+        countRow = scratchDb.prepare(`SELECT COUNT(*) as cnt FROM memories${where}`).get(...params) as SqlRow | undefined;
+      } catch (err) {
+        throw new Error(`Candidate database schema is not readable: ${(err as Error).message}`);
+      }
+      const actualCount = countRow ? this.getNumber(countRow, 'cnt') : NaN;
+      if (!Number.isFinite(actualCount)) {
+        throw new Error('Candidate database schema is not readable: memories table missing or malformed');
+      }
+      if (expectedMemoryCount !== undefined && actualCount !== expectedMemoryCount) {
+        throw new Error(
+          `Candidate database record count mismatch: expected ${expectedMemoryCount} memories, found ${actualCount}`,
+        );
+      }
+    } finally {
+      scratchDb.close();
+      this.removeStaleSidecarFiles(path);
+    }
+  }
+
+  /** Deletes `path` if present, swallowing errors — never the failure that matters. */
+  private cleanupFileBestEffort(path: string): void {
+    if (existsSync(path)) {
+      try {
+        unlinkSync(path);
+      } catch {
+        // Best-effort cleanup; a leftover scratch/discard file is harmless
+        // and cannot be mistaken for a committed artifact.
+      }
+    }
+  }
+
+  /** Removes any `-wal`/`-shm`/`-journal` sidecars next to `path` (default `dbPath`), if present. */
+  private removeStaleSidecarFiles(path: string = this.dbPath): void {
+    for (const suffix of ['-wal', '-shm', '-journal']) {
+      const sidecar = `${path}${suffix}`;
       if (existsSync(sidecar)) {
         try {
           unlinkSync(sidecar);
@@ -2464,18 +2650,36 @@ export class SqliteStore implements SqliteStorage {
     }));
   }
 
+  deleteBackupMeta(path: string): void {
+    this.assertMutableAllowed();
+    this.execSql(`DELETE FROM backup_metadata WHERE path = ?`, [path]);
+  }
+
   /**
    * `DatabaseSync` has no `serialize()`/`export()` (sql.js's whole-image dump).
    * `VACUUM INTO` writes a compacted, self-contained, checkpointed copy of the
-   * live database to a temp file inside `dataDir` (same volume, so the rename-
-   * free `readFileSync` below never crosses a filesystem boundary), which is
-   * read back into memory and then removed. See design.md "exportData() via
-   * VACUUM INTO".
+   * live database to a unique temp file inside `dataDir`, and returns its
+   * path (plus size) instead of reading it into memory — callers that need
+   * to hash/copy a potentially large export (backup creation, task 1.4) can
+   * stream it in bounded-memory chunks via that path rather than holding a
+   * whole-database `Buffer`. The caller owns cleanup of the returned path.
+   * See design.md "exportData() via VACUUM INTO".
+   */
+  exportDataToFile(): { path: string; sizeBytes: number } {
+    const tmpPath = join(this.dataDir, `.brain-export-${randomUUID()}.sqlite`);
+    this.db.prepare('VACUUM INTO ?').run(tmpPath);
+    return { path: tmpPath, sizeBytes: statSync(tmpPath).size };
+  }
+
+  /**
+   * Whole-buffer convenience wrapper over `exportDataToFile` for callers
+   * that genuinely need the full export in memory at once (small databases,
+   * tests). Backup creation uses `exportDataToFile` directly instead, to
+   * stream a potentially large export rather than buffering it here.
    */
   exportData(): Buffer {
-    const tmpPath = join(this.dataDir, `.brain-export-${randomUUID()}.sqlite`);
+    const { path: tmpPath } = this.exportDataToFile();
     try {
-      this.db.prepare('VACUUM INTO ?').run(tmpPath);
       return readFileSync(tmpPath);
     } finally {
       if (existsSync(tmpPath)) {
@@ -2786,6 +2990,26 @@ export class SqliteStore implements SqliteStorage {
     if (this.lifecycleOperation && lifecycleToken !== this.lifecycleToken) {
       throw new Error(`Storage lifecycle operation in progress: ${this.lifecycleOperation}`);
     }
+    // Cross-process guard: `this.lifecycleOperation` only reflects a restore
+    // (or other lifecycle op) running in *this* process — a restore driven
+    // from another CLI invocation or server process leaves it `null` here,
+    // so without this check a concurrent write would silently land on a
+    // database image the restoring process is about to rename away or
+    // replace. `BackupService.acquireRestoreDirectoryLock` creates this file
+    // (`<data_dir>/.restore.lock`) for the whole restore, including the
+    // rename-aside/activation window in `activateDatabaseImage` above, so
+    // its mere presence — regardless of which process holds it — is enough
+    // to refuse a mutation here rather than let it race the swap. Skipped
+    // whenever *this* process already knows about a lifecycle op (handled,
+    // correctly, by the branch above) so a restoring process's own
+    // token-authorized calls are never blocked by its own lock file.
+    if (!this.lifecycleOperation && existsSync(this.restoreLockPath())) {
+      throw new Error('Storage lifecycle operation in progress: restore (held by another process)');
+    }
+  }
+
+  private restoreLockPath(): string {
+    return join(this.dataDir, '.restore.lock');
   }
 
   private getRow(value: unknown): SqlRow {
@@ -2831,6 +3055,39 @@ export class SqliteStore implements SqliteStorage {
   }
 }
 
+/**
+ * Shared durability tail for both the whole-buffer (`atomicWriteFileSync`)
+ * and streamed (`atomicWriteStreamAsync`) writers below: fsyncs the
+ * already-fully-written temp file, renames it into place, restricts its
+ * mode, and fsyncs the containing directory where supported. `tmpPath` must
+ * already be completely written and closed before this runs.
+ */
+function finalizeDurableTempFile(tmpPath: string, targetPath: string): void {
+  const fileDescriptor = openSync(tmpPath, 'r');
+  try {
+    fsyncSync(fileDescriptor);
+  } finally {
+    closeSync(fileDescriptor);
+  }
+  renameSync(tmpPath, targetPath);
+  chmodSync(targetPath, 0o600);
+
+  // Filesystems that do not support syncing a directory (notably some
+  // Windows filesystems) report EINVAL/EPERM; rename remains the strongest
+  // available atomic guarantee there. Propagate all other failures.
+  const directoryDescriptor = openSync(dirname(targetPath), 'r');
+  try {
+    try {
+      fsyncSync(directoryDescriptor);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'EINVAL' && code !== 'EPERM' && code !== 'ENOTSUP') throw err;
+    }
+  } finally {
+    closeSync(directoryDescriptor);
+  }
+}
+
 export function atomicWriteFileSync(targetPath: string, data: Buffer | string): void {
   const tmpPath = `${targetPath}.${randomUUID()}.tmp`;
   let renamed = false;
@@ -2839,30 +3096,8 @@ export function atomicWriteFileSync(targetPath: string, data: Buffer | string): 
     // deleting or replacing another writer's staged artifact. 0600 keeps
     // backups, database images, and credentials out of other local accounts.
     writeFileSync(tmpPath, data, { mode: 0o600, flag: 'wx' });
-    const fileDescriptor = openSync(tmpPath, 'r');
-    try {
-      fsyncSync(fileDescriptor);
-    } finally {
-      closeSync(fileDescriptor);
-    }
-    renameSync(tmpPath, targetPath);
+    finalizeDurableTempFile(tmpPath, targetPath);
     renamed = true;
-    chmodSync(targetPath, 0o600);
-
-    // Filesystems that do not support syncing a directory (notably some
-    // Windows filesystems) report EINVAL/EPERM; rename remains the strongest
-    // available atomic guarantee there. Propagate all other failures.
-    const directoryDescriptor = openSync(dirname(targetPath), 'r');
-    try {
-      try {
-        fsyncSync(directoryDescriptor);
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code !== 'EINVAL' && code !== 'EPERM' && code !== 'ENOTSUP') throw err;
-      }
-    } finally {
-      closeSync(directoryDescriptor);
-    }
   } finally {
     if (!renamed && existsSync(tmpPath)) {
       try {
@@ -2873,4 +3108,58 @@ export function atomicWriteFileSync(targetPath: string, data: Buffer | string): 
       }
     }
   }
+}
+
+/**
+ * Streamed counterpart to `atomicWriteFileSync`: `write` is handed an
+ * exclusively-created (0600) temp `WriteStream` to push chunks into —
+ * incrementally, via `writeChunk` below, never requiring the caller to
+ * assemble the full content as one in-memory buffer — and once it resolves,
+ * the temp file is finalized (fsync, rename, dir fsync) the same durable way
+ * `atomicWriteFileSync` finalizes its whole-buffer write. Used by backup
+ * creation (make-backup-restore-transactional task 1.4) to stream a
+ * potentially large SQLite export through hashing and disk output with
+ * memory bounded by chunk size, not database size.
+ */
+export async function atomicWriteStreamAsync(
+  targetPath: string,
+  write: (dest: WriteStream) => Promise<void>,
+): Promise<void> {
+  const tmpPath = `${targetPath}.${randomUUID()}.tmp`;
+  let renamed = false;
+  try {
+    const dest = createWriteStream(tmpPath, { mode: 0o600, flags: 'wx' });
+    await new Promise<void>((resolve, reject) => {
+      dest.on('error', reject);
+      write(dest).then(
+        () => dest.end(),
+        reject,
+      );
+      dest.on('finish', resolve);
+    });
+    finalizeDurableTempFile(tmpPath, targetPath);
+    renamed = true;
+  } finally {
+    if (!renamed && existsSync(tmpPath)) {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        // Preserve the original writer failure; a unique stale temp file is
+        // harmless and cannot be mistaken for a committed artifact.
+      }
+    }
+  }
+}
+
+/**
+ * Writes one chunk to `stream` and resolves only once it has been flushed
+ * (the write callback fired), rather than as soon as it is buffered. Callers
+ * that `await` this before requesting their next chunk (e.g. reading the
+ * next piece from a source stream via `for await`) never build up more than
+ * one chunk of unflushed data in memory, regardless of total transfer size.
+ */
+export function writeChunk(stream: WriteStream, chunk: Buffer): Promise<void> {
+  return new Promise((resolve, reject) => {
+    stream.write(chunk, (err) => (err ? reject(err) : resolve()));
+  });
 }

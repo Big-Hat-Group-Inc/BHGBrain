@@ -1,4 +1,3 @@
-import { v4 as uuidv4 } from 'uuid';
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager } from '../storage/index.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
@@ -22,6 +21,7 @@ import type {
 import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
 import { computeChecksum } from '../domain/normalize.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
+import { buildRestoredMemoryFromArchive } from '../domain/archive-restore.js';
 import { handleImport } from './import.js';
 import { handleBootstrap } from './bootstrap.js';
 import { ZodError } from 'zod';
@@ -90,9 +90,19 @@ export async function handleTool(
       namespace: logCtx.namespace ?? null,
     });
     return result;
-  } catch (err) {
+  } catch (rawErr) {
     status = 'error';
     duration = Date.now() - start;
+    // A mutation that raced an active restore (this process's own lifecycle
+    // guard, or SqliteStore.assertMutableAllowed's cross-process restore-lock
+    // check — see make-backup-restore-transactional task 2.2/2.5) surfaces as
+    // a plain Error naming the real lock holder, not a BrainError. Classify
+    // it here, at the one place every tool call funnels through, so the
+    // client sees a retryable CONFLICT (and a real reason) instead of a
+    // generic INTERNAL error masking what actually happened.
+    const err = (!(rawErr instanceof BrainError) && /Storage lifecycle operation.*in progress/.test((rawErr as Error).message))
+      ? new BrainError('CONFLICT', (rawErr as Error).message, true)
+      : rawErr;
     if (err instanceof BrainError) {
       ctx.logger.warn({
         event: 'tool_error', tool: toolName, error_code: err.code, duration_ms: duration, client_id: clientId,
@@ -591,56 +601,20 @@ async function handleReview(
   if (!archived) throw notFound(`Archived memory ${id} not found`);
   logCtx.namespace = archived.namespace;
 
-  const now = new Date();
-  const nowIso = now.toISOString();
-  const metadata = lifecycle.buildMetadata(archived.tier, now);
-  // Provenance-carrying stub: content is the retained summary (archive rows
-  // keep no content/vector), tagged so it's identifiable as a restore rather
-  // than implying the original memory survived intact.
-  const tags = [...new Set([...archived.tags, 'restored-from-archive'])];
-  const content = archived.summary;
-  const restoredId = uuidv4();
-
-  const memory: Omit<MemoryRecord, 'embedding'> = {
-    id: restoredId,
-    namespace: archived.namespace,
-    collection: 'general',
-    type: 'semantic',
-    category: null,
-    content,
-    summary: archived.summary,
-    tags,
+  // Shared with the CLI's `archive restore` path (src/backup/retention.ts)
+  // so checksum, expiry/review, and provenance fields cannot drift between
+  // entrypoints — see openspec/changes/make-backup-restore-transactional.
+  const memory = buildRestoredMemoryFromArchive(ctx.config, archived, {
     source: 'cli',
-    checksum: computeChecksum(content),
-    importance: 0.5,
-    retention_tier: archived.tier,
-    expires_at: metadata.expires_at,
-    decay_eligible: metadata.decay_eligible,
-    review_due: metadata.review_due,
-    access_count: 0,
-    last_operation: 'ADD',
-    merged_from: null,
-    archived: false,
-    vector_synced: true,
-    // Archive rows carry no pin state, so a `review restore` never
-    // resurrects a memory as pinned.
-    pinned: false,
-    device_id: ctx.config.device.id ?? null,
-    // Archive rows carry no origin/confidence either, so this restore has
-    // no provenance to recover — same "legacy row" default as elsewhere.
-    origin: null,
-    confidence: 1.0,
-    created_at: nowIso,
-    updated_at: nowIso,
-    last_accessed: nowIso,
-  };
+    deviceId: ctx.config.device.id ?? null,
+  });
+  const restoredId = memory.id;
+  const nowIso = memory.created_at;
 
-  const vector = await ctx.embedding.embed(content);
+  const vector = await ctx.embedding.embed(memory.content);
   await ctx.storage.writeMemory(memory, vector);
 
-  // Archive row is retained (not deleted) so the origin stays inspectable —
-  // this deliberately differs from the CLI's `archive restore` path, which
-  // deletes the archive row after restoring.
+  // Archive row is retained (not deleted) so the origin stays inspectable.
   ctx.storage.logAudit('RESTORE', restoredId, archived.namespace, clientId, {
     details: {
       memory_id: restoredId,

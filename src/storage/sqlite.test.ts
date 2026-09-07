@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { SqliteStore } from './sqlite.js';
 import { DatabaseSync } from 'node:sqlite';
 import type { StatementSync } from 'node:sqlite';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -1622,6 +1622,42 @@ describe('SqliteStore origin/confidence (add-memory-provenance-metadata)', () =>
       }
     });
 
+    // Task 1.4 (make-backup-restore-transactional): `exportDataToFile`
+    // returns a path instead of a whole-database `Buffer`, so a caller
+    // (backup creation) can stream it rather than buffering it in memory.
+    it('exportDataToFile() writes a standalone export and reports its real size, leaving cleanup to the caller', async () => {
+      const mem = {
+        ...sampleMemory(),
+        retention_tier: 'T2' as const, expires_at: null, decay_eligible: true, review_due: null,
+        archived: false, vector_synced: true, pinned: false, origin: null, confidence: 1,
+      };
+      store.insertMemory(mem);
+      store.flush();
+
+      const { path: exportPath, sizeBytes } = store.exportDataToFile();
+      try {
+        expect(existsSync(exportPath)).toBe(true);
+        expect(readFileSync(exportPath).length).toBe(sizeBytes);
+
+        const standaloneDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-standalone-'));
+        try {
+          const standaloneStore = new SqliteStore(standaloneDir);
+          writeFileSync(join(standaloneDir, 'brain.db'), readFileSync(exportPath));
+          await standaloneStore.init();
+          try {
+            expect(standaloneStore.getMemoryById(mem.id)?.content).toBe(mem.content);
+          } finally {
+            standaloneStore.close();
+          }
+        } finally {
+          rmSync(standaloneDir, { recursive: true, force: true });
+        }
+      } finally {
+        // exportDataToFile() leaves cleanup to the caller (unlike exportData()).
+        rmSync(exportPath, { force: true });
+      }
+    });
+
     it('activateDatabaseImage() swaps in a replacement image while the store is open (Windows close-before-overwrite)', async () => {
       const mem = sampleMemory();
       store.insertMemory(mem);
@@ -2096,6 +2132,174 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
 
       expect(next).toBe(6);
       expect(store.listRevisions('mem-a').map(row => row.revision).sort((a, b) => a - b)).toEqual([4, 5, 6]);
+    });
+  });
+
+});
+
+// Task 2.1/2.2/2.3 (make-backup-restore-transactional): activateDatabaseImage
+// validates a candidate image in a scratch copy before ever touching the
+// live database and rolls back to a preserved pre-restore image on any later
+// failure, and ordinary mutations are rejected while another process holds
+// the cross-process restore lock.
+describe('SqliteStore restore activation (make-backup-restore-transactional)', () => {
+  let store: SqliteStore;
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-'));
+    store = new SqliteStore(tempDir);
+    await store.init();
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const sampleMemory = () => ({
+    id: '550e8400-e29b-41d4-a716-446655440000',
+    namespace: 'global',
+    collection: 'general',
+    type: 'semantic' as const,
+    category: null,
+    content: 'test content',
+    summary: 'test content',
+    tags: [] as string[],
+    source: 'cli' as const,
+    checksum: 'abc123',
+    importance: 0.5,
+    access_count: 0,
+    last_operation: 'ADD' as const,
+    merged_from: null,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    last_accessed: new Date().toISOString(),
+    retention_tier: 'T2' as const,
+    expires_at: null,
+    decay_eligible: true,
+    review_due: null,
+    archived: false,
+    vector_synced: true,
+    pinned: false,
+    origin: null,
+    confidence: 1,
+  });
+
+  describe('activateDatabaseImage', () => {
+    async function buildCandidate(memories: ReturnType<typeof sampleMemory>[]): Promise<Buffer> {
+      const dir = mkdtempSync(join(tmpdir(), 'bhgbrain-test-candidate-'));
+      const candidate = new SqliteStore(dir);
+      await candidate.init();
+      for (const mem of memories) candidate.insertMemory(mem);
+      candidate.flush();
+      const bytes = readFileSync(candidate.getDatabasePath());
+      candidate.close();
+      rmSync(dir, { recursive: true, force: true });
+      return bytes;
+    }
+
+    it('activates a valid candidate image, replacing the live database', async () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      store.flush();
+
+      const candidateMem = { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440077', checksum: 'candidate-chk' };
+      const candidateBytes = await buildCandidate([candidateMem]);
+
+      await store.activateDatabaseImage(candidateBytes, { expectedMemoryCount: 1 });
+
+      expect(store.getMemoryById(mem.id)).toBeNull();
+      expect(store.getMemoryById(candidateMem.id)).not.toBeNull();
+    });
+
+    it('rejects a candidate that is not a valid SQLite file, leaving the live store untouched', async () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      store.flush();
+
+      await expect(store.activateDatabaseImage(Buffer.from('not a sqlite file at all')))
+        .rejects.toThrow(/not a valid SQLite file|failed integrity check/);
+
+      expect(store.getMemoryById(mem.id)).not.toBeNull();
+      expect(store.countMemories()).toBe(1);
+    });
+
+    it('rejects a candidate whose record count does not match expectedMemoryCount, leaving the live store untouched', async () => {
+      const mem = sampleMemory();
+      store.insertMemory(mem);
+      store.flush();
+
+      const candidateBytes = await buildCandidate([
+        { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440088', checksum: 'x' },
+      ]);
+
+      await expect(store.activateDatabaseImage(candidateBytes, { expectedMemoryCount: 5 }))
+        .rejects.toThrow(/record count mismatch/);
+
+      expect(store.getMemoryById(mem.id)).not.toBeNull();
+      expect(store.countMemories()).toBe(1);
+    });
+
+    it('leaves no stray scratch or pre-restore files behind after a successful activation', async () => {
+      store.insertMemory(sampleMemory());
+      store.flush();
+      const candidateBytes = await buildCandidate([
+        { ...sampleMemory(), id: '550e8400-e29b-41d4-a716-446655440066', checksum: 'z' },
+      ]);
+
+      await store.activateDatabaseImage(candidateBytes, { expectedMemoryCount: 1 });
+
+      const leftovers = readdirSync(tempDir).filter(
+        name => name.includes('.restore-scratch-') || name.includes('.pre-restore-'),
+      );
+      expect(leftovers).toEqual([]);
+    });
+
+    it('leaves no stray scratch files behind after a rejected candidate', async () => {
+      store.insertMemory(sampleMemory());
+      store.flush();
+
+      await expect(store.activateDatabaseImage(Buffer.from('garbage'))).rejects.toThrow();
+
+      const leftovers = readdirSync(tempDir).filter(
+        name => name.includes('.restore-scratch-') || name.includes('.pre-restore-'),
+      );
+      expect(leftovers).toEqual([]);
+    });
+  });
+
+  // Task 2.2: another process's restore (recognized by the presence of the
+  // cross-process restore lock file `BackupService` maintains — this store
+  // has no lifecycle op of its own, so the in-process guard alone would miss
+  // it) must block ordinary mutations rather than let them race the swap.
+  describe('cross-process restore lock guard', () => {
+    const restoreLockPath = () => join(tempDir, '.restore.lock');
+
+    it('rejects an ordinary mutation while another process holds the restore lock, and allows it again once released', () => {
+      writeFileSync(restoreLockPath(), '');
+      try {
+        expect(() => store.setCategory('Blocked', 'custom', 'nope')).toThrow(/restore/);
+        expect(() => store.pruneAuditLog(100)).toThrow(/restore/);
+      } finally {
+        rmSync(restoreLockPath(), { force: true });
+      }
+
+      // Lock released: ordinary mutations succeed again.
+      expect(() => store.setCategory('Allowed', 'custom', 'ok')).not.toThrow();
+    });
+
+    it('does not block a restore this same process is running, only writers unaware of it', () => {
+      writeFileSync(restoreLockPath(), '');
+      try {
+        const lifecycleToken = store.beginLifecycleOperation('restore');
+        // The restoring process's own token-authorized call is unaffected by
+        // the lock file it created for itself.
+        expect(() => store.pruneAuditLog(100, lifecycleToken)).not.toThrow();
+        store.endLifecycleOperation(lifecycleToken, 'restore');
+      } finally {
+        rmSync(restoreLockPath(), { force: true });
+      }
     });
   });
 });

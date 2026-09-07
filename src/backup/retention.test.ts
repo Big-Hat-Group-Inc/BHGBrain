@@ -9,6 +9,7 @@ import type { BrainConfig } from '../config/index.js';
 import { StorageManager } from '../storage/index.js';
 import type { QdrantStore } from '../storage/qdrant.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
+import { computeChecksum } from '../domain/normalize.js';
 
 describe('RetentionService', () => {
   let sqlite: SqliteStore;
@@ -894,5 +895,59 @@ describe('RetentionService', () => {
       event: 'retention_gc_archive_failed', memory_id: expired.id, error: 'archive disk failure',
     }));
     expect(failureLogger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'retention_gc', outcome: 'degraded' }));
+  });
+
+  // Task 2.4: the CLI's `archive restore` path (RetentionService.restoreArchive)
+  // and the `review` MCP tool's `restore` action must derive checksum,
+  // expiry/review, and provenance fields through the exact same mapping —
+  // see buildRestoredMemoryFromArchive in src/domain/archive-restore.ts. An
+  // earlier CLI-only implementation set `checksum` to `archived.memory_id`
+  // (an unrelated identifier) instead of deriving it from restored content.
+  it('restoreArchive derives checksum from restored content, retains the archive row, and matches the tool mapping', async () => {
+    const archivedMemory = {
+      ...memory('archived-1', '2025-01-01T00:00:00.000Z'),
+      retention_tier: 'T2' as const,
+      tags: ['ops'],
+    };
+    sqlite.insertMemory(archivedMemory);
+    sqlite.archiveMemory(archivedMemory, '2025-06-01T00:00:00.000Z');
+    const archiveRow = sqlite.getArchiveByMemoryId(archivedMemory.id);
+    expect(archiveRow).not.toBeNull();
+
+    const qdrant = {
+      deleteMany: vi.fn(async () => {}),
+      upsert: vi.fn(async () => {}),
+    } as unknown as QdrantStore;
+    const embedded = [4, 5, 6];
+    const embedding = {
+      provider: 'openai', model: 'test', dimensions: 3, identity: 'openai/test@3',
+      embed: vi.fn(async () => embedded),
+      embedBatch: vi.fn(async (texts: string[]) => texts.map(() => embedded)),
+      healthCheck: vi.fn(async () => true),
+    } as unknown as EmbeddingProvider;
+    const storage = new StorageManager(sqlite, qdrant, embedding);
+    const config = { retention: {} } as unknown as BrainConfig;
+
+    const result = await new RetentionService(config, storage).restoreArchive(archivedMemory.id);
+
+    expect(result.restored).toBe(true);
+    expect(result.restored_from).toBe(archivedMemory.id);
+    expect(result.archive_id).toBe(archiveRow!.id);
+    expect(embedding.embed).toHaveBeenCalledWith(archiveRow!.summary);
+
+    const restored = sqlite.getMemoryById(result.id)!;
+    expect(restored).not.toBeNull();
+    // Checksum is derived from the restored content, never from the
+    // original memory id.
+    expect(restored.checksum).toBe(computeChecksum(archiveRow!.summary));
+    expect(restored.checksum).not.toBe(archivedMemory.id);
+    expect(restored.tags).toEqual(expect.arrayContaining(['ops', 'restored-from-archive']));
+    expect(restored.origin).toBeNull();
+    expect(restored.confidence).toBe(1.0);
+    expect(restored.pinned).toBe(false);
+    expect(restored.retention_tier).toBe('T2');
+    // Archive row is retained (not deleted), matching the `review` tool's
+    // restore behavior.
+    expect(sqlite.getArchiveByMemoryId(archivedMemory.id)).not.toBeNull();
   });
 });

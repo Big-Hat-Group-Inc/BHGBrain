@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { SqliteStore } from './sqlite.js';
-import type { LifecycleOperationToken } from './sqlite.js';
+import type { LifecycleOperationToken, ActivateDatabaseImageOptions } from './sqlite.js';
 import { QdrantStore } from './qdrant.js';
 import type { EmbeddingProvider } from '../embedding/index.js';
 import type { MemoryRecord, MemoryOrigin, WriteOperation, AuditEntry, LifecycleAuditDetails } from '../domain/types.js';
@@ -17,12 +17,31 @@ export interface VectorDriftReconciliationOutcome {
   // 'no-drift': every restored memory's vector already matches Qdrant; nothing
   //   was cleared or marked unsynced.
   // 'partial-drift': only the memories whose content checksum differs from (or
-  //   is missing in) Qdrant were marked unsynced for re-embedding.
-  // 'full-rebuild': drift could not be reliably determined (embedding model or
-  //   dimensions changed, or Qdrant state was unreadable), so every memory was
-  //   marked unsynced and managed collections were cleared.
-  mode: 'no-drift' | 'partial-drift' | 'full-rebuild';
+  //   is missing in) Qdrant were marked unsynced for re-embedding — genuine
+  //   checksum drift, not a model change or a read failure.
+  // 'full-rebuild': the embedding model or dimensions changed since the
+  //   backup was created, so every existing vector is the wrong
+  //   dimensionality regardless of content — managed collections were
+  //   cleared and every memory was marked unsynced.
+  // 'inspection-failed': Qdrant's existing vector state could not be read
+  //   (a transient outage, not a model change), so per-memory drift can't be
+  //   trusted and every memory was marked unsynced as a conservative
+  //   fallback — but, unlike 'full-rebuild', nothing was cleared: the
+  //   existing (still dimensionally valid) vectors are left in place and
+  //   keep serving search until reconciliation individually replaces each
+  //   one. Kept distinct from 'full-rebuild' (make-backup-restore-
+  //   transactional task 3.3) so a transient read outage is never reported
+  //   to callers/health as "the embedding model changed".
+  mode: 'no-drift' | 'partial-drift' | 'full-rebuild' | 'inspection-failed';
   driftedCount: number;
+  // Vector-only points (no corresponding row in the restored SQLite image)
+  // that were found and deleted this pass, vs. found but left unpruned
+  // because their delete batch failed (0/0 in the 'full-rebuild' and
+  // 'inspection-failed' modes, where surplus is not computed — see
+  // detectAndMarkVectorDrift). See make-backup-restore-transactional tasks
+  // 3.1/3.2.
+  surplusPruned: number;
+  surplusRemaining: number;
 }
 
 export interface ReconcileVectorsResult {
@@ -586,8 +605,8 @@ export class StorageManager {
    * migrate-sqlite-to-native-engine design.md "Restore must
    * close-before-overwrite".
    */
-  async activateSqliteImage(image: Buffer): Promise<void> {
-    await this.sqlite.activateDatabaseImage(image);
+  async activateSqliteImage(image: Buffer, options?: ActivateDatabaseImageOptions): Promise<void> {
+    await this.sqlite.activateDatabaseImage(image, options);
   }
 
   markAllMemoriesVectorSync(synced: boolean, options?: { lifecycleToken?: LifecycleOperationToken }): number {
@@ -663,26 +682,109 @@ export class StorageManager {
   }
 
   /**
-   * Reads back the checksum payload field for every point in every managed
-   * Qdrant collection. Used to detect drift without paying any embedding
-   * cost: a point whose stored checksum matches the restored SQLite row's
-   * checksum did not change and does not need to be re-embedded. Points
-   * written before this field existed simply have no entry here, which the
-   * caller treats as "needs re-embedding" (self-healing on first reconcile).
+   * Streams every point in every managed Qdrant collection exactly once
+   * (page by page via `scrollAllPages`, never buffering a whole collection)
+   * and, against `sqliteChecksums` (the restored SQLite image — the source
+   * of truth), computes:
+   *  - `driftedIds`: SQLite memory ids whose Qdrant checksum differs from
+   *    (or is entirely missing from) the restored row's checksum — these
+   *    need re-embedding.
+   *  - `surplus`: Qdrant points that exist but have NO corresponding row in
+   *    the restored SQLite image at all — vector-only orphans a restore to
+   *    an older backup can leave behind. A point is only a surplus
+   *    *candidate* when its payload's `device_id` is absent (legacy, predates
+   *    device stamping) or matches `deviceId` (this device's own data);
+   *    a point stamped with a *different* device's id is the intended
+   *    cross-device search fallback (device-namespace-partitioning) and is
+   *    never touched here, restore or not.
+   *
+   * See make-backup-restore-transactional task 3.1.
    */
-  async collectExistingVectorChecksums(): Promise<Map<string, string>> {
+  private async computeVectorReconciliationDiff(
+    sqliteChecksums: Map<string, string>,
+    deviceId: string | null,
+  ): Promise<{ driftedIds: string[]; surplus: Array<{ namespace: string; collection: string; id: string }> }> {
     const collections = await this.qdrant.listAllCollections();
-    const checksums = new Map<string, string>();
+    const seenWithMatchingChecksum = new Set<string>();
+    const drifted = new Set<string>();
+    const surplus: Array<{ namespace: string; collection: string; id: string }> = [];
+
     for (const name of collections) {
-      const points = await this.qdrant.scrollAll(name);
-      for (const point of points) {
-        const checksum = point.payload.checksum;
-        if (typeof checksum === 'string') {
-          checksums.set(point.id, checksum);
+      for await (const page of this.qdrant.scrollAllPages(name)) {
+        for (const point of page) {
+          const expectedChecksum = sqliteChecksums.get(point.id);
+          if (expectedChecksum !== undefined) {
+            const actualChecksum = point.payload.checksum;
+            if (actualChecksum === expectedChecksum) {
+              seenWithMatchingChecksum.add(point.id);
+            } else {
+              drifted.add(point.id);
+            }
+            continue;
+          }
+
+          const pointDeviceId = typeof point.payload.device_id === 'string' ? point.payload.device_id : null;
+          if (pointDeviceId !== null && pointDeviceId !== deviceId) continue;
+
+          const namespace = typeof point.payload.namespace === 'string' ? point.payload.namespace : null;
+          const collection = typeof point.payload.collection === 'string' ? point.payload.collection : null;
+          // Can't target a delete without knowing where it lives; leave it
+          // for a future pass rather than guessing.
+          if (namespace === null || collection === null) continue;
+          surplus.push({ namespace, collection, id: point.id });
         }
       }
     }
-    return checksums;
+
+    // A restored row whose id was never seen in Qdrant with a matching
+    // checksum (missing outright, or seen but drifted) needs re-embedding.
+    for (const id of sqliteChecksums.keys()) {
+      if (!seenWithMatchingChecksum.has(id)) drifted.add(id);
+    }
+
+    return { driftedIds: [...drifted], surplus };
+  }
+
+  /**
+   * Deletes surplus (vector-only orphan) points in bounded batches, grouped
+   * by their owning namespace/collection. A batch failure is recorded and
+   * skipped rather than aborting the whole pass, so one unreachable
+   * collection cannot block pruning the rest. See make-backup-restore-
+   * transactional task 3.2.
+   */
+  private async pruneVectorSurplus(
+    surplus: Array<{ namespace: string; collection: string; id: string }>,
+    batchSize = 100,
+  ): Promise<{ deleted: number; remaining: number }> {
+    const groups = new Map<string, { namespace: string; collection: string; ids: string[] }>();
+    for (const point of surplus) {
+      const key = `${point.namespace} ${point.collection}`;
+      const group = groups.get(key);
+      if (group) {
+        group.ids.push(point.id);
+      } else {
+        groups.set(key, { namespace: point.namespace, collection: point.collection, ids: [point.id] });
+      }
+    }
+
+    let deleted = 0;
+    for (const { namespace, collection, ids } of groups.values()) {
+      for (let i = 0; i < ids.length; i += batchSize) {
+        const batch = ids.slice(i, i + batchSize);
+        try {
+          await this.qdrant.deleteMany(namespace, collection, batch);
+          deleted += batch.length;
+        } catch {
+          this.metrics?.incCounter('bhgbrain_restore_orphan_prune_failed_total', batch.length);
+          // Left unpruned; retried on the next reconciliation pass (another
+          // restore, or a future explicit orphan-sweep) rather than losing
+          // track of it. The caller (BackupService) logs the aggregate
+          // remaining count and keeps restore results/health degraded.
+        }
+      }
+    }
+
+    return { deleted, remaining: surplus.length - deleted };
   }
 
   /**
@@ -699,11 +801,20 @@ export class StorageManager {
    *    embedding space is unchanged and the existing vectors are left in
    *    place (not cleared) so search keeps using them until reconciliation
    *    individually replaces each one.
+   *
+   * When drift *can* be determined, this also prunes vector-only surplus
+   * (points with no corresponding restored SQLite row) in bounded batches —
+   * see `computeVectorReconciliationDiff`/`pruneVectorSurplus` and
+   * make-backup-restore-transactional tasks 3.1-3.3. Surplus pruning is
+   * skipped in the model-change/inspection-failed branches: the former
+   * already clears every managed vector, and the latter couldn't read
+   * Qdrant's state reliably enough to tell surplus from valid data.
    */
   async detectAndMarkVectorDrift(options: {
     expectedEmbeddingModel: string;
     expectedEmbeddingDimensions: number;
     lifecycleToken?: LifecycleOperationToken;
+    deviceId?: string | null;
   }): Promise<VectorDriftReconciliationOutcome> {
     const modelChanged = options.expectedEmbeddingModel !== this.embedding.model
       || options.expectedEmbeddingDimensions !== this.embedding.dimensions;
@@ -713,12 +824,13 @@ export class StorageManager {
       const driftedCount = this.markAllMemoriesVectorSync(false, {
         lifecycleToken: options.lifecycleToken,
       });
-      return { mode: 'full-rebuild', driftedCount };
+      return { mode: 'full-rebuild', driftedCount, surplusPruned: 0, surplusRemaining: 0 };
     }
 
-    let existingChecksums: Map<string, string>;
+    const sqliteChecksums = new Map(this.sqlite.listMemoryChecksums().map(row => [row.id, row.checksum]));
+    let diff: { driftedIds: string[]; surplus: Array<{ namespace: string; collection: string; id: string }> };
     try {
-      existingChecksums = await this.collectExistingVectorChecksums();
+      diff = await this.computeVectorReconciliationDiff(sqliteChecksums, options.deviceId ?? null);
     } catch {
       // Qdrant state could not be read reliably, so per-memory drift can't be
       // trusted; every memory is marked unsynced so reconciliation re-embeds
@@ -728,28 +840,30 @@ export class StorageManager {
       // are deliberately left in place — search keeps using them until each
       // is individually replaced by the (bounded, resumable) reconciliation
       // pass, instead of being destroyed up front on what may be a
-      // transient read failure.
+      // transient read failure. Surplus can't be determined either without
+      // a reliable read, so none is pruned this pass.
       const driftedCount = this.markAllMemoriesVectorSync(false, {
         lifecycleToken: options.lifecycleToken,
       });
-      return { mode: 'full-rebuild', driftedCount };
+      return { mode: 'inspection-failed', driftedCount, surplusPruned: 0, surplusRemaining: 0 };
     }
 
-    const rows = this.sqlite.listMemoryChecksums();
-    const driftedIds = rows
-      .filter(row => existingChecksums.get(row.id) !== row.checksum)
-      .map(row => row.id);
-
-    if (driftedIds.length > 0) {
-      this.sqlite.markVectorsSyncBatch(driftedIds, false, {
+    if (diff.driftedIds.length > 0) {
+      this.sqlite.markVectorsSyncBatch(diff.driftedIds, false, {
         lifecycleToken: options.lifecycleToken,
       });
       this.sqlite.flushIfDirty();
     }
 
+    const { deleted: surplusPruned, remaining: surplusRemaining } = diff.surplus.length > 0
+      ? await this.pruneVectorSurplus(diff.surplus)
+      : { deleted: 0, remaining: 0 };
+
     return {
-      mode: driftedIds.length === 0 ? 'no-drift' : 'partial-drift',
-      driftedCount: driftedIds.length,
+      mode: diff.driftedIds.length === 0 ? 'no-drift' : 'partial-drift',
+      driftedCount: diff.driftedIds.length,
+      surplusPruned,
+      surplusRemaining,
     };
   }
 

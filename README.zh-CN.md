@@ -342,6 +342,18 @@ BHGBrain 从以下位置加载配置文件：
     "pin_limit_per_namespace": 20
   },
 
+  // 备份*文件*保留策略（与下方的记忆级 `retention` 不同）
+  "backup": {
+    "retention": {
+      // 最多保留这么多份备份；超出此数量的最旧备份会在每次成功的
+      // `backup create` 之后被清理。null 表示禁用此上限。
+      "max_count": 30,
+      // 清理超过这么多天的备份，与数量无关。
+      // null 表示禁用此上限。
+      "max_age_days": 90
+    }
+  },
+
   // 记忆保留与生命周期设置
   "retention": {
     // 零访问天数超过此值后，记忆成为过期候选
@@ -2115,29 +2127,38 @@ sequenceDiagram
     rect rgb(230, 245, 230)
         Note over C,FS: CREATE BACKUP
         C->>S: backup create
-        S->>DB: Export full database
-        DB-->>S: Raw DB bytes
-        S->>S: Compute SHA-256 checksum
-        S->>S: Build JSON header<br/>(version, count, checksum)
-        S->>FS: Atomic write .bhgb file<br/>(write-to-temp-then-rename)
+        S->>DB: VACUUM INTO a scratch export file
+        S->>FS: Stream-hash the export (bounded memory)
+        S->>S: Build JSON header<br/>(version, count, checksum, header_checksum)
+        S->>FS: Stream header + export into a unique temp file,<br/>fsync, rename into place (backups/)
         FS-->>S: Success
+        S->>S: Prune backups over count/age bounds
         S-->>C: path, size, memory_count
     end
 
     rect rgb(230, 235, 250)
         Note over C,FS: RESTORE BACKUP
         C->>S: backup restore (path)
-        S->>FS: Read .bhgb file
-        FS-->>S: Header + DB bytes
-        S->>S: Validate SHA-256 checksum
-        alt Checksum mismatch
-            S-->>C: ❌ INVALID_INPUT
+        S->>S: Acquire cross-process restore lock
+        S->>FS: Read .bhgb file; verify header_checksum + body checksum
+        alt Checksum or version invalid
+            S-->>C: ❌ INVALID_INPUT (live database untouched)
         else Checksum valid
-            S->>FS: Atomic write to data dir<br/>(write-to-temp-then-rename)
-            S->>DB: Hot-reload in-memory SQLite
-            S->>DB: Run schema migrations
-            DB-->>S: Ready
-            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+            S->>FS: Write candidate to a scratch file;<br/>open it, run integrity_check + schema/count checks
+            alt Candidate fails validation
+                S-->>C: ❌ live database untouched
+            else Candidate valid
+                S->>DB: Checkpoint + close live connection
+                S->>FS: Rename live db aside (pre-restore-*),<br/>rename candidate into place
+                S->>DB: Reopen; re-verify record count
+                alt Activation or post-activation check fails
+                    S->>FS: Rename pre-restore image back; reopen
+                    S-->>C: ❌ prior database restored and active
+                else Activation succeeds
+                    S->>S: Reconcile vectors: stream drift + surplus scan,<br/>prune vector-only orphans
+                    S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+                end
+            end
         end
     end
 ```
@@ -2153,7 +2174,7 @@ sequenceDiagram
 bhgbrain backup create
 ```
 
-备份捕获整个 SQLite 数据库（所有记忆、类别、集合、审计日志、版本历史和归档记录），作为单个 `.bhgb` 文件保存在数据目录的 `backups/` 子目录中。
+备份捕获整个 SQLite 数据库（所有记忆、类别、集合、审计日志、版本历史和归档记录），作为单个 `.bhgb` 文件保存在数据目录的 `backups/` 子目录中。创建过程会以流式方式对导出内容进行哈希计算和磁盘写入——无论数据库大小如何，峰值内存都限定在一个较小的固定数量的数据块内，而不是一次性将整个导出内容保存在内存中。
 
 **备份文件格式：**
 ```
@@ -2162,24 +2183,44 @@ bhgbrain backup create
 [剩余字节：SQLite 数据库导出]
 ```
 
-JSON 头部包含：
+JSON 头部（格式版本 2）包含：
 ```json
 {
-  "version": 1,
+  "version": 2,
   "memory_count": 1234,
   "checksum": "<db 数据的 sha256>",
   "created_at": "2026-03-15T12:00:00Z",
   "embedding_model": "text-embedding-3-small",
-  "embedding_dimensions": 1536
+  "embedding_dimensions": 1536,
+  "header_checksum": "<上述规范字段的 sha256>"
 }
 ```
 
-**备份中不包含的内容：**
-- Qdrant 向量数据**不**包含在内。从备份恢复后，必须通过重新嵌入内容来重建 Qdrant 集合。在此之前，全文搜索可用，但语义搜索不可用。
+`header_checksum` 对头部自身的字段进行认证（因此在恢复过程将其用于任何破坏性用途之前，被篡改的 `memory_count`/`checksum`/嵌入字段会被拒绝），并与正文校验和一并验证。版本 1 的备份（没有 `header_checksum`）仍可通过兼容性解析器读取，该解析器绝不会将未经认证的字段用于任何破坏性用途；任何其他版本都会在恢复触及活动数据库之前以 `INVALID_INPUT` 被拒绝。
 
-**备份完整性：** 数据库数据的 SHA-256 校验和存储在头部并在恢复时验证。如果文件损坏，恢复失败并返回 `INVALID_INPUT: Backup integrity check failed`。恢复的数据库激活后，其记忆数量还会与头部中的 `memory_count` 进行交叉核对；如果不一致，恢复将以 `INTERNAL` 失败（记录为 `backup_restore_count_mismatch` 事件），而不是在数据静默错误的情况下返回成功响应。
+**备份中不包含的内容：**
+- Qdrant 向量数据**不**包含在内。从备份恢复后，向量会根据漂移进行协调（见下文），而不是打包进档案中——这使得备份更小、更便于携带。
+
+**备份完整性：** 正文的 SHA-256 校验和以及头部自身的 `header_checksum` 都会在任何头部字段被用于破坏性用途之前得到验证。文件损坏或被截断，或其头部被独立于正文篡改，都会导致恢复在触及活动数据库之前以 `INVALID_INPUT` 失败。
+
+**持久性提交：** 备份文件（以及恢复的数据库镜像）会被写入具有严格 `0600` 权限的唯一临时文件，执行 `fsync`，然后重命名到最终位置；在文件系统支持的情况下，所在目录也会执行 `fsync`——进程或主机在备份创建报告成功后崩溃，绝不会在最终路径留下不完整的文件，中断的写入也绝不会覆盖另一个写入者仍在进行中的临时文件。
 
 **备份元数据**追踪在 SQLite 的 `backup_metadata` 表中，以便 `backup list` 可以返回历史备份信息。
+
+**备份文件保留策略：** 每次 `backup create` 成功后，会清理超出配置数量或年龄的备份（文件与元数据行一并清理）。通过 `config.json` 中的 `backup.retention` 进行配置：
+
+```json
+{
+  "backup": {
+    "retention": {
+      "max_count": 30,
+      "max_age_days": 90
+    }
+  }
+}
+```
+
+任一限制单独满足即可触发清理该备份；将某个限制设为 `null` 可禁用它（两者都设为 `null` 会完全禁用保留策略——不建议这样做，因为备份存储会因此无限增长，并与数据库大小成正比）。文件删除失败的备份会保留在元数据中，以便下一轮重试，而不会失去对它的追踪。超出限制且文件已经不存在的备份，其过期元数据行会被清理，并与真正的删除操作分开标记。`backup list` 还会标记（`missing: true`）任何文件已消失但元数据行尚未清理的备份，而不是将其呈现为可恢复的备份。
 
 ### 列出备份
 
@@ -2195,7 +2236,8 @@ JSON 头部包含：
       "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
@@ -2211,20 +2253,19 @@ JSON 头部包含：
 ```
 
 **恢复过程：**
-1. 验证文件存在且完整性校验和匹配。
-
-2. 将嵌入的 SQLite 数据库原子性写入数据目录（先写临时文件再重命名）。
-3. 从恢复的文件热重载内存中的 SQLite 数据库，无需重启进程。
-4. 对重新加载的数据库运行 schema 迁移以确保向前兼容。
-5. 根据实际漂移（drift）对向量进行协调（见下文），并返回 `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`。
+1. 获取跨进程恢复锁（见下文），并验证文件存在、格式版本受支持，且头部与正文的校验和均匹配。
+2. 将候选数据库写入临时文件，并在*触及活动数据库之前*对其进行验证：打开它、运行 `PRAGMA integrity_check`、确认 schema 可读，并确认其记录数量与头部的 `memory_count` 一致。任何一项检查失败的候选文件都会使活动数据库完全不受影响。
+3. 对活动连接执行 checkpoint 并关闭，将活动数据库文件*挪至一旁*，改名为一个唯一的恢复前路径（而非原地覆盖），将验证通过的候选文件改名到位，然后重新打开。
+4. 重新验证重新打开的数据库的记录数量。如果激活或此激活后检查失败，恢复前的镜像会被改名回原位并重新打开——恢复始终会留下一个可用、处于活动状态且已重新打开的数据库，绝不会留下一半替换或损坏的数据库。
+5. 根据实际漂移和纯向量剩余项（见下文）协调向量，并返回 `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`。
 
 **恢复是实时的：** 恢复的数据库立即生效。无需重启服务器。响应包含 `metadata_activated: true` 以确认这一点。
 
-**激活后的记忆数量核对：** 由于备份是 SQLite 数据库的逐字节导出，激活后的记忆数量必须与头部中的 `memory_count` 完全一致。如果不一致，恢复将抛出 `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` 并记录 `backup_restore_count_mismatch` 事件——该调用不会返回成功响应。
+**回滚保证：** 报告的恢复失败——无论是来自激活前验证、活动/候选文件交换，还是激活后记录数量检查——都始终会使先前的数据库保持可恢复且已重新打开的状态，绝不会留下缺失、写了一半或悄然出错的数据库。错误消息会明确说明先前的数据库是否已被恢复（`"...the prior database was restored and is active"`）还是从未被触及（`"...before any change to the active database"`）。
 
-**向量协调仅针对实际漂移，且有边界限制。** 恢复不会无条件清空并重新嵌入整个语料库：它会将每条恢复记忆的内容校验和与 Qdrant 中已存储的向量进行比较，只将新增或内容发生变化的记忆标记为需要重新嵌入。如果自备份创建以来嵌入模型/维度发生了变化，或无法读取 Qdrant 的现有状态，恢复会转而执行完整重建。一旦漂移检查完成，恢复生命周期锁即被释放——如果没有任何漂移，`vector_reconciliation.state` 会立即变为 `"reconciled"`；如果漂移子集的重新嵌入需要在调用已经返回之后，在一个有边界的后台任务（每轮有超时和批次上限，并带有自动重试）中继续进行，则为 `"reconciling"`。可轮询 `health://status`（`components.vector_reconciliation`）以观察其完成情况。
+**跨进程互斥：** 一个独占锁文件（`<data_dir>/.restore.lock`）在整个恢复过程中被持有，每一次 SQLite 写操作（无论在本进程还是另一进程中）都会检查它——来自另一个 CLI 调用或服务器进程的重叠恢复，或与活动恢复竞争的普通写操作，都会以可重试的 `CONFLICT`（`"Backup restore is already active for this data directory"` 或 `"Storage lifecycle operation in progress: restore (held by another process)"`）明确失败，而不会写入即将被改名或替换的数据库镜像。
 
-**并发恢复保护：** 如果恢复操作已在进行中，后续恢复请求返回 `INVALID_INPUT: Backup restore already in progress`。该锁仅覆盖元数据激活和漂移检查阶段，不包括后台重新嵌入，因此即使是大规模恢复也会很快释放。
+**向量协调仅针对实际漂移，具有边界限制，且是双向的。** 恢复不会无条件清空并重新嵌入整个语料库：它会以流式方式遍历每个受管理的 Qdrant 集合一次（绝不会将整个集合缓冲到内存中），并将每个点的校验和与恢复的 SQLite 行进行比较，只将新增或内容发生变化的记忆标记为需要重新嵌入。它还会识别**纯向量剩余项**——在恢复的 SQLite 镜像中完全没有对应行的 Qdrant 点，这些点是备份早于它们创建时遗留下来的——并以有边界的批次删除它们，且仅限于本设备自身的点（或早于设备标记功能的旧有数据点），以确保另一台设备合法的跨设备搜索回退永远不会被触及。删除失败的剩余项会作为可重试的孤立工作保留下来，并使 `vector_reconciliation` 保持降级状态，而不是被错误地报告为健康，从而确保它永远不会作为一个永不过期的载荷回退出现在 `recall` 中。当自备份创建以来嵌入模型/维度发生了变化时，恢复会转而执行完整重建；当 Qdrant 的现有状态根本无法*读取*时（一次瞬时故障，而非模型变更），会保守地重新嵌入整个语料库而不清空任何内容，并将其报告为独立的 `inspection-failed` 原因，而不是被错误地归类为模型变更。一旦此项检查完成，恢复锁即被释放——如果没有任何漂移且没有剩余项未清理，`vector_reconciliation.state` 会立即变为 `"reconciled"`；如果漂移子集的重新嵌入在调用已经返回之后，在一个有边界的后台任务（每轮有超时和批次上限，并带有自动重试）中继续进行，或者仍有未清理的剩余项作为可重试的工作，则为 `"reconciling"`。可轮询 `health://status`（`components.vector_reconciliation`）以观察其完成情况。
 
 ---
 
@@ -3144,9 +3185,11 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
   "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
   "size_bytes": 2048576,
   "memory_count": 1234,
-  "created_at": "2026-03-15T12:00:00Z"
+  "created_at": "2026-03-15T12:00:00Z",
+  "missing": false
 }
 ```
+每次 `create` 成功后都会自动执行备份文件保留策略（`backup.retention.max_count`/`max_age_days`）——参见[创建备份](#创建备份)。
 
 **`list` 输出：**
 ```json
@@ -3156,11 +3199,13 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
       "path": "...",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
 ```
+`missing: true` 标记某条元数据行在磁盘上已无对应文件的备份，而不是将其呈现为可恢复的备份。
 
 **`restore` 输出：**
 ```json
@@ -3175,7 +3220,7 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
   }
 }
 ```
-当没有向量真正发生漂移（无需重新嵌入）时，`vector_reconciliation.state` 为 `"reconciled"`；当一个有边界的后台任务正在重新嵌入漂移或缺失的子集时，为 `"reconciling"`。参见[从备份恢复](#从备份恢复)。
+当没有向量真正发生漂移、没有纯向量剩余项未清理、且无需任何重新嵌入时，`vector_reconciliation.state` 为 `"reconciled"`；当一个有边界的后台任务正在重新嵌入漂移或缺失的子集，或仍有未清理的剩余项作为可重试工作时，为 `"reconciling"`；如果漂移/剩余项检测本身未能完成，则为 `"pending"`。参见[从备份恢复](#从备份恢复)。
 
 ---
 
@@ -3824,9 +3869,9 @@ bhgbrain backup create
 
 `backup.restore` 在返回成功之前重新加载运行时 SQLite 状态。当恢复的数据立即生效时，恢复响应包含 `metadata_activated: true`。服务器无需重启。
 
-恢复操作会获取一个故障保护锁（`beginRestoreOperation()`），该锁仅在 SQLite 被激活以及恢复的向量针对 Qdrant 进行漂移检查期间阻止并发写入。向量**不会**被无条件清空并重新嵌入：只有内容校验和与 Qdrant 中不一致（或在其中缺失）的记忆才会被标记为需要重新嵌入，因此无漂移的恢复完成时甚至不会调用嵌入提供方。如果自备份创建以来嵌入模型/维度发生了变化，或无法读取 Qdrant 的现有状态，恢复会转而执行完整重建。
+恢复操作会获取一个故障保护锁（`beginRestoreOperation()`，此外还有跨进程的 `.restore.lock` 文件以及每次写操作自身的锁检查——参见[从备份恢复](#从备份恢复)），该锁在候选数据库于临时副本中被验证、活动/候选数据库文件被交换、以及恢复的向量针对 Qdrant 进行漂移与剩余项检查期间阻止并发写入。向量**不会**被无条件清空并重新嵌入：只有内容校验和与 Qdrant 中不一致（或在其中缺失）的记忆才会被标记为需要重新嵌入，因此无漂移的恢复完成时甚至不会调用嵌入提供方。如果自备份创建以来嵌入模型/维度发生了变化，恢复会转而执行完整重建；如果 Qdrant 的现有状态根本无法读取（一次瞬时故障），则会保守地重新嵌入整个语料库而不清空任何内容，并将其报告为独立的 `inspection-failed` 原因，而不是被错误地归类为模型变更。
 
-漂移检查完成后，该锁即被释放——对漂移子集（如果有）的重新嵌入会在一个有边界的后台任务（每轮有超时和批次上限）中运行，而不会拖住恢复调用或在此期间阻塞其他写入。遇到暂时性故障时会自动带退避重试；如果始终未能完全追上进度，`health://status` 会持续报告 `vector_reconciliation.state: "pending"`（或在某轮任务进行中时报告 `"reconciling"`），而不是悄无声息地让语义搜索为空。进度会按批次粒度落盘，因此进程在协调过程中被强制终止最多只会丢失一个批次的工作——重启后会通过幂等的重新 upsert，安全地从剩余未同步集合继续。
+漂移/剩余项检查完成后，该锁即被释放——对漂移子集（如果有）的重新嵌入会在一个有边界的后台任务（每轮有超时和批次上限）中运行，而不会拖住恢复调用或在此期间阻塞其他写入。遇到暂时性故障时会自动带退避重试；如果始终未能完全追上进度，`health://status` 会持续报告 `vector_reconciliation.state: "pending"`（或在某轮任务进行中时报告 `"reconciling"`），而不是悄无声息地让语义搜索为空。进度会按批次粒度落盘，因此进程在协调过程中被强制终止最多只会丢失一个批次的工作——重启后会通过幂等的重新 upsert，安全地从剩余未同步集合继续。纯向量剩余项（在 SQLite 中没有对应恢复行的点）的删除操作会作为漂移/剩余项检查本身的一部分同步执行，以有边界的批次进行；某批次删除失败会使 `vector_reconciliation` 连同剩余数量一起保持降级状态，而不是在未解决的孤立工作上被错误地报告为健康。
 
 ### HTTP 安全加固
 

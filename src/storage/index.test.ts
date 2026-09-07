@@ -132,6 +132,7 @@ function createMockSqlite(): MockSqliteStore {
 }
 
 function createMockQdrant(shouldFail = false): MockQdrantStore {
+  const scrollAll = vi.fn(async (_name: string) => [] as Array<{ id: string; payload: Record<string, unknown> }>);
   return {
     upsert: shouldFail
       ? vi.fn(async () => { throw new Error('Qdrant unavailable'); })
@@ -141,7 +142,14 @@ function createMockQdrant(shouldFail = false): MockQdrantStore {
     deleteCollection: vi.fn(async () => {}),
     clearManagedCollections: vi.fn(async () => 0),
     listAllCollections: vi.fn(async () => []),
-    scrollAll: vi.fn(async () => []),
+    scrollAll,
+    // Delegates to whatever `scrollAll` is mocked to return, yielded as one
+    // page — keeps every existing `scrollAll.mockResolvedValue(...)` test
+    // setup working against the streaming reconciliation path unchanged.
+    scrollAllPages: vi.fn(async function* (name: string) {
+      const points = await scrollAll(name);
+      if (points.length > 0) yield points;
+    }),
   } as unknown as MockQdrantStore;
 }
 
@@ -622,7 +630,7 @@ describe('StorageManager cross-store consistency', () => {
         expectedEmbeddingDimensions: 3,
       });
 
-      expect(outcome).toEqual({ mode: 'no-drift', driftedCount: 0 });
+      expect(outcome).toEqual({ mode: 'no-drift', driftedCount: 0, surplusPruned: 0, surplusRemaining: 0 });
       expect(sqlite.markVectorsSyncBatch).not.toHaveBeenCalled();
       expect(qdrant.clearManagedCollections).not.toHaveBeenCalled();
     });
@@ -648,7 +656,7 @@ describe('StorageManager cross-store consistency', () => {
         expectedEmbeddingDimensions: 3,
       });
 
-      expect(outcome).toEqual({ mode: 'partial-drift', driftedCount: 2 });
+      expect(outcome).toEqual({ mode: 'partial-drift', driftedCount: 2, surplusPruned: 0, surplusRemaining: 0 });
       expect(sqlite.markVectorsSyncBatch).toHaveBeenCalledWith(
         expect.arrayContaining(['mem-b', 'mem-c']),
         false,
@@ -674,13 +682,19 @@ describe('StorageManager cross-store consistency', () => {
         allowDuringLifecycle: true,
       });
 
-      expect(outcome).toEqual({ mode: 'full-rebuild', driftedCount: 1 });
+      expect(outcome).toEqual({ mode: 'full-rebuild', driftedCount: 1, surplusPruned: 0, surplusRemaining: 0 });
       expect(qdrant.clearManagedCollections).toHaveBeenCalledTimes(1);
       expect(qdrant.listAllCollections).not.toHaveBeenCalled();
       expect(sqlite.getMemoryById('mem-a')?.vector_synced).toBe(false);
     });
 
-    it('falls back to a full rebuild when existing Qdrant state cannot be read', async () => {
+    // Task 3.3 (make-backup-restore-transactional): a transient Qdrant read
+    // outage is distinguishable from a genuine embedding-model change —
+    // both conservatively mark the whole corpus unsynced, but only the
+    // model-change case is reported as 'full-rebuild'; an unreadable Qdrant
+    // state is its own 'inspection-failed' mode so callers/health never
+    // mislabel a retryable read failure as "the embedding model changed".
+    it('reports inspection-failed (not full-rebuild) when existing Qdrant state cannot be read', async () => {
       const sqlite = createMockSqlite();
       const qdrant = createMockQdrant(false);
       const embedding = createMockEmbedding();
@@ -694,13 +708,87 @@ describe('StorageManager cross-store consistency', () => {
         expectedEmbeddingDimensions: 3,
       });
 
-      expect(outcome).toEqual({ mode: 'full-rebuild', driftedCount: 1 });
+      expect(outcome).toEqual({ mode: 'inspection-failed', driftedCount: 1, surplusPruned: 0, surplusRemaining: 0 });
       // Unlike the model-change fallback, an unreadable Qdrant state does
       // not imply the existing vectors are unusable (the embedding space is
       // unchanged), so they are deliberately left in place rather than
       // destroyed on what may be a transient read failure.
       expect(qdrant.clearManagedCollections).not.toHaveBeenCalled();
       expect(sqlite.getMemoryById('mem-a')?.vector_synced).toBe(false);
+    });
+
+    // Tasks 3.1/3.2 (make-backup-restore-transactional): a Qdrant point with
+    // no corresponding row in the restored SQLite image is a vector-only
+    // surplus/orphan and is deleted in bounded batches, without disturbing
+    // the SQLite side (no drift is implied by an orphan's mere existence).
+    it('prunes a vector-only surplus point that matches this device, leaving matched points untouched', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      sqlite.insertMemory({
+        ...baseMem, id: 'mem-a', checksum: 'chk-a', vector_synced: true, pinned: false, origin: null, confidence: 1,
+      });
+      qdrant.listAllCollections.mockResolvedValue(['bhgbrain_global_general']);
+      qdrant.scrollAll.mockResolvedValue([
+        { id: 'mem-a', payload: { checksum: 'chk-a', namespace: 'global', collection: 'general' } },
+        // No SQLite row for 'orphan-1' and it's stamped with this device's
+        // own id, so it's a genuine restore-time orphan.
+        { id: 'orphan-1', payload: { namespace: 'global', collection: 'general', device_id: 'this-device' } },
+      ]);
+
+      const outcome = await storage.detectAndMarkVectorDrift({
+        expectedEmbeddingModel: 'test',
+        expectedEmbeddingDimensions: 3,
+        deviceId: 'this-device',
+      });
+
+      expect(outcome).toEqual({ mode: 'no-drift', driftedCount: 0, surplusPruned: 1, surplusRemaining: 0 });
+      expect(qdrant.deleteMany).toHaveBeenCalledWith('global', 'general', ['orphan-1']);
+      expect(sqlite.markVectorsSyncBatch).not.toHaveBeenCalled();
+    });
+
+    it('never prunes a surplus point stamped with a different device (the cross-device search fallback)', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      qdrant.listAllCollections.mockResolvedValue(['bhgbrain_global_general']);
+      qdrant.scrollAll.mockResolvedValue([
+        { id: 'other-device-mem', payload: { namespace: 'global', collection: 'general', device_id: 'other-device' } },
+      ]);
+
+      const outcome = await storage.detectAndMarkVectorDrift({
+        expectedEmbeddingModel: 'test',
+        expectedEmbeddingDimensions: 3,
+        deviceId: 'this-device',
+      });
+
+      expect(outcome).toEqual({ mode: 'no-drift', driftedCount: 0, surplusPruned: 0, surplusRemaining: 0 });
+      expect(qdrant.deleteMany).not.toHaveBeenCalled();
+    });
+
+    it('leaves a surplus point unpruned and reports it as remaining when deletion fails', async () => {
+      const sqlite = createMockSqlite();
+      const qdrant = createMockQdrant(false);
+      const embedding = createMockEmbedding();
+      const storage = new StorageManager(sqlite, qdrant, embedding);
+
+      qdrant.listAllCollections.mockResolvedValue(['bhgbrain_global_general']);
+      qdrant.scrollAll.mockResolvedValue([
+        { id: 'orphan-1', payload: { namespace: 'global', collection: 'general' } },
+      ]);
+      (qdrant.deleteMany as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('qdrant unreachable'));
+
+      const outcome = await storage.detectAndMarkVectorDrift({
+        expectedEmbeddingModel: 'test',
+        expectedEmbeddingDimensions: 3,
+        deviceId: null,
+      });
+
+      expect(outcome).toEqual({ mode: 'no-drift', driftedCount: 0, surplusPruned: 0, surplusRemaining: 1 });
     });
   });
 

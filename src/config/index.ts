@@ -106,6 +106,19 @@ const ConfigSchema = z.object({
     // turning a stuck external writer into an unbounded request stall.
     sqlite_busy_timeout_ms: z.number().int().min(0).max(60_000).default(5_000),
   }).prefault({}),
+  backup: z.object({
+    retention: z.object({
+      // Backup *file* retention (how many/how old `.bhgb` artifacts to keep)
+      // — distinct from `retention` above, which governs individual memory
+      // lifecycle. `null` disables that particular bound; growth is
+      // otherwise unbounded and proportional to database size, so a stock
+      // install keeps both bounds on by default. Applied after every
+      // successful `backup create` (both bounds evaluated; a backup beyond
+      // either is pruned) — see make-backup-restore-transactional task 3.4.
+      max_count: z.number().int().positive().nullable().default(30),
+      max_age_days: z.number().int().positive().nullable().default(90),
+    }).prefault({}),
+  }).prefault({}),
   transport: z.object({
     http: z.object({
       enabled: z.boolean().default(true),

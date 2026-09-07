@@ -356,6 +356,18 @@ The file is created automatically on first run with all defaults applied. Edit i
     "pin_limit_per_namespace": 20
   },
 
+  // Backup *file* retention (distinct from memory-level `retention` below)
+  "backup": {
+    "retention": {
+      // Keep at most this many backups; the oldest beyond this count are
+      // pruned after every successful `backup create`. null disables this bound.
+      "max_count": 30,
+      // Prune backups older than this many days, regardless of count.
+      // null disables this bound.
+      "max_age_days": 90
+    }
+  },
+
   // Memory retention and lifecycle settings
   "retention": {
     // Days of zero access after which a memory becomes a stale candidate
@@ -2214,29 +2226,38 @@ sequenceDiagram
     rect rgb(230, 245, 230)
         Note over C,FS: CREATE BACKUP
         C->>S: backup create
-        S->>DB: Export full database
-        DB-->>S: Raw DB bytes
-        S->>S: Compute SHA-256 checksum
-        S->>S: Build JSON header<br/>(version, count, checksum)
-        S->>FS: Atomic write .bhgb file<br/>(write-to-temp-then-rename)
+        S->>DB: VACUUM INTO a scratch export file
+        S->>FS: Stream-hash the export (bounded memory)
+        S->>S: Build JSON header<br/>(version, count, checksum, header_checksum)
+        S->>FS: Stream header + export into a unique temp file,<br/>fsync, rename into place (backups/)
         FS-->>S: Success
+        S->>S: Prune backups over count/age bounds
         S-->>C: path, size, memory_count
     end
 
     rect rgb(230, 235, 250)
         Note over C,FS: RESTORE BACKUP
         C->>S: backup restore (path)
-        S->>FS: Read .bhgb file
-        FS-->>S: Header + DB bytes
-        S->>S: Validate SHA-256 checksum
-        alt Checksum mismatch
-            S-->>C: ❌ INVALID_INPUT
+        S->>S: Acquire cross-process restore lock
+        S->>FS: Read .bhgb file; verify header_checksum + body checksum
+        alt Checksum or version invalid
+            S-->>C: ❌ INVALID_INPUT (live database untouched)
         else Checksum valid
-            S->>FS: Atomic write to data dir<br/>(write-to-temp-then-rename)
-            S->>DB: Hot-reload in-memory SQLite
-            S->>DB: Run schema migrations
-            DB-->>S: Ready
-            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+            S->>FS: Write candidate to a scratch file;<br/>open it, run integrity_check + schema/count checks
+            alt Candidate fails validation
+                S-->>C: ❌ live database untouched
+            else Candidate valid
+                S->>DB: Checkpoint + close live connection
+                S->>FS: Rename live db aside (pre-restore-*),<br/>rename candidate into place
+                S->>DB: Reopen; re-verify record count
+                alt Activation or post-activation check fails
+                    S->>FS: Rename pre-restore image back; reopen
+                    S-->>C: ❌ prior database restored and active
+                else Activation succeeds
+                    S->>S: Reconcile vectors: stream drift + surplus scan,<br/>prune vector-only orphans
+                    S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+                end
+            end
         end
     end
 ```
@@ -2252,7 +2273,7 @@ Or via CLI:
 bhgbrain backup create
 ```
 
-Backups capture the entire SQLite database (all memories, categories, collections, audit log, revisions, and archive records) as a single `.bhgb` file in the `backups/` subdirectory of your data directory.
+Backups capture the entire SQLite database (all memories, categories, collections, audit log, revisions, and archive records) as a single `.bhgb` file in the `backups/` subdirectory of your data directory. Creation streams the database export through hashing and disk output — peak memory stays bounded to a small, fixed number of chunks regardless of database size, rather than holding the whole export in memory at once.
 
 **Backup file format:**
 ```
@@ -2261,24 +2282,44 @@ Backups capture the entire SQLite database (all memories, categories, collection
 [remaining bytes: SQLite database export]
 ```
 
-The JSON header contains:
+The JSON header (format version 2) contains:
 ```json
 {
-  "version": 1,
+  "version": 2,
   "memory_count": 1234,
   "checksum": "<sha256 of db data>",
   "created_at": "2026-03-15T12:00:00Z",
   "embedding_model": "text-embedding-3-small",
-  "embedding_dimensions": 1536
+  "embedding_dimensions": 1536,
+  "header_checksum": "<sha256 of the canonical fields above>"
 }
 ```
 
-**What is NOT in the backup:**
-- Qdrant vector data is **not** included. After restoring from a backup, Qdrant collections must be rebuilt by re-embedding content. Until then, fulltext search works but semantic search does not.
+`header_checksum` authenticates the header's own fields (so a tampered `memory_count`/`checksum`/embedding fields is rejected before restore trusts them for anything destructive) and is verified in addition to the body checksum. Version-1 backups (no `header_checksum`) remain readable through a compatibility parser that never trusts their unauthenticated fields destructively; any other version is rejected with `INVALID_INPUT` before restore touches the active database.
 
-**Backup integrity:** A SHA-256 checksum of the database data is stored in the header and verified on restore. If the file is corrupted, restore fails with `INVALID_INPUT: Backup integrity check failed`. After the restored database is activated, its memory count is also cross-checked against `memory_count` in the header — a mismatch fails the restore with `INTERNAL` (logged as `backup_restore_count_mismatch`) rather than returning a successful response over silently wrong data.
+**What is NOT in the backup:**
+- Qdrant vector data is **not** included. After restoring from a backup, vectors are reconciled against drift (see below) rather than bundled into the archive — this keeps backups small and portable.
+
+**Backup integrity:** the body's SHA-256 checksum and the header's own `header_checksum` are both verified before any header field is used destructively. A corrupted or truncated file, or one whose header was tampered with independently of the body, fails restore with `INVALID_INPUT` before the active database is touched.
+
+**Durable commit:** backup files (and the restored database image) are written to a unique temporary file with restrictive `0600` permissions, `fsync`ed, renamed into place, and the containing directory is `fsync`ed too where the filesystem supports it — a process or host crash after backup creation reports success never leaves a partial file at the final path, and an interrupted write never clobbers another writer's in-progress temp file.
 
 **Backup metadata** is tracked in the SQLite `backup_metadata` table so `backup list` can return information about historical backups.
+
+**Backup file retention:** after every successful `backup create`, backups beyond the configured count or age are pruned (file and metadata row together). Configure via `backup.retention` in `config.json`:
+
+```json
+{
+  "backup": {
+    "retention": {
+      "max_count": 30,
+      "max_age_days": 90
+    }
+  }
+}
+```
+
+Either bound alone is enough to prune a backup; set a bound to `null` to disable it (both `null` disables retention entirely — not recommended, since backup storage otherwise grows unbounded and proportional to database size). A backup whose file delete fails is left in metadata so the next pass retries it, rather than losing track of it. A backup beyond the bounds whose file is *already* gone has its stale metadata row cleaned up and is flagged separately from a genuine delete. `backup list` also flags (`missing: true`) any backup whose file is gone but whose metadata row hasn't been cleaned up yet, rather than presenting it as a restorable backup.
 
 ### Listing Backups
 
@@ -2294,7 +2335,8 @@ Returns:
       "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
@@ -2310,19 +2352,19 @@ Returns:
 ```
 
 **Restore process:**
-1. Validate the file exists and the integrity checksum matches.
-2. Write the embedded SQLite database atomically to the data directory (write-to-temp-then-rename).
-3. Hot-reload the in-memory SQLite database from the restored file without restarting the process.
-4. Run schema migrations on the reloaded database to ensure forward compatibility.
-5. Reconcile vectors against actual drift (see below) and return `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
+1. Acquire the cross-process restore lock (see below) and validate the file exists, its format version is supported, and both the header and body checksums match.
+2. Write the candidate database to a scratch file and validate it *before* touching the live database: open it, run `PRAGMA integrity_check`, confirm the schema is readable, and confirm its record count matches the header's `memory_count`. A candidate that fails any of these leaves the live database completely untouched.
+3. Checkpoint and close the live connection, rename the live database file *aside* to a unique pre-restore path (not overwritten in place), rename the validated candidate into its place, and reopen.
+4. Re-verify the reopened database's record count. If activation or this post-activation check fails, the pre-restore image is renamed back into place and reopened — restore always leaves a working database, live and reopened, never a half-swapped or corrupt one.
+5. Reconcile vectors against actual drift and vector-only surplus (see below) and return `{ memory_count: <count>, metadata_activated: true, vector_reconciliation: {...} }`.
 
 **Restore is live:** The restored database is immediately active. There is no need to restart the server. The response includes `metadata_activated: true` to confirm this.
 
-**Post-activation memory-count check:** Because a backup is a byte-for-byte export of the SQLite database, the memory count after activation must exactly equal `memory_count` from the header. If it doesn't, restore throws `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` and logs a `backup_restore_count_mismatch` event — the call does not return a successful response.
+**Rollback guarantee:** a reported restore failure — whether from pre-activation validation, the live/candidate file swap, or the post-activation record-count check — always leaves the prior database recoverable and reopened, never a database that is missing, half-written, or silently wrong. The error message says explicitly whether the prior database was restored (`"...the prior database was restored and is active"`) versus never touched at all (`"...before any change to the active database"`).
 
-**Vector reconciliation is drift-only and bounded.** Restore does not unconditionally clear and re-embed the whole corpus: it compares each restored memory's content checksum against the vector already stored in Qdrant and marks only memories that are new or whose content changed for re-embedding. When the embedding model/dimensions changed since the backup was created, or Qdrant's existing state can't be read, restore falls back to a full rebuild instead. Once this drift check completes, the restore lifecycle lock is released — `vector_reconciliation.state` is `"reconciled"` immediately if nothing drifted, or `"reconciling"` if re-embedding the drifted subset continues in a bounded background task (a timeout and batch cap per pass, with automatic retries on transient failures) after the call has already returned. Poll `health://status` (`components.vector_reconciliation`) to watch it finish.
+**Cross-process exclusion:** an exclusive lock file (`<data_dir>/.restore.lock`) is held for the whole restore, and every SQLite mutation (in this process or another) checks for it — an overlapping restore from another CLI invocation or server process, or an ordinary write racing an active restore, fails visibly with a retryable `CONFLICT` (`"Backup restore is already active for this data directory"` or `"Storage lifecycle operation in progress: restore (held by another process)"`) instead of writing to a database image that is about to be renamed away or replaced.
 
-**Concurrent restore protection:** If a restore is already in progress, subsequent restore requests return `INVALID_INPUT: Backup restore already in progress`. That guard only covers metadata activation and the drift check, not the background re-embed, so it releases quickly even for a large restore.
+**Vector reconciliation is drift-only, bounded, and bidirectional.** Restore does not unconditionally clear and re-embed the whole corpus: it streams every managed Qdrant collection once (never buffering a whole collection in memory) and compares each point's checksum against the restored SQLite row, marking only memories that are new or whose content changed for re-embedding. It also identifies **vector-only surplus** — Qdrant points with no corresponding row in the restored SQLite image at all, left behind when the backup predates them — and deletes them in bounded batches, scoped to this device's own points (or legacy points that predate device stamping) so another device's legitimate cross-device search fallback is never touched. A surplus point that fails to delete is left as retryable orphan work and keeps `vector_reconciliation` degraded rather than being silently reported healthy, so it can never resurface in recall as a non-expiring payload fallback. When the embedding model/dimensions changed since the backup was created, restore falls back to a full rebuild instead; when Qdrant's existing state simply can't be *read* (a transient outage, not a model change), it conservatively re-embeds the corpus without clearing anything, and is reported as its own `inspection-failed` cause rather than being mislabeled as a model change. Once this check completes, the restore lock is released — `vector_reconciliation.state` is `"reconciled"` immediately if nothing drifted and no surplus remains, or `"reconciling"` if re-embedding the drifted subset continues in a bounded background task (a timeout and batch cap per pass, with automatic retries on transient failures) after the call has already returned. Poll `health://status` (`components.vector_reconciliation`) to watch it finish.
 
 ---
 
@@ -3281,9 +3323,11 @@ Create, list, or restore memory backups.
   "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
   "size_bytes": 2048576,
   "memory_count": 1234,
-  "created_at": "2026-03-15T12:00:00Z"
+  "created_at": "2026-03-15T12:00:00Z",
+  "missing": false
 }
 ```
+Backup file retention (`backup.retention.max_count`/`max_age_days`) runs automatically after every successful `create` — see [Creating a Backup](#creating-a-backup).
 
 **`list` output:**
 ```json
@@ -3293,11 +3337,13 @@ Create, list, or restore memory backups.
       "path": "...",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
 ```
+`missing: true` flags a backup whose metadata row has no corresponding file on disk any more, rather than presenting it as restorable.
 
 **`restore` output:**
 ```json
@@ -3312,7 +3358,7 @@ Create, list, or restore memory backups.
   }
 }
 ```
-`vector_reconciliation.state` is `"reconciled"` when no memory's vector actually drifted (nothing to re-embed), or `"reconciling"` while a bounded background task re-embeds the drifted/missing subset. See [Restoring from Backup](#restoring-from-backup).
+`vector_reconciliation.state` is `"reconciled"` when no memory's vector actually drifted, no vector-only surplus remains unpruned, and nothing needs re-embedding; `"reconciling"` while a bounded background task re-embeds the drifted/missing subset or unpruned surplus remains as retryable work; `"pending"` if drift/surplus detection itself couldn't complete. See [Restoring from Backup](#restoring-from-backup).
 
 ---
 
@@ -4036,9 +4082,9 @@ The backup is stored in the data directory (`%LOCALAPPDATA%\BHGBrain\` on Window
 
 `backup.restore` reloads runtime SQLite state before returning success. Restore responses include `metadata_activated: true` when restored data is immediately active. The server does not need to be restarted.
 
-Restore acquires a fail-safe guard (`beginRestoreOperation()`) that blocks concurrent writes only while SQLite is being activated and restored vectors are checked for drift against Qdrant. Vectors are **not** unconditionally cleared and re-embedded: only memories whose content checksum differs from (or is missing in) Qdrant are marked for re-embedding, so a no-drift restore completes without calling the embedding provider at all. If the embedding model/dimensions changed since the backup was taken, or Qdrant's existing state can't be read, restore falls back to a full rebuild instead.
+Restore acquires a fail-safe guard (`beginRestoreOperation()`, plus the cross-process `.restore.lock` file and every mutation's own lock check — see [Restoring from Backup](#restoring-from-backup)) that blocks concurrent writes while the candidate is validated in a scratch copy, the live/candidate database files are swapped, and restored vectors are checked for drift and surplus against Qdrant. Vectors are **not** unconditionally cleared and re-embedded: only memories whose content checksum differs from (or is missing in) Qdrant are marked for re-embedding, so a no-drift restore completes without calling the embedding provider at all. If the embedding model/dimensions changed since the backup was taken, restore falls back to a full rebuild instead; if Qdrant's existing state simply can't be read (a transient outage), it conservatively re-embeds the corpus without clearing anything and reports that as a distinct `inspection-failed` cause rather than a model change.
 
-Once the drift check finishes, the guard is released — re-embedding the drifted subset (if any) runs in a bounded background task (a timeout and batch cap per pass) instead of holding up the restore call or blocking other writers for its duration. It retries automatically with backoff on transient failures; if it never fully catches up, `health://status` keeps reporting `vector_reconciliation.state: "pending"` (or `"reconciling"` while a pass is in flight) rather than silently leaving semantic search blank. Progress is flushed to disk at batch granularity, so a hard crash mid-reconciliation loses at most one batch of work — restart safely resumes from the remaining unsynced set via idempotent re-upsert.
+Once the drift/surplus check finishes, the guard is released — re-embedding the drifted subset (if any) runs in a bounded background task (a timeout and batch cap per pass) instead of holding up the restore call or blocking other writers for its duration. It retries automatically with backoff on transient failures; if it never fully catches up, `health://status` keeps reporting `vector_reconciliation.state: "pending"` (or `"reconciling"` while a pass is in flight) rather than silently leaving semantic search blank. Progress is flushed to disk at batch granularity, so a hard crash mid-reconciliation loses at most one batch of work — restart safely resumes from the remaining unsynced set via idempotent re-upsert. Vector-only surplus deletion (points with no restored SQLite row) runs synchronously as part of the drift/surplus check itself, in bounded batches; a batch that fails to delete keeps `vector_reconciliation` degraded with the remaining count rather than reporting healthy over unresolved orphan work.
 
 ### HTTP Hardening
 

@@ -347,6 +347,18 @@ Die Datei wird beim ersten Start automatisch mit allen Standardwerten erstellt. 
     "pin_limit_per_namespace": 20
   },
 
+  // Aufbewahrung von Sicherungs*dateien* (getrennt von der Erinnerungs-`retention` unten)
+  "backup": {
+    "retention": {
+      // Höchstens so viele Sicherungen behalten; die ältesten darüber hinaus
+      // werden nach jeder erfolgreichen `backup create` entfernt. null deaktiviert diese Grenze.
+      "max_count": 30,
+      // Sicherungen entfernen, die älter als so viele Tage sind, unabhängig von der Anzahl.
+      // null deaktiviert diese Grenze.
+      "max_age_days": 90
+    }
+  },
+
   // Einstellungen für Aufbewahrung und Lebenszyklus von Erinnerungen
   "retention": {
     // Tage ohne Zugriff, nach denen eine Erinnerung als Stale-Kandidat gilt
@@ -2226,30 +2238,38 @@ sequenceDiagram
     rect rgb(230, 245, 230)
         Note over C,FS: CREATE BACKUP
         C->>S: backup create
-        S->>DB: Export full database
-        DB-->>S: Raw DB bytes
-        S->>S: Compute SHA-256 checksum
-        S->>S: Build JSON header<br/>(version, count, checksum)
-        S->>FS: Atomic write .bhgb file<br/>(write-to-temp-then-rename)
+        S->>DB: VACUUM INTO a scratch export file
+        S->>FS: Stream-hash the export (bounded memory)
+        S->>S: Build JSON header<br/>(version, count, checksum, header_checksum)
+        S->>FS: Stream header + export into a unique temp file,<br/>fsync, rename into place (backups/)
         FS-->>S: Success
+        S->>S: Prune backups over count/age bounds
         S-->>C: path, size, memory_count
     end
 
     rect rgb(230, 235, 250)
         Note over C,FS: RESTORE BACKUP
         C->>S: backup restore (path)
-        S->>FS: Read .bhgb file
-        FS-->>S: Header + DB bytes
-        S->>S: Validate SHA-256 checksum
-
-        alt Checksum mismatch
-            S-->>C: ❌ INVALID_INPUT
+        S->>S: Acquire cross-process restore lock
+        S->>FS: Read .bhgb file; verify header_checksum + body checksum
+        alt Checksum or version invalid
+            S-->>C: ❌ INVALID_INPUT (live database untouched)
         else Checksum valid
-            S->>FS: Atomic write to data dir<br/>(write-to-temp-then-rename)
-            S->>DB: Hot-reload in-memory SQLite
-            S->>DB: Run schema migrations
-            DB-->>S: Ready
-            S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+            S->>FS: Write candidate to a scratch file;<br/>open it, run integrity_check + schema/count checks
+            alt Candidate fails validation
+                S-->>C: ❌ live database untouched
+            else Candidate valid
+                S->>DB: Checkpoint + close live connection
+                S->>FS: Rename live db aside (pre-restore-*),<br/>rename candidate into place
+                S->>DB: Reopen; re-verify record count
+                alt Activation or post-activation check fails
+                    S->>FS: Rename pre-restore image back; reopen
+                    S-->>C: ❌ prior database restored and active
+                else Activation succeeds
+                    S->>S: Reconcile vectors: stream drift + surplus scan,<br/>prune vector-only orphans
+                    S-->>C: memory_count, metadata_activated: true, vector_reconciliation
+                end
+            end
         end
     end
 ```
@@ -2265,7 +2285,7 @@ Oder über CLI:
 bhgbrain backup create
 ```
 
-Sicherungen erfassen die gesamte SQLite-Datenbank (alle Erinnerungen, Kategorien, Sammlungen, Audit-Protokoll, Revisionen und Archivdatensätze) als einzelne `.bhgb`-Datei im Unterverzeichnis `backups/` Ihres Datenverzeichnisses.
+Sicherungen erfassen die gesamte SQLite-Datenbank (alle Erinnerungen, Kategorien, Sammlungen, Audit-Protokoll, Revisionen und Archivdatensätze) als einzelne `.bhgb`-Datei im Unterverzeichnis `backups/` Ihres Datenverzeichnisses. Die Erstellung streamt den Datenbankexport durch Hashing und Festplattenausgabe — der Spitzenspeicherverbrauch bleibt unabhängig von der Datenbankgröße auf eine kleine, feste Anzahl von Chunks begrenzt, statt den gesamten Export auf einmal im Speicher zu halten.
 
 **Sicherungsdateiformat:**
 ```
@@ -2274,24 +2294,44 @@ Sicherungen erfassen die gesamte SQLite-Datenbank (alle Erinnerungen, Kategorien
 [verbleibende Bytes: SQLite-Datenbankexport]
 ```
 
-Der JSON-Header enthält:
+Der JSON-Header (Formatversion 2) enthält:
 ```json
 {
-  "version": 1,
+  "version": 2,
   "memory_count": 1234,
   "checksum": "<sha256 of db data>",
   "created_at": "2026-03-15T12:00:00Z",
   "embedding_model": "text-embedding-3-small",
-  "embedding_dimensions": 1536
+  "embedding_dimensions": 1536,
+  "header_checksum": "<sha256 of the canonical fields above>"
 }
 ```
 
-**Was NICHT in der Sicherung enthalten ist:**
-- Qdrant-Vektordaten sind **nicht** enthalten. Nach der Wiederherstellung aus einer Sicherung müssen Qdrant-Sammlungen durch erneutes Einbetten der Inhalte neu aufgebaut werden. Bis dahin funktioniert die Volltextsuche, aber nicht die semantische Suche.
+`header_checksum` authentifiziert die Header-Felder selbst (sodass ein manipulierter `memory_count`/`checksum`/Embedding-Felder abgelehnt wird, bevor die Wiederherstellung ihnen für irgendetwas Destruktives vertraut) und wird zusätzlich zur Body-Prüfsumme verifiziert. Version-1-Sicherungen (ohne `header_checksum`) bleiben über einen Kompatibilitäts-Parser lesbar, der ihren nicht authentifizierten Feldern nie destruktiv vertraut; jede andere Version wird mit `INVALID_INPUT` abgelehnt, bevor die Wiederherstellung die aktive Datenbank berührt.
 
-**Sicherungsintegrität:** Ein SHA-256-Prüfsumme der Datenbankdaten wird im Header gespeichert und bei der Wiederherstellung überprüft. Wenn die Datei beschädigt ist, schlägt die Wiederherstellung mit `INVALID_INPUT: Backup integrity check failed` fehl. Nachdem die wiederhergestellte Datenbank aktiviert wurde, wird ihre Erinnerungsanzahl außerdem gegen `memory_count` im Header abgeglichen — eine Abweichung lässt die Wiederherstellung mit `INTERNAL` fehlschlagen (protokolliert als `backup_restore_count_mismatch`), statt eine erfolgreiche Antwort über stillschweigend falsche Daten zurückzugeben.
+**Was NICHT in der Sicherung enthalten ist:**
+- Qdrant-Vektordaten sind **nicht** enthalten. Nach der Wiederherstellung aus einer Sicherung werden Vektoren gegen Abweichungen abgeglichen (siehe unten), statt im Archiv gebündelt zu sein — das hält Sicherungen klein und portabel.
+
+**Sicherungsintegrität:** Sowohl die SHA-256-Prüfsumme des Bodys als auch die eigene `header_checksum` des Headers werden verifiziert, bevor irgendein Header-Feld destruktiv verwendet wird. Eine beschädigte oder abgeschnittene Datei, oder eine, deren Header unabhängig vom Body manipuliert wurde, lässt die Wiederherstellung mit `INVALID_INPUT` fehlschlagen, bevor die aktive Datenbank berührt wird.
+
+**Dauerhaftes Committen:** Sicherungsdateien (und das wiederhergestellte Datenbank-Image) werden in eine eindeutige temporäre Datei mit restriktiven `0600`-Berechtigungen geschrieben, per `fsync` gesichert, an ihren endgültigen Platz umbenannt, und das enthaltende Verzeichnis wird ebenfalls per `fsync` gesichert, sofern das Dateisystem dies unterstützt — ein Prozess- oder Host-Absturz, nachdem die Sicherungserstellung Erfolg gemeldet hat, hinterlässt niemals eine unvollständige Datei am endgültigen Pfad, und ein unterbrochener Schreibvorgang überschreibt nie die temporäre Datei eines anderen Schreibers, die noch in Arbeit ist.
 
 **Sicherungsmetadaten** werden in der SQLite-Tabelle `backup_metadata` verfolgt, damit `backup list` Informationen über historische Sicherungen zurückgeben kann.
+
+**Aufbewahrung von Sicherungsdateien:** Nach jeder erfolgreichen `backup create` werden Sicherungen, die die konfigurierte Anzahl oder das Alter überschreiten, entfernt (Datei und Metadaten-Zeile zusammen). Konfiguration über `backup.retention` in `config.json`:
+
+```json
+{
+  "backup": {
+    "retention": {
+      "max_count": 30,
+      "max_age_days": 90
+    }
+  }
+}
+```
+
+Jede Grenze allein genügt, um eine Sicherung zu entfernen; setzen Sie eine Grenze auf `null`, um sie zu deaktivieren (beide `null` deaktiviert die Aufbewahrung vollständig — nicht empfohlen, da der Sicherungsspeicher sonst unbegrenzt und proportional zur Datenbankgröße wächst). Eine Sicherung, deren Datei-Löschung fehlschlägt, bleibt in den Metadaten, damit der nächste Durchlauf sie erneut versucht, statt den Überblick über sie zu verlieren. Eine Sicherung außerhalb der Grenzen, deren Datei bereits verschwunden ist, wird in ihrer veralteten Metadaten-Zeile bereinigt und getrennt von einer echten Löschung markiert. `backup list` markiert außerdem (`missing: true`) jede Sicherung, deren Datei verschwunden ist, deren Metadaten-Zeile aber noch nicht bereinigt wurde, statt sie als wiederherstellbare Sicherung darzustellen.
 
 ### Sicherungen auflisten
 
@@ -2307,7 +2347,8 @@ Gibt zurück:
       "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
@@ -2323,20 +2364,19 @@ Gibt zurück:
 ```
 
 **Wiederherstellungsprozess:**
-1. Prüfen, ob die Datei vorhanden ist und die Integritätsprüfsumme übereinstimmt.
-
-2. Die eingebettete SQLite-Datenbank atomar in das Datenverzeichnis schreiben (Schreiben-in-Temp-dann-Umbenennen).
-3. Die im-Arbeitsspeicher-SQLite-Datenbank aus der wiederhergestellten Datei ohne Neustart des Prozesses neu laden.
-4. Schema-Migrationen auf der neu geladenen Datenbank ausführen, um Vorwärtskompatibilität sicherzustellen.
-5. Vektoren gegen tatsächliche Abweichungen (Drift) abgleichen (siehe unten) und `{ memory_count: <Anzahl>, metadata_activated: true, vector_reconciliation: {...} }` zurückgeben.
+1. Die prozessübergreifende Wiederherstellungssperre erwerben (siehe unten) und prüfen, ob die Datei vorhanden ist, ihre Formatversion unterstützt wird und sowohl Header- als auch Body-Prüfsumme übereinstimmen.
+2. Die Kandidaten-Datenbank in eine Scratch-Datei schreiben und sie *vor* jeder Berührung der Live-Datenbank validieren: öffnen, `PRAGMA integrity_check` ausführen, bestätigen, dass das Schema lesbar ist, und bestätigen, dass ihre Datensatzanzahl mit `memory_count` aus dem Header übereinstimmt. Ein Kandidat, der eine dieser Prüfungen nicht besteht, lässt die Live-Datenbank vollständig unberührt.
+3. Die Live-Verbindung checkpointen und schließen, die Live-Datenbankdatei *beiseite* an einen eindeutigen Pre-Restore-Pfad umbenennen (nicht direkt überschrieben), den validierten Kandidaten an ihre Stelle umbenennen und neu öffnen.
+4. Die Datensatzanzahl der neu geöffneten Datenbank erneut verifizieren. Wenn die Aktivierung oder diese Prüfung nach der Aktivierung fehlschlägt, wird das Pre-Restore-Image zurück an seinen Platz umbenannt und neu geöffnet — die Wiederherstellung hinterlässt immer eine funktionierende, live geöffnete Datenbank, nie eine halb ausgetauschte oder beschädigte.
+5. Vektoren gegen tatsächliche Abweichungen (Drift) und vektor-only Überschuss (siehe unten) abgleichen und `{ memory_count: <Anzahl>, metadata_activated: true, vector_reconciliation: {...} }` zurückgeben.
 
 **Wiederherstellung ist live:** Die wiederhergestellte Datenbank ist sofort aktiv. Ein Neustart des Servers ist nicht erforderlich. Die Antwort enthält `metadata_activated: true` zur Bestätigung.
 
-**Prüfung der Erinnerungsanzahl nach der Aktivierung:** Da ein Backup ein Byte-für-Byte-Export der SQLite-Datenbank ist, muss die Erinnerungsanzahl nach der Aktivierung exakt `memory_count` aus dem Header entsprechen. Andernfalls wirft die Wiederherstellung `INTERNAL: Backup restore integrity check failed: expected <N> memories after activation but found <M>` und protokolliert ein `backup_restore_count_mismatch`-Ereignis — der Aufruf gibt keine erfolgreiche Antwort zurück.
+**Rollback-Garantie:** Ein gemeldeter Wiederherstellungsfehler — ob aus der Vor-Aktivierungs-Validierung, dem Live/Kandidat-Dateiaustausch oder der Datensatzanzahl-Prüfung nach der Aktivierung — hinterlässt immer die vorherige Datenbank wiederherstellbar und neu geöffnet, nie eine Datenbank, die fehlt, halb geschrieben oder stillschweigend falsch ist. Die Fehlermeldung sagt explizit, ob die vorherige Datenbank wiederhergestellt wurde (`"...the prior database was restored and is active"`) oder nie berührt wurde (`"...before any change to the active database"`).
 
-**Die Vektor-Abgleichung ist drift-basiert und begrenzt.** Die Wiederherstellung leert und re-embedded nicht bedingungslos den gesamten Bestand: Sie vergleicht die Inhalts-Prüfsumme jeder wiederhergestellten Erinnerung mit dem bereits in Qdrant gespeicherten Vektor und markiert nur neue oder inhaltlich geänderte Erinnerungen für ein erneutes Embedding. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben oder der Qdrant-Zustand nicht gelesen werden kann, greift stattdessen ein vollständiger Neuaufbau. Sobald diese Drift-Prüfung abgeschlossen ist, wird die Restore-Lifecycle-Sperre freigegeben — `vector_reconciliation.state` ist sofort `"reconciled"`, wenn nichts abgewichen ist, oder `"reconciling"`, wenn das erneute Embedding der abweichenden Teilmenge in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf, mit automatischen Wiederholungsversuchen) fortgesetzt wird, nachdem der Aufruf bereits zurückgekehrt ist. Fragen Sie `health://status` (`components.vector_reconciliation`) ab, um den Fortschritt zu beobachten.
+**Prozessübergreifender Ausschluss:** Eine exklusive Sperrdatei (`<data_dir>/.restore.lock`) wird für die gesamte Wiederherstellung gehalten, und jede SQLite-Mutation (in diesem oder einem anderen Prozess) prüft auf sie — eine überlappende Wiederherstellung von einem anderen CLI-Aufruf oder Serverprozess, oder ein gewöhnlicher Schreibvorgang, der mit einer aktiven Wiederherstellung konkurriert, schlägt sichtbar mit einem wiederholbaren `CONFLICT` fehl (`"Backup restore is already active for this data directory"` oder `"Storage lifecycle operation in progress: restore (held by another process)"`), statt auf ein Datenbank-Image zu schreiben, das gerade umbenannt oder ersetzt wird.
 
-**Schutz vor gleichzeitiger Wiederherstellung:** Wenn bereits eine Wiederherstellung läuft, geben nachfolgende Wiederherstellungsanfragen `INVALID_INPUT: Backup restore already in progress` zurück. Diese Sperre deckt nur die Metadaten-Aktivierung und die Drift-Prüfung ab, nicht das Hintergrund-Re-Embedding, und wird daher auch bei einer großen Wiederherstellung schnell wieder freigegeben.
+**Die Vektor-Abgleichung ist drift-basiert, begrenzt und bidirektional.** Die Wiederherstellung leert und re-embedded nicht bedingungslos den gesamten Bestand: Sie durchläuft jede verwaltete Qdrant-Sammlung einmal als Stream (ohne je eine ganze Sammlung im Speicher zu puffern) und vergleicht die Prüfsumme jedes Punkts mit der wiederhergestellten SQLite-Zeile, wobei nur neue oder inhaltlich geänderte Erinnerungen für ein erneutes Embedding markiert werden. Sie identifiziert außerdem **vektor-only Überschuss** — Qdrant-Punkte ohne entsprechende Zeile im wiederhergestellten SQLite-Image überhaupt, die zurückbleiben, wenn die Sicherung ihnen vorausgeht — und löscht sie in begrenzten Batches, beschränkt auf die eigenen Punkte dieses Geräts (oder Legacy-Punkte, die der Geräte-Kennzeichnung vorausgehen), sodass der legitime geräteübergreifende Such-Fallback eines anderen Geräts nie berührt wird. Ein Überschuss-Punkt, dessen Löschung fehlschlägt, bleibt als wiederholbare Waisen-Arbeit zurück und hält `vector_reconciliation` degradiert, statt fälschlich als gesund gemeldet zu werden, sodass er nie als nicht-verfallender Payload-Fallback im Recall auftauchen kann. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben, greift stattdessen ein vollständiger Neuaufbau; wenn der Qdrant-Zustand einfach nicht *gelesen* werden kann (ein vorübergehender Ausfall, keine Modelländerung), wird der Bestand konservativ neu eingebettet, ohne etwas zu löschen, und als eigene Ursache `inspection-failed` gemeldet, statt fälschlich als Modelländerung eingestuft zu werden. Sobald diese Prüfung abgeschlossen ist, wird die Wiederherstellungssperre freigegeben — `vector_reconciliation.state` ist sofort `"reconciled"`, wenn nichts abgewichen ist und kein Überschuss verbleibt, oder `"reconciling"`, wenn das erneute Embedding der abweichenden Teilmenge in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf, mit automatischen Wiederholungsversuchen) fortgesetzt wird oder unbereinigter Überschuss als wiederholbare Arbeit verbleibt, nachdem der Aufruf bereits zurückgekehrt ist. Fragen Sie `health://status` (`components.vector_reconciliation`) ab, um den Fortschritt zu beobachten.
 
 ---
 
@@ -3312,9 +3352,11 @@ Speichersicherungen erstellen, auflisten oder wiederherstellen.
   "path": "/home/user/.bhgbrain/backups/2026-03-15T12-00-00-000Z.bhgb",
   "size_bytes": 2048576,
   "memory_count": 1234,
-  "created_at": "2026-03-15T12:00:00Z"
+  "created_at": "2026-03-15T12:00:00Z",
+  "missing": false
 }
 ```
+Die Aufbewahrung von Sicherungsdateien (`backup.retention.max_count`/`max_age_days`) läuft automatisch nach jeder erfolgreichen `create` — siehe [Sicherung erstellen](#sicherung-erstellen).
 
 **`list`-Ausgabe:**
 ```json
@@ -3324,11 +3366,13 @@ Speichersicherungen erstellen, auflisten oder wiederherstellen.
       "path": "...",
       "size_bytes": 2048576,
       "memory_count": 1234,
-      "created_at": "2026-03-15T12:00:00Z"
+      "created_at": "2026-03-15T12:00:00Z",
+      "missing": false
     }
   ]
 }
 ```
+`missing: true` markiert eine Sicherung, deren Metadaten-Zeile keine entsprechende Datei mehr auf der Festplatte hat, statt sie als wiederherstellbar darzustellen.
 
 **`restore`-Ausgabe:**
 ```json
@@ -3343,7 +3387,7 @@ Speichersicherungen erstellen, auflisten oder wiederherstellen.
   }
 }
 ```
-`vector_reconciliation.state` ist `"reconciled"`, wenn kein Vektor tatsächlich abgewichen ist (nichts erneut einzubetten), oder `"reconciling"`, während eine begrenzte Hintergrundaufgabe die abweichende/fehlende Teilmenge erneut einbettet. Siehe [Aus Sicherung wiederherstellen](#aus-sicherung-wiederherstellen).
+`vector_reconciliation.state` ist `"reconciled"`, wenn kein Vektor tatsächlich abgewichen ist, kein vektor-only Überschuss unbereinigt verbleibt und nichts erneut eingebettet werden muss; `"reconciling"`, während eine begrenzte Hintergrundaufgabe die abweichende/fehlende Teilmenge erneut einbettet oder unbereinigter Überschuss als wiederholbare Arbeit verbleibt; `"pending"`, wenn die Drift-/Überschuss-Erkennung selbst nicht abgeschlossen werden konnte. Siehe [Aus Sicherung wiederherstellen](#aus-sicherung-wiederherstellen).
 
 ---
 
@@ -4018,9 +4062,9 @@ Die Sicherung wird im Datenverzeichnis gespeichert (`%LOCALAPPDATA%\BHGBrain\` u
 
 `backup.restore` lädt den Laufzeit-SQLite-Zustand vor der Rückgabe des Erfolgs neu. Wiederherstellungsantworten enthalten `metadata_activated: true`, wenn die wiederhergestellten Daten sofort aktiv sind. Der Server muss nicht neu gestartet werden.
 
-Die Wiederherstellung erwirbt eine Fail-Safe-Sperre (`beginRestoreOperation()`), die gleichzeitige Schreibvorgänge nur so lange blockiert, wie SQLite aktiviert und die wiederhergestellten Vektoren auf Abweichungen (Drift) gegenüber Qdrant geprüft werden. Vektoren werden **nicht** bedingungslos geleert und neu eingebettet: Nur Erinnerungen, deren Inhalts-Prüfsumme von Qdrant abweicht (oder dort fehlt), werden für ein erneutes Embedding markiert, sodass eine Wiederherstellung ohne Abweichungen abgeschlossen wird, ohne den Embedding-Anbieter überhaupt aufzurufen. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben oder der Qdrant-Zustand nicht gelesen werden kann, greift stattdessen ein vollständiger Neuaufbau.
+Die Wiederherstellung erwirbt eine Fail-Safe-Sperre (`beginRestoreOperation()`, zusätzlich zur prozessübergreifenden `.restore.lock`-Datei und der eigenen Sperrprüfung jeder Mutation — siehe [Aus Sicherung wiederherstellen](#aus-sicherung-wiederherstellen)), die gleichzeitige Schreibvorgänge blockiert, während der Kandidat in einer Scratch-Kopie validiert, die Live-/Kandidat-Datenbankdateien ausgetauscht und die wiederhergestellten Vektoren auf Abweichungen und Überschuss gegenüber Qdrant geprüft werden. Vektoren werden **nicht** bedingungslos geleert und neu eingebettet: Nur Erinnerungen, deren Inhalts-Prüfsumme von Qdrant abweicht (oder dort fehlt), werden für ein erneutes Embedding markiert, sodass eine Wiederherstellung ohne Abweichungen abgeschlossen wird, ohne den Embedding-Anbieter überhaupt aufzurufen. Wenn sich das Embedding-Modell/die Dimensionen seit der Erstellung des Backups geändert haben, greift stattdessen ein vollständiger Neuaufbau; wenn der Qdrant-Zustand einfach nicht gelesen werden kann (ein vorübergehender Ausfall), wird der Bestand konservativ neu eingebettet, ohne etwas zu löschen, und als eigene Ursache `inspection-failed` gemeldet, statt fälschlich als Modelländerung eingestuft zu werden.
 
-Sobald die Drift-Prüfung abgeschlossen ist, wird die Sperre freigegeben — das erneute Embedding der abweichenden Teilmenge (falls vorhanden) läuft in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf), anstatt den Wiederherstellungsaufruf zu blockieren oder andere Schreibvorgänge währenddessen aufzuhalten. Bei vorübergehenden Fehlern wird automatisch mit Backoff wiederholt; falls die Abgleichung nie vollständig aufholt, meldet `health://status` weiterhin `vector_reconciliation.state: "pending"` (oder `"reconciling"`, während ein Durchlauf läuft), anstatt die semantische Suche stillschweigend leer zu lassen. Der Fortschritt wird in Batch-Granularität auf die Festplatte geschrieben, sodass ein harter Absturz während der Abgleichung höchstens einen Batch an Arbeit verliert — ein Neustart setzt über idempotentes Re-Upsert sicher bei der verbleibenden nicht synchronisierten Menge fort.
+Sobald die Drift-/Überschuss-Prüfung abgeschlossen ist, wird die Sperre freigegeben — das erneute Embedding der abweichenden Teilmenge (falls vorhanden) läuft in einer begrenzten Hintergrundaufgabe (Timeout und Batch-Obergrenze pro Durchlauf), anstatt den Wiederherstellungsaufruf zu blockieren oder andere Schreibvorgänge währenddessen aufzuhalten. Bei vorübergehenden Fehlern wird automatisch mit Backoff wiederholt; falls die Abgleichung nie vollständig aufholt, meldet `health://status` weiterhin `vector_reconciliation.state: "pending"` (oder `"reconciling"`, während ein Durchlauf läuft), anstatt die semantische Suche stillschweigend leer zu lassen. Der Fortschritt wird in Batch-Granularität auf die Festplatte geschrieben, sodass ein harter Absturz während der Abgleichung höchstens einen Batch an Arbeit verliert — ein Neustart setzt über idempotentes Re-Upsert sicher bei der verbleibenden nicht synchronisierten Menge fort. Die Löschung von vektor-only Überschuss (Punkte ohne wiederhergestellte SQLite-Zeile) läuft synchron als Teil der Drift-/Überschuss-Prüfung selbst, in begrenzten Batches; ein Batch, dessen Löschung fehlschlägt, hält `vector_reconciliation` degradiert mit der verbleibenden Anzahl, statt fälschlich als gesund über unbereinigte Waisen-Arbeit gemeldet zu werden.
 
 ### HTTP-Absicherung
 

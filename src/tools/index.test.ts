@@ -1066,6 +1066,68 @@ describe('tool-handler latency recording (record-tool-latency-on-all-paths)', ()
   });
 });
 
+// Task 2.2/2.5 (make-backup-restore-transactional): a mutation that raced an
+// active restore (SqliteStore.assertMutableAllowed's in-process or
+// cross-process guard) surfaces as a plain Error naming the real lock
+// holder, not a BrainError — handleTool's outer catch is the one place every
+// tool call funnels through, so it classifies that message into a retryable
+// CONFLICT instead of a generic, non-retryable-looking INTERNAL error.
+describe('lifecycle-conflict classification at the handleTool boundary', () => {
+  function createCtx(overrides?: { storage?: Partial<StorageManager> }): ToolContext {
+    return {
+      config: {} as ToolContext['config'],
+      storage: (overrides?.storage ?? {}) as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('reports a retryable CONFLICT naming the real lock holder for an in-process lifecycle conflict', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        getCategory: () => { throw new Error('Storage lifecycle operation in progress: gc'); },
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    const result = await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('CONFLICT');
+    expect(result.error.retryable).toBe(true);
+    expect(result.error.message).toMatch(/gc/);
+  });
+
+  it('reports a retryable CONFLICT for the cross-process restore-lock guard', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        getCategory: () => { throw new Error('Storage lifecycle operation in progress: restore (held by another process)'); },
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    const result = await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('CONFLICT');
+    expect(result.error.retryable).toBe(true);
+    expect(result.error.message).toMatch(/another process/);
+  });
+
+  it('leaves an unrelated internal error classified as INTERNAL, not CONFLICT', async () => {
+    const ctx = createCtx({
+      storage: { sqlite: {
+        getCategory: () => { throw new Error('disk full'); },
+      } } as unknown as Partial<StorageManager>,
+    });
+
+    const result = await handleTool(ctx, 'category', { action: 'get', name: 'x' }, 'c1') as BrainErrorEnvelope;
+
+    expect(result.error.code).toBe('INTERNAL');
+  });
+});
+
 describe('handleRecall filter pushdown and score semantics (push-down-recall-filters)', () => {
   let ctx: ToolContext;
   let searchMock: ReturnType<typeof vi.fn>;

@@ -539,16 +539,20 @@ export class QdrantStore {
     return names;
   }
 
-  async scrollAll(
+  /**
+   * Pages through `collectionName` one server round trip at a time, yielding
+   * each page as it arrives rather than accumulating the whole collection in
+   * memory — used by callers that only need to inspect points once each (a
+   * restored-ID/checksum reconciliation scan) instead of holding a
+   * potentially large corpus's payloads live for the whole pass. See
+   * make-backup-restore-transactional task 3.1. `scrollAll` below is a thin
+   * accumulator over this for callers that do need the full list at once.
+   */
+  async *scrollAllPages(
     collectionName: string,
     batchSize = 100,
-    // Distillation's clustering pass (add-memory-distillation) needs the raw
-    // vectors behind every point in a collection to compute cosine similarity
-    // in memory; every pre-existing caller omits this, so `with_vector` stays
-    // `false` (its original hardcoded value) and their behavior is unchanged.
     withVector = false,
-  ): Promise<Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>> {
-    const allPoints: Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }> = [];
+  ): AsyncGenerator<Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>> {
     let offset: string | number | undefined = undefined;
 
     while (true) {
@@ -559,18 +563,30 @@ export class QdrantStore {
         with_vector: withVector,
       });
 
-      for (const point of response.points) {
-        allPoints.push({
-          id: point.id as string,
-          payload: (point.payload ?? {}) as Record<string, unknown>,
-          vector: withVector ? extractDenseVector(point.vector) : undefined,
-        });
-      }
+      yield response.points.map(point => ({
+        id: point.id as string,
+        payload: (point.payload ?? {}) as Record<string, unknown>,
+        vector: withVector ? extractDenseVector(point.vector) : undefined,
+      }));
 
       if (!response.next_page_offset) break;
       offset = response.next_page_offset as string | number | undefined;
     }
+  }
 
+  async scrollAll(
+    collectionName: string,
+    batchSize = 100,
+    // Distillation's clustering pass (add-memory-distillation) needs the raw
+    // vectors behind every point in a collection to compute cosine similarity
+    // in memory; every pre-existing caller omits this, so `with_vector` stays
+    // `false` (its original hardcoded value) and their behavior is unchanged.
+    withVector = false,
+  ): Promise<Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }>> {
+    const allPoints: Array<{ id: string; payload: Record<string, unknown>; vector?: number[] }> = [];
+    for await (const page of this.scrollAllPages(collectionName, batchSize, withVector)) {
+      allPoints.push(...page);
+    }
     return allPoints;
   }
 

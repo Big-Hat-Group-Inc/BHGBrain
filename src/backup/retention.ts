@@ -1,8 +1,8 @@
-import { v4 as uuidv4 } from 'uuid';
 import type { BrainConfig } from '../config/index.js';
 import type { StorageManager, DeleteMemoriesResult } from '../storage/index.js';
 import type { ArchiveRecord, MemoryRecord, RetentionTier } from '../domain/types.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
+import { buildRestoredMemoryFromArchive } from '../domain/archive-restore.js';
 import type { MetricsCollector } from '../health/metrics.js';
 
 type CleanupPageSqlite = {
@@ -446,62 +446,37 @@ export class RetentionService {
     return this.lifecycle.buildMetadata(tier, new Date());
   }
 
-  async restoreArchive(memoryId: string): Promise<{ restored: boolean; id: string }> {
+  async restoreArchive(
+    memoryId: string,
+  ): Promise<{ restored: boolean; id: string; restored_from?: string; archive_id?: number }> {
     const archived = this.storage.sqlite.getArchiveByMemoryId(memoryId);
     if (!archived) {
       return { restored: false, id: memoryId };
     }
 
-    const now = new Date().toISOString();
-    const metadata = this.lifecycle.buildMetadata(archived.tier, new Date(now));
-    const memory: Omit<MemoryRecord, 'embedding'> = {
-      id: archived.memory_id || uuidv4(),
-      namespace: archived.namespace,
-      collection: 'general',
-      type: 'semantic',
-      category: null,
-      content: archived.summary,
-      summary: archived.summary,
-      tags: archived.tags,
-      source: 'cli',
-      checksum: archived.memory_id,
-      importance: 0.5,
-      retention_tier: archived.tier,
-      expires_at: metadata.expires_at,
-      decay_eligible: metadata.decay_eligible,
-      review_due: metadata.review_due,
-      access_count: 0,
-      last_operation: 'ADD',
-      merged_from: null,
-      archived: false,
-      vector_synced: true,
-      // Archive rows carry no pin state (ArchiveRecord has no `pinned`
-      // field), so a restore never resurrects a memory as pinned.
-      pinned: false,
-      // Archive rows carry no origin/confidence either (ArchiveRecord has
-      // neither field) — a restore has no provenance to recover, so this
-      // matches the "legacy row" default (origin: null, confidence: 1.0).
-      // See add-memory-provenance-metadata.
-      origin: null,
-      confidence: 1.0,
-      created_at: now,
-      updated_at: now,
-      last_accessed: now,
-    };
+    // Shared with the `review` MCP tool's `restore` action (src/tools/index.ts)
+    // so checksum, expiry/review, and provenance fields cannot drift between
+    // the CLI and tool entrypoints — see
+    // openspec/changes/make-backup-restore-transactional (task 2.4). An
+    // earlier version of this method derived `checksum` from
+    // `archived.memory_id` (an unrelated identifier) rather than the
+    // restored content.
+    const memory = buildRestoredMemoryFromArchive(this.config, archived, { source: 'cli' });
     const vector = await this.storage.embedding.embed(memory.content);
     await this.storage.writeMemory(memory, vector);
-    this.storage.sqlite.deleteArchive(memoryId);
+    // Archive row is retained (not deleted) so the origin stays inspectable,
+    // matching the `review` tool's restore behavior.
     this.storage.logAudit('RESTORE', memory.id, memory.namespace, 'system', {
       details: {
         memory_id: memory.id,
         prior_tier: null,
         new_tier: archived.tier,
         actor: 'system',
-        timestamp: now,
+        timestamp: memory.created_at,
         action: 'restore',
       },
     });
     this.storage.sqlite.flushIfDirty();
-    return { restored: true, id: memory.id };
+    return { restored: true, id: memory.id, restored_from: archived.memory_id, archive_id: archived.id };
   }
 }
