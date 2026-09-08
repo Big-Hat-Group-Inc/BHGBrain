@@ -245,7 +245,7 @@ export const MCP_TOOL_DEFINITIONS = [
   {
     name: 'bootstrap',
     title: 'Bootstrap Interview',
-    description: 'Interactive bootstrap interview for building your profile. Drives a stateful 10-section interview, storing memories as you go. Supports pause/resume across sessions.',
+    description: 'Interactive bootstrap interview for building your profile. Drives a stateful 10-section interview, storing memories as you go. Supports pause/resume across sessions. action: "reset" permanently deletes the section\'s memories and requires confirm: "RESET".',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -253,12 +253,17 @@ export const MCP_TOOL_DEFINITIONS = [
         section: { type: 'number', minimum: 1, maximum: 10, description: 'Section number (required for submit and reset)' },
         answers: { type: 'string', description: 'Your answers for the section (required for submit)', maxLength: 500000 },
         namespace: { type: 'string', description: 'Namespace scope (default: profile)', pattern: '^[a-zA-Z0-9/-]{1,200}$' },
+        confirm: { type: 'string', description: 'Required for action: "reset" only — must be exactly "RESET". Omitted or wrong values leave storage unchanged.' },
       },
       required: ['action'],
       additionalProperties: false,
     },
-    // Writes interview memories; nothing is discarded.
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    // `start`/`submit`/`status` are additive/non-destructive, but the MCP SDK
+    // cannot express a per-action annotation — `reset` permanently deletes
+    // the section's memories, so the whole tool is marked destructive (see
+    // design.md decision 6) and `reset` additionally requires an exact
+    // confirm: "RESET" value (align-runtime-entrypoint-contracts task 2.4).
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   {
     name: 'import',

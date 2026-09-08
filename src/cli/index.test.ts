@@ -246,6 +246,30 @@ describe('CLI', () => {
     expect(errorSpy).toHaveBeenCalledWith('Memory missing not found.');
   });
 
+  it('sets a non-zero exit code when a tool call returns an error envelope (align-runtime-entrypoint-contracts task 2.2)', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { handleTool } = await import('../tools/index.js');
+    vi.mocked(handleTool).mockImplementation(async () => (
+      { error: { code: 'NOT_FOUND', message: 'Memory not found', retryable: false } }
+    ));
+
+    const context = createMockContext();
+    await runProgram(['forget', '12345678-1234-1234-1234-123456789abc'], context);
+
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('leaves the exit code untouched on a successful tool call', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { handleTool } = await import('../tools/index.js');
+    vi.mocked(handleTool).mockImplementation(async () => ({ ok: true }));
+
+    const context = createMockContext();
+    await runProgram(['forget', '12345678-1234-1234-1234-123456789abc'], context);
+
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it('covers server and maintenance commands', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const execFileSync = vi.fn();
@@ -268,6 +292,15 @@ describe('CLI', () => {
       expect.arrayContaining(['--stdio']),
       { stdio: 'inherit' },
     );
+    // align-runtime-entrypoint-contracts task 3.4: the spawned entry path
+    // must be a real filesystem path (via fileURLToPath), not a raw file:
+    // URL .pathname — which stays percent-encoded and, on Windows, keeps a
+    // leading slash before the drive letter.
+    const [, spawnArgs] = execFileSync.mock.calls[0] as [string, string[]];
+    const entryPath = spawnArgs[0]!;
+    expect(entryPath).not.toContain('file://');
+    expect(entryPath).not.toMatch(/%[0-9A-Fa-f]{2}/);
+    expect(entryPath.endsWith('index.js')).toBe(true);
     expect(logSpy).toHaveBeenCalledWith('New token: token-1234');
     expect(distillationMocks.runOnce).toHaveBeenCalledWith({ dryRun: true });
     expect(logSpy).toHaveBeenCalledWith(JSON.stringify(

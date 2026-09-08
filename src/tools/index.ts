@@ -18,14 +18,26 @@ import {
 import type {
   WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter, RetentionTier,
 } from '../domain/types.js';
-import { BrainError, invalidInput, notFound, conflict } from '../errors/index.js';
+import { BrainError, invalidInput, notFound, conflict, classifyResidualLockError } from '../errors/index.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { assembleWithinCharBudget } from '../domain/response-budget.js';
 import { buildRestoredMemoryFromArchive } from '../domain/archive-restore.js';
 import { handleImport } from './import.js';
 import { handleBootstrap } from './bootstrap.js';
 import { computeRecallFetchLimit } from './recall-pool.js';
+import { MCP_TOOL_NAMES } from './schemas.js';
+import { toLogError, withStableFields } from '../health/logger.js';
 import { ZodError } from 'zod';
+
+// strengthen-operational-observability task 2.1: the one bounded label a
+// tool-call metric may use in place of an unrecognized/unvalidated tool
+// name — a REST caller probing arbitrary `/tool/:name` paths must never be
+// able to allocate its own permanent metric series, however many distinct
+// bogus names it tries. `dispatch`'s own `default:` branch still reports
+// the real (unbounded) name in the thrown `INVALID_INPUT` message and in
+// structured logs, where cardinality is not a concern — only the metrics
+// registry is bounded this way.
+const UNKNOWN_TOOL_METRIC_LABEL = 'invalid_tool';
 
 // Fixed slack reserved out of `defaults.max_response_chars` for a result
 // object's own envelope — the `results`/`truncated`/`degraded` keys, array
@@ -79,9 +91,19 @@ export async function handleTool(
   toolName: string,
   args: unknown,
   clientId = 'unknown',
+  // strengthen-operational-observability task 1.5: a request/session-scoped
+  // child logger (carrying `request_id`/`session_id`/trusted client
+  // identity — see transport/middleware.ts's `createRequestContextMiddleware`
+  // and transport/mcp-http.ts/mcp-server.ts's per-session/per-call child
+  // loggers) so this call's `tool_call`/`tool_error` events correlate back
+  // to the exact request that produced them, even when several concurrent
+  // callers are in flight. Falls back to the process-wide `ctx.logger` for
+  // any caller that has not been threaded through yet (the CLI's one-shot
+  // invocations, and any test double).
+  requestLogger?: pino.Logger,
 ): Promise<unknown> {
   const start = Date.now();
-  ctx.metrics.incCounter('bhgbrain_tool_calls_total');
+  const logger = requestLogger ?? ctx.logger;
   const logCtx: ToolLogContext = {};
   // Hoisted so the `finally` block below can record the tool-handler latency
   // histogram exactly once, on every path (success, BrainError, and
@@ -89,11 +111,14 @@ export async function handleTool(
   // in the try/catch branches, each computing `duration` once per branch.
   let duration = 0;
   let status: 'ok' | 'error' = 'ok';
+  // strengthen-operational-observability task 2.1: bounded label — see
+  // `UNKNOWN_TOOL_METRIC_LABEL`'s doc comment above.
+  const metricTool = MCP_TOOL_NAMES.has(toolName) ? toolName : UNKNOWN_TOOL_METRIC_LABEL;
 
   try {
     const result = await dispatch(ctx, toolName, args, clientId, logCtx);
     duration = Date.now() - start;
-    ctx.logger.info({
+    logger.info({
       event: 'tool_call', tool: toolName, duration_ms: duration, client_id: clientId,
       namespace: logCtx.namespace ?? null,
     });
@@ -108,18 +133,32 @@ export async function handleTool(
     // it here, at the one place every tool call funnels through, so the
     // client sees a retryable CONFLICT (and a real reason) instead of a
     // generic INTERNAL error masking what actually happened.
-    const err = (!(rawErr instanceof BrainError) && /Storage lifecycle operation.*in progress/.test((rawErr as Error).message))
+    const lifecycleClassified = (!(rawErr instanceof BrainError) && /Storage lifecycle operation.*in progress/.test((rawErr as Error).message))
       ? new BrainError('CONFLICT', (rawErr as Error).message, true)
       : rawErr;
+    // harden-dual-store-mutations task 2.5: a residual SQLite lock error —
+    // raw (a call site that never wrapped it) or already flattened into a
+    // non-CONFLICT BrainError's message by an intermediate `internal(...)`
+    // catch — is reclassified the same way as the lifecycle-lock case above,
+    // so every REST/MCP caller sees a retryable CONFLICT rather than a
+    // generic non-retryable INTERNAL error for what is, in fact, ordinary
+    // transient write contention. See errors/index.ts's
+    // `classifyResidualLockError`.
+    const err = classifyResidualLockError(lifecycleClassified);
     if (err instanceof BrainError) {
-      ctx.logger.warn({
-        event: 'tool_error', tool: toolName, error_code: err.code, duration_ms: duration, client_id: clientId,
+      // strengthen-operational-observability task 1.2: the exception is
+      // logged under the standardized `err` field (pino's serializer picks
+      // up BrainError's own `code`/`retryable` properties automatically —
+      // see health/logger.ts) rather than flattened to a bare `error_code`
+      // string, so the message/stack/cause survive into the log line too.
+      logger.warn({
+        event: 'tool_error', tool: toolName, err, duration_ms: duration, client_id: clientId,
         namespace: logCtx.namespace ?? null,
       });
       return err.toEnvelope();
     }
-    ctx.logger.error({
-      event: 'tool_error', tool: toolName, error: (err as Error).message, duration_ms: duration, client_id: clientId,
+    logger.error({
+      event: 'tool_error', tool: toolName, err: toLogError(err), duration_ms: duration, client_id: clientId,
       namespace: logCtx.namespace ?? null,
     });
     return { error: { code: 'INTERNAL', message: 'An unexpected error occurred', retryable: true } };
@@ -127,7 +166,14 @@ export async function handleTool(
     // Per-tool identification via a `tool` label (design decision 2), plus an
     // `ok`/`error` status label so the success/failure split is preserved
     // without excluding failures from the latency histogram itself.
-    ctx.metrics.recordHistogram('bhgbrain_tool_handler_ms', duration, { tool: toolName, status });
+    ctx.metrics.recordHistogram('bhgbrain_tool_handler_ms', duration, { tool: metricTool, status });
+    // strengthen-operational-observability task 2.3: a true monotonic
+    // cumulative counter — distinct from the rolling latency histogram's
+    // bounded sample window — so an operator can derive a tool's error rate
+    // (error count / total count) from `bhgbrain_tool_calls_total` and have
+    // it stay meaningful indefinitely, not just across the most recent 1,000
+    // calls the histogram's buffer retains.
+    ctx.metrics.incCounter('bhgbrain_tool_calls_total', 1, { tool: metricTool, status });
   }
 }
 
@@ -1001,7 +1047,7 @@ async function handleConsolidateMerge(
 
   if (liveSources.length === 0) {
     for (const failure of failures) {
-      ctx.logger.warn({ event: 'consolidation_source_failed', target_id: targetId, ...failure });
+      ctx.logger.warn(withStableFields({ event: 'consolidation_source_failed', target_id: targetId }, failure));
     }
     return { target_id: targetId, merged: [], failed: failures.map(failure => failure.id), failures };
   }
@@ -1069,7 +1115,7 @@ async function handleConsolidateMerge(
   }
 
   for (const failure of failures) {
-    ctx.logger.warn({ event: 'consolidation_source_failed', target_id: targetId, ...failure });
+    ctx.logger.warn(withStableFields({ event: 'consolidation_source_failed', target_id: targetId }, failure));
   }
 
   ctx.metrics.setGauge('bhgbrain_memory_count', ctx.storage.sqlite.countMemories());

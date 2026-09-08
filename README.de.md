@@ -1117,6 +1117,8 @@ Das repair-Tool:
 
 **Hinweis**: Erinnerungen, die vor dem Feature Content-in-Qdrant gespeichert wurden (vor 1.3), haben keinen Inhalt in ihrem Qdrant-Payload und können nicht über repair wiederhergestellt werden. Nur Metadaten (Tags, Typ, Wichtigkeit) bleiben für diese Einträge erhalten.
 
+**Automatische Hydration bei jedem Start, wiederaufnehmbar.** Dieselbe Wiederherstellung läuft auch automatisch bei jedem Serverstart ab (nicht nur bei `repair --from-qdrant`), pro Qdrant-Collection statt an die lokale Erinnerungsanzahl gekoppelt: Das Ergebnis jeder Collection wird dauerhaft in der lokalen SQLite-Datenbank festgehalten (`complete` oder `failed`), sodass eine Collection, deren Hydration fehlschlägt (ein vorübergehender Netzwerk-/Qdrant-Fehler, kein Datenproblem einzelner Punkte — siehe Hinweis oben), beim *nächsten* Start erneut versucht wird, statt dass eine zuvor erfolgreich hydrierte Collection den Fehler dauerhaft verdeckt. Eine bereits als `complete` verzeichnete Collection wird beim automatischen Pfad übersprungen (nicht erneut durchlaufen), sodass ein vollständig hydrierter Speicher bei jedem Start nur einen günstigen Qdrant-Collection-Listenaufruf kostet, keinen vollständigen erneuten Scan — `bhgbrain repair --from-qdrant` führt dagegen immer einen vollständigen erneuten Scan jeder Collection durch, unabhängig vom verzeichneten Status, da dieser Befehl selbst eine bewusste Wiederherstellungsanfrage ist. `health://status`s `components.bootstrap_hydration` meldet `"degraded"`, solange eine Collection als `failed` verzeichnet ist, und benennt sie, sodass eine hängengebliebene Collection ohne Log-Analyse sichtbar ist.
+
 ### Migration des Einbettungsmodells
 
 Jeder Vektor wird beim Schreiben mit einer anbieterqualifizierten Identität versehen —
@@ -2512,7 +2514,27 @@ Gibt einen `HealthSnapshot` von `GET /health` zurück:
     "sqlite": { "status": "healthy" },
     "qdrant": { "status": "healthy" },
     "embedding": { "status": "healthy" },
-    "retention": { "status": "healthy" }
+    "vector_reconciliation": {
+      "status": "healthy",
+      "state": "reconciled",
+      "unsynced_vectors": 0,
+      "drift_cause": null,
+      "qdrant_points_total": 1234,
+      "sqlite_memory_count": 1234,
+      "checked_at": "2026-03-01T00:00:00.000Z"
+    },
+    "retention": { "status": "healthy" },
+    "capacity": {
+      "status": "healthy",
+      "db_size_bytes": 8388608,
+      "db_size_limit_bytes": 2147483648,
+      "db_size_percent": 0.4,
+      "memory_count": 1234,
+      "memory_count_limit": 500000,
+      "memory_count_percent": 0.2
+    },
+    "schedulers": { "status": "healthy" },
+    "bootstrap_hydration": { "status": "healthy" }
   },
   "memory_count": 1234,
   "db_size_bytes": 8388608,
@@ -2539,11 +2561,17 @@ Gibt einen `HealthSnapshot` von `GET /health` zurück:
 
 `components.retention` wird ebenfalls `"degraded"` (mit Nachricht), wenn der letzte GC-Lauf — geplant oder manuell — einen teilweisen Fehler gemeldet hat (ein Archivierungs- oder Löschschritt ist fehlgeschlagen), unabhängig vom Kapazitätsdruck der Stufen. Der Status wird beim nächsten sauberen GC-Lauf wieder auf `"healthy"` zurückgesetzt.
 
+`components.capacity` prüft `retention.max_db_size_gb`/`retention.max_memories` (die harten Obergrenzen) UND `retention.warn_at_percent` (eine frühe Warnschwelle, Standard 80 %) gegen die aktuelle Byte-Größe und Speicheranzahl des Stores — der Status wird `"degraded"`, sobald eine der beiden die Warnschwelle überschreitet, mit einer Nachricht, die zwischen „nähert sich" der Grenze und tatsächlich „erreicht" unterscheidet, sodass ein Betreiber Vorwarnzeit hat, bevor Schreibvorgänge betroffen sind. `db_size_percent`/`memory_count_percent` werden immer gemeldet, unabhängig vom Status.
+
+`components.vector_reconciliation.state` ist entweder `"reconciled"` (gesund — SQLite und der Vektor-Store stimmen überein), `"reconciling"` (eine Wiederherstellung oder ein begrenztes Hintergrund-Re-Embedding läuft gerade), `"pending"` (SQLite-Metadaten benötigen Vektoren, und nichts gleicht das gerade ab — automatische Wiederholung ausgeschöpft, oder ein Reparaturlauf ist nötig) oder `"surplus_suspected"` (der Vektor-Store meldet deutlich mehr verwaltete Punkte, als SQLite maßgebliche Erinnerungen dafür hat — vermutlich verwaiste, nur-vektor-vorhandene Punkte aus einem unterbrochenen Löschvorgang). `drift_cause` unterscheidet, sofern nicht `null`, *warum* `"reconciling"`/`"pending"` degradiert ist: `"full-rebuild"` (das Embedding-Modell/die Dimensionen haben sich seit der letzten Wiederherstellung geändert), `"inspection-failed"` (ein vorübergehender Qdrant-Lesefehler während der letzten Wiederherstellung, vorsorglich als re-embedding-bedürftig behandelt — **keine** Modelländerung) oder `"partial-drift"` (eine gewöhnliche Prüfsummen-Abweichung im Inhalt). Der Wert bleibt über den Wiederherstellungsaufruf hinaus, der ihn entdeckt hat, gespeichert und ist daher bei späteren `/health`-Abfragen sichtbar, bis die Abgleichung ihn auflöst. `qdrant_points_total`/`sqlite_memory_count`/`checked_at` melden den gecachten bidirektionalen Zählvergleich (Task 3.2), der `"surplus_suspected"` erkennt — 60 Sekunden gecacht (ein Scan über alle Qdrant-Collections, kein günstiger lokaler Lesevorgang), kann also bis zu diese Zeitspanne hinter einem live geschriebenen Wert zurückliegen; schlägt die Berechnung vorübergehend fehl, werden die Felder für diese Abfrage einfach weggelassen, statt die gesamte Antwort scheitern zu lassen.
+
 `components.sqlite` bleibt `"healthy"`, führt aber eine `message`, wenn das laufende SQLite-Build kein `fts5`-Modul besitzt: Die Volltextsuche läuft dann über den alten `LIKE`-basierten Matcher (siehe [Volltextsuche](#volltextsuche)) statt über einen FTS5/BM25-Index. Dies wird auch einmalig beim Start protokolliert (`event: "fts5_unavailable"`).
+
+`components.bootstrap_hydration` wird `"degraded"` (mit Nennung der betroffenen Collection(s) in `message`), solange eine Qdrant-Collection im dauerhaften Hydration-Status dieses Geräts als `"failed"` verzeichnet ist — d. h. ein Vektor-zu-SQLite-Hydration-Durchlauf ist für diese Collection auf einen Fehler gestoßen (ein vorübergehender Netzwerk-/Qdrant-Fehler, kein Datenproblem einzelner Punkte) und wurde noch nicht erfolgreich wiederholt. Der Status wechselt zurück auf `"healthy"`, sobald ein späterer Hydration-Durchlauf (der nächste Prozessstart oder `bhgbrain repair --from-qdrant`) diese Collection erfolgreich hydriert. Siehe [Reparatur und Wiederherstellung](#reparatur-und-wiederherstellung).
 
 **Gesamtstatus-Logik:**
 - `unhealthy` — wenn SQLite oder Qdrant fehlerhaft ist
-- `degraded` — wenn Einbettung degradiert/fehlerhaft ist, ODER Aufbewahrung degradiert ist (über Kapazität oder nicht synchronisierte Vektoren)
+- `degraded` — wenn Einbettung degradiert/fehlerhaft ist, ODER Aufbewahrung degradiert ist (über Kapazität oder nicht synchronisierte Vektoren), ODER die Kapazität die Warnschwelle überschreitet, ODER die Vektorabgleichung sich in `reconciling`/`pending`/`surplus_suspected` befindet, ODER ein Scheduler fehlgeschlagen oder nicht aktiviert ist, ODER eine Bootstrap-Hydration-Collection degradiert ist (fehlgeschlagen und auf Wiederholung wartend)
 - `healthy` — alle Komponenten sind gesund
 
 **Komponentenstatus:**
@@ -2554,6 +2582,10 @@ Gibt einen `HealthSnapshot` von `GET /health` zurück:
 | `qdrant` | Eine begrenzte, lesende Vektorabfrage ist erfolgreich (ein leeres Ergebnis oder eine noch nicht angelegte Collection gelten ebenfalls als gesund) | — | Die Vektorabfrage selbst schlägt fehl, auch wenn der Server erreichbar ist |
 | `embedding` | Embed-API-Aufruf erfolgreich | Fehlende Anmeldedaten oder nicht erreichbar | — |
 | `retention` | Alle Budgets innerhalb der Limits, keine nicht synchronisierten Vektoren | Budget überschritten ODER nicht synchronisierte Vektoren > 0 | — |
+| `capacity` | DB-Größe und Speicheranzahl beide unter `warn_at_percent` ihrer konfigurierten Limits | Eine der beiden überschreitet `warn_at_percent`, oder erreicht ihre harte Obergrenze | — |
+| `vector_reconciliation` | SQLite und Qdrant stimmen überein (keine nicht synchronisierten Metadaten, kein vermuteter Überschuss) | Abgleichung läuft, steht aus, oder ein vermuteter Vektor-Überschuss | — |
+| `schedulers` | Jeder konfigurierte geplante Job (Cleanup, Distillation) ist aktiviert und ohne verzeichneten Fehler | Ein konfigurierter Job ist bei seinem letzten Lauf fehlgeschlagen oder ist nicht aktiviert | — |
+| `bootstrap_hydration` | Jede entdeckte Qdrant-Collection ist hydriert (oder es existiert noch keine) | Mindestens eine Collection konnte nicht hydriert werden und wartet auf Wiederholung | — |
 
 **Circuit-Breaker:** Das `circuitBreakers`-Objekt meldet den Zustand jedes Unterbrechers für externe Abhängigkeiten (`closed`, `open` oder `half-open`). Ist ein Breaker `open`, werden Anfragen an diese Abhängigkeit bis zum Ablauf des Öffnungsfensters und einer erfolgreichen Half-Open-Probe mit einem `CircuitOpenError` kurzgeschlossen. Schwellenwerte werden über `resilience.circuit_breaker` konfiguriert (siehe [Konfiguration](#konfiguration)).
 
@@ -2676,36 +2708,44 @@ den Sweep-Timer und schließt jede lebende Sitzungs-Transport.
 
 ### Metriken
 
-Wenn `observability.metrics_enabled: true`, ist ein Metriken-Endpunkt verfügbar:
-
 ```bash
 GET /metrics
 ```
 
-Gibt Metriken im Prometheus-Textformat zurück: eine `# TYPE <name> <counter|gauge|histogram>`-Zeile
-einmal pro Metrikname, gefolgt von `name{label="value",...} value`-Zeilen (der `{...}`-Teil entfällt bei
-Metriken ohne Labels, sodass die Ausgabe abwärtskompatibel zum vorherigen labellosen Format bleibt).
+Wenn `observability.metrics_enabled: true` (Standard `false`), gibt dies Metriken im
+Prometheus-Textformat zurück: eine `# TYPE <name> <counter|gauge|histogram>`-Zeile einmal pro
+Metrikname, gefolgt von `name{label="value",...} value`-Zeilen (der `{...}`-Teil entfällt bei Metriken
+ohne Labels).
+
+Sind Metriken deaktiviert, existiert die Route trotzdem — sie antwortet mit `503` und einer expliziten
+Erklärung (`{"metrics_enabled": false, "message": "..."}`) statt mit Express' generischem
+„Route nicht gefunden"-`404`, und der Server protokolliert beim Start einmalig ein
+`metrics_disabled`-Ereignis, sodass „ist `/metrics` deaktiviert, oder gibt es das in diesem Build gar
+nicht" nie mehrdeutig ist — weder bei einer Abfrage noch im Log.
 
 | Metrik | Typ | Beschreibung |
 |---|---|---|
-| `bhgbrain_tool_calls_total` | Zähler | Gesamte Tool-Aufrufe |
-| `bhgbrain_tool_handler_ms_avg` | Histogramm | Durchschnittliche Tool-Handler-Latenz in Millisekunden, mit den Labels `tool` (Tool-Name) und `status` (`ok`/`error`). Wird bei jedem Aufruf erfasst, auch bei Fehlern. |
+| `bhgbrain_tool_calls_total` | Zähler | Monoton wachsende Zählung der Tool-Abschlüsse, mit den Labels `tool` (aus der festen Dispatch-Menge — ein unbekannter Name wird als `invalid_tool` gemeldet und erzeugt nie eine eigene Serie) und `status` (`ok`/`error`). Anders als das Latenz-Histogramm unten setzt sich dieser Zähler nie zurück, sodass `error / total` allein aus diesem Zähler dauerhaft aussagekräftig bleibt – nicht nur über die letzten 1.000 Aufrufe. |
+| `bhgbrain_tool_handler_ms_avg` | Histogramm | Durchschnittliche Tool-Handler-Latenz in Millisekunden, mit den Labels `tool` und `status`. Wird bei jedem Aufruf erfasst, auch bei Fehlern. |
 | `bhgbrain_tool_handler_ms_p50` | Histogramm | 50. Perzentil der Tool-Handler-Latenz, mit den Labels `tool` und `status` |
 | `bhgbrain_tool_handler_ms_p95` | Histogramm | 95. Perzentil der Tool-Handler-Latenz, mit den Labels `tool` und `status` |
 | `bhgbrain_tool_handler_ms_p99` | Histogramm | 99. Perzentil der Tool-Handler-Latenz, mit den Labels `tool` und `status` |
-| `bhgbrain_tool_handler_ms_count` | Zähler | Anzahl der Tool-Handler-Latenzmessungen, mit den Labels `tool` und `status` |
+| `bhgbrain_tool_handler_ms_sample_count` | Messuhr | Aktuelle Belegung des Rolling-Fensters (0-1000) für diese `tool`/`status`-Kombination — **nicht** monoton, da ältere Messungen aus dem Fenster fallen |
+| `bhgbrain_tool_handler_ms_observations_total` | Zähler | Echte monotone Gesamtzahl aller je erfassten Tool-Handler-Latenzmessungen für diese `tool`/`status`-Kombination, unbeeinflusst vom Verdrängen im Rolling-Fenster |
 | `embedding_embed_batch_ms_p95` | Histogramm | 95. Perzentil der Embedding-Batch-Latenz |
 | `search_total_ms_p95` | Histogramm | 95. Perzentil der End-to-End-Suchlatenz |
 | `search_result_count_avg` | Histogramm | Durchschnittliche Anzahl der pro `search`/`recall`-Aufruf zurückgegebenen Ergebnisse, mit `mode`-Label (`semantic`/`fulltext`/`hybrid`). Zählt nur modus-spezifische Ergebnisse - von `include_archived` angehängte archivierte Treffer sind ausgeschlossen. |
 | `search_result_count_p50` | Histogramm | 50. Perzentil der Ergebnisanzahl, mit `mode`-Label |
 | `search_result_count_p95` | Histogramm | 95. Perzentil der Ergebnisanzahl, mit `mode`-Label |
 | `search_result_count_p99` | Histogramm | 99. Perzentil der Ergebnisanzahl, mit `mode`-Label |
-| `search_result_count_count` | Zähler | Anzahl der `search_result_count`-Stichproben, mit `mode`-Label |
+| `search_result_count_sample_count` | Messuhr | Aktuelle Belegung des Rolling-Fensters, mit `mode`-Label |
+| `search_result_count_observations_total` | Zähler | Echte monotone Gesamtzahl der `search_result_count`-Stichproben, mit `mode`-Label |
 | `search_result_score_avg` | Histogramm | Durchschnittlicher zusammengesetzter Ergebnis-Score pro `search`/`recall`-Aufruf, mit `mode`-Label. Ein Sample pro Ergebnis; archivierte Treffer sind ausgeschlossen, da sie einen Platzhalter-Score (keinen Relevanz-Score) tragen. |
 | `search_result_score_p50` | Histogramm | 50. Perzentil des zusammengesetzten Ergebnis-Scores, mit `mode`-Label |
 | `search_result_score_p95` | Histogramm | 95. Perzentil des zusammengesetzten Ergebnis-Scores, mit `mode`-Label |
 | `search_result_score_p99` | Histogramm | 99. Perzentil des zusammengesetzten Ergebnis-Scores, mit `mode`-Label |
-| `search_result_score_count` | Zähler | Anzahl der `search_result_score`-Stichproben, mit `mode`-Label |
+| `search_result_score_sample_count` | Messuhr | Aktuelle Belegung des Rolling-Fensters, mit `mode`-Label |
+| `search_result_score_observations_total` | Zähler | Echte monotone Gesamtzahl der `search_result_score`-Stichproben, mit `mode`-Label |
 | `bhgbrain_memory_count` | Messuhr | Aktuelle Gesamt-Erinnerungsanzahl (bei Schreiben/Löschen aktualisiert) |
 | `bhgbrain_rate_limit_buckets` | Messuhr | Aktive Rate-Limit-Verfolgungseimer |
 | `bhgbrain_rate_limited_total` | Zähler | Gesamt rate-limitierte Anfragen |
@@ -2716,7 +2756,9 @@ Metriken ohne Labels, sodass die Ausgabe abwärtskompatibel zum vorherigen label
 | `bhgbrain_mcp_sessions_evicted_total` | Zähler | Gesamtzahl der vom Sitzungsmanager geschlossenen MCP-HTTP-Sitzungen, mit Label `reason` (`idle` oder `capacity`) |
 | `recall_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive Nachprüfung von `recall` (Typ/Tags/`after`/`before`) nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
 | `search_zero_after_filter` | Zähler | Wird erhöht, wenn die defensive `after`/`before`-Nachprüfung von `search` nach dem Abruf ein Ergebnis entfernt, das der Speicher bereits als passend gemeldet hatte – ein Signal für Filter-Aushungerung, das im Normalfall bei 0 bleiben sollte |
-| `search_embedding_degraded` | Zähler | Wird erhöht, wenn eine Suche im Modus `hybrid` auf reinen Volltext zurückfällt, weil der Embedding-Provider oder der Vektorspeicher nicht verfügbar ist, mit `namespace`-Label |
+| `search_embedding_degraded` | Zähler | Wird erhöht, wenn eine Suche vom semantischen Scoring zurückfällt, weil der Embedding-Provider oder der Vektorspeicher nicht verfügbar ist, mit `mode`-Label (`semantic`/`hybrid`). **Nicht** mit `namespace`-Label – ein unbegrenzter, vom Aufrufer kontrollierter Wert wird nie zu einem Metrik-Label (siehe unten). |
+| `bhgbrain_metrics_dropped_series_total` | Zähler | Kumulative Zählung neuer Metrik-Serien, die die Registry ablehnte, weil sie bereits an ihrer festen Obergrenze war. Ab der ersten Abfrage vorhanden (bei `0`), sodass Sättigung sichtbar ist, ohne selbst eine Serie zu belegen. |
+| `bhgbrain_metrics_registry_size` | Messuhr | Aktuelle Gesamtzahl unterschiedlicher Serien (Zähler + Histogramm-Familien) in der In-Process-Registry |
 
 Zum Beispiel:
 
@@ -2727,10 +2769,52 @@ bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
 ```
 
 Histogramme verwenden einen begrenzten Ringpuffer der letzten 1.000 Messungen **pro Label-Kombination**
-(jede Tool-/Status-Kombination erhält also ihr eigenes 1.000-Messungen-Fenster). Metriken sind nur im
-Prozess – es gibt keinen externen Push. Da Fehler jetzt in `bhgbrain_tool_handler_ms` enthalten sind,
-spiegeln p95/p99 den langsamen Fehler-Tail wider (Timeouts, geöffnete Circuit-Breaker usw.) und können
-höher ausfallen als bevor diese Metrik Fehler erfasste.
+(jede Tool-/Status-Kombination erhält also ihr eigenes 1.000-Messungen-Fenster) — die Belegung dieses
+Rolling-Fensters wird als `_sample_count`-Messuhr ausgegeben, nie als `_count`-Zähler, damit ein Scraper
+sie nicht für monoton hält; der `_observations_total`-Zähler daneben ist die tatsächliche monotone
+Größe. Metriken sind nur im Prozess – es gibt keinen externen Push. Da Fehler jetzt in
+`bhgbrain_tool_handler_ms` enthalten sind, spiegeln p95/p99 den langsamen Fehler-Tail wider (Timeouts,
+geöffnete Circuit-Breaker usw.) und können höher ausfallen als bevor diese Metrik Fehler erfasste.
+
+**Begrenzte Kardinalität:** Die gesamte In-Process-Registry (jeder Zähler und jede Histogramm-Familie
+zusammen) ist auf eine feste Gesamtzahl von Serien begrenzt. Label-Werte, die sonst unbegrenzt wären –
+ein unbekannter Tool-Name von einem REST-Aufrufer, der beliebige `/tool/:name`-Pfade abfragt, ein
+Namespace, eine Collection – werden entweder vor der Verwendung als Label auf ein kleines, festes
+Vokabular normalisiert (`invalid_tool` für einen unbekannten Tool-Namen) oder ganz aus dem Label-Set
+weggelassen (Namespace/Collection), sodass keine Kombination vom Aufrufer kontrollierter Eingaben die
+Registry unbegrenzt wachsen lassen kann. Ist die Obergrenze erreicht, wird eine tatsächlich neue Serie
+abgelehnt statt angelegt (sichtbar über `bhgbrain_metrics_dropped_series_total`/
+`bhgbrain_metrics_registry_size` oben); eine bereits verfolgte Serie ist davon nie betroffen.
+
+### Anfragekorrelation und strukturierte Logs
+
+Jede HTTP-Antwort trägt einen `X-Request-Id`-Header — übernommen aus einem eingehenden
+`X-Request-Id`-Anfrage-Header, falls vorhanden (damit eine Anfrage über einen vorgeschalteten Proxy
+hinweg nachverfolgbar bleibt), sonst neu generiert — und jede Log-Zeile, die der Server während der
+Bearbeitung dieser Anfrage erzeugt (der Tool-Aufruf selbst und der abschließende Fehlerhandler bei
+einem Fehlschlag), enthält dasselbe `request_id`-Feld, plus `client_id`, wenn ableitbar. Über MCP sind
+die entsprechenden Kennungen `session_id` (eine pro Streamable-HTTP-Sitzung, konstant für deren
+Lebensdauer) und `call_id` (eine pro Tool-Aufruf innerhalb dieser Sitzung, bzw. pro Aufruf bei stdio).
+Damit kann ein Betreiber jede Log-Zeile für genau eine fehlschlagende Anfrage aus einem belebten,
+nebenläufigen Server herausfiltern — per Grep auf die für den Client sichtbare `request_id`/`session_id`
+aus einem Header oder Fehler, nicht anhand eines Zeitfensters, in das mehrere gleichzeitige Aufrufe
+gleichermaßen passen könnten.
+
+Jede Log-Zeile trägt außerdem feste `service`/`version`-Basisfelder, und jede Ausnahme wird unter einem
+einzigen `err`-Feld protokolliert (Typ, Nachricht, Stack und — wenn der zugrunde liegende `Error` mit
+`{ cause }` konstruiert wurde — die in dieselbe Nachricht/denselben Stack eingefaltete Ursachenkette)
+statt eines pro Aufrufstelle uneinheitlich benannten, abgeflachten `error`/`message`/`stack`-Felder-Sets.
+Der eigene `code`/`retryable` eines `BrainError` wird auf dasselbe `err`-Objekt übertragen.
+
+Die CLI (`bhgbrain ...`) schreibt ihre eigenen strukturierten Logs immer nach **stderr** und hält
+**stdout** für das JSON-Ergebnis frei, das ein die Ausgabe des Befehls verarbeitendes Skript sauber
+parsen können muss (spiegelt die bestehende Aufteilung von stdout/stderr des stdio-MCP-Transports
+— siehe [stdio-Modus](#stdio-modus-mcp-über-stdinstdout)).
+
+Ein Zustand, der für die gesamte Lebensdauer eines Prozesses gilt (z. B. „kein Bearer-Token
+konfiguriert, dieser Server bedient also unauthentifizierten Datenverkehr"), wird einmal pro
+Serverstart protokolliert, nicht einmal pro Anfrage — ein Loopback-Deployment, das Tausende von
+Anfragen bedient, ertränkt seine Warn-Level-Logs nicht in derselben, tausendfach wiederholten Zeile.
 
 ---
 

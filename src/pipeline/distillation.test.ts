@@ -249,8 +249,10 @@ describe('DistillationService', () => {
     expect(first.candidatesSkipped).toBe(2);
     expect(first.candidates).toHaveLength(1);
     expect([...first.candidates[0]!.ids].sort()).toEqual(['a', 'b']);
+    // No namespace/collection label (strengthen-operational-observability
+    // task 2.1): both are unbounded, caller-controlled strings.
     expect(metrics.incCounter).toHaveBeenCalledWith(
-      'bhgbrain_distill_candidates_skipped_total', 2, { namespace: 'global', collection: 'general' },
+      'bhgbrain_distill_candidates_skipped_total', 2,
     );
 
     // Second run: the persisted cursor advanced past the first window, so

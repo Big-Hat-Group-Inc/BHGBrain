@@ -617,7 +617,17 @@ export class StorageManager {
 
   async bootstrapFromQdrant(
     logger?: { info: (obj: Record<string, unknown>) => void; warn?: (obj: Record<string, unknown>) => void },
-    options?: { deviceId?: string | null; allDevices?: boolean },
+    options?: {
+      deviceId?: string | null;
+      allDevices?: boolean;
+      // Skips a collection whose persisted state (bootstrap_hydration_state)
+      // already reports 'complete', instead of rescrolling it — the
+      // automatic startup hook (task 3.1) opts in so a call on every boot
+      // stays cheap once every discovered collection has converged, while
+      // `repair --from-qdrant` (an explicit, deliberate recovery request)
+      // leaves this false and always does a full rescan, exactly as before.
+      skipCompleted?: boolean;
+    },
   ): Promise<number> {
     const log = (msg: string, data?: Record<string, unknown>) => {
       if (logger) logger.info({ event: 'bootstrap', message: msg, ...data });
@@ -640,6 +650,11 @@ export class StorageManager {
     const collections = await this.qdrant.listAllCollections();
     log(`[bootstrap] hydrating from qdrant: found ${collections.length} collections`, { collections_count: collections.length });
 
+    // Persisted per-collection state (task 3.1): loaded once up front so
+    // each collection's skip/retry decision below is a plain Map lookup,
+    // not a query per collection.
+    const priorState = new Map(this.sqlite.getBootstrapHydrationState().map(row => [row.collection_name, row]));
+
     // Preloaded once for the whole bootstrap run (trim-sqlite-query-and-health-overhead
     // task 2.3) so per-point existence checks become a Set lookup instead of a
     // `getMemoryById` query; `hydrateBatch` mutates this in place as it inserts.
@@ -647,48 +662,78 @@ export class StorageManager {
 
     let total = 0;
     for (const collectionName of collections) {
+      if (options?.skipCompleted && priorState.get(collectionName)?.status === 'complete') {
+        log(`[bootstrap] collection ${collectionName}: already complete, skipping rescan`, { collection: collectionName });
+        continue;
+      }
+
       let collectionHydrated = 0;
       let pageIndex = 0;
-      // Paged (bound-corpus-scale-workflows task 1.2) rather than buffering
-      // the whole collection's points before hydrating any of them — each
-      // page is hydrated (and its transaction committed, via `hydrateBatch`)
-      // as soon as it arrives, so peak retained scan data stays bounded near
-      // one page regardless of collection size, and progress is reported
-      // incrementally instead of only once the entire collection has been
-      // scrolled. Full payload is requested (no `payloadFields` projection):
-      // hydration reconstructs a whole memory record, so every field is
-      // required, unlike drift detection's four-field projection.
-      for await (const page of this.qdrant.scrollAllPages(collectionName)) {
-        pageIndex++;
-        const filteredPoints = deviceFilter
-          ? page.points.filter(point => {
-              const pointDeviceId = typeof point.payload.device_id === 'string' ? point.payload.device_id : null;
-              return pointDeviceId === deviceFilter;
-            })
-          : page.points;
+      // One collection's scroll failing (a transient Qdrant/network error,
+      // not a per-point data issue — those are handled inside hydrateBatch
+      // below and never throw) must not abort the remaining collections in
+      // this pass: the failure is recorded so a later bootstrapFromQdrant
+      // call (next startup, or `repair --from-qdrant`) retries exactly this
+      // collection, and the loop continues to whatever collections are left
+      // (align-runtime-entrypoint-contracts task 3.1; design.md decision 2).
+      try {
+        // Paged (bound-corpus-scale-workflows task 1.2) rather than buffering
+        // the whole collection's points before hydrating any of them — each
+        // page is hydrated (and its transaction committed, via `hydrateBatch`)
+        // as soon as it arrives, so peak retained scan data stays bounded near
+        // one page regardless of collection size, and progress is reported
+        // incrementally instead of only once the entire collection has been
+        // scrolled. Full payload is requested (no `payloadFields` projection):
+        // hydration reconstructs a whole memory record, so every field is
+        // required, unlike drift detection's four-field projection.
+        for await (const page of this.qdrant.scrollAllPages(collectionName)) {
+          pageIndex++;
+          const filteredPoints = deviceFilter
+            ? page.points.filter(point => {
+                const pointDeviceId = typeof point.payload.device_id === 'string' ? point.payload.device_id : null;
+                return pointDeviceId === deviceFilter;
+              })
+            : page.points;
 
-        // Hydration is best-effort across the whole scan: one point that fails a
-        // SQLite constraint (fails loudly, atomically — see hydrateBatch) must not
-        // silently succeed, but it also must not abort the remaining points in this
-        // page or in later pages/collections. One BEGIN/COMMIT per page, with a
-        // SAVEPOINT per point preserving that same per-point atomicity/isolation.
-        const { hydrated, failures } = this.sqlite.hydrateBatch(filteredPoints, existingIds);
-        for (const failure of failures) {
-          logFailure(`[bootstrap] failed to hydrate point ${failure.id} in ${collectionName}: ${failure.error}`, {
+          // Hydration is best-effort across the whole scan: one point that fails a
+          // SQLite constraint (fails loudly, atomically — see hydrateBatch) must not
+          // silently succeed, but it also must not abort the remaining points in this
+          // page or in later pages/collections. One BEGIN/COMMIT per page, with a
+          // SAVEPOINT per point preserving that same per-point atomicity/isolation.
+          const { hydrated, failures } = this.sqlite.hydrateBatch(filteredPoints, existingIds);
+          for (const failure of failures) {
+            logFailure(`[bootstrap] failed to hydrate point ${failure.id} in ${collectionName}: ${failure.error}`, {
+              collection: collectionName,
+              point_id: failure.id,
+            });
+          }
+          this.sqlite.flushIfDirty();
+          collectionHydrated += hydrated;
+          log(`[bootstrap] collection ${collectionName}: page ${pageIndex} hydrated ${hydrated} (running total ${collectionHydrated})`, {
             collection: collectionName,
-            point_id: failure.id,
+            page: pageIndex,
+            hydrated,
+            running_total: collectionHydrated,
+            done: page.done,
           });
         }
-        this.sqlite.flushIfDirty();
-        collectionHydrated += hydrated;
-        log(`[bootstrap] collection ${collectionName}: page ${pageIndex} hydrated ${hydrated} (running total ${collectionHydrated})`, {
+      } catch (err) {
+        const message = (err as Error).message;
+        logFailure(`[bootstrap] collection ${collectionName} failed and will be retried on a later hydration pass: ${message}`, {
           collection: collectionName,
-          page: pageIndex,
-          hydrated,
-          running_total: collectionHydrated,
-          done: page.done,
         });
+        this.sqlite.setBootstrapCollectionFailed(collectionName, message);
+        this.sqlite.flushIfDirty();
+        // A non-zero local row count from earlier collections (or an
+        // earlier partial pass through this same collection) must not
+        // suppress retrying this collection later — recording 'failed'
+        // rather than throwing is exactly what makes that true.
+        total += collectionHydrated;
+        continue;
       }
+
+      this.sqlite.setBootstrapCollectionComplete(collectionName, collectionHydrated);
+      this.sqlite.flushIfDirty();
       log(`[bootstrap] collection ${collectionName}: ${collectionHydrated} points hydrated`, { collection: collectionName, hydrated: collectionHydrated });
       total += collectionHydrated;
     }

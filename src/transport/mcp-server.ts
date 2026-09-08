@@ -8,6 +8,8 @@
  * transport connection. See `openspec/changes/adopt-streamable-http-mcp-transport`.
  */
 
+import { randomUUID } from 'node:crypto';
+import type pino from 'pino';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import {
   CallToolRequestSchema,
@@ -27,7 +29,7 @@ import { handleTool, type ToolContext } from '../tools/index.js';
 import { MCP_TOOL_DEFINITIONS, MCP_TOOL_NAMES } from '../tools/schemas.js';
 import { MCP_PROMPT_DEFINITIONS, handleGetPrompt } from '../prompts/index.js';
 import { buildToolCallResponse, isErrorEnvelope } from './mcp-response.js';
-import type { WriteResult } from '../domain/types.js';
+import type { WriteResult, ErrorCode as DomainErrorCode } from '../domain/types.js';
 import { PACKAGE_VERSION } from '../version.js';
 
 // Single source of truth for the MCP `serverInfo.version` field, kept in
@@ -36,6 +38,29 @@ import { PACKAGE_VERSION } from '../version.js';
 // drifted from the real package version; reading it at startup means a
 // version bump needs no code edit).
 export const MCP_SERVER_VERSION = PACKAGE_VERSION;
+
+/**
+ * Maps a classified `ErrorCode` (domain/types.ts) to the MCP protocol error
+ * code that best conveys the same failure over `ReadResourceRequestSchema`
+ * (task 2.3) — mirrors the REST `ERROR_STATUS` mapping in
+ * src/errors/index.ts, just targeting the MCP SDK's own error enum instead
+ * of an HTTP status.
+ */
+function mcpErrorCodeFor(code: DomainErrorCode): number {
+  switch (code) {
+    case 'INVALID_INPUT':
+      return ErrorCode.InvalidParams;
+    case 'NOT_FOUND':
+      return ErrorCode.InvalidRequest;
+    case 'AUTH_REQUIRED':
+    case 'RATE_LIMITED':
+    case 'CONFLICT':
+    case 'EMBEDDING_UNAVAILABLE':
+    case 'INTERNAL':
+    default:
+      return ErrorCode.InternalError;
+  }
+}
 
 /**
  * `remember`'s handler returns `WriteResult | WriteResult[]` (single object
@@ -58,13 +83,35 @@ function normalizeRememberResult(toolName: string, result: unknown): unknown {
 }
 
 /**
+ * Options threading request/session correlation into a built `Server`
+ * (strengthen-operational-observability task 1.5/design.md decision 1:
+ * "MCP uses session ID plus a per-call ID; trusted client identity is
+ * passed into `buildMcpServer` and child loggers").
+ */
+export interface BuildMcpServerOptions {
+  /**
+   * Base logger for this server instance — a session-scoped child logger
+   * (carrying `session_id`/`client_id`) for the Streamable HTTP transport
+   * (see `src/transport/mcp-http.ts`'s `createSession`), or the process-wide
+   * logger for stdio, where there is exactly one long-lived connection per
+   * process. Defaults to `ctx.logger`.
+   */
+  logger?: pino.Logger;
+  /** Trusted client identity (HTTP: the derived socket/forwarded IP; stdio: unknown — a single local client). Defaults to 'unknown'. */
+  clientId?: string;
+}
+
+/**
  * Constructs a new MCP `Server` with the ListTools/CallTool/ListResources/
  * ListResourceTemplates/ReadResource handlers registered against the given
  * `ctx`/`resources`. Callers connect the returned server to whichever
  * `Transport` is appropriate (stdio, or a per-session
  * `StreamableHTTPServerTransport`).
  */
-export function buildMcpServer(ctx: ToolContext, resources: ResourceHandler): Server {
+export function buildMcpServer(ctx: ToolContext, resources: ResourceHandler, options?: BuildMcpServerOptions): Server {
+  const baseLogger = options?.logger ?? ctx.logger;
+  const clientId = options?.clientId ?? 'unknown';
+
   const server = new Server(
     { name: 'bhgbrain', version: MCP_SERVER_VERSION },
     { capabilities: { tools: {}, resources: { listChanged: true }, prompts: {} } },
@@ -82,7 +129,16 @@ export function buildMcpServer(ctx: ToolContext, resources: ResourceHandler): Se
     if (!MCP_TOOL_NAMES.has(name)) {
       throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
     }
-    const result = await handleTool(ctx, name, toolArgs);
+    // strengthen-operational-observability task 1.5: a per-call id on top of
+    // the session-scoped base logger, so two concurrent calls on the same
+    // MCP session (or the same stdio connection) still produce
+    // distinguishable `tool_call`/`tool_error` log lines. `baseLogger` is
+    // optional-chained rather than assumed present so a caller that omits
+    // `ctx.logger` entirely (a bare test double) still gets a well-defined
+    // `undefined` — `handleTool` itself falls back to `ctx.logger` in that
+    // case, exactly as it did before this call ever passed a logger through.
+    const callLogger = baseLogger?.child({ call_id: randomUUID() });
+    const result = await handleTool(ctx, name, toolArgs, clientId, callLogger);
     return buildToolCallResponse(normalizeRememberResult(name, result));
   });
 
@@ -116,6 +172,18 @@ export function buildMcpServer(ctx: ToolContext, resources: ResourceHandler): Se
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const { uri } = request.params;
     const result = await resources.handle(uri);
+    // `ResourceHandler.handle` reports failures (unknown scheme, malformed
+    // URI, not found, ...) by *returning* an error-envelope object rather
+    // than throwing (see resources/index.ts) — the REST `/resource` route
+    // already maps that shape to an HTTP status. Over MCP, the equivalent
+    // native failure signal is a protocol-level error, not `contents`
+    // holding the JSON-stringified envelope as if it were successful data;
+    // without this, a NOT_FOUND resource read looked identical to a
+    // successful one to an MCP client (align-runtime-entrypoint-contracts
+    // task 2.3).
+    if (isErrorEnvelope(result)) {
+      throw new McpError(mcpErrorCodeFor(result.error.code), result.error.message);
+    }
     return {
       contents: [{
         uri,

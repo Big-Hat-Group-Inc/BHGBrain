@@ -198,7 +198,7 @@ export class CleanupScheduler {
       this.logger?.error?.({
         event: 'retention_scheduler_invalid_cron',
         cleanup_schedule: this.config.retention.cleanup_schedule,
-        error: (err as Error).message,
+        err,
       });
       return;
     }
@@ -217,7 +217,7 @@ export class CleanupScheduler {
       await this.retention.runGc();
     } catch (err) {
       this.state = { ...this.state, failure: (err as Error).message };
-      this.logger?.error?.({ event: 'retention_scheduler_run_failed', error: (err as Error).message });
+      this.logger?.error?.({ event: 'retention_scheduler_run_failed', err });
     } finally {
       this.scheduleNext();
     }
@@ -284,7 +284,7 @@ export class DistillationScheduler {
       this.logger?.error?.({
         event: 'distillation_scheduler_invalid_cron',
         schedule: this.config.retention.distillation.schedule,
-        error: (err as Error).message,
+        err,
       });
       return;
     }
@@ -303,7 +303,7 @@ export class DistillationScheduler {
       await this.distillation.runOnce();
     } catch (err) {
       this.state = { ...this.state, failure: (err as Error).message };
-      this.logger?.error?.({ event: 'distillation_scheduler_run_failed', error: (err as Error).message });
+      this.logger?.error?.({ event: 'distillation_scheduler_run_failed', err });
     } finally {
       this.scheduleNext();
     }

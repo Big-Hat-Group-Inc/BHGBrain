@@ -143,7 +143,7 @@ describe('WritePipeline NOOP handling', () => {
       event: 'degraded_write',
       namespace: 'global',
       collection: 'general',
-      error: 'embedding unavailable',
+      err: expect.objectContaining({ message: 'embedding unavailable' }),
     }));
   });
 
@@ -1069,7 +1069,7 @@ describe('WritePipeline contradiction detection', () => {
       event: 'contradiction_check_degraded',
       namespace: 'global',
       collection: 'general',
-      error: 'entailment check timed out after 5000ms',
+      err: expect.objectContaining({ message: 'entailment check timed out after 5000ms' }),
     }));
   });
 });
@@ -1225,7 +1225,7 @@ describe('WritePipeline multi-candidate extraction', () => {
       namespace: 'global',
       collection: 'general',
       candidate_index: 1,
-      error: 'vector store unavailable',
+      err: expect.objectContaining({ message: 'vector store unavailable' }),
     }));
     expect(metrics.incCounter).toHaveBeenCalledWith('extraction_candidate_failed_total');
   });

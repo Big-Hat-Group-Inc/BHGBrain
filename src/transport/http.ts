@@ -10,6 +10,8 @@ import {
   createAuthMiddleware,
   createRateLimitMiddleware,
   createSizeLimitMiddleware,
+  createRequestContextMiddleware,
+  requestLogger,
   validateLoopbackBinding,
   validateExternalAuthBinding,
   deriveTrustedClientId,
@@ -17,8 +19,8 @@ import {
 import { McpSessionManager } from './mcp-http.js';
 import type { MetricEntry } from '../health/metrics.js';
 import type pino from 'pino';
-import { BrainError } from '../errors/index.js';
-import type { ErrorCode } from '../domain/types.js';
+import { BrainError, ERROR_STATUS, isErrorEnvelope } from '../errors/index.js';
+import { toLogError } from '../health/logger.js';
 
 // Prometheus text-exposition label-value escaping: backslash, then quote,
 // then newline (order matters so a literal backslash isn't re-escaped).
@@ -60,34 +62,12 @@ export interface HttpServerHandle {
   mcpSessions: McpSessionManager;
 }
 
-// Status codes consistent with the choices already made in middleware.ts
-// (401/400/429/413) and mcp-http.ts (404), extended to cover the rest of the
-// `ErrorCode` union so no BrainError falls through to the generic 500 branch.
-const ERROR_STATUS: Record<ErrorCode, number> = {
-  INVALID_INPUT: 400,
-  NOT_FOUND: 404,
-  CONFLICT: 409,
-  AUTH_REQUIRED: 401,
-  RATE_LIMITED: 429,
-  EMBEDDING_UNAVAILABLE: 503,
-  INTERNAL: 500,
-};
-
-/**
- * `ResourceHandler.handle` reports failures (unknown scheme, malformed URI —
- * task 3.2) by *returning* an envelope object rather than throwing, since it
- * is also reached from stdio and `/mcp`, which have no HTTP status to set.
- * The `/resource` route below is the one caller that does have a status
- * line, so it detects that shape here and maps it, rather than always
- * answering 200 for a request that actually failed.
- */
-function isErrorEnvelope(value: unknown): value is { error: { code: ErrorCode; message: string; retryable: boolean } } {
-  if (typeof value !== 'object' || value === null) return false;
-  const err = (value as { error?: unknown }).error;
-  if (typeof err !== 'object' || err === null) return false;
-  const code = (err as { code?: unknown }).code;
-  return typeof code === 'string' && code in ERROR_STATUS;
-}
+// `ERROR_STATUS` (401/400/429/413 consistent with the choices already made
+// in middleware.ts, and mcp-http.ts's 404) and `isErrorEnvelope` now live in
+// src/errors/index.ts — the one shared definition every transport adapter
+// (REST here, MCP in mcp-response.ts/mcp-server.ts, CLI in cli/index.ts)
+// imports, instead of each transport carrying its own copy
+// (align-runtime-entrypoint-contracts task 2.2).
 
 /**
  * Terminal 4-arg Express error middleware — registered last, after every
@@ -107,8 +87,18 @@ function createErrorMiddleware(logger: pino.Logger) {
       return;
     }
 
+    // strengthen-operational-observability task 1.5: the request-scoped
+    // child logger (carrying `request_id`/`client_id` — see
+    // `createRequestContextMiddleware`) when the context middleware ran for
+    // this request, so an error surfacing all the way to this terminal
+    // handler still correlates back to the request that caused it. Falls
+    // back to the process-wide logger for any request that reached here
+    // without going through that middleware first (defensive; every real
+    // request does).
+    const log = requestLogger(req, logger);
+
     if (err instanceof BrainError) {
-      logger.warn({ event: 'http_error', code: err.code, path: req.path, message: err.message });
+      log.warn({ event: 'http_error', code: err.code, path: req.path, err });
       res.status(ERROR_STATUS[err.code]).json(err.toEnvelope());
       return;
     }
@@ -118,20 +108,19 @@ function createErrorMiddleware(logger: pino.Logger) {
     // explicitly so they get the same envelope shape as everything else.
     const bodyParserType = (err as { type?: string } | null)?.type;
     if (bodyParserType === 'entity.parse.failed') {
-      logger.warn({ event: 'http_error', code: 'INVALID_INPUT', path: req.path, message: 'Malformed JSON request body' });
+      log.warn({ event: 'http_error', code: 'INVALID_INPUT', path: req.path, message: 'Malformed JSON request body' });
       res.status(400).json({ error: { code: 'INVALID_INPUT', message: 'Malformed JSON request body', retryable: false } });
       return;
     }
     if (bodyParserType === 'entity.too.large') {
-      logger.warn({ event: 'http_error', code: 'INVALID_INPUT', path: req.path, message: 'Request body too large' });
+      log.warn({ event: 'http_error', code: 'INVALID_INPUT', path: req.path, message: 'Request body too large' });
       res.status(413).json({ error: { code: 'INVALID_INPUT', message: 'Request body too large', retryable: false } });
       return;
     }
 
     // Anything else is unanticipated: log the real error server-side, but
     // never put its message or stack in the response body.
-    const error = err as { message?: string; stack?: string } | null;
-    logger.error({ event: 'http_error', code: 'INTERNAL', path: req.path, error: error?.message, stack: error?.stack });
+    log.error({ event: 'http_error', code: 'INTERNAL', path: req.path, err: toLogError(err) });
     res.status(500).json({ error: { code: 'INTERNAL', message: 'An unexpected error occurred', retryable: true } });
   };
 }
@@ -149,6 +138,36 @@ export function applyHttpServerTimeouts(httpServer: HttpServer, config: BrainCon
   httpServer.keepAliveTimeout = config.transport.http.keep_alive_timeout_ms;
   httpServer.headersTimeout = config.transport.http.headers_timeout_ms;
   httpServer.requestTimeout = config.transport.http.request_timeout_ms;
+}
+
+/**
+ * Binds `app` to `host`/`port` and resolves once the listener is actually
+ * ready, rejecting instead of throwing an unhandled `'error'` event if the
+ * bind itself fails (most commonly `EADDRINUSE`) — plain `app.listen(...)`
+ * returns synchronously before the bind outcome is known, so a caller could
+ * only find out about a failed bind by also attaching its own `'error'`
+ * listener, which src/index.ts previously did not do at all: an
+ * unhandled `'error'` event on an `EventEmitter` throws, crashing the
+ * process without a structured log or any chance to close already-opened
+ * resources (sqlite, breakers, ...). Callers should `await` this before
+ * starting any background scheduler, so background work never starts
+ * against a server that never actually came up
+ * (align-runtime-entrypoint-contracts task 3.2).
+ */
+export function listenAsync(app: express.Express, port: number, host: string): Promise<HttpServer> {
+  return new Promise((resolve, reject) => {
+    const server = app.listen(port, host);
+    const onError = (err: Error): void => {
+      server.removeListener('listening', onListening);
+      reject(err);
+    };
+    const onListening = (): void => {
+      server.removeListener('error', onError);
+      resolve(server);
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+  });
 }
 
 /**
@@ -177,6 +196,13 @@ export function createHttpServer(
   validateExternalAuthBinding(config, logger);
 
   const app = express();
+
+  // strengthen-operational-observability task 1.5: registered before every
+  // other middleware (auth, rate limiting, `/health/live` included) so
+  // every response — a 401, a 429, a terse liveness check — carries an
+  // `X-Request-Id` header and every log line this request produces, however
+  // early it fails, can be correlated back to it.
+  app.use(createRequestContextMiddleware(logger));
 
   // Response hygiene (harden-http-server-lifecycle task 5.1): don't
   // advertise the framework, and tell browsers/proxies not to MIME-sniff
@@ -267,7 +293,27 @@ export function createHttpServer(
     // `add-operations-security-reliability` audit follow-up 2026-06-05,
     // task 4.4.
     const clientId = deriveTrustedClientId(req) ?? 'http-client';
-    const result = await handleTool(ctx, req.params.name, req.body, clientId);
+    // req.params.name is passed straight into handleTool with no allowlist
+    // of its own — REST intentionally has no separate tool-name registry
+    // that could drift from dispatch's own switch in tools/index.ts (see
+    // schemas.test.ts's "no separate allowlist" parity test). An unknown
+    // name already reaches dispatch's `default: throw invalidInput(...)`
+    // and comes back as an INVALID_INPUT envelope; the isErrorEnvelope
+    // check below is what makes that a proper non-2xx status instead of
+    // always answering 200 (align-runtime-entrypoint-contracts task 2.2/2.3).
+    // strengthen-operational-observability task 1.5: the request-scoped
+    // child logger, so this call's `tool_call`/`tool_error` events carry
+    // `request_id` and correlate back to this exact HTTP request.
+    const result = await handleTool(ctx, req.params.name, req.body, clientId, requestLogger(req, ctx.logger));
+    // handleTool never throws (BrainError and unexpected errors are both
+    // caught and returned as an envelope — see src/tools/index.ts), so every
+    // tool failure must be mapped to its HTTP status here explicitly; without
+    // this check every classified failure (NOT_FOUND, CONFLICT, ...)
+    // previously answered 200 (align-runtime-entrypoint-contracts task 2.2).
+    if (isErrorEnvelope(result)) {
+      res.status(ERROR_STATUS[result.error.code]).json(result);
+      return;
+    }
     res.json(result);
   });
 
@@ -286,12 +332,34 @@ export function createHttpServer(
     res.json(result);
   });
 
-  // Metrics endpoint (if enabled)
+  // Metrics endpoint — strengthen-operational-observability task 2.4:
+  // registered unconditionally (unlike before, where a disabled
+  // `observability.metrics_enabled` meant the route was never registered at
+  // all) so an operator probing `/metrics` on a disabled install gets an
+  // explicit, explained response instead of Express's generic "Cannot GET
+  // /metrics" 404, which is indistinguishable from the route simply not
+  // existing (spec: "the response identifies the disabling setting and does
+  // not imply the route is unknown"). A one-time startup log line (below)
+  // gives the same fact to log-only monitoring that never probes the route.
   if (config.observability.metrics_enabled) {
     app.get('/metrics', (_req, res) => {
-      // Histogram families emit `_avg`, `_p50`, `_p95`, `_p99`, and `_count` lines.
+      // Histogram families emit `_avg`, `_p50`, `_p95`, `_p99`, `_sample_count`
+      // (gauge: current rolling-window occupancy), and `_observations_total`
+      // (counter: true monotonic total) lines.
       const metrics = ctx.metrics.getMetrics();
       res.type('text/plain').send(renderPrometheusText(metrics));
+    });
+  } else {
+    logger.info({
+      event: 'metrics_disabled',
+      message: 'Metrics are disabled (observability.metrics_enabled=false); /metrics returns 503 with this explanation instead of registering the Prometheus endpoint.',
+    });
+    app.get('/metrics', (_req, res) => {
+      res.status(503).json({
+        metrics_enabled: false,
+        message: 'Metrics are disabled by configuration (observability.metrics_enabled=false in config.json). ' +
+          'Set it to true and restart to enable the Prometheus-format /metrics endpoint.',
+      });
     });
   }
 

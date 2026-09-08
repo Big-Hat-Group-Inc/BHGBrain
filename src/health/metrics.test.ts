@@ -78,7 +78,8 @@ describe('MetricsCollector', () => {
     expect(entries.latency_ms_p50).toBe(20);
     expect(entries.latency_ms_p95).toBe(40);
     expect(entries.latency_ms_p99).toBe(40);
-    expect(entries.latency_ms_count).toBe(4);
+    expect(entries.latency_ms_sample_count).toBe(4);
+    expect(entries.latency_ms_observations_total).toBe(4);
   });
 
   it('accumulates incCounter across multiple calls (task 3.1 / 8.1)', () => {
@@ -131,8 +132,12 @@ describe('MetricsCollector', () => {
     expect(entries.latency_ms_p50).toBe('histogram');
     expect(entries.latency_ms_p95).toBe('histogram');
     expect(entries.latency_ms_p99).toBe('histogram');
-    // The rolling sample count is itself tagged 'counter', not 'histogram'.
-    expect(entries.latency_ms_count).toBe('counter');
+    // The rolling sample-window occupancy is a gauge (task 2.3): it does not
+    // grow monotonically, since old samples fall out of the window.
+    expect(entries.latency_ms_sample_count).toBe('gauge');
+    // The true monotonic total of every observation ever recorded IS a
+    // counter, distinct from the rolling window's occupancy above.
+    expect(entries.latency_ms_observations_total).toBe('counter');
   });
 
   it('buckets a labeled histogram separately per distinct label set (record-tool-latency-on-all-paths task 2)', () => {
@@ -187,12 +192,57 @@ describe('MetricsCollector', () => {
 
     const entries = Object.fromEntries(metrics.getMetrics().map(entry => [entry.name, entry.value]));
     // Exactly `capacity` items remain in the window (not 1005).
-    expect(entries.rolling_ms_count).toBe(1000);
+    expect(entries.rolling_ms_sample_count).toBe(1000);
     // Average of the most-recent window [6..1005], not the full [1..1005]
     // sequence (which would average to 503).
     expect(entries.rolling_ms_avg).toBe(505.5);
     expect(entries.rolling_ms_p50).toBe(505);
     expect(entries.rolling_ms_p95).toBe(955);
     expect(entries.rolling_ms_p99).toBe(995);
+    // The true monotonic total keeps counting every observation (task 2.3)
+    // even once the rolling window itself has wrapped and started evicting.
+    expect(entries.rolling_ms_observations_total).toBe(1005);
+  });
+
+  it('caps total series and reports dropped-series/registry-size metrics once the cap is reached (task 2.1/2.2)', () => {
+    const metrics = new MetricsCollector(createConfig());
+    // Force the registry well past a plausible cap with distinct label sets
+    // — each is a new series.
+    for (let i = 0; i < 2100; i += 1) {
+      metrics.incCounter('unbounded_total', 1, { arbitrary: `value-${i}` });
+    }
+
+    const entries = metrics.getMetrics();
+    const distinctUnboundedSeries = entries.filter(e => e.name === 'unbounded_total').length;
+    // The registry never grows past its fixed cap regardless of how many
+    // distinct label values were requested.
+    expect(distinctUnboundedSeries).toBeLessThan(2100);
+
+    const dropped = entries.find(e => e.name === 'bhgbrain_metrics_dropped_series_total');
+    const registrySize = entries.find(e => e.name === 'bhgbrain_metrics_registry_size');
+    expect(dropped).toBeDefined();
+    expect(dropped!.value).toBeGreaterThan(0);
+    expect(registrySize).toBeDefined();
+    expect(registrySize!.value).toBe(distinctUnboundedSeries);
+  });
+
+  it('publishes the dropped-series and registry-size metrics even at zero, so saturation is visible without allocating new series (task 2.2)', () => {
+    const metrics = new MetricsCollector(createConfig());
+    metrics.incCounter('requests_total');
+
+    const entries = metrics.getMetrics();
+    expect(entries.find(e => e.name === 'bhgbrain_metrics_dropped_series_total')).toEqual({
+      name: 'bhgbrain_metrics_dropped_series_total', type: 'counter', value: 0,
+    });
+    expect(entries.find(e => e.name === 'bhgbrain_metrics_registry_size')?.value).toBeGreaterThan(0);
+  });
+
+  it('truncates pathologically long label values instead of storing them unbounded', () => {
+    const metrics = new MetricsCollector(createConfig());
+    const huge = 'x'.repeat(10_000);
+    metrics.incCounter('some_total', 1, { reason: huge });
+
+    const entry = metrics.getMetrics().find(e => e.name === 'some_total');
+    expect(entry?.labels?.reason.length).toBeLessThanOrEqual(128);
   });
 });

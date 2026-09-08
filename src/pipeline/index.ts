@@ -143,7 +143,7 @@ export class WritePipeline {
           namespace: input.namespace,
           collection: input.collection,
           candidate_index: index,
-          error: (err as Error).message,
+          err,
         });
         this.metrics?.incCounter('extraction_candidate_failed_total');
       }
@@ -189,7 +189,7 @@ export class WritePipeline {
       // deterministic single-candidate path.
       this.logger?.warn({
         event: 'extraction_failed',
-        error: (err as Error).message,
+        err,
       });
       return singleCandidate;
     }
@@ -280,7 +280,7 @@ export class WritePipeline {
           event: 'degraded_write',
           namespace: input.namespace,
           collection: input.collection,
-          error: (err as Error).message,
+          err,
         });
         return await this.deterministicFallback(candidate, input, checksum, now);
       }
@@ -569,7 +569,7 @@ export class WritePipeline {
         collection,
         code,
         retryable,
-        error: (err as Error).message,
+        err,
       });
       return false;
     }

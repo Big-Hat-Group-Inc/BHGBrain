@@ -1121,6 +1121,8 @@ La herramienta de reparación:
 
 **Nota**: Las memorias almacenadas antes de que se añadiera la función de contenido en Qdrant (pre-1.3) no tienen contenido en su payload de Qdrant y no pueden recuperarse vía reparación. Solo los metadatos (etiquetas, tipo, importancia) sobreviven para esas entradas.
 
+**Hidratación automática en cada inicio, de forma reanudable.** La misma recuperación también se ejecuta automáticamente en cada inicio del servidor (no solo con `repair --from-qdrant`), delimitada por colección de Qdrant en lugar de condicionada al recuento local de memorias: el resultado de cada colección se registra de forma duradera (`complete` o `failed`) en SQLite local, de modo que una colección cuya hidratación falla (un fallo transitorio de red/Qdrant, no un problema de datos por punto — ver la nota anterior) se reintenta en el *siguiente* inicio en lugar de que una colección anterior hidratada con éxito enmascare el fallo permanentemente. Una colección ya registrada como `complete` se omite (no se vuelve a escanear) en la ruta automática, por lo que un almacén completamente hidratado solo cuesta una llamada económica de listado de colecciones de Qdrant en cada inicio, no un reescaneo completo — `bhgbrain repair --from-qdrant`, en cambio, siempre realiza un reescaneo completo de cada colección independientemente del estado registrado, ya que ese comando es en sí mismo una solicitud de recuperación deliberada. `components.bootstrap_hydration` de `health://status` reporta `"degraded"` mientras alguna colección esté registrada como `failed`, nombrándola, de modo que una colección atascada sea visible sin leer los logs.
+
 ### Migración de Modelo de Embedding
 
 Cada vector se marca en el momento de la escritura con una identidad cualificada por
@@ -2520,7 +2522,27 @@ Devuelve un `HealthSnapshot` desde `GET /health`:
     "sqlite": { "status": "healthy" },
     "qdrant": { "status": "healthy" },
     "embedding": { "status": "healthy" },
-    "retention": { "status": "healthy" }
+    "vector_reconciliation": {
+      "status": "healthy",
+      "state": "reconciled",
+      "unsynced_vectors": 0,
+      "drift_cause": null,
+      "qdrant_points_total": 1234,
+      "sqlite_memory_count": 1234,
+      "checked_at": "2026-03-01T00:00:00.000Z"
+    },
+    "retention": { "status": "healthy" },
+    "capacity": {
+      "status": "healthy",
+      "db_size_bytes": 8388608,
+      "db_size_limit_bytes": 2147483648,
+      "db_size_percent": 0.4,
+      "memory_count": 1234,
+      "memory_count_limit": 500000,
+      "memory_count_percent": 0.2
+    },
+    "schedulers": { "status": "healthy" },
+    "bootstrap_hydration": { "status": "healthy" }
   },
   "memory_count": 1234,
   "db_size_bytes": 8388608,
@@ -2543,11 +2565,17 @@ Devuelve un `HealthSnapshot` desde `GET /health`:
 
 `components.retention` también pasa a `"degraded"` (con un mensaje) cuando la última ejecución de GC — programada o manual — reportó un fallo parcial (falló un paso de archivado o eliminación), independientemente de la presión de capacidad por nivel. Vuelve a `"healthy"` en la siguiente ejecución de GC limpia.
 
+`components.capacity` evalúa `retention.max_db_size_gb`/`retention.max_memories` (los límites duros) Y `retention.warn_at_percent` (un umbral de aviso temprano, 80 % por defecto) contra el tamaño en bytes y el conteo de memorias actuales del almacén — pasa a `"degraded"` en cuanto cualquiera de los dos cruza el porcentaje de aviso, con un mensaje que distingue "acercándose" al límite de haberlo "alcanzado" realmente, para que un operador tenga aviso previo antes de que las escrituras se vean afectadas. `db_size_percent`/`memory_count_percent` se reportan siempre, esté o no degradado.
+
+`components.vector_reconciliation.state` es uno de `"reconciled"` (saludable — SQLite y el almacén vectorial coinciden), `"reconciling"` (una restauración o un re-embedding acotado en segundo plano está en curso), `"pending"` (los metadatos de SQLite necesitan vectores y nada los está reconciliando en este momento — el reintento automático se agotó, o hace falta ejecutar una reparación) o `"surplus_suspected"` (el almacén vectorial reporta materialmente más puntos gestionados de los que SQLite tiene memorias autoritativas — probablemente puntos huérfanos o solo-vector de una eliminación interrumpida). `drift_cause`, cuando no es `null`, distingue *por qué* `"reconciling"`/`"pending"` está degradado: `"full-rebuild"` (el modelo/dimensiones de embedding cambiaron desde la última restauración), `"inspection-failed"` (un fallo transitorio de lectura de Qdrant durante la última restauración, tratado de forma conservadora como necesitado de re-embedding — **no** un cambio de modelo), o `"partial-drift"` (un desajuste de checksum de contenido ordinario). Se conserva más allá de la llamada de restauración que lo detectó, por lo que sigue visible en sondeos posteriores de `/health` hasta que la reconciliación lo resuelva. `qdrant_points_total`/`sqlite_memory_count`/`checked_at` reportan la comparación bidireccional de conteos en caché (tarea 3.2) que detecta `"surplus_suspected"` — cacheada durante 60 segundos (un escaneo de todas las colecciones de Qdrant, no una lectura local barata), por lo que puede ir hasta ese tiempo por detrás de una escritura en vivo; ante un fallo transitorio al calcularla, los campos simplemente se omiten en ese sondeo en lugar de fallar toda la respuesta.
+
 `components.sqlite` permanece en `"healthy"` pero incluye un `message` cuando la compilación de SQLite en uso no tiene el módulo `fts5`: la búsqueda de texto completo se ejecuta con el comparador heredado basado en `LIKE` (ver [Búsqueda de texto completo](#búsqueda-de-texto-completo)) en lugar de un índice FTS5/BM25. Esto también se registra una vez al iniciar (`event: "fts5_unavailable"`).
+
+`components.bootstrap_hydration` pasa a `"degraded"` (nombrando la(s) colección(es) afectada(s) en `message`) mientras alguna colección de Qdrant esté registrada de forma duradera como `"failed"` en el estado de hidratación de bootstrap de este dispositivo — es decir, una pasada de hidratación de vectores a SQLite encontró un error (un fallo transitorio de red/Qdrant, no un problema de datos por punto) para esa colección y aún no se ha reintentado con éxito. Vuelve a `"healthy"` en cuanto una pasada de hidratación posterior (el siguiente inicio del proceso, o `bhgbrain repair --from-qdrant`) hidrata esa colección con éxito. Ver [Reparación y Recuperación](#reparación-y-recuperación).
 
 **Lógica del estado general:**
 - `unhealthy` — si SQLite o Qdrant no están en buen estado
-- `degraded` — si el embedding está degradado/no disponible, O si la retención está degradada (sobre capacidad o vectores no sincronizados)
+- `degraded` — si el embedding está degradado/no disponible, O si la retención está degradada (sobre capacidad o vectores no sincronizados), O si la capacidad cruza su umbral de aviso, O si la reconciliación vectorial está en `reconciling`/`pending`/`surplus_suspected`, O si un planificador falló o no está activado, O si una colección de hidratación de bootstrap está degradada (fallida y a la espera de reintento)
 - `healthy` — todos los componentes están en buen estado
 
 **Estados de componentes:**
@@ -2558,6 +2586,10 @@ Devuelve un `HealthSnapshot` desde `GET /health`:
 | `qdrant` | Una consulta vectorial acotada y de solo lectura tiene éxito (un resultado vacío o una colección que aún no existe también cuentan como saludable) | — | La consulta vectorial en sí falla, incluso con el servidor accesible |
 | `embedding` | La llamada a la API de embed tiene éxito | Credenciales faltantes o no accesible | — |
 | `retention` | Todos los presupuestos dentro de los límites, sin vectores no sincronizados | Presupuesto excedido O vectores no sincronizados > 0 | — |
+| `capacity` | Tamaño de BD y conteo de memorias ambos por debajo de `warn_at_percent` de sus límites configurados | Alguno cruza `warn_at_percent`, o alcanza su límite duro | — |
+| `vector_reconciliation` | SQLite y Qdrant coinciden (sin metadatos no sincronizados, sin excedente sospechado) | Reconciliando, pendiente, o un excedente vectorial sospechado | — |
+| `schedulers` | Cada trabajo programado configurado (limpieza, destilación) está activado y sin fallo registrado | Un trabajo configurado falló en su última ejecución o no está activado | — |
+| `bootstrap_hydration` | Cada colección de Qdrant descubierta está hidratada (o ninguna existe aún) | Al menos una colección falló al hidratarse y espera reintento | — |
 
 **Códigos de estado HTTP (`GET /health`):**
 - `200` tanto para `healthy` como para `degraded`
@@ -2680,37 +2712,44 @@ barrido y cierra el transporte de cada sesión activa.
 
 ### Métricas
 
-Si `observability.metrics_enabled: true`, hay un endpoint de métricas disponible:
-
 ```bash
 GET /metrics
 ```
 
-Devuelve métricas en formato de exposición de texto de Prometheus: una línea `# TYPE <name>
-<counter|gauge|histogram>` una vez por nombre de métrica, seguida de líneas `name{label="value",...}
-value` (el segmento `{...}` se omite en las métricas sin etiquetas, manteniendo la salida compatible
-con el formato anterior sin etiquetas).
+Cuando `observability.metrics_enabled: true` (por defecto `false`), esto devuelve métricas en formato
+de exposición de texto de Prometheus: una línea `# TYPE <name> <counter|gauge|histogram>` una vez por
+nombre de métrica, seguida de líneas `name{label="value",...} value` (el segmento `{...}` se omite en
+las métricas sin etiquetas).
+
+Cuando las métricas están deshabilitadas, la ruta sigue existiendo — responde `503` con una explicación
+explícita (`{"metrics_enabled": false, "message": "..."}`) en lugar del `404` genérico de "ruta no
+encontrada" de Express, y el servidor registra un evento `metrics_disabled` al iniciar, de modo que "¿está
+`/metrics` deshabilitado, o esta compilación simplemente no lo tiene" nunca es ambiguo, ni al sondear ni
+en el registro.
 
 | Métrica | Tipo | Descripción |
 |---|---|---|
-| `bhgbrain_tool_calls_total` | contador | Total de invocaciones de herramientas |
-| `bhgbrain_tool_handler_ms_avg` | histograma | Latencia promedio del manejador de herramientas en milisegundos, etiquetada con `tool` (nombre de la herramienta) y `status` (`ok`/`error`). Se registra en cada llamada, incluidos los fallos. |
+| `bhgbrain_tool_calls_total` | contador | Conteo monótono de finalizaciones de herramientas, etiquetado con `tool` (del conjunto fijo de despacho — un nombre no reconocido se reporta como `invalid_tool`, sin asignar nunca su propia serie) y `status` (`ok`/`error`). A diferencia del histograma de latencia de abajo, este nunca reinicia su ventana, por lo que `error / total` calculado solo con este contador sigue siendo significativo indefinidamente, no solo en las últimas 1.000 llamadas. |
+| `bhgbrain_tool_handler_ms_avg` | histograma | Latencia promedio del manejador de herramientas en milisegundos, etiquetada con `tool` y `status`. Se registra en cada llamada, incluidos los fallos. |
 | `bhgbrain_tool_handler_ms_p50` | histograma | Percentil 50 de la latencia del manejador de herramientas, etiquetada con `tool` y `status` |
 | `bhgbrain_tool_handler_ms_p95` | histograma | Percentil 95 de la latencia del manejador de herramientas, etiquetada con `tool` y `status` |
 | `bhgbrain_tool_handler_ms_p99` | histograma | Percentil 99 de la latencia del manejador de herramientas, etiquetada con `tool` y `status` |
-| `bhgbrain_tool_handler_ms_count` | contador | Número de muestras de latencia del manejador de herramientas, etiquetada con `tool` y `status` |
+| `bhgbrain_tool_handler_ms_sample_count` | medidor | Ocupación actual de la ventana móvil (0-1000) para este par `tool`/`status` — **no** es monótono, ya que las muestras antiguas salen de la ventana |
+| `bhgbrain_tool_handler_ms_observations_total` | contador | Total monótono real de cada muestra de latencia del manejador de herramientas jamás registrada para este par `tool`/`status`, sin verse afectado por el desalojo de la ventana móvil |
 | `embedding_embed_batch_ms_p95` | histograma | Percentil 95 de la latencia del lote de embeddings |
 | `search_total_ms_p95` | histograma | Percentil 95 de la latencia de búsqueda de extremo a extremo |
 | `search_result_count_avg` | histograma | Número promedio de resultados devueltos por llamada a `search`/`recall`, etiquetado con `mode` (`semantic`/`fulltext`/`hybrid`). Cuenta solo los resultados específicos del modo - las coincidencias archivadas añadidas por `include_archived` quedan excluidas. |
 | `search_result_count_p50` | histograma | Percentil 50 del número de resultados, etiquetado con `mode` |
 | `search_result_count_p95` | histograma | Percentil 95 del número de resultados, etiquetado con `mode` |
 | `search_result_count_p99` | histograma | Percentil 99 del número de resultados, etiquetado con `mode` |
-| `search_result_count_count` | contador | Número de muestras de `search_result_count`, etiquetado con `mode` |
+| `search_result_count_sample_count` | medidor | Ocupación actual de la ventana móvil, etiquetado con `mode` |
+| `search_result_count_observations_total` | contador | Total monótono real de muestras de `search_result_count`, etiquetado con `mode` |
 | `search_result_score_avg` | histograma | Puntuación compuesta promedio de los resultados por llamada a `search`/`recall`, etiquetado con `mode`. Una muestra por resultado; excluye las coincidencias archivadas, que llevan una puntuación de marcador de posición (no de relevancia). |
 | `search_result_score_p50` | histograma | Percentil 50 de la puntuación compuesta de los resultados, etiquetado con `mode` |
 | `search_result_score_p95` | histograma | Percentil 95 de la puntuación compuesta de los resultados, etiquetado con `mode` |
 | `search_result_score_p99` | histograma | Percentil 99 de la puntuación compuesta de los resultados, etiquetado con `mode` |
-| `search_result_score_count` | contador | Número de muestras de `search_result_score`, etiquetado con `mode` |
+| `search_result_score_sample_count` | medidor | Ocupación actual de la ventana móvil, etiquetado con `mode` |
+| `search_result_score_observations_total` | contador | Total monótono real de muestras de `search_result_score`, etiquetado con `mode` |
 | `bhgbrain_memory_count` | medidor | Recuento total de memorias actual (actualizado en escritura/eliminación) |
 | `bhgbrain_rate_limit_buckets` | medidor | Cubos de seguimiento de límite de tasa activos |
 | `bhgbrain_rate_limited_total` | contador | Total de solicitudes con límite de tasa excedido |
@@ -2721,7 +2760,9 @@ con el formato anterior sin etiquetas).
 | `bhgbrain_mcp_sessions_evicted_total` | contador | Total de sesiones MCP HTTP cerradas por el gestor de sesiones, etiquetado con `reason` (`idle` o `capacity`) |
 | `recall_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva de tipo/etiquetas/`after`/`before` posterior a la recuperación de `recall` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
 | `search_zero_after_filter` | contador | Se incrementa cuando la revalidación defensiva `after`/`before` posterior a la recuperación de `search` elimina un resultado que el almacén ya había declarado coincidente — una señal de inanición de filtros que debería permanecer en 0 en estado estable |
-| `search_embedding_degraded` | contador | Se incrementa cuando una búsqueda en modo `hybrid` recae en solo texto completo porque el proveedor de embeddings o el almacén de vectores no está disponible, etiquetado con `namespace` |
+| `search_embedding_degraded` | contador | Se incrementa cuando una búsqueda recae fuera de la puntuación semántica porque el proveedor de embeddings o el almacén de vectores no está disponible, etiquetado con `mode` (`semantic`/`hybrid`). **No** etiquetado con `namespace` — un valor no acotado y controlado por el llamador nunca se convierte en una etiqueta de métrica (ver abajo). |
+| `bhgbrain_metrics_dropped_series_total` | contador | Conteo acumulado de nuevas series de métricas que el registro rechazó porque ya estaba en su límite fijo. Presente (en `0`) desde el primer sondeo, para que la saturación sea visible sin asignar ella misma una serie. |
+| `bhgbrain_metrics_registry_size` | medidor | Número total actual de series distintas (contadores + familias de histogramas) que mantiene el registro en proceso |
 
 Por ejemplo:
 
@@ -2732,11 +2773,54 @@ bhgbrain_tool_handler_ms_p95{tool="remember",status="error"} 340
 ```
 
 Los histogramas usan un búfer circular acotado de las últimas 1.000 muestras **por combinación de
-etiquetas** (cada par herramienta/estado tiene su propia ventana de 1.000 muestras). Las métricas son
-solo en proceso — no hay push externo. Dado que los fallos ahora se incluyen en
-`bhgbrain_tool_handler_ms`, sus p95/p99 reflejan la cola lenta de fallos (tiempos de espera agotados,
-aperturas de disyuntor de circuito, etc.) y pueden mostrar valores más altos que antes de que esta
-métrica registrara fallos.
+etiquetas** (cada par herramienta/estado tiene su propia ventana de 1.000 muestras) — la ocupación de
+esa ventana móvil se expone como un medidor `_sample_count`, nunca como un contador `_count`, para que
+un scraper no pueda confundirlo con un valor monótono; el contador `_observations_total` junto a él es
+la cifra monótona real. Las métricas son solo en proceso — no hay push externo. Dado que los fallos
+ahora se incluyen en `bhgbrain_tool_handler_ms`, sus p95/p99 reflejan la cola lenta de fallos (tiempos
+de espera agotados, aperturas de disyuntor de circuito, etc.) y pueden mostrar valores más altos que
+antes de que esta métrica registrara fallos.
+
+**Cardinalidad acotada:** todo el registro en proceso (cada contador y familia de histogramas
+combinados) está limitado a un número total fijo de series. Los valores de etiqueta que de otro modo
+serían ilimitados — un nombre de herramienta no reconocido de un llamador REST que sondea rutas
+arbitrarias `/tool/:name`, un namespace, una colección — se normalizan a un pequeño vocabulario fijo
+antes de usarse como etiqueta (`invalid_tool` para un nombre de herramienta no reconocido) o se omiten
+por completo del conjunto de etiquetas (namespace/colección), de modo que ninguna combinación de
+entradas controladas por el llamador puede hacer crecer el registro sin límite. Una vez alcanzado el
+límite, una serie genuinamente nueva se rechaza en lugar de asignarse (visible mediante
+`bhgbrain_metrics_dropped_series_total`/`bhgbrain_metrics_registry_size` arriba); una serie ya existente
+nunca se ve afectada.
+
+### Correlación de Solicitudes y Registros Estructurados
+
+Cada respuesta HTTP lleva una cabecera `X-Request-Id` — reutilizada de una cabecera `X-Request-Id`
+entrante si está presente (para que una solicitud siga siendo rastreable a través de un proxy
+delantero), o generada de nuevo en caso contrario — y cada línea de registro que el servidor produce
+mientras atiende esa solicitud (la llamada a la herramienta en sí, y el manejador de errores terminal
+en caso de fallo) incluye el mismo campo `request_id`, más `client_id` cuando es derivable. Sobre MCP,
+los identificadores equivalentes son `session_id` (uno por sesión Streamable HTTP, constante durante su
+vida) y `call_id` (uno por llamada a herramienta dentro de esa sesión, o por llamada en stdio). Esto es
+lo que permite a un operador extraer cada línea de registro de una solicitud fallida específica de un
+servidor concurrente y ocupado — mediante grep sobre el `request_id`/`session_id` visible para el
+cliente desde una cabecera o error, no sobre una ventana de tiempo en la que varias llamadas
+concurrentes podrían encajar igualmente.
+
+Cada línea de registro también lleva campos base fijos `service`/`version`, y cualquier excepción se
+registra bajo un único campo `err` (tipo, mensaje, stack y — cuando el `Error` subyacente se construyó
+con `{ cause }` — la cadena de causas incorporada en ese mismo mensaje/stack) en lugar de un conjunto de
+campos `error`/`message`/`stack` aplanado e inconsistentemente nombrado por punto de llamada. El propio
+`code`/`retryable` de un `BrainError` se traslada a ese mismo objeto `err`.
+
+La CLI (`bhgbrain ...`) siempre escribe sus propios registros estructurados en **stderr**, reservando
+**stdout** para el resultado JSON que un script que canaliza la salida del comando espera poder analizar
+limpiamente (reflejando la división existente de stdout/stderr del transporte MCP stdio — ver
+[modo stdio](#modo-stdio-mcp-sobre-stdinstdout)).
+
+Una condición que es verdadera durante toda la vida de un proceso (p. ej. "no hay token bearer
+configurado, por lo que este servidor sirve tráfico sin autenticar") se registra una vez por arranque
+del servidor, no una vez por solicitud — un despliegue en loopback que atiende miles de solicitudes no
+ahoga sus registros de nivel warn repitiendo la misma línea miles de veces.
 
 ---
 

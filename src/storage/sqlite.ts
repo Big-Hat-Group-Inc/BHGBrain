@@ -19,6 +19,7 @@ import type {
   RetentionTier,
   TierStats,
   RecallFilter,
+  VectorDriftCause,
 } from '../domain/types.js';
 import { mapQdrantPayloadToMemoryFields } from './payload-mapper.js';
 
@@ -187,6 +188,8 @@ export interface SqliteStorage {
   getExpectedEmbeddingIdentity(): string | null;
   adoptEmbeddingIdentityIfAbsent(identity: string): void;
   setExpectedEmbeddingIdentity(identity: string): void;
+  getVectorDriftState(): { cause: VectorDriftCause | null; message: string | null; updated_at: string | null };
+  setVectorDriftState(cause: VectorDriftCause | null, message?: string | null): void;
   countMemoriesWithStaleEmbeddingStamp(activeIdentity: string, includeLegacy: boolean): number;
   listMemoriesWithStaleEmbeddingStamp(
     activeIdentity: string, includeLegacy: boolean, limit: number, cursor?: string,
@@ -501,6 +504,45 @@ CREATE TABLE IF NOT EXISTS embedding_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   identity TEXT NOT NULL,
   adopted_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- strengthen-operational-observability task 3.3: persists the most recent
+-- restore/reconcile vector-drift cause (see VectorDriftCause /
+-- StorageManager.detectAndMarkVectorDrift's 'mode') past the one-shot
+-- restore response that originally discovered it, so a LATER /health poll —
+-- while background reconciliation is still catching up, or after it gave up
+-- retrying — can still distinguish "the embedding model changed" from "a
+-- transient Qdrant read failure" from "an ordinary checksum mismatch"
+-- instead of collapsing all three into one generic "reconciling" message.
+-- Singleton row (id=1), same shape as embedding_state above. cause IS NULL
+-- means no drift is on record (a fresh install, or the last one fully
+-- resolved) — see SqliteStore.getVectorDriftState/setVectorDriftState.
+CREATE TABLE IF NOT EXISTS vector_drift_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  cause TEXT,
+  message TEXT,
+  updated_at TEXT NOT NULL
+);
+
+-- Per-Qdrant-collection durable progress for bootstrapFromQdrant's
+-- vector-to-SQLite hydration (align-runtime-entrypoint-contracts task 3.1):
+-- previously hydration tracked no state at all, so one collection's scroll
+-- failing mid-run aborted every remaining collection for that pass, and the
+-- automatic startup hook only ever ran while countMemories() === 0 — a
+-- non-zero local row count (even from just one successfully-hydrated
+-- collection) permanently suppressed retrying the rest. Recording status
+-- per collection lets bootstrapFromQdrant skip already-'complete'
+-- collections on a later call (cheap: it still lists collections, just
+-- doesn't rescroll ones already done) while resuming exactly the
+-- 'failed'/never-attempted ones — on a later process startup or an explicit
+-- repair --from-qdrant call, until every discovered collection converges
+-- to 'complete'. See design.md decision 2.
+CREATE TABLE IF NOT EXISTS bootstrap_hydration_state (
+  collection_name TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK (status IN ('complete', 'failed')),
+  hydrated_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
   updated_at TEXT NOT NULL
 );
 
@@ -2275,6 +2317,61 @@ export class SqliteStore implements SqliteStorage {
     );
   }
 
+  /**
+   * Durable per-collection bootstrap hydration progress
+   * (align-runtime-entrypoint-contracts task 3.1). `getBootstrapHydrationState`
+   * returns the persisted status for every Qdrant collection this device has
+   * previously attempted to hydrate from — `bootstrapFromQdrant` (see
+   * storage/index.ts) consults it to skip collections already recorded
+   * 'complete' and to retry ones recorded 'failed' (or never attempted at
+   * all) on a later call.
+   */
+  getBootstrapHydrationState(): Array<{
+    collection_name: string;
+    status: 'complete' | 'failed';
+    hydrated_count: number;
+    last_error: string | null;
+    updated_at: string;
+  }> {
+    const rows = this.queryAll(`SELECT collection_name, status, hydrated_count, last_error, updated_at FROM bootstrap_hydration_state`);
+    return rows.map(row => ({
+      collection_name: this.getString(row, 'collection_name'),
+      status: this.getString(row, 'status') as 'complete' | 'failed',
+      hydrated_count: this.getNumber(row, 'hydrated_count'),
+      last_error: this.getNullableString(row, 'last_error'),
+      updated_at: this.getString(row, 'updated_at'),
+    }));
+  }
+
+  /** Records that `collectionName` finished hydrating cleanly this pass. */
+  setBootstrapCollectionComplete(collectionName: string, hydratedCount: number): void {
+    this.assertMutableAllowed();
+    this.execSql(
+      `INSERT INTO bootstrap_hydration_state (collection_name, status, hydrated_count, last_error, updated_at)
+       VALUES (?1, 'complete', ?2, NULL, ?3)
+       ON CONFLICT(collection_name) DO UPDATE SET
+         status = 'complete', hydrated_count = ?2, last_error = NULL, updated_at = ?3`,
+      [collectionName, hydratedCount, new Date().toISOString()],
+    );
+  }
+
+  /**
+   * Records that `collectionName` failed to hydrate this pass — a later
+   * `bootstrapFromQdrant` call (next startup, or an explicit
+   * `repair --from-qdrant`) retries it instead of treating an earlier
+   * unrelated collection's success as "hydration is done".
+   */
+  setBootstrapCollectionFailed(collectionName: string, error: string): void {
+    this.assertMutableAllowed();
+    this.execSql(
+      `INSERT INTO bootstrap_hydration_state (collection_name, status, hydrated_count, last_error, updated_at)
+       VALUES (?1, 'failed', 0, ?2, ?3)
+       ON CONFLICT(collection_name) DO UPDATE SET
+         status = 'failed', last_error = ?2, updated_at = ?3`,
+      [collectionName, error, new Date().toISOString()],
+    );
+  }
+
   countArchivedMemories(): number {
     const row = this.queryOneCached(`SELECT COUNT(*) as cnt FROM memory_archive`);
     return row ? this.getNumber(row, 'cnt') : 0;
@@ -2340,6 +2437,39 @@ export class SqliteStore implements SqliteStorage {
       `INSERT INTO embedding_state (id, identity, adopted_at, updated_at) VALUES (1, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET identity = ?1, updated_at = ?3`,
       [identity, now, now],
+    );
+  }
+
+  /**
+   * The persisted cause of the most recent restore/reconcile vector drift —
+   * see `vector_drift_state`'s doc comment above. `cause: null` (no row, or
+   * an explicitly cleared one) means no drift is currently on record.
+   */
+  getVectorDriftState(): { cause: VectorDriftCause | null; message: string | null; updated_at: string | null } {
+    const row = this.queryOne(`SELECT cause, message, updated_at FROM vector_drift_state WHERE id = 1`);
+    if (!row) return { cause: null, message: null, updated_at: null };
+    return {
+      cause: (this.getNullableString(row, 'cause') as VectorDriftCause | null),
+      message: this.getNullableString(row, 'message'),
+      updated_at: this.getNullableString(row, 'updated_at'),
+    };
+  }
+
+  /**
+   * Records (or, with `cause: null`, clears) the current restore/reconcile
+   * vector-drift cause. Called by `BackupService` when a restore's drift
+   * detection completes (see design.md decision 5) and again once bounded
+   * background reconciliation resolves it — so a health poll mid-way
+   * through reconciliation, or after auto-retry has been exhausted, still
+   * reflects the real cause instead of a stale/absent one.
+   */
+  setVectorDriftState(cause: VectorDriftCause | null, message: string | null = null): void {
+    this.assertMutableAllowed();
+    const now = new Date().toISOString();
+    this.execSql(
+      `INSERT INTO vector_drift_state (id, cause, message, updated_at) VALUES (1, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET cause = ?1, message = ?2, updated_at = ?3`,
+      [cause, message, now],
     );
   }
 
@@ -2664,8 +2794,16 @@ export class SqliteStore implements SqliteStorage {
     });
   }
 
+  // harden-dual-store-mutations task 1.4: fixed SQL, called on every
+  // vector-producing write (StorageManager.ensureCollectionCompatible) and
+  // every reconciliation batch item, so it is compiled once per database
+  // handle via the same `queryOneCached`/`preparedStatement` cache
+  // `getMemoryById` already uses, instead of `db.prepare()` recompiling this
+  // statement on every call.
   getCollection(namespace: string, name: string): CollectionRecord | null {
-    const row = this.queryOne(`SELECT * FROM collections WHERE namespace = ? AND name = ?`, [namespace, name]);
+    const row = this.queryOneCached(
+      `SELECT * FROM collections WHERE namespace = ? AND name = ?`, [namespace, name],
+    );
     if (!row) return null;
     return {
       name: this.getString(row, 'name'),

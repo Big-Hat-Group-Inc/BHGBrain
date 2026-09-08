@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import * as nodeCrypto from 'node:crypto';
-import { createAuthMiddleware, createRateLimitMiddleware, validateExternalAuthBinding } from './middleware.js';
+import {
+  createAuthMiddleware, createRateLimitMiddleware, validateExternalAuthBinding,
+  createRequestContextMiddleware, getRequestContext, requestLogger,
+} from './middleware.js';
 import type { BrainConfig } from '../config/index.js';
 import type { MetricsCollector } from '../health/metrics.js';
 import type pino from 'pino';
@@ -45,6 +48,38 @@ describe('transport middleware hardening', () => {
 
     expect(next).toHaveBeenCalledTimes(1);
     expect(res.status).not.toHaveBeenCalled();
+  });
+
+  // strengthen-operational-observability task 1.6: whether a token is
+  // configured never changes across requests for one middleware instance,
+  // so the "no token configured" condition must log once per instance, not
+  // once per request — otherwise a busy loopback deployment logs one
+  // `auth_skip` warning per call for the lifetime of the process.
+  it('logs auth_skip exactly once per middleware instance, not once per request', () => {
+    delete process.env.BHGBRAIN_TOKEN;
+
+    const logger = { warn: vi.fn() } as unknown as pino.Logger;
+    const config = {
+      transport: { http: { bearer_token_env: 'BHGBRAIN_TOKEN' } },
+    } as unknown as BrainConfig;
+    const middleware = createAuthMiddleware(config, logger);
+
+    // The construction call above already logged once; verify it happened
+    // exactly once before any request, then drive several requests through
+    // and confirm the count never grows.
+    const authSkipCalls = () => (logger.warn as ReturnType<typeof vi.fn>).mock.calls
+      .filter(call => (call[0] as { event?: string }).event === 'auth_skip');
+    expect(authSkipCalls()).toHaveLength(1);
+
+    for (let i = 0; i < 5; i += 1) {
+      const req = { path: '/tool/recall', headers: {} } as unknown as Request;
+      const res = createResponseDouble() as unknown as Response;
+      const next = vi.fn() as unknown as NextFunction;
+      middleware(req, res, next);
+      expect(next).toHaveBeenCalledTimes(1);
+    }
+
+    expect(authSkipCalls()).toHaveLength(1);
   });
 
   it('requires auth for the full diagnostic /health snapshot when a token is configured', () => {
@@ -360,5 +395,82 @@ describe('fail-closed auth startup policy', () => {
     } as unknown as BrainConfig;
 
     expect(() => validateExternalAuthBinding(config)).not.toThrow();
+  });
+});
+
+// strengthen-operational-observability task 1.5: request correlation.
+describe('createRequestContextMiddleware / getRequestContext / requestLogger', () => {
+  function createFakeLogger() {
+    const children: Array<{ bindings: Record<string, unknown>; logger: unknown }> = [];
+    const logger = {
+      warn: vi.fn(), info: vi.fn(), error: vi.fn(),
+      child: vi.fn((bindings: Record<string, unknown>) => {
+        const childLogger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), bindings };
+        children.push({ bindings, logger: childLogger });
+        return childLogger;
+      }),
+    };
+    return { logger: logger as unknown as pino.Logger, children };
+  }
+
+  it('generates a fresh request id and stamps it on the response header when none is supplied', () => {
+    const { logger } = createFakeLogger();
+    const middleware = createRequestContextMiddleware(logger);
+    const req = { headers: {}, ip: '127.0.0.1' } as unknown as Request;
+    const res = { setHeader: vi.fn() } as unknown as Response;
+    const next = vi.fn() as unknown as NextFunction;
+
+    middleware(req, res, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    const ctx = getRequestContext(req);
+    expect(ctx?.requestId).toEqual(expect.any(String));
+    expect(ctx?.requestId.length).toBeGreaterThan(0);
+    expect(res.setHeader).toHaveBeenCalledWith('X-Request-Id', ctx?.requestId);
+  });
+
+  it('reuses an inbound X-Request-Id header instead of generating a new one', () => {
+    const { logger } = createFakeLogger();
+    const middleware = createRequestContextMiddleware(logger);
+    const req = { headers: { 'x-request-id': 'client-supplied-id-123' }, ip: '127.0.0.1' } as unknown as Request;
+    const res = { setHeader: vi.fn() } as unknown as Response;
+    const next = vi.fn() as unknown as NextFunction;
+
+    middleware(req, res, next);
+
+    expect(getRequestContext(req)?.requestId).toBe('client-supplied-id-123');
+    expect(res.setHeader).toHaveBeenCalledWith('X-Request-Id', 'client-supplied-id-123');
+  });
+
+  it('builds a child logger carrying request_id and client_id, distinct per request', () => {
+    const { logger, children } = createFakeLogger();
+    const middleware = createRequestContextMiddleware(logger);
+
+    const reqA = { headers: {}, ip: '10.0.0.1' } as unknown as Request;
+    const resA = { setHeader: vi.fn() } as unknown as Response;
+    middleware(reqA, resA, vi.fn() as unknown as NextFunction);
+
+    const reqB = { headers: {}, ip: '10.0.0.2' } as unknown as Request;
+    const resB = { setHeader: vi.fn() } as unknown as Response;
+    middleware(reqB, resB, vi.fn() as unknown as NextFunction);
+
+    // Two concurrent-shaped requests produce two distinct child loggers with
+    // distinct request_id/client_id bindings — the "concurrent calls can be
+    // correlated end to end" requirement: nothing here lets request A's and
+    // request B's log lines be confused for each other.
+    expect(children).toHaveLength(2);
+    expect(children[0]!.bindings.request_id).not.toBe(children[1]!.bindings.request_id);
+    expect(children[0]!.bindings.client_id).toBe('10.0.0.1');
+    expect(children[1]!.bindings.client_id).toBe('10.0.0.2');
+
+    expect(requestLogger(reqA, logger)).toBe(children[0]!.logger);
+    expect(requestLogger(reqB, logger)).toBe(children[1]!.logger);
+  });
+
+  it('requestLogger falls back to the process-wide logger for a request the context middleware never saw', () => {
+    const { logger } = createFakeLogger();
+    const bareReq = {} as Request;
+    expect(requestLogger(bareReq, logger)).toBe(logger);
+    expect(getRequestContext(bareReq)).toBeUndefined();
   });
 });

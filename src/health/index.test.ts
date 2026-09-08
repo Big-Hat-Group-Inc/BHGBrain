@@ -117,9 +117,12 @@ describe('HealthService', () => {
         getDistillationState: vi.fn(() => ({
           last_run_at: null, last_run_degraded: false, distilled_total: 0, skipped_total: 0,
         })),
+        getBootstrapHydrationState: vi.fn(() => []),
+        getVectorDriftState: vi.fn(() => ({ cause: null, message: null, updated_at: null })),
       },
       qdrant: {
         healthCheck: vi.fn(async () => true),
+        getTotalManagedPointsCount: vi.fn(async () => 42),
       },
       isBackgroundReconciliationActive: vi.fn(() => false),
     } as unknown as StorageManager;
@@ -209,10 +212,16 @@ describe('HealthService', () => {
     const health = new HealthService(storage, embedding, createConfig());
     const result = await health.check();
     expect(result.status).toBe('healthy');
-    expect(result.components.vector_reconciliation).toEqual({
+    // strengthen-operational-observability task 3.2: the bidirectional
+    // signal's qdrant_points_total/sqlite_memory_count/checked_at are
+    // additive fields on top of the pre-existing shape (createStorage's
+    // default fixture reports 42 on both sides — no surplus).
+    expect(result.components.vector_reconciliation).toMatchObject({
       status: 'healthy',
       state: 'reconciled',
       unsynced_vectors: 0,
+      qdrant_points_total: 42,
+      sqlite_memory_count: 42,
     });
   });
 
@@ -429,6 +438,7 @@ describe('HealthService', () => {
       state: 'pending',
       unsynced_vectors: 3,
       message: 'SQLite metadata is active, but vector reconciliation is still required.',
+      drift_cause: null,
     });
   });
 
@@ -446,6 +456,7 @@ describe('HealthService', () => {
       state: 'reconciling',
       unsynced_vectors: 2,
       message: 'Restore is active and vector reconciliation is in progress.',
+      drift_cause: null,
     });
   });
 
@@ -464,6 +475,63 @@ describe('HealthService', () => {
     expect(result.components.retention).toEqual({
       status: 'degraded',
       message: 'Archive step failed for 1 memory',
+    });
+  });
+
+  describe('capacity thresholds (strengthen-operational-observability task 3.1)', () => {
+    it('reports healthy capacity well under both thresholds', async () => {
+      const storage = createStorage();
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.status).toBe('healthy');
+      expect(result.components.capacity).toMatchObject({
+        status: 'healthy',
+        memory_count: 42,
+        memory_count_limit: 500000,
+      });
+    });
+
+    it('degrades once memory count crosses the configured warning percentage, before the hard cap', async () => {
+      const storage = createStorage();
+      // 80% of max_memories (500000) is the configured warn_at_percent.
+      storage.sqlite.countMemories = vi.fn(() => 450_000);
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.status).toBe('degraded');
+      expect(result.components.capacity?.status).toBe('degraded');
+      expect(result.components.capacity?.memory_count_percent).toBe(90);
+      expect(result.components.capacity?.message).toMatch(/approaching/);
+      // Not yet at the hard cap.
+      expect(450_000).toBeLessThan(500_000);
+    });
+
+    it('degrades once memory count reaches the hard cap, with a distinct "reached" message', async () => {
+      const storage = createStorage();
+      storage.sqlite.countMemories = vi.fn(() => 500_000);
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.status).toBe('degraded');
+      expect(result.components.capacity?.status).toBe('degraded');
+      expect(result.components.capacity?.message).toMatch(/reached/);
+    });
+
+    it('degrades once database size crosses the configured warning percentage of max_db_size_gb', async () => {
+      const storage = createStorage();
+      // max_db_size_gb: 2 -> 2 * 1024^3 bytes; 85% of that crosses warn_at_percent: 80.
+      const limitBytes = 2 * 1024 * 1024 * 1024;
+      storage.sqlite.getDbSizeBytes = vi.fn(() => Math.floor(limitBytes * 0.85));
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.status).toBe('degraded');
+      expect(result.components.capacity?.status).toBe('degraded');
+      expect(result.components.capacity?.db_size_percent).toBe(85);
     });
   });
 
@@ -507,6 +575,100 @@ describe('HealthService', () => {
       state: 'reconciling',
       unsynced_vectors: 5,
       message: 'Bounded background vector reconciliation is in progress.',
+      drift_cause: null,
+    });
+  });
+
+  describe('vector drift cause / bidirectional count (strengthen-operational-observability tasks 3.2/3.3)', () => {
+    it('surfaces the persisted drift cause while background reconciliation is in progress, distinguishing it from a generic message', async () => {
+      const storage = createStorage();
+      storage.sqlite.getLifecycleOperation = vi.fn(() => null);
+      storage.sqlite.countUnsyncedVectors = vi.fn(() => 5);
+      storage.isBackgroundReconciliationActive = vi.fn(() => true);
+      storage.sqlite.getVectorDriftState = vi.fn(() => ({
+        cause: 'inspection-failed' as const, message: 'transient failure', updated_at: '2026-03-01T00:00:00.000Z',
+      }));
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.components.vector_reconciliation.drift_cause).toBe('inspection-failed');
+      // A transient inspection failure must never be reported as a model change.
+      expect(result.components.vector_reconciliation.message).not.toMatch(/model changed/);
+      expect(result.components.vector_reconciliation.message).toMatch(/transient failure, not a model change/);
+    });
+
+    it('surfaces a full-rebuild drift cause distinctly once auto-retry is exhausted and the state falls back to "pending"', async () => {
+      const storage = createStorage();
+      storage.sqlite.getLifecycleOperation = vi.fn(() => null);
+      storage.sqlite.countUnsyncedVectors = vi.fn(() => 8);
+      storage.isBackgroundReconciliationActive = vi.fn(() => false);
+      storage.sqlite.getVectorDriftState = vi.fn(() => ({
+        cause: 'full-rebuild' as const, message: 'embedding model changed', updated_at: '2026-03-01T00:00:00.000Z',
+      }));
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.components.vector_reconciliation.state).toBe('pending');
+      expect(result.components.vector_reconciliation.drift_cause).toBe('full-rebuild');
+      expect(result.components.vector_reconciliation.message).toMatch(/embedding model or dimensions changed/);
+    });
+
+    it('reports surplus_suspected when the vector store holds materially more points than SQLite has authoritative rows for', async () => {
+      const storage = createStorage();
+      storage.sqlite.countMemories = vi.fn(() => 100);
+      storage.qdrant.getTotalManagedPointsCount = vi.fn(async () => 150);
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.status).toBe('degraded');
+      expect(result.components.vector_reconciliation).toMatchObject({
+        status: 'degraded',
+        state: 'surplus_suspected',
+        qdrant_points_total: 150,
+        sqlite_memory_count: 100,
+      });
+      expect(result.components.vector_reconciliation.message).toMatch(/orphan/);
+    });
+
+    it('tolerates a small count mismatch without reporting suspected surplus (normal write-path timing)', async () => {
+      const storage = createStorage();
+      storage.sqlite.countMemories = vi.fn(() => 100);
+      storage.qdrant.getTotalManagedPointsCount = vi.fn(async () => 101);
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+      const result = await health.check();
+
+      expect(result.status).toBe('healthy');
+      expect(result.components.vector_reconciliation.state).toBe('reconciled');
+    });
+
+    it('caches the Qdrant point-count scan rather than re-scanning on every /health poll', async () => {
+      const storage = createStorage();
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+
+      await health.check();
+      await health.check();
+
+      expect(storage.qdrant.getTotalManagedPointsCount).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls back to the last known count (not a crash) when the bidirectional scan itself fails', async () => {
+      const storage = createStorage();
+      storage.qdrant.getTotalManagedPointsCount = vi.fn(async () => { throw new Error('qdrant unreachable'); });
+      const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger;
+
+      const health = new HealthService(storage, createEmbedding(true), createConfig(), {}, logger);
+      const result = await health.check();
+
+      // No crash, and the rest of health reporting is unaffected — the
+      // signal is simply omitted this cycle rather than failing the whole
+      // /health response.
+      expect(result.status).toBe('healthy');
+      expect(result.components.vector_reconciliation.qdrant_points_total).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'vector_bidirectional_count_failed' }));
     });
   });
 
@@ -568,6 +730,35 @@ describe('HealthService', () => {
 
     expect(result.status).toBe('degraded');
     expect(result.components.schedulers).toEqual({ status: 'degraded', message: 'timer registration failed' });
+  });
+
+  // align-runtime-entrypoint-contracts task 3.1
+  describe('bootstrap_hydration component', () => {
+    it('reports healthy when no collection has ever been recorded', async () => {
+      const storage = createStorage();
+      storage.sqlite.getBootstrapHydrationState = vi.fn(() => []);
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+
+      const result = await health.check();
+
+      expect(result.status).toBe('healthy');
+      expect(result.components.bootstrap_hydration).toEqual({ status: 'healthy' });
+    });
+
+    it('degrades overall health when a collection is recorded failed, naming it in the message', async () => {
+      const storage = createStorage();
+      storage.sqlite.getBootstrapHydrationState = vi.fn(() => [
+        { collection_name: 'bhgbrain_global_general', status: 'complete' as const, hydrated_count: 4, last_error: null, updated_at: 'now' },
+        { collection_name: 'bhgbrain_global_broken', status: 'failed' as const, hydrated_count: 0, last_error: 'timeout', updated_at: 'now' },
+      ]);
+      const health = new HealthService(storage, createEmbedding(true), createConfig());
+
+      const result = await health.check();
+
+      expect(result.status).toBe('degraded');
+      expect(result.components.bootstrap_hydration?.status).toBe('degraded');
+      expect(result.components.bootstrap_hydration?.message).toContain('bhgbrain_global_broken');
+    });
   });
 
   // bound-qdrant-http-runtime task 2.1: liveness/readiness/diagnostics split.

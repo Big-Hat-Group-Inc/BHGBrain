@@ -107,7 +107,7 @@ export class LlmExtractionProvider implements ExtractionProvider {
     } catch (err) {
       this.logger?.warn({
         event: 'extraction_invalid_response',
-        error: (err as Error).message,
+        err,
       });
       this.metrics?.incCounter('extraction_fallback_total');
       return null;

@@ -582,7 +582,7 @@ describe('RetentionService', () => {
     expect(result).toMatchObject({ deleted: 1, compacted: [], degraded: false });
     expect(qdrant.compact).not.toHaveBeenCalled();
     expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({
-      event: 'retention_gc_collection_info_failed', error: 'Qdrant 503',
+      event: 'retention_gc_collection_info_failed', err: expect.objectContaining({ message: 'Qdrant 503' }),
     }));
   });
 
@@ -892,7 +892,7 @@ describe('RetentionService', () => {
     const result = await new RetentionService(config, failureStorage, failureLogger).runGc();
     expect(result.degraded).toBe(true);
     expect(failureLogger.warn).toHaveBeenCalledWith(expect.objectContaining({
-      event: 'retention_gc_archive_failed', memory_id: expired.id, error: 'archive disk failure',
+      event: 'retention_gc_archive_failed', memory_id: expired.id, err: expect.objectContaining({ message: 'archive disk failure' }),
     }));
     expect(failureLogger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: 'retention_gc', outcome: 'degraded' }));
   });

@@ -17,6 +17,7 @@ import type { ToolContext } from '../tools/index.js';
 import type { ResourceHandler } from '../resources/index.js';
 import { buildMcpServer } from './mcp-server.js';
 import { deriveTrustedClientId } from './middleware.js';
+import { toLogError } from '../health/logger.js';
 
 const SESSION_HEADER = 'mcp-session-id';
 
@@ -125,7 +126,7 @@ export class McpSessionManager {
     this.ctx.metrics.incCounter('bhgbrain_mcp_sessions_evicted_total', 1, { reason });
     this.logger.info({ event: 'mcp_session_evicted', session_id: sessionId, reason });
     entry.transport.close().catch((err: unknown) => {
-      this.logger.warn({ event: 'mcp_session_close_failed', session_id: sessionId, error: (err as Error).message });
+      this.logger.warn({ event: 'mcp_session_close_failed', session_id: sessionId, err: toLogError(err) });
     });
     this.updateActiveGauge();
   }
@@ -222,11 +223,20 @@ export class McpSessionManager {
       }
     }
 
-    const server = buildMcpServer(this.ctx, this.resources);
     const clientId = deriveTrustedClientId(req) ?? 'http-client';
+    // strengthen-operational-observability task 1.5: generated up front
+    // (rather than left to the transport's own `sessionIdGenerator`) so it
+    // is known before `buildMcpServer` builds this session's child logger —
+    // every `tool_call`/`tool_error` event this session ever produces then
+    // carries the same `session_id` a concurrent session never collides
+    // with. `sessionIdGenerator: () => sessionId` hands the transport this
+    // pre-generated id instead of letting it mint its own.
+    const sessionId = randomUUID();
+    const sessionLogger = this.logger.child({ session_id: sessionId, client_id: clientId });
+    const server = buildMcpServer(this.ctx, this.resources, { logger: sessionLogger, clientId });
 
     const transport: StreamableHTTPServerTransport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: randomUUID,
+      sessionIdGenerator: () => sessionId,
       enableJsonResponse: true,
       onsessioninitialized: (sessionId: string) => {
         this.sessions.set(sessionId, { transport, lastSeenAt: Date.now() });

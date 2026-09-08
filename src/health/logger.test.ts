@@ -69,20 +69,29 @@ describe('logger helpers', () => {
     vi.resetModules();
   });
 
-  it('redacts long content and short/long tokens correctly', async () => {
+  it('redacts long content and previews tokens as a hash, never raw characters', async () => {
     const { redactContent, redactToken } = await import('./logger.js');
     expect(redactContent('short content')).toBe('short content');
     expect(redactContent('x'.repeat(60))).toBe(`${'x'.repeat(50)}...[redacted]`);
-    expect(redactToken('short')).toBe('***');
-    expect(redactToken('1234567890abcdef')).toBe('1234...cdef');
+    expect(redactToken('')).toBe('***');
+    // Hash-prefix preview (task 1.4/design.md decision 4): deterministic for
+    // the same input, but must not contain any literal substring of the
+    // token itself.
+    const preview = redactToken('1234567890abcdef');
+    expect(preview).toMatch(/^sha256:[0-9a-f]{8}$/);
+    expect(preview).not.toContain('1234');
+    expect(preview).not.toContain('cdef');
+    expect(redactToken('1234567890abcdef')).toBe(preview); // deterministic
+    expect(redactToken('different-token')).not.toBe(preview); // distinguishable
   });
 
   it('passes logger level and redact config to pino', async () => {
     const pinoMock = vi.fn(() => ({ level: 'warn' }));
     const stdTimeFunctions = { isoTime: vi.fn() };
+    const stdSerializers = { err: vi.fn() };
 
     vi.doMock('pino', () => ({
-      default: Object.assign(pinoMock, { stdTimeFunctions }),
+      default: Object.assign(pinoMock, { stdTimeFunctions, stdSerializers }),
     }));
 
     const { createLogger } = await import('./logger.js');
@@ -127,12 +136,82 @@ describe('logger helpers', () => {
     expect(output).toContain('[Redacted]');
   });
 
+  it('stamps service/version base fields and serializes a nested-cause error under `err`', async () => {
+    vi.doUnmock('pino');
+    const chunks: string[] = [];
+    const destination = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+
+    const { createLogger } = await import('./logger.js');
+    const { PACKAGE_VERSION } = await import('../version.js');
+    const logger = createLogger(createConfig(false), destination);
+
+    const cause = new Error('root cause failure');
+    const outer = new Error('outer failure', { cause });
+
+    logger.error({ event: 'tool_error', tool: 'remember', err: outer });
+
+    const line = JSON.parse(chunks.join(''));
+    expect(line.service).toBe('bhgbrain');
+    expect(line.version).toBe(PACKAGE_VERSION);
+    expect(line.event).toBe('tool_error');
+    expect(line.err.message).toContain('outer failure');
+    // pino's err serializer folds a `.cause` chain's message/stack into the
+    // top-level `message`/`stack` fields rather than a separate `cause` key.
+    expect(line.err.message).toContain('root cause failure');
+    expect(line.err.stack).toContain('root cause failure');
+  });
+
+  it('includes BrainError code/retryable in the serialized `err` field', async () => {
+    vi.doUnmock('pino');
+    const chunks: string[] = [];
+    const destination = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    });
+
+    const { createLogger } = await import('./logger.js');
+    const { BrainError } = await import('../errors/index.js');
+    const logger = createLogger(createConfig(false), destination);
+
+    logger.warn({ event: 'tool_error', tool: 'forget', err: new BrainError('NOT_FOUND', 'Memory x not found', false) });
+
+    const line = JSON.parse(chunks.join(''));
+    expect(line.err.code).toBe('NOT_FOUND');
+    expect(line.err.retryable).toBe(false);
+    expect(line.err.message).toContain('Memory x not found');
+  });
+
+  it('withStableFields never lets caller-influenced details override the stable event fields', async () => {
+    const { withStableFields } = await import('./logger.js');
+    const details = { event: 'spoofed_event', tool: 'spoofed_tool', extra: 'kept' };
+    const merged = withStableFields({ event: 'tool_error', tool: 'remember' }, details);
+    expect(merged.event).toBe('tool_error');
+    expect(merged.tool).toBe('remember');
+    expect(merged.extra).toBe('kept');
+  });
+
+  it('toLogError wraps a non-Error throw instead of dropping it', async () => {
+    const { toLogError } = await import('./logger.js');
+    const wrapped = toLogError('a plain string throw');
+    expect(wrapped).toBeInstanceOf(Error);
+    expect(wrapped.message).toBe('a plain string throw');
+    expect(toLogError(new Error('already an error')).message).toBe('already an error');
+  });
+
   it('omits redact config when redaction is disabled', async () => {
     const pinoMock = vi.fn(() => ({ level: 'warn' }));
     const stdTimeFunctions = { isoTime: vi.fn() };
+    const stdSerializers = { err: vi.fn() };
 
     vi.doMock('pino', () => ({
-      default: Object.assign(pinoMock, { stdTimeFunctions }),
+      default: Object.assign(pinoMock, { stdTimeFunctions, stdSerializers }),
     }));
 
     const { createLogger } = await import('./logger.js');

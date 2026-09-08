@@ -1,6 +1,6 @@
 import type pino from 'pino';
 import type { BrainConfig } from '../config/index.js';
-import type { HealthSnapshot, HealthStatus, ComponentHealth, VectorReconciliationStatus } from '../domain/types.js';
+import type { HealthSnapshot, HealthStatus, ComponentHealth, VectorReconciliationStatus, CapacityHealth, VectorDriftCause } from '../domain/types.js';
 import type { StorageManager } from '../storage/index.js';
 import { DegradedEmbeddingProvider, type EmbeddingProvider } from '../embedding/index.js';
 import type { RetentionTier } from '../domain/types.js';
@@ -75,6 +75,19 @@ export class HealthService {
   private cachedQdrantAt = 0;
   private static readonly QDRANT_HEALTH_CACHE_MS = 5_000; // cache for 5s
 
+  // strengthen-operational-observability task 3.2: `getTotalManagedPointsCount()`
+  // is an N-collection scan (one Qdrant round trip per managed collection),
+  // not a cheap local read like the caches above — cached for a full minute
+  // so it amortizes across many /health polls instead of running on every
+  // one. See `getCachedQdrantPointsTotal`.
+  private cachedQdrantPointsTotal: { total: number; at: number } | null = null;
+  private static readonly VECTOR_COUNT_CACHE_MS = 60_000; // cache for 60s
+  // A small fixed allowance before a Qdrant-vs-SQLite count mismatch is
+  // reported as suspected surplus — normal write-path timing (a vector
+  // upserted just before its SQLite row commits, or vice versa) can produce
+  // a transient off-by-a-few difference that is not actually drift.
+  private static readonly VECTOR_SURPLUS_TOLERANCE = 3;
+
   constructor(
     private storage: StorageManager,
     private embedding: EmbeddingProvider,
@@ -127,10 +140,14 @@ export class HealthService {
     // status and again for the reported stats block.
     const stats = this.getSqliteStats();
     const retentionOk = this.checkRetention(stats.countsByTier);
+    const capacityOk = this.checkCapacity(stats);
     const schedulersOk = this.checkSchedulers();
-    const vectorReconciliation = this.checkVectorReconciliation(stats.unsyncedVectors);
+    const vectorReconciliation = await this.checkVectorReconciliation(stats.unsyncedVectors, stats.memoryCount);
+    const bootstrapHydrationOk = this.checkBootstrapHydration();
 
-    const overall = this.computeOverall(sqliteOk, qdrantOk, embeddingOk, vectorReconciliation, retentionOk, schedulersOk);
+    const overall = this.computeOverall(
+      sqliteOk, qdrantOk, embeddingOk, vectorReconciliation, retentionOk, schedulersOk, bootstrapHydrationOk, capacityOk,
+    );
 
     return {
       status: overall,
@@ -140,7 +157,9 @@ export class HealthService {
         embedding: embeddingOk,
         vector_reconciliation: vectorReconciliation,
         retention: retentionOk,
+        capacity: capacityOk,
         schedulers: schedulersOk,
+        bootstrap_hydration: bootstrapHydrationOk,
       },
       memory_count: stats.memoryCount,
       db_size_bytes: stats.dbSizeBytes,
@@ -327,6 +346,58 @@ export class HealthService {
     return { status: 'healthy' };
   }
 
+  /**
+   * strengthen-operational-observability task 3.1: evaluates the configured
+   * `retention.max_db_size_gb`/`max_memories` hard caps AND the
+   * `retention.warn_at_percent` early-warning threshold against them — the
+   * two config fields existed already (config/index.ts) but nothing in the
+   * codebase ever read them before this. Degrades at the warning percentage
+   * so an operator has advance notice before the hard cap (already enforced
+   * separately by `isOverCapacity`/`checkRetention`, which blocks/GCs
+   * writes) is ever reached, per the spec scenario "Database exceeds its
+   * warning threshold ... health becomes degraded before the hard cap is
+   * exceeded".
+   */
+  private checkCapacity(stats: SqliteStatsSnapshot): CapacityHealth {
+    const dbSizeLimitBytes = this.config.retention.max_db_size_gb * 1024 * 1024 * 1024;
+    const memoryCountLimit = this.config.retention.max_memories;
+    const warnAtPercent = this.config.retention.warn_at_percent;
+
+    const dbSizePercent = dbSizeLimitBytes > 0 ? (stats.dbSizeBytes / dbSizeLimitBytes) * 100 : 0;
+    const memoryCountPercent = memoryCountLimit > 0 ? (stats.memoryCount / memoryCountLimit) * 100 : 0;
+
+    const base = {
+      db_size_bytes: stats.dbSizeBytes,
+      db_size_limit_bytes: dbSizeLimitBytes,
+      db_size_percent: Math.round(dbSizePercent * 10) / 10,
+      memory_count: stats.memoryCount,
+      memory_count_limit: memoryCountLimit,
+      memory_count_percent: Math.round(memoryCountPercent * 10) / 10,
+    };
+
+    if (stats.dbSizeBytes >= dbSizeLimitBytes || stats.memoryCount >= memoryCountLimit) {
+      return {
+        ...base,
+        status: 'degraded',
+        message: `Database has reached its configured capacity limit ` +
+          `(size ${base.db_size_percent}% of ${this.config.retention.max_db_size_gb}GB, ` +
+          `memories ${base.memory_count_percent}% of ${memoryCountLimit}).`,
+      };
+    }
+
+    if (dbSizePercent >= warnAtPercent || memoryCountPercent >= warnAtPercent) {
+      return {
+        ...base,
+        status: 'degraded',
+        message: `Database is approaching its configured capacity limit ` +
+          `(size ${base.db_size_percent}%, memories ${base.memory_count_percent}% — ` +
+          `warning threshold is ${warnAtPercent}%).`,
+      };
+    }
+
+    return { ...base, status: 'healthy' };
+  }
+
   private checkSchedulers(): ComponentHealth {
     const states = this.schedulerStates?.() ?? [];
     const failed = states.find(state => state.failure !== null);
@@ -336,13 +407,57 @@ export class HealthService {
     return { status: 'healthy' };
   }
 
-  private checkVectorReconciliation(unsyncedVectors: number): VectorReconciliationStatus {
+  /**
+   * Reports 'degraded' while any Qdrant collection is durably recorded
+   * 'failed' in bootstrap_hydration_state — resumable hydration (task 3.1)
+   * means a failed collection is retried on a later
+   * bootstrapFromQdrant call rather than aborting the whole run, but until
+   * that retry actually converges the collection to 'complete', health
+   * should visibly reflect that this device's local SQLite copy may still
+   * be missing memories the rest of the fleet already has.
+   */
+  private checkBootstrapHydration(): ComponentHealth {
+    const state = this.storage.sqlite.getBootstrapHydrationState();
+    const failed = state.filter(row => row.status === 'failed');
+    if (failed.length > 0) {
+      return {
+        status: 'degraded',
+        message: `${failed.length} Qdrant collection(s) failed to hydrate and will be retried: ${failed.map(f => f.collection_name).join(', ')}`,
+      };
+    }
+    return { status: 'healthy' };
+  }
+
+  /**
+   * strengthen-operational-observability task 3.3: a human-readable cause
+   * for an on-record vector drift — see `VectorDriftCause` and
+   * `BackupService.restoreVectorStateAfterActivation`, which persists it via
+   * `SqliteStore.setVectorDriftState` at the moment a restore first detects
+   * it, past that call's own one-shot response.
+   */
+  private static describeDriftCause(cause: VectorDriftCause): string {
+    switch (cause) {
+      case 'full-rebuild':
+        return 'the embedding model or dimensions changed since the last restore, so vectors are being fully rebuilt';
+      case 'inspection-failed':
+        return 'the vector store could not be inspected for drift during the last restore (a transient failure, not a model change), so reconciliation is conservatively re-embedding the corpus';
+      case 'partial-drift':
+        return 'a checksum mismatch was found during the last restore; vector reconciliation for the drifted subset is continuing';
+    }
+  }
+
+  private async checkVectorReconciliation(unsyncedVectors: number, memoryCount: number): Promise<VectorReconciliationStatus> {
     // `getLifecycleOperation()`/`isBackgroundReconciliationActive()` are live
     // in-memory/single-row reads, so the "reconciling" transition is visible
     // immediately regardless of the stats cache above — only `unsyncedVectors`
     // itself (the "pending" vs. "healthy" count) is sourced from the shared
     // snapshot.
     const lifecycleOperation = this.storage.sqlite.getLifecycleOperation();
+    // strengthen-operational-observability task 3.3: read once and reused by
+    // every branch below that can attribute its degraded state to a
+    // specific, persisted cause rather than a generic "reconciliation in
+    // progress" message.
+    const driftState = this.storage.sqlite.getVectorDriftState();
 
     if (lifecycleOperation === 'restore') {
       return {
@@ -350,6 +465,7 @@ export class HealthService {
         state: 'reconciling',
         unsynced_vectors: unsyncedVectors,
         message: 'Restore is active and vector reconciliation is in progress.',
+        drift_cause: driftState.cause,
       };
     }
 
@@ -361,7 +477,10 @@ export class HealthService {
         status: 'degraded',
         state: 'reconciling',
         unsynced_vectors: unsyncedVectors,
-        message: 'Bounded background vector reconciliation is in progress.',
+        message: driftState.cause
+          ? `Bounded background vector reconciliation is in progress: ${HealthService.describeDriftCause(driftState.cause)}.`
+          : 'Bounded background vector reconciliation is in progress.',
+        drift_cause: driftState.cause,
       };
     }
 
@@ -370,15 +489,74 @@ export class HealthService {
         status: 'degraded',
         state: 'pending',
         unsynced_vectors: unsyncedVectors,
-        message: 'SQLite metadata is active, but vector reconciliation is still required.',
+        message: driftState.cause
+          ? `SQLite metadata is active, but vector reconciliation is still required: ${HealthService.describeDriftCause(driftState.cause)} — automatic retry was exhausted; run the repair tool (mode: "re-embed") or trigger reconciliation again.`
+          : 'SQLite metadata is active, but vector reconciliation is still required.',
+        drift_cause: driftState.cause,
       };
+    }
+
+    // strengthen-operational-observability task 3.2: the bidirectional
+    // count cross-check — nothing on the SQLite side says reconciliation is
+    // needed, but the vector store may still hold points SQLite has no
+    // record of at all (an orphan from an interrupted delete, a stale
+    // cross-device fallback point, ...). Cached (see `getCachedQdrantPointsTotal`)
+    // since it is an N-collection scan, not a cheap local read.
+    const qdrantCounts = await this.getCachedQdrantPointsTotal();
+    if (qdrantCounts && qdrantCounts.total > memoryCount) {
+      const surplus = qdrantCounts.total - memoryCount;
+      if (surplus > HealthService.VECTOR_SURPLUS_TOLERANCE) {
+        return {
+          status: 'degraded',
+          state: 'surplus_suspected',
+          unsynced_vectors: 0,
+          qdrant_points_total: qdrantCounts.total,
+          sqlite_memory_count: memoryCount,
+          checked_at: qdrantCounts.checkedAt,
+          message: `The vector store reports ${qdrantCounts.total} managed points, ${surplus} more than SQLite's ` +
+            `${memoryCount} authoritative memories — suspected orphan/vector-only points. ` +
+            `Run the repair tool or a backup restore's drift detection to prune them.`,
+        };
+      }
     }
 
     return {
       status: 'healthy',
       state: 'reconciled',
       unsynced_vectors: 0,
+      ...(qdrantCounts ? {
+        qdrant_points_total: qdrantCounts.total,
+        sqlite_memory_count: memoryCount,
+        checked_at: qdrantCounts.checkedAt,
+      } : {}),
     };
+  }
+
+  /**
+   * strengthen-operational-observability task 3.2: cached — an N-collection
+   * scan (`QdrantStore.getTotalManagedPointsCount`), not a cheap local
+   * read — so a burst of health polls (or the authenticated `/health` route
+   * being hit repeatedly) cannot each start a fresh full-registry Qdrant
+   * scan. On a genuine failure, falls back to the last known total (still
+   * tagged with its original `checked_at`, so a consumer can tell it is
+   * stale) rather than dropping the signal outright — design.md risk
+   * mitigation: "report staleness timestamp".
+   */
+  private async getCachedQdrantPointsTotal(): Promise<{ total: number; checkedAt: string } | null> {
+    const now = Date.now();
+    if (this.cachedQdrantPointsTotal && (now - this.cachedQdrantPointsTotal.at) < HealthService.VECTOR_COUNT_CACHE_MS) {
+      return { total: this.cachedQdrantPointsTotal.total, checkedAt: new Date(this.cachedQdrantPointsTotal.at).toISOString() };
+    }
+    try {
+      const total = await this.storage.qdrant.getTotalManagedPointsCount();
+      this.cachedQdrantPointsTotal = { total, at: now };
+      return { total, checkedAt: new Date(now).toISOString() };
+    } catch (err) {
+      this.logger?.warn({ event: 'vector_bidirectional_count_failed', err });
+      return this.cachedQdrantPointsTotal
+        ? { total: this.cachedQdrantPointsTotal.total, checkedAt: new Date(this.cachedQdrantPointsTotal.at).toISOString() }
+        : null;
+    }
   }
 
   private computeOverall(
@@ -388,6 +566,8 @@ export class HealthService {
     vectorReconciliation: VectorReconciliationStatus,
     retention: ComponentHealth,
     schedulers: ComponentHealth,
+    bootstrapHydration: ComponentHealth,
+    capacity: ComponentHealth,
   ): HealthStatus {
     if (sqlite.status === 'unhealthy') {
       return 'unhealthy';
@@ -400,8 +580,12 @@ export class HealthService {
       vectorReconciliation.status === 'unhealthy' ||
       retention.status === 'degraded' ||
       retention.status === 'unhealthy' ||
+      capacity.status === 'degraded' ||
+      capacity.status === 'unhealthy' ||
       schedulers.status === 'degraded' ||
       schedulers.status === 'unhealthy' ||
+      bootstrapHydration.status === 'degraded' ||
+      bootstrapHydration.status === 'unhealthy' ||
       Object.values(this.breakers).some(breaker => breaker.getState() === 'open')
     ) {
       return 'degraded';

@@ -43,8 +43,55 @@ describe('buildMcpServer', () => {
 
     const result = await client.callTool({ name: 'remember', arguments: { content: 'hello' } });
 
-    expect(handleToolMock).toHaveBeenCalledWith(ctx, 'remember', { content: 'hello' });
+    // strengthen-operational-observability task 1.5: a trusted-client-id
+    // default ('unknown' when buildMcpServer was given no options — the
+    // stdio-shaped call) and a per-call child logger (undefined here since
+    // this bare `ctx` carries no `logger` to build one from) are threaded
+    // through to handleTool alongside the original 3 arguments.
+    expect(handleToolMock).toHaveBeenCalledWith(ctx, 'remember', { content: 'hello' }, 'unknown', undefined);
     expect(JSON.stringify(result.structuredContent)).toContain('mem-1');
+
+    await client.close();
+    await server.close();
+  });
+
+  // strengthen-operational-observability task 1.5: "MCP uses session ID plus
+  // a per-call ID; trusted client identity is passed into buildMcpServer and
+  // child loggers" (design.md decision 1).
+  it('threads the given clientId and a distinct per-call child logger into every handleTool call', async () => {
+    const { buildMcpServer } = await import('./mcp-server.js');
+    const ctx = {} as ToolContext;
+    const resources = { handle: vi.fn() } as unknown as ResourceHandler;
+    handleToolMock.mockResolvedValue({ ok: true });
+
+    const childLoggers: unknown[] = [];
+    const sessionLogger = {
+      warn: vi.fn(), info: vi.fn(), error: vi.fn(),
+      child: vi.fn((bindings: Record<string, unknown>) => {
+        const child = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), bindings };
+        childLoggers.push(child);
+        return child;
+      }),
+    };
+
+    const server = buildMcpServer(ctx, resources, { logger: sessionLogger as never, clientId: '10.0.0.5' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test-client', version: '0.0.0' });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    // Two calls on the same session — each must get its own call_id-tagged
+    // child logger (a concurrent-call correlation guarantee), while both
+    // share the session's trusted clientId.
+    await client.callTool({ name: 'recall', arguments: { query: 'a' } });
+    await client.callTool({ name: 'recall', arguments: { query: 'b' } });
+
+    expect(handleToolMock).toHaveBeenNthCalledWith(1, ctx, 'recall', { query: 'a' }, '10.0.0.5', childLoggers[0]);
+    expect(handleToolMock).toHaveBeenNthCalledWith(2, ctx, 'recall', { query: 'b' }, '10.0.0.5', childLoggers[1]);
+    expect(childLoggers).toHaveLength(2);
+    expect(childLoggers[0]).not.toBe(childLoggers[1]);
+    const bindingsA = (childLoggers[0] as { bindings: Record<string, unknown> }).bindings;
+    const bindingsB = (childLoggers[1] as { bindings: Record<string, unknown> }).bindings;
+    expect(bindingsA.call_id).not.toBe(bindingsB.call_id);
 
     await client.close();
     await server.close();
@@ -72,6 +119,28 @@ describe('buildMcpServer', () => {
     const [content] = result.contents;
     expect(content && 'text' in content).toBe(true);
     expect(JSON.stringify(content && 'text' in content ? content.text : undefined)).toContain('memory://list');
+
+    await client.close();
+    await server.close();
+  });
+
+  it('converts a resource read error envelope into an MCP protocol error, not a successful contents read (task 2.3)', async () => {
+    const { buildMcpServer } = await import('./mcp-server.js');
+    const ctx = {} as ToolContext;
+    const handle = vi.fn(async () => ({ error: { code: 'NOT_FOUND', message: 'Memory abc not found', retryable: false } }));
+    const resources = { handle } as unknown as ResourceHandler;
+
+    const server = buildMcpServer(ctx, resources);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'test-client', version: '0.0.0' });
+
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    await expect(client.readResource({ uri: 'memory://abc' }))
+      .rejects.toMatchObject({ message: expect.stringContaining('Memory abc not found') });
 
     await client.close();
     await server.close();
