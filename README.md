@@ -2906,6 +2906,12 @@ BHGBrain exposes MCP resources (readable via `ReadResource`) in addition to tool
 | `category://{name}` | Category | Full category content by name |
 | `collection://{name}` | Collection | Memories in a specific collection |
 
+`category://list` and `collection://list` (and `collection://{name}`'s own `memories`
+page, documented under `memory://list` above) are likewise assembled within
+`defaults.max_response_chars`, each reporting `truncated: true` if a large number of
+rows had to be left out to stay within budget — the same pattern `recall`'s `results`
+use, applied consistently across every list-shaped resource.
+
 ### Resource List Change Notifications
 
 BHGBrain declares the `resources.listChanged` MCP capability. After a `collections`
@@ -2937,6 +2943,14 @@ Response:
 ```
 
 Pagination uses composite cursors (`created_at|id`) for stable ordering. Ties at the same timestamp are broken by ID, ensuring no row is skipped or duplicated across pages.
+
+The page (already bounded by `limit`) is additionally assembled within
+`defaults.max_response_chars`, the same way `recall`'s `results` are — large `items`
+(long `content` fields) can leave `items.length` smaller than `limit` even on the last
+page. `truncated` is `true` whenever either cause applies (more pages exist, or this
+page itself had to leave trailing items out), and `cursor` always resumes from the last
+item actually included in `items`, so a byte-budget cut never causes the next page to
+silently skip a memory.
 
 `memory://list` and `memory://{id}` apply the same lifecycle-visibility rule as `search`/`recall`: an expired, decay-eligible `T2`/`T3` memory is excluded (reads on `memory://{id}` return `NOT_FOUND`). `T0` and `T1` memories remain visible regardless of transient expiry.
 
@@ -3059,9 +3073,14 @@ Response:
   "revisions": [
     { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
     { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
-  ]
+  ],
+  "truncated": false
 }
 ```
+
+`revisions` is assembled within `defaults.max_response_chars` the same way `recall`'s
+`results` are — `truncated: true` marks a response that left trailing (older)
+revisions out for a memory with a long history.
 
 To read this from a stdio client that lacks resource support, use the `revisions` tool's `list` action instead (same data — see [MCP Tools Reference](#mcp-tools-reference)).
 
@@ -3548,9 +3567,14 @@ List, create, or delete collections within a namespace.
   "collections": [
     { "name": "general", "count": 42 },
     { "name": "architecture", "count": 10 }
-  ]
+  ],
+  "truncated": false
 }
 ```
+
+`collections` is assembled within `defaults.max_response_chars` the same way `recall`'s
+`results` are; `truncated: true` marks a response that left trailing collections out
+for a namespace with an unusually large number of them.
 
 **`create` output:**
 ```json
@@ -3782,11 +3806,17 @@ ID first). Only T0 memories accumulate revisions — see
   "revisions": [
     { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
     { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
 A memory with no content changes returns an empty `revisions` array, not an error.
+`revisions` is assembled within `defaults.max_response_chars` the same way `recall`'s
+`results` are (see [`recall`](#recall---semantic-recall) above): each revision carries
+its full historical `content`, and `revisions_per_memory_max` may be configured
+unbounded, so a memory with a long history can exceed the budget — `truncated: true`
+then marks a response that left trailing (older) revisions out.
 
 **Output (`action: "revert"`):**
 

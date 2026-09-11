@@ -2955,6 +2955,13 @@ envía solo por el transporte stdio (un único `Server` de larga vida por conexi
 stdio); no está conectada a las conexiones por sesión del transporte Streamable
 HTTP `/mcp`.
 
+`category://list` y `collection://list` (así como la propia página `memories` de
+`collection://{name}`, documentada más abajo bajo `memory://list`) también se
+ensamblan dentro de `defaults.max_response_chars`, cada uno reportando
+`truncated: true` si un gran número de filas tuvo que omitirse para mantenerse
+dentro del presupuesto — el mismo patrón que usan los `results` de `recall`,
+aplicado de forma consistente en todo recurso con forma de lista.
+
 ### `memory://list` — Listado Paginado de Memorias
 
 Parámetros de consulta:
@@ -2973,6 +2980,15 @@ Respuesta:
 ```
 
 La paginación usa cursores compuestos (`created_at|id`) para un orden estable. Los empates en la misma marca de tiempo se desempatan por ID, asegurando que ninguna fila se omita o duplique entre páginas.
+
+La página (ya acotada por `limit`) se ensambla además dentro de
+`defaults.max_response_chars`, de la misma forma que los `results` de `recall` —
+`items` grandes (campos `content` largos) pueden hacer que `items.length` sea menor
+que `limit` incluso en la última página. `truncated` es `true` siempre que aplique
+cualquiera de las dos causas (existen más páginas, o esta página tuvo que omitir
+elementos finales), y `cursor` siempre reanuda desde el último elemento realmente
+incluido en `items`, de modo que un corte por presupuesto de bytes nunca hace que la
+siguiente página omita una memoria silenciosamente.
 
 `memory://list` y `memory://{id}` aplican la misma regla de visibilidad de ciclo de vida que `search`/`recall`: una memoria `T2`/`T3` expirada y elegible para decaimiento se excluye (las lecturas en `memory://{id}` devuelven `NOT_FOUND`). Las memorias `T0` y `T1` permanecen visibles sin importar la expiración transitoria.
 
@@ -3104,9 +3120,14 @@ Respuesta:
   "revisions": [
     { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
     { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
-  ]
+  ],
+  "truncated": false
 }
 ```
+
+`revisions` se ensambla dentro de `defaults.max_response_chars` de la misma forma que
+los `results` de `recall` — `truncated: true` marca una respuesta que tuvo que omitir
+revisiones finales (más antiguas) en una memoria con un historial largo.
 
 Para un cliente stdio sin soporte de recursos, use en su lugar la acción `list` de la herramienta `revisions` (los mismos datos — ver [Referencia de Herramientas MCP](#referencia-de-herramientas-mcp)).
 
@@ -3596,9 +3617,15 @@ Lista, crea o elimina colecciones dentro de un namespace.
   "collections": [
     { "name": "general", "count": 42 },
     { "name": "architecture", "count": 10 }
-  ]
+  ],
+  "truncated": false
 }
 ```
+
+`collections` se ensambla dentro de `defaults.max_response_chars` de la misma forma
+que los `results` de `recall`; `truncated: true` marca una respuesta que tuvo que
+omitir colecciones finales en un namespace con un número inusualmente grande de
+ellas.
 
 **Salida de `create`:**
 ```json
@@ -3827,11 +3854,17 @@ Lista el historial de revisiones de una memoria, o revierte su contenido a una r
   "revisions": [
     { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
     { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
 Una memoria sin cambios de contenido devuelve un array `revisions` vacío, no un error.
+`revisions` se ensambla dentro de `defaults.max_response_chars` de la misma forma que
+los `results` de `recall` (ver arriba): cada revisión lleva su `content` histórico
+completo, y `revisions_per_memory_max` puede configurarse sin límite, por lo que una
+memoria con un historial largo puede exceder el presupuesto — `truncated: true` marca
+entonces una respuesta en la que se omitieron revisiones finales (más antiguas).
 
 **Salida (`action: "revert"`):**
 

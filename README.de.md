@@ -2949,6 +2949,13 @@ Diese Benachrichtigung wird nur über den stdio-Transport gesendet (ein
 langlebiger `Server` pro stdio-Verbindung); sie ist nicht mit den
 sitzungsbasierten Streamable-HTTP-`/mcp`-Verbindungen verdrahtet.
 
+`category://list` und `collection://list` (sowie die eigene `memories`-Seite von
+`collection://{name}`, dokumentiert weiter unten unter `memory://list`) werden
+ebenfalls innerhalb von `defaults.max_response_chars` zusammengestellt und melden
+jeweils `truncated: true`, wenn eine große Anzahl von Zeilen weggelassen werden musste,
+um das Budget einzuhalten — dasselbe Muster wie bei den `results` von `recall`,
+konsequent auf jede listenförmige Ressource angewendet.
+
 ### `memory://list` — Paginierte Erinnerungsauflistung
 
 Abfrageparameter:
@@ -2967,6 +2974,15 @@ Antwort:
 ```
 
 Die Paginierung verwendet zusammengesetzte Cursor (`created_at|id`) für stabile Sortierung. Gleichstände mit demselben Zeitstempel werden durch die ID aufgelöst, sodass keine Zeile über Seiten hinweg übersprungen oder dupliziert wird.
+
+Die Seite (bereits durch `limit` begrenzt) wird zusätzlich innerhalb von
+`defaults.max_response_chars` zusammengestellt, genauso wie die `results` von `recall` —
+große `items` (lange `content`-Felder) können `items.length` selbst auf der letzten
+Seite kleiner als `limit` machen. `truncated` ist `true`, sobald einer der beiden
+Gründe zutrifft (es gibt weitere Seiten, oder diese Seite selbst musste nachfolgende
+Einträge weglassen), und `cursor` setzt immer beim letzten tatsächlich in `items`
+enthaltenen Eintrag fort, sodass ein budgetbedingtes Kürzen niemals dazu führt, dass
+die nächste Seite stillschweigend eine Erinnerung überspringt.
 
 `memory://list` und `memory://{id}` wenden dieselbe Lifecycle-Sichtbarkeitsregel wie `search`/`recall` an: Eine abgelaufene, verfallsberechtigte `T2`/`T3`-Erinnerung wird ausgeschlossen (Abfragen über `memory://{id}` liefern `NOT_FOUND`). `T0`- und `T1`-Erinnerungen bleiben unabhängig von einem vorübergehenden Ablauf sichtbar.
 
@@ -3106,9 +3122,15 @@ Antwort:
   "revisions": [
     { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
     { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
-  ]
+  ],
+  "truncated": false
 }
 ```
+
+`revisions` wird innerhalb von `defaults.max_response_chars` zusammengestellt, genauso
+wie die `results` von `recall` — `truncated: true` markiert eine Antwort, bei der
+nachfolgende (ältere) Revisionen bei einer Erinnerung mit langer Historie weggelassen
+werden mussten.
 
 Für stdio-Clients ohne Ressourcen-Unterstützung liefert die Aktion `list` des `revisions`-Tools dieselben Daten (siehe [MCP-Tools-Referenz](#mcp-tools-referenz)).
 
@@ -3596,9 +3618,15 @@ Sammlungen innerhalb eines Namensraums auflisten, erstellen oder löschen.
   "collections": [
     { "name": "general", "count": 42 },
     { "name": "architecture", "count": 10 }
-  ]
+  ],
+  "truncated": false
 }
 ```
+
+`collections` wird innerhalb von `defaults.max_response_chars` zusammengestellt,
+genauso wie die `results` von `recall`; `truncated: true` markiert eine Antwort, bei
+der bei einem Namensraum mit ungewöhnlich vielen Sammlungen nachfolgende Einträge
+weggelassen werden mussten.
 
 **`create`-Ausgabe:**
 ```json
@@ -3827,11 +3855,18 @@ Listet den Revisionsverlauf einer Erinnerung auf oder setzt deren Inhalt auf ein
   "revisions": [
     { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
     { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
 Eine Erinnerung ohne Inhaltsänderungen liefert ein leeres `revisions`-Array, keinen Fehler.
+`revisions` wird innerhalb von `defaults.max_response_chars` zusammengestellt, genauso
+wie die `results` von `recall` (siehe oben): Jede Revision trägt ihren vollständigen
+historischen `content`, und `revisions_per_memory_max` kann unbegrenzt konfiguriert
+sein, sodass eine Erinnerung mit langer Historie das Budget überschreiten kann —
+`truncated: true` markiert dann eine Antwort, bei der nachfolgende (ältere) Revisionen
+weggelassen wurden.
 
 **Ausgabe (`action: "revert"`):**
 

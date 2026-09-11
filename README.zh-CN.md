@@ -2763,6 +2763,12 @@ BHGBrain 声明了 `resources.listChanged` MCP 能力。当 `collections` 调用
 stdio 传输发送（每个 stdio 连接对应一个长期存活的 `Server`）；它没有接入
 基于会话的 Streamable HTTP `/mcp` 连接。
 
+`category://list` 与 `collection://list`（以及 `collection://{name}` 自身的
+`memories` 分页，见下文 `memory://list` 部分）同样在 `defaults.max_response_chars`
+范围内组装，当需要省略大量行才能保持在预算内时，各自都会报告
+`truncated: true`——与 `recall` 的 `results` 相同的模式，被一致地应用于每一个
+列表形态的资源。
+
 ### `memory://list`——分页记忆列表
 
 查询参数：
@@ -2781,6 +2787,13 @@ stdio 传输发送（每个 stdio 连接对应一个长期存活的 `Server`）�
 ```
 
 分页使用复合游标（`created_at|id`）以保证稳定排序。相同时间戳的记录按 ID 打破平局，确保跨页不跳过或重复任何行。
+
+该页（已受 `limit` 限制）还会在 `defaults.max_response_chars` 范围内组装，方式与
+`recall` 的 `results` 相同——较大的 `items`（较长的 `content` 字段）可能使
+`items.length` 即便在最后一页也小于 `limit`。只要满足其中任一原因（还有更多页，
+或本页自身不得不省略末尾的条目），`truncated` 就为 `true`；`cursor` 始终从
+`items` 中实际返回的最后一个条目继续，因此字节预算的截断永远不会让下一页悄悄
+跳过某条记忆。
 
 `memory://list` 与 `memory://{id}` 应用与 `search`/`recall` 相同的生命周期可见性规则：已过期且具备衰减资格的 `T2`/`T3` 记忆会被排除（通过 `memory://{id}` 读取会返回 `NOT_FOUND`）。`T0` 与 `T1` 记忆不受临时过期影响，始终可见。
 
@@ -2890,9 +2903,13 @@ stdio 传输发送（每个 stdio 连接对应一个长期存活的 `Server`）�
   "revisions": [
     { "id": 2, "memory_id": "<uuid>", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
     { "id": 1, "memory_id": "<uuid>", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
-  ]
+  ],
+  "truncated": false
 }
 ```
+
+`revisions` 与 `recall` 的 `results` 一样在 `defaults.max_response_chars` 范围内
+组装——`truncated: true` 表示对于历史较长的记忆，响应省略了末尾（较旧）的版本。
 
 对于不支持资源的 stdio 客户端，可改用 `revisions` 工具的 `list` 动作读取相同数据（参见 [MCP 工具参考](#mcp-工具参考)）。
 
@@ -3359,9 +3376,13 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
   "collections": [
     { "name": "general", "count": 42 },
     { "name": "architecture", "count": 10 }
-  ]
+  ],
+  "truncated": false
 }
 ```
+
+`collections` 与 `recall` 的 `results` 一样在 `defaults.max_response_chars` 范围内
+组装；`truncated: true` 表示对于集合数量异常多的命名空间，响应省略了末尾的集合。
 
 **`create` 输出：**
 ```json
@@ -3590,11 +3611,16 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
   "revisions": [
     { "id": 2, "memory_id": "3f4a1b2c-...", "revision": 2, "content": "...", "updated_at": "2026-03-15T12:00:00.000Z", "updated_by": "client-a" },
     { "id": 1, "memory_id": "3f4a1b2c-...", "revision": 1, "content": "...", "updated_at": "2026-03-10T09:00:00.000Z", "updated_by": "client-a" }
-  ]
+  ],
+  "truncated": false
 }
 ```
 
 从未发生过内容变更的记忆会返回空的 `revisions` 数组，而不是错误。
+`revisions` 与上文 `recall` 的 `results` 一样在 `defaults.max_response_chars`
+范围内组装：每个版本都携带完整的历史 `content`，而 `revisions_per_memory_max`
+可以配置为不设上限，因此历史较长的记忆可能超出预算——此时 `truncated: true`
+表示响应省略了末尾（较旧）的版本。
 
 **输出（`action: "revert"`）：**
 
