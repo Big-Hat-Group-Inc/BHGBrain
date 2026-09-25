@@ -803,3 +803,131 @@ describe('collection resource scoping', () => {
     expect(result.error.code).toBe('INVALID_INPUT');
   });
 });
+
+// bound-corpus-scale-workflows task 3.3: `memory://list`, `collection://{name}`,
+// `memory://{id}/revisions`, `category://list`, and `collection://list` are
+// all budgeted the same way recall/search already were, via the shared
+// `assembleWithinCharBudget` helper.
+describe('resource response budget (bound-corpus-scale-workflows task 3.3)', () => {
+  const mkMem = (id: string, createdAt: string) => ({
+    id, namespace: 'global', collection: 'general', type: 'semantic', category: null,
+    content: 'x'.repeat(2000), summary: 's', tags: [], source: 'cli', checksum: id,
+    importance: 0.5, access_count: 0, last_operation: 'ADD', merged_from: null,
+    created_at: createdAt, updated_at: createdAt, last_accessed: createdAt,
+  });
+
+  it('memory://list: a byte-budget cut past the limit still points the cursor at the last item actually returned', async () => {
+    // 3 large memories requested with limit=3 (limit+1=4 fetched, so
+    // hasMore is false — the store has nothing more) but the budget can
+    // only fit 2 of them: `truncated` must still be true, and the next
+    // cursor must resume from item #2 (the last one actually returned),
+    // not silently skip it by pointing past item #3.
+    const rows = [mkMem('m1', '2026-01-03T00:00:00.000Z'), mkMem('m2', '2026-01-02T00:00:00.000Z'), mkMem('m3', '2026-01-01T00:00:00.000Z')];
+    const storage = {
+      sqlite: {
+        listMemories: (_ns: string, limit: number, cursor?: string) => {
+          const startIdx = cursor ? rows.findIndex(m => `${m.created_at}|${m.id}` === cursor) + 1 : 0;
+          return rows.slice(startIdx, startIdx + limit);
+        },
+        countMemories: () => rows.length,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global', max_response_chars: 5_200 } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(config, storage, {} as SearchService, { check: async () => ({ status: 'healthy' }) } as HealthService);
+
+    const result = await handler.handle('memory://list?limit=3') as { items: Array<{ id: string }>; cursor: string | null; truncated: boolean };
+
+    expect(result.truncated).toBe(true);
+    expect(result.items.map(m => m.id)).toEqual(['m1', 'm2']);
+    expect(result.cursor).toBe('2026-01-02T00:00:00.000Z|m2');
+
+    // Resuming from that cursor must yield the memory the budget cut, not skip it.
+    const next = await handler.handle(`memory://list?limit=3&cursor=${encodeURIComponent(result.cursor!)}`) as { items: Array<{ id: string }> };
+    expect(next.items.map(m => m.id)).toEqual(['m3']);
+  });
+
+  it('memory://list: reports truncated: false and a null cursor when everything fits', async () => {
+    const rows = [mkMem('m1', '2026-01-01T00:00:00.000Z')];
+    const storage = {
+      sqlite: {
+        listMemories: (_ns: string, limit: number) => rows.slice(0, limit),
+        countMemories: () => rows.length,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global', max_response_chars: 50_000 } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(config, storage, {} as SearchService, { check: async () => ({ status: 'healthy' }) } as HealthService);
+
+    const result = await handler.handle('memory://list?limit=5') as { items: unknown[]; cursor: string | null; truncated: boolean };
+    expect(result.truncated).toBe(false);
+    expect(result.cursor).toBeNull();
+  });
+
+  it('collection://{name}: a byte-budget cut points the cursor at the last item actually returned', async () => {
+    const rows = [mkMem('m1', '2026-01-02T00:00:00.000Z'), mkMem('m2', '2026-01-01T00:00:00.000Z')];
+    const storage = {
+      sqlite: {
+        listCollections: () => [],
+        listMemoriesInCollection: (_ns: string, _c: string, limit: number) => rows.slice(0, limit),
+        countMemoriesInCollection: () => rows.length,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global', max_response_chars: 2_500 } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(config, storage, {} as SearchService, { check: async () => ({ status: 'healthy' }) } as HealthService);
+
+    const result = await handler.handle('collection://work?limit=2') as { memories: Array<{ id: string }>; cursor: string | null; truncated: boolean };
+
+    expect(result.truncated).toBe(true);
+    expect(result.memories.map(m => m.id)).toEqual(['m1']);
+    expect(result.cursor).toBe('2026-01-02T00:00:00.000Z|m1');
+  });
+
+  it('memory://{id}/revisions: drops trailing revisions and reports truncated: true once large content would exceed the budget', async () => {
+    const revisions = Array.from({ length: 5 }, (_, i) => ({
+      id: i + 1, memory_id: 'mem-1', revision: i + 1, content: 'x'.repeat(2000),
+      updated_at: '2026-01-01T00:00:00.000Z', updated_by: null,
+    }));
+    const storage = {
+      sqlite: {
+        getMemoryById: () => ({ id: 'mem-1', namespace: 'global' }),
+        listRevisions: () => revisions,
+      },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global', max_response_chars: 3_000 } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(config, storage, {} as SearchService, { check: async () => ({ status: 'healthy' }) } as HealthService);
+
+    const result = await handler.handle('memory://mem-1/revisions') as { revisions: unknown[]; truncated: boolean };
+
+    expect(result.truncated).toBe(true);
+    expect(result.revisions.length).toBeLessThan(5);
+  });
+
+  it('category://list: reports truncated: true once a large number of categories would exceed the budget', async () => {
+    const categories = Array.from({ length: 50 }, (_, i) => ({
+      name: `category-${i}`, slot: 'custom' as const, content: 'x'.repeat(200), revision: 1, updated_at: '2026-01-01T00:00:00.000Z',
+    }));
+    const storage = {
+      sqlite: { listCategories: () => categories },
+    } as unknown as StorageManager;
+    const config = { defaults: { max_response_chars: 1_000 } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(config, storage, {} as SearchService, { check: async () => ({ status: 'healthy' }) } as HealthService);
+
+    const result = await handler.handle('category://list') as { categories: unknown[]; truncated: boolean };
+
+    expect(result.truncated).toBe(true);
+    expect(result.categories.length).toBeLessThan(50);
+  });
+
+  it('collection://list: reports truncated: true once a large number of collections would exceed the budget', async () => {
+    const collections = Array.from({ length: 200 }, (_, i) => ({ name: `collection-with-a-long-name-${i}`, count: i }));
+    const storage = {
+      sqlite: { listCollections: () => collections },
+    } as unknown as StorageManager;
+    const config = { defaults: { namespace: 'global', max_response_chars: 500 } } as unknown as BrainConfig;
+    const handler = new ResourceHandler(config, storage, {} as SearchService, { check: async () => ({ status: 'healthy' }) } as HealthService);
+
+    const result = await handler.handle('collection://list') as { collections: unknown[]; truncated: boolean };
+
+    expect(result.truncated).toBe(true);
+    expect(result.collections.length).toBeLessThan(200);
+  });
+});

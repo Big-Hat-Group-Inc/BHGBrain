@@ -2069,8 +2069,11 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
     }
 
     it('listMemories uses idx_memories_ns_created with no temp B-tree sort', () => {
+      // Exact deployed SQL, INDEXED BY hint included (task 2.4 below adds a
+      // sibling idx_memories_archived_created index that the planner would
+      // otherwise prefer here — see the "misselection" test further down).
       const detail = plan(
-        `SELECT * FROM memories WHERE namespace = ? AND archived = 0 ORDER BY created_at DESC, id DESC LIMIT ?`,
+        `SELECT * FROM memories INDEXED BY idx_memories_ns_created WHERE namespace = ? AND archived = 0 ORDER BY created_at DESC, id DESC LIMIT ?`,
         ['global', 10],
       );
       expect(detail).toContain('USING INDEX idx_memories_ns_created');
@@ -2079,7 +2082,7 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
 
     it('listMemoriesInCollection uses idx_memories_ns_coll_created with no temp B-tree sort', () => {
       const detail = plan(
-        `SELECT * FROM memories WHERE namespace = ? AND collection = ? AND archived = 0 ORDER BY created_at DESC, id DESC LIMIT ?`,
+        `SELECT * FROM memories INDEXED BY idx_memories_ns_coll_created WHERE namespace = ? AND collection = ? AND archived = 0 ORDER BY created_at DESC, id DESC LIMIT ?`,
         ['global', 'general', 10],
       );
       expect(detail).toContain('USING INDEX idx_memories_ns_coll_created');
@@ -2094,12 +2097,13 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
       expect(detail).toContain('USING INDEX idx_memories_stale_accessed');
     });
 
-    it('listMemoriesNeedingVectorSync uses idx_memories_unsynced_created', () => {
+    it('listMemoriesNeedingVectorSync uses idx_memories_unsynced_created with no temp B-tree sort', () => {
       const detail = plan(
-        `SELECT * FROM memories WHERE archived = 0 AND vector_synced = 0 ORDER BY created_at ASC, id ASC LIMIT ?`,
+        `SELECT * FROM memories INDEXED BY idx_memories_unsynced_created WHERE archived = 0 AND vector_synced = 0 ORDER BY created_at ASC, id ASC LIMIT ?`,
         [10],
       );
       expect(detail).toContain('USING INDEX idx_memories_unsynced_created');
+      expect(detail).not.toContain('USE TEMP B-TREE');
     });
 
     // -- bound-corpus-scale-workflows task 2.4 --
@@ -2133,14 +2137,59 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
       expect(detail).not.toContain('USE TEMP B-TREE');
     });
 
-    // No covering index for listMemoriesWithStaleEmbeddingStamp: see the
-    // SCHEMA_SQL comment above idx_memories_archived_expiry for why one
-    // (archived, created_at, id)) was deliberately not added — at a
-    // realistic scale it displaced idx_memories_ns_created/
-    // idx_memories_unsynced_created for their own unrelated, hotter-path
-    // queries. `embedding_model != ?` is not seekable by any index
-    // regardless; the selector stays keyset-paginated and
-    // deadline/batch-bounded instead (StorageManager.reembedMismatchedVectors).
+    it('listMemoriesWithStaleEmbeddingStamp uses idx_memories_archived_created with no temp B-tree sort', () => {
+      // `embedding_model != ?` is never seekable by any index, but the
+      // archived = 0 equality and the ORDER BY created_at ASC, id ASC both
+      // are — idx_memories_archived_created covers both, so embedding_model
+      // is filtered post-hoc per row with no separate sort step.
+      const detail = plan(
+        `SELECT * FROM memories INDEXED BY idx_memories_archived_created
+         WHERE archived = 0 AND (embedding_model != ?1 OR (embedding_model IS NULL AND ?2))
+         ORDER BY created_at ASC, id ASC LIMIT ?3`,
+        ['openai/text-embedding-3-small@1536', 0, 10],
+      );
+      expect(detail).toContain('USING INDEX idx_memories_archived_created');
+      expect(detail).not.toContain('USE TEMP B-TREE');
+    });
+
+    // Proof that the INDEXED BY hints on listMemories/listMemoriesInCollection/
+    // listMemoriesNeedingVectorSync above are load-bearing, not decorative:
+    // with idx_memories_archived_created present but the hint removed, the
+    // planner (no ANALYZE stats — this codebase never runs it) prefers the
+    // new single-column archived=0 index over each query's own narrower,
+    // hotter-path index, turning a namespace/vector_synced seek into a
+    // corpus-wide archived=0 scan filtered post-hoc. Reproduces even against
+    // an empty table (this is a structural cost-model tie the planner breaks
+    // in the new index's favor, not something that only appears at row-count
+    // scale) — verified separately against a throwaway 20k-row/5-namespace
+    // script before writing this assertion, per this suite's existing
+    // convention for EXPLAIN QUERY PLAN coverage.
+    it('without the INDEXED BY hint, idx_memories_archived_created would wrongly win over idx_memories_ns_created and idx_memories_unsynced_created', () => {
+      const listMemoriesDetail = plan(
+        `SELECT * FROM memories WHERE namespace = ? AND archived = 0 ORDER BY created_at DESC, id DESC LIMIT ?`,
+        ['global', 10],
+      );
+      expect(listMemoriesDetail).toContain('USING INDEX idx_memories_archived_created');
+      expect(listMemoriesDetail).not.toContain('idx_memories_ns_created');
+
+      const unsyncedDetail = plan(
+        `SELECT * FROM memories WHERE archived = 0 AND vector_synced = 0 ORDER BY created_at ASC, id ASC LIMIT ?`,
+        [10],
+      );
+      expect(unsyncedDetail).toContain('USING INDEX idx_memories_archived_created');
+      expect(unsyncedDetail).not.toContain('idx_memories_unsynced_created');
+
+      // listMemoriesInCollection is unaffected either way: its own index
+      // matches two equality columns (namespace, collection) versus the new
+      // index's one (archived), so it always wins on structural cost alone —
+      // the INDEXED BY hint there guards against a future planner/index
+      // change rather than a demonstrated regression today.
+      const collectionDetail = plan(
+        `SELECT * FROM memories WHERE namespace = ? AND collection = ? AND archived = 0 ORDER BY created_at DESC, id DESC LIMIT ?`,
+        ['global', 'general', 10],
+      );
+      expect(collectionDetail).toContain('USING INDEX idx_memories_ns_coll_created');
+    });
   });
 
   // -- bound-corpus-scale-workflows task 2.3: FTS5 maintenance seeks by rowid --
@@ -2260,6 +2309,7 @@ describe('SqliteStore pinned memories (add-inject-pinning)', () => {
         expect(indexNames).toContain('idx_memories_tier_review_due');
         expect(indexNames).toContain('idx_memories_pinned_updated');
         expect(indexNames).toContain('idx_memories_archived_expiry');
+        expect(indexNames).toContain('idx_memories_archived_created');
       } finally {
         migStore.close();
       }

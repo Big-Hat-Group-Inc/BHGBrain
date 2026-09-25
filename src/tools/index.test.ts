@@ -1836,6 +1836,73 @@ describe('handleRecall/handleSearch response budget (bound-corpus-scale-workflow
   });
 });
 
+// bound-corpus-scale-workflows task 3.3: the `revisions` tool's `list`
+// action and the `collections` tool's `list` action are budgeted the same
+// way recall/search are — a memory's revision history carries full
+// historical `content` per row (and `revisions_per_memory_max` may be
+// configured unbounded), so it is not safe to assume it always fits.
+describe('handleRevisions/handleCollections response budget (bound-corpus-scale-workflows task 3.3)', () => {
+  const UUID = '550e8400-e29b-41d4-a716-446655440009';
+
+  function makeCtx(maxResponseChars: number, storage: Partial<StorageManager['sqlite']>): ToolContext {
+    return {
+      config: { defaults: { max_response_chars: maxResponseChars } } as unknown as ToolContext['config'],
+      storage: { sqlite: storage } as unknown as StorageManager,
+      embedding: {} as EmbeddingProvider,
+      pipeline: {} as WritePipeline,
+      search: {} as SearchService,
+      backup: {} as BackupService,
+      health: {} as HealthService,
+      metrics: { incCounter: vi.fn(), recordHistogram: vi.fn(), setGauge: vi.fn() } as unknown as MetricsCollector,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as pino.Logger,
+    };
+  }
+
+  it('revisions list reports truncated: true and drops trailing revisions once large content would exceed the budget', async () => {
+    const revisions = Array.from({ length: 5 }, (_, i) => ({
+      id: i + 1, memory_id: UUID, revision: i + 1, content: 'x'.repeat(2000),
+      updated_at: '2026-01-01T00:00:00.000Z', updated_by: null,
+    }));
+    const ctx = makeCtx(3_000, {
+      getMemoryById: vi.fn(() => ({ id: UUID, namespace: 'global' })),
+      listRevisions: vi.fn(() => revisions),
+    } as unknown as StorageManager['sqlite']);
+
+    const result = await handleTool(ctx, 'revisions', { action: 'list', id: UUID }, 'c1') as RevisionsListResult & { truncated: boolean };
+
+    expect(result.truncated).toBe(true);
+    expect(result.revisions.length).toBeLessThan(5);
+    expect(JSON.stringify(result.revisions).length).toBeLessThanOrEqual(3_000);
+  });
+
+  it('revisions list reports truncated: false when the full history comfortably fits the budget', async () => {
+    const revisions = [
+      { id: 1, memory_id: UUID, revision: 1, content: 'short', updated_at: '2026-01-01T00:00:00.000Z', updated_by: null },
+    ];
+    const ctx = makeCtx(50_000, {
+      getMemoryById: vi.fn(() => ({ id: UUID, namespace: 'global' })),
+      listRevisions: vi.fn(() => revisions),
+    } as unknown as StorageManager['sqlite']);
+
+    const result = await handleTool(ctx, 'revisions', { action: 'list', id: UUID }, 'c1') as RevisionsListResult & { truncated: boolean };
+
+    expect(result.truncated).toBe(false);
+    expect(result.revisions).toHaveLength(1);
+  });
+
+  it('collections list reports truncated: true once a large number of collections would exceed the budget', async () => {
+    const collections = Array.from({ length: 200 }, (_, i) => ({ name: `collection-with-a-long-name-${i}`, count: i }));
+    const ctx = makeCtx(500, {
+      listCollections: vi.fn(() => collections),
+    } as unknown as StorageManager['sqlite']);
+
+    const result = await handleTool(ctx, 'collections', { action: 'list' }, 'c1') as { collections: unknown[]; truncated: boolean };
+
+    expect(result.truncated).toBe(true);
+    expect(result.collections.length).toBeLessThan(200);
+  });
+});
+
 // add-multi-candidate-extraction task 5.5: `handleRemember` already collapses
 // a length-1 result array but returns the array unchanged otherwise
 // (src/tools/index.ts:153) — exercised here with a live multi-candidate

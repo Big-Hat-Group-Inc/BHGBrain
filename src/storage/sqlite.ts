@@ -334,22 +334,30 @@ DROP INDEX IF EXISTS idx_memories_collection;
 -- covering a selector that previously matched no index's leading column at
 -- all (a full SCAN memories before this).
 --
--- A fourth candidate, an (archived, created_at, id) index meant to cover
--- the re-embed migration's listMemoriesWithStaleEmbeddingStamp selector,
--- was deliberately NOT added: measured at 20k rows across 5 namespaces with
--- no ANALYZE stats (this codebase's actual runtime condition), the planner
--- preferred it over both idx_memories_ns_created and
--- idx_memories_unsynced_created for their own (unrelated, much
--- hotter-path) queries -- trading a narrow namespace-scoped seek for a
--- corpus-wide archived=0 scan filtered post-hoc by namespace, a real
--- regression, not just a cosmetic plan change. embedding_model != ? is
--- not seekable by any index regardless, so the re-embed selector keeps
--- paying a scan+sort per page; it is already keyset-paginated and
--- deadline/batch-bounded (StorageManager.reembedMismatchedVectors), which
--- is what keeps it resumable and non-blocking even without this index.
+-- A fourth candidate, idx_memories_archived_created (archived, created_at,
+-- id), covers the re-embed migration's listMemoriesWithStaleEmbeddingStamp
+-- selector (embedding_model != ? is never seekable by any index, but
+-- archived = 0 plus its ORDER BY created_at ASC, id ASC both are). It IS
+-- added below, but only alongside explicit INDEXED BY hints on the three
+-- other hot queries that also filter archived = 0 and order by created_at
+-- (listMemories, listMemoriesInCollection, listMemoriesNeedingVectorSync):
+-- measured at 20k rows across 5 namespaces with no ANALYZE stats (this
+-- codebase's actual runtime condition), the planner preferred this new
+-- index over each of their own narrower, hotter-path indexes
+-- (idx_memories_ns_created, idx_memories_ns_coll_created,
+-- idx_memories_unsynced_created) once it existed -- trading a narrow seek
+-- for a corpus-wide archived=0 scan filtered post-hoc, a real regression.
+-- The INDEXED BY hints in those three query strings pin them back to their
+-- original indexes regardless of what the cost-based planner would guess
+-- without ANALYZE stats, so the new index only ever helps the selector it
+-- was built for. See the EXPLAIN QUERY PLAN tests in sqlite.test.ts
+-- ("composite index EXPLAIN QUERY PLAN") for both halves of this: the new
+-- index winning for listMemoriesWithStaleEmbeddingStamp, and the pinned
+-- three still winning their own indexes with the new one present.
 CREATE INDEX IF NOT EXISTS idx_memories_tier_review_due ON memories(retention_tier, review_due, id);
 CREATE INDEX IF NOT EXISTS idx_memories_pinned_updated ON memories(namespace, pinned, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_archived_expiry ON memories(archived, expires_at);
+CREATE INDEX IF NOT EXISTS idx_memories_archived_created ON memories(archived, created_at, id);
 DROP INDEX IF EXISTS idx_memories_review_due;
 DROP INDEX IF EXISTS idx_memories_pinned;
 
@@ -1618,7 +1626,13 @@ export class SqliteStore implements SqliteStorage {
   }
 
   listMemories(namespace: string, limit: number, cursor?: string, nowIso = new Date().toISOString()): MemoryRecordWithoutEmbedding[] {
-    let sql = `SELECT * FROM memories WHERE namespace = ? AND archived = 0 AND deletion_pending = 0 AND (expires_at IS NULL OR expires_at >= ?)`;
+    // INDEXED BY pins this to its namespace-scoped covering index. Without
+    // the hint, adding idx_memories_archived_created (task 2.4, below) gives
+    // the planner an archived=0 alternative it sometimes prefers over this
+    // namespace-seeking index at scale with no ANALYZE stats — trading a
+    // narrow seek for a corpus-wide scan filtered post-hoc by namespace. See
+    // the SCHEMA_SQL comment above idx_memories_archived_created.
+    let sql = `SELECT * FROM memories INDEXED BY idx_memories_ns_created WHERE namespace = ? AND archived = 0 AND deletion_pending = 0 AND (expires_at IS NULL OR expires_at >= ?)`;
     const params: SqlParams = [namespace, nowIso];
     if (cursor) {
       const sepIdx = cursor.indexOf('|');
@@ -1638,7 +1652,9 @@ export class SqliteStore implements SqliteStorage {
   }
 
   listMemoriesInCollection(namespace: string, collection: string, limit: number, cursor?: string, nowIso = new Date().toISOString()): MemoryRecordWithoutEmbedding[] {
-    let sql = `SELECT * FROM memories WHERE namespace = ? AND collection = ? AND archived = 0 AND deletion_pending = 0 AND (expires_at IS NULL OR expires_at >= ?)`;
+    // INDEXED BY: see the comment in listMemories() above — same reasoning,
+    // pinned to this query's own namespace+collection covering index.
+    let sql = `SELECT * FROM memories INDEXED BY idx_memories_ns_coll_created WHERE namespace = ? AND collection = ? AND archived = 0 AND deletion_pending = 0 AND (expires_at IS NULL OR expires_at >= ?)`;
     const params: SqlParams = [namespace, collection, nowIso];
     if (cursor) {
       const sepIdx = cursor.indexOf('|');
@@ -2383,7 +2399,9 @@ export class SqliteStore implements SqliteStorage {
   }
 
   listMemoriesNeedingVectorSync(limit: number, cursor?: string): MemoryRecordWithoutEmbedding[] {
-    let sql = `SELECT * FROM memories WHERE archived = 0 AND deletion_pending = 0 AND vector_synced = 0`;
+    // INDEXED BY: see the comment in listMemories() above — same reasoning,
+    // pinned to this query's own vector_synced-seeking covering index.
+    let sql = `SELECT * FROM memories INDEXED BY idx_memories_unsynced_created WHERE archived = 0 AND deletion_pending = 0 AND vector_synced = 0`;
     const params: SqlParams = [];
     if (cursor) {
       const sepIdx = cursor.indexOf('|');
@@ -2492,7 +2510,13 @@ export class SqliteStore implements SqliteStorage {
   listMemoriesWithStaleEmbeddingStamp(
     activeIdentity: string, includeLegacy: boolean, limit: number, cursor?: string,
   ): MemoryRecordWithoutEmbedding[] {
-    let sql = `SELECT * FROM memories
+    // INDEXED BY idx_memories_archived_created (task 2.4): embedding_model
+    // != ? is never seekable by any index, but archived = 0 plus the
+    // ORDER BY created_at ASC, id ASC below both are — this index turns the
+    // prior corpus-wide SCAN + "USE TEMP B-TREE FOR ORDER BY" into an
+    // archived=0 index seek with the sort satisfied by index order, filtering
+    // embedding_model post-hoc per row instead of per page.
+    let sql = `SELECT * FROM memories INDEXED BY idx_memories_archived_created
        WHERE archived = 0 AND (embedding_model != ?1 OR (embedding_model IS NULL AND ?2))`;
     const params: SqlParams = [activeIdentity, includeLegacy ? 1 : 0];
     if (cursor) {

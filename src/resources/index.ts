@@ -6,6 +6,13 @@ import type { InjectPayload, PaginatedResult, MemoryRecord, MemoryRevisionRecord
 import type { CategoryHeader } from '../storage/sqlite.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { cosineSimilarity } from '../search/similarity.js';
+import { assembleWithinCharBudget } from '../domain/response-budget.js';
+
+// bound-corpus-scale-workflows task 3.3: same fixed envelope slack
+// tools/index.ts reserves out of `defaults.max_response_chars` for a
+// result object's own keys/brackets/braces around a budgeted array — see
+// that file's RESPONSE_BUDGET_RESERVED_CHARS for the full rationale.
+const RESPONSE_BUDGET_RESERVED_CHARS = 200;
 
 export class ResourceHandler {
   private static readonly LIST_LIMIT_MIN = 1;
@@ -101,12 +108,22 @@ export class ResourceHandler {
     return { error: { code: 'NOT_FOUND', message: 'Invalid memory resource URI', retryable: false } };
   }
 
-  private handleMemoryRevisions(id: string): { id: string; revisions: MemoryRevisionRecord[] } | { error: { code: 'NOT_FOUND'; message: string; retryable: false } } {
+  private handleMemoryRevisions(
+    id: string,
+  ): { id: string; revisions: MemoryRevisionRecord[]; truncated: boolean } | { error: { code: 'NOT_FOUND'; message: string; retryable: false } } {
     const mem = this.storage.sqlite.getMemoryById(id);
     if (!mem || this.isExpiredForResource(mem)) {
       return { error: { code: 'NOT_FOUND', message: `Memory ${id} not found`, retryable: false } };
     }
-    return { id, revisions: this.storage.sqlite.listRevisions(id) };
+    // bound-corpus-scale-workflows task 3.3: mirrors the `revisions` tool's
+    // `list` action — full historical `content` per revision, and
+    // `revisions_per_memory_max` may be configured unbounded (null).
+    const budgeted = assembleWithinCharBudget(
+      this.storage.sqlite.listRevisions(id),
+      this.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY,
+      RESPONSE_BUDGET_RESERVED_CHARS,
+    );
+    return { id, revisions: budgeted.items, truncated: budgeted.truncated };
   }
 
   private listMemories(
@@ -118,15 +135,30 @@ export class ResourceHandler {
     const items = this.storage.sqlite.listMemories(namespace, limit + 1, cursor, nowIso);
     const hasMore = items.length > limit;
     const page = hasMore ? items.slice(0, limit) : items;
-    const lastItem = page[page.length - 1];
-    const nextCursor = hasMore && lastItem ? `${lastItem.created_at}|${lastItem.id}` : null;
     const total = this.storage.sqlite.countMemories(namespace, nowIso);
 
+    // bound-corpus-scale-workflows task 3.3: the page is already bounded by
+    // `limit`, but its serialized size is not — run the byte-budget
+    // assembler over the page BEFORE computing the resume cursor, so a
+    // budget cut (fewer items than `limit`) and a limit cut (`hasMore`) are
+    // both reflected in `truncated`, and — critically — `cursor` always
+    // points just past the last item actually *returned*, never past one
+    // that was cut for byte-budget reasons but never sent. Pointing it past
+    // a page-limit-cut-but-budget-kept item would silently skip that memory
+    // on the next call.
+    const budgeted = assembleWithinCharBudget(
+      page,
+      this.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY,
+      RESPONSE_BUDGET_RESERVED_CHARS,
+    );
+    const lastKept = budgeted.items[budgeted.items.length - 1];
+    const nextCursor = (hasMore || budgeted.truncated) && lastKept ? `${lastKept.created_at}|${lastKept.id}` : null;
+
     return {
-      items: page,
+      items: budgeted.items,
       cursor: nextCursor,
       total_results: total,
-      truncated: hasMore,
+      truncated: hasMore || budgeted.truncated,
     };
   }
 
@@ -353,15 +385,22 @@ export class ResourceHandler {
     const path = url.hostname || url.pathname.replace('//', '');
 
     if (path === 'list') {
-      return {
-        categories: this.storage.sqlite.listCategories().map(c => ({
+      // bound-corpus-scale-workflows task 3.3: rows are already capped to a
+      // 200-char preview, so this is low-risk regardless, but a namespace
+      // with an unusually large number of categories still gets the same
+      // budget guarantee as every other list surface.
+      const budgeted = assembleWithinCharBudget(
+        this.storage.sqlite.listCategories().map(c => ({
           name: c.name,
           slot: c.slot,
           preview: c.content.substring(0, 200),
           revision: c.revision,
           updated_at: c.updated_at,
         })),
-      };
+        this.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY,
+        RESPONSE_BUDGET_RESERVED_CHARS,
+      );
+      return { categories: budgeted.items, truncated: budgeted.truncated };
     }
 
     // category://{name}
@@ -382,7 +421,14 @@ export class ResourceHandler {
     const namespace = url.searchParams.get('namespace') ?? this.config.defaults.namespace;
 
     if (path === 'list') {
-      return { collections: this.storage.sqlite.listCollections(namespace) };
+      // bound-corpus-scale-workflows task 3.3: rows are tiny ({name, count}),
+      // but budgeted for the same reason as every other list surface.
+      const budgeted = assembleWithinCharBudget(
+        this.storage.sqlite.listCollections(namespace),
+        this.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY,
+        RESPONSE_BUDGET_RESERVED_CHARS,
+      );
+      return { collections: budgeted.items, truncated: budgeted.truncated };
     }
 
     // collection://{name} - list memories in the collection, namespace-scoped and
@@ -397,15 +443,26 @@ export class ResourceHandler {
     const items = this.storage.sqlite.listMemoriesInCollection(namespace, path, parsedLimit + 1, cursor, nowIso);
     const hasMore = items.length > parsedLimit;
     const page = hasMore ? items.slice(0, parsedLimit) : items;
-    const lastItem = page[page.length - 1];
-    const nextCursor = hasMore && lastItem ? `${lastItem.created_at}|${lastItem.id}` : null;
+
+    // bound-corpus-scale-workflows task 3.3: same reasoning as
+    // `listMemories()` above — budget the already limit-bounded page before
+    // deriving the resume cursor, so the cursor never points past an item
+    // cut for byte-budget reasons but never returned.
+    const budgeted = assembleWithinCharBudget(
+      page,
+      this.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY,
+      RESPONSE_BUDGET_RESERVED_CHARS,
+    );
+    const lastKept = budgeted.items[budgeted.items.length - 1];
+    const nextCursor = (hasMore || budgeted.truncated) && lastKept ? `${lastKept.created_at}|${lastKept.id}` : null;
+
     return {
       collection: path,
       namespace,
-      memories: page,
+      memories: budgeted.items,
       cursor: nextCursor,
       total_results: this.storage.sqlite.countMemoriesInCollection(namespace, path, nowIso),
-      truncated: hasMore,
+      truncated: hasMore || budgeted.truncated,
     };
   }
 }

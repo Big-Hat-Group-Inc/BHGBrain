@@ -522,14 +522,25 @@ async function handleTag(
 
 async function handleRevisions(
   ctx: ToolContext, args: unknown, clientId: string, logCtx: ToolLogContext,
-): Promise<{ id: string; revisions: MemoryRevisionRecord[] } | { id: string; revision: number; content: string }> {
+): Promise<
+  { id: string; revisions: MemoryRevisionRecord[]; truncated: boolean } | { id: string; revision: number; content: string }
+> {
   const input = parseInput(RevisionsInputSchema, args);
   const mem = ctx.storage.sqlite.getMemoryById(input.id);
   if (!mem) throw notFound(`Memory ${input.id} not found`);
   logCtx.namespace = mem.namespace;
 
   if (input.action === 'list') {
-    return { id: input.id, revisions: ctx.storage.sqlite.listRevisions(input.id) };
+    // bound-corpus-scale-workflows task 3.3: each revision carries its full
+    // historical `content`, and `revisions_per_memory_max` may be configured
+    // unbounded (null) — so, like recall/search, this is budgeted rather
+    // than returned as a single unbounded array.
+    const budgeted = assembleWithinCharBudget(
+      ctx.storage.sqlite.listRevisions(input.id),
+      ctx.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY,
+      RESPONSE_BUDGET_RESERVED_CHARS,
+    );
+    return { id: input.id, revisions: budgeted.items, truncated: budgeted.truncated };
   }
 
   // 'revert' — schema's refine already guarantees `revision` is present here.
@@ -1131,8 +1142,17 @@ async function handleCollections(
   logCtx.namespace = namespace;
 
   switch (input.action) {
-    case 'list':
-      return { collections: ctx.storage.sqlite.listCollections(namespace) };
+    case 'list': {
+      // bound-corpus-scale-workflows task 3.3: rows are tiny ({name, count}),
+      // but a namespace with a very large number of collections still
+      // deserves the same budget guarantee as every other list surface.
+      const budgeted = assembleWithinCharBudget(
+        ctx.storage.sqlite.listCollections(namespace),
+        ctx.config.defaults?.max_response_chars ?? Number.POSITIVE_INFINITY,
+        RESPONSE_BUDGET_RESERVED_CHARS,
+      );
+      return { collections: budgeted.items, truncated: budgeted.truncated };
+    }
 
     case 'create':
       if (!input.name) throw invalidInput('name is required for create');
