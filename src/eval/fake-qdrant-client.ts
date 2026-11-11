@@ -92,9 +92,14 @@ function matchesClause(payload: Record<string, unknown>, clause: FilterClause): 
   return meetsRange(payload[clause.key], clause.range);
 }
 
-function notFoundError(name: string): Error & { status: number } {
-  const err = new Error(`Collection \`${name}\` doesn't exist!`) as Error & { status: number };
+// Mirrors the real `@qdrant/js-client-rest` `ApiError` shape: `message` is
+// only the HTTP status text, and Qdrant's explanation is in
+// `data.status.error` (fix-non-default-collection-writes — a fake that put
+// the explanation in `message` hid a production misclassification).
+function notFoundError(name: string): Error & { status: number; data: { status: { error: string } } } {
+  const err = new Error('Not Found') as Error & { status: number; data: { status: { error: string } } };
   err.status = 404;
+  err.data = { status: { error: `Not found: Collection \`${name}\` doesn't exist!` } };
   return err;
 }
 

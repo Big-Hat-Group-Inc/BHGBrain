@@ -80,6 +80,35 @@ function encodeCollectionNameSegment(value: string): string {
   return out;
 }
 
+/**
+ * Qdrant's own phrasing for a missing object (matched against lowercased
+ * text): a missing collection is "Collection `x` doesn't exist!", a missing
+ * point is "No point with id <id> found". Deliberately phrase-level, so an
+ * endpoint-level 404 that merely mentions a `/collections/...` path (which
+ * contains "not found" and "collection" but never "doesn't exist") is not
+ * mistaken for a missing collection.
+ */
+const QDRANT_MISSING_OBJECT_PATTERNS: readonly RegExp[] = [
+  /\b(?:doesn't|does not) exist\b/,
+  /\bno point with id\b[^\n]*\bfound\b/,
+];
+
+/**
+ * Qdrant's own error text for a failed request, as carried by the real
+ * client's `ApiError` (`data.status.error` from Qdrant's JSON error body —
+ * the error's `message` is only the HTTP status text). Returns `''` when the
+ * error carries no Qdrant-shaped body, e.g. a proxy's HTML 404 page.
+ */
+export function qdrantErrorDetail(err: unknown): string {
+  if (!err || typeof err !== 'object') return '';
+  const data = (err as { data?: unknown }).data;
+  if (!data || typeof data !== 'object') return '';
+  const status = (data as { status?: unknown }).status;
+  if (!status || typeof status !== 'object') return '';
+  const error = (status as { error?: unknown }).error;
+  return typeof error === 'string' ? error : '';
+}
+
 // Narrows Qdrant's `ScoredPoint.vector` (unnamed dense vector | named vectors |
 // sparse | null | undefined per the client's OpenAPI types) down to the plain
 // `number[]` this codebase's dense, unnamed vectors always are. Named/sparse
@@ -824,27 +853,46 @@ export class QdrantStore {
 
   /**
    * bound-qdrant-http-runtime task 1.3: narrowed so only a *confirmed missing
-   * managed collection or point* is treated idempotently. The real client's
-   * generic HTTP error wrapper (`QdrantClientUnexpectedResponseError`) never
-   * sets `.status`/`.response.status` and its message is just
-   * `"Unexpected Response: 404 (Not Found)\n..."` for ANY non-2xx response —
-   * including a routing failure, an ingress/reverse-proxy's own 404 page, or
-   * every endpoint on the route going 404 (e.g. a misconfigured URL). Such a
-   * bare 404 must surface as a real failure (unhealthy/thrown), not silently
-   * collapse into "the collection doesn't exist yet". Only Qdrant's own
-   * not-found errors, which always name what's missing ("Collection `x`
-   * doesn't exist!", "Not found: Collection `x`...", a missing point, etc.),
-   * are treated as idempotent no-ops.
+   * managed collection or point* is treated idempotently. A bare 404 (a
+   * routing failure, an ingress/reverse-proxy's own 404 page, every endpoint
+   * on the route going 404 because of a misconfigured URL) must surface as a
+   * real failure (unhealthy/thrown), not silently collapse into "the
+   * collection doesn't exist yet". Only Qdrant's own not-found errors, which
+   * always name what's missing ("Not found: Collection `x` doesn't exist!",
+   * a missing point, etc.), are treated as idempotent no-ops.
+   *
+   * fix-non-default-collection-writes (BIG-928): `@qdrant/js-client-rest`
+   * surfaces a non-2xx response as the fetcher's `ApiError`, whose `message`
+   * is only the HTTP status text (`"Not Found"`, or `""` when the transport
+   * supplies none) — Qdrant's explanation lives in `data.status.error`. An
+   * earlier version of this check read `message` alone, so every genuine
+   * missing-collection 404 from the real client was misclassified as a hard
+   * failure: the write pipeline's dedup lookup threw for any namespace/
+   * collection whose Qdrant collection didn't exist yet, and every first
+   * write outside `global/general` failed as a generic INTERNAL error.
+   * `QdrantClientUnexpectedResponseError` ("Unexpected Response: 404 (Not
+   * Found)\nRaw response content:\n...") is only produced for non-error
+   * statuses the middleware doesn't accept, but its embedded body is still
+   * honoured via `message` for safety.
+   *
+   * The text must carry one of Qdrant's own missing-object phrases (see
+   * `QDRANT_MISSING_OBJECT_PATTERNS`) — not merely the words "not found" and
+   * "collection"/"point" somewhere, which an endpoint-level 404 such as
+   * "Not found: /collections/x/points/query" (a misrouted or unavailable
+   * route) also contains. Swallowing that would hide a routing failure and
+   * let writes skip deduplication (PR #24 review).
    */
   private isNotFoundError(err: unknown): boolean {
     if (!err || typeof err !== 'object') return false;
-    const maybeErr = err as { status?: number; response?: { status?: number }; message?: string };
-    const status = maybeErr.status ?? maybeErr.response?.status;
-    const message = maybeErr.message?.toLowerCase() ?? '';
+    const maybeErr = err as { status?: unknown; response?: { status?: unknown }; message?: unknown };
+    const status = typeof maybeErr.status === 'number'
+      ? maybeErr.status
+      : typeof maybeErr.response?.status === 'number' ? maybeErr.response.status : undefined;
+    const message = typeof maybeErr.message === 'string' ? maybeErr.message.toLowerCase() : '';
     const is404 = status === 404 || message.includes('(not found)') || message.includes('404 ');
     if (!is404) return false;
-    return message.includes('does not exist') || message.includes('doesn\'t exist') ||
-      (message.includes('not found') && (message.includes('collection') || message.includes('point')));
+    const detail = `${message}\n${qdrantErrorDetail(err).toLowerCase()}`;
+    return QDRANT_MISSING_OBJECT_PATTERNS.some(pattern => pattern.test(detail));
   }
 
   private isAlreadyExistsError(err: unknown): boolean {
