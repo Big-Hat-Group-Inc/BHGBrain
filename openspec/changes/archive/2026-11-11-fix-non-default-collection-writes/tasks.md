@@ -20,6 +20,6 @@
 
 ## 5. Deployment and data cleanup (bhgbrain-vm)
 
-- [ ] 5.1 Redeploy `bhgbrain-vm` with this fix and re-run BIG-928's reproduction table (tests 2–4 and `bootstrap submit` must succeed).
-- [ ] 5.2 Delete the empty `projects/shipwin32` collection row (`collections delete`, namespace `projects`, name `shipwin32`), or reuse it now that writes into it succeed.
-- [ ] 5.3 (Optional) Re-file the workaround bootstrap memories `f2870bb6-…` (section 1) and `eb2d6720-…` (section 2) from `global/general` into `profile` via `bootstrap submit`, then `forget` the originals, so bootstrap resumes at section 3.
+- [x] 5.1 Redeploy `bhgbrain-vm` with this fix and re-run BIG-928's reproduction table (tests 2–4 and `bootstrap submit` must succeed). _(2026-11-11: `/opt/bhgbrain/src` pulled to `d8353ee`, `docker compose up -d --build bhgbrain`; container healthy on 1.34.13. `remember` returned ADD for `test/diagnostic`, `diagnostic-ns`, `global/diagnostic` and the pre-created `projects/shipwin32`; `bootstrap submit` section 1 into `test/bootstrap-probe` completed and `status` showed it complete. Probe memories, the bootstrap probe section, and the four probe-created collections were removed afterwards.)_
+- [x] 5.2 Delete the empty `projects/shipwin32` collection row (`collections delete`, namespace `projects`, name `shipwin32`), or reuse it now that writes into it succeed. _(Deleted 2026-11-11 with `force: true` so its empty Qdrant collection was dropped too — a non-force delete leaves the Qdrant collection behind, tracked in BIG-929.)_
+- [x] 5.3 (Optional) Re-file the workaround bootstrap memories `f2870bb6-…` (section 1) and `eb2d6720-…` (section 2) from `global/general` into `profile` via `bootstrap submit`, then `forget` the originals, so bootstrap resumes at section 3. _(Done 2026-11-11: sections 1 and 2 complete in `profile`, originals forgotten; bootstrap resumes at section 3.)_
