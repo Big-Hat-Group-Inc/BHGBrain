@@ -18,7 +18,9 @@ import {
 import type {
   WriteResult, SearchResult, MemoryRecord, MemoryRevisionRecord, RecallFilter, RetentionTier,
 } from '../domain/types.js';
-import { BrainError, invalidInput, notFound, conflict, classifyResidualLockError } from '../errors/index.js';
+import {
+  BrainError, invalidInput, notFound, conflict, classifyResidualLockError, classifyPermanentDependencyError,
+} from '../errors/index.js';
 import { MemoryLifecycleService } from '../domain/lifecycle.js';
 import { assembleWithinCharBudget } from '../domain/response-budget.js';
 import { buildRestoredMemoryFromArchive } from '../domain/archive-restore.js';
@@ -144,7 +146,11 @@ export async function handleTool(
     // generic non-retryable INTERNAL error for what is, in fact, ordinary
     // transient write contention. See errors/index.ts's
     // `classifyResidualLockError`.
-    const err = classifyResidualLockError(lifecycleClassified);
+    // fix-non-default-collection-writes: a raw upstream 4xx (e.g. a Qdrant
+    // `ApiError`) is permanent — surface it as non-retryable rather than the
+    // generic retryable INTERNAL fallback below. See errors/index.ts's
+    // `classifyPermanentDependencyError`.
+    const err = classifyPermanentDependencyError(classifyResidualLockError(lifecycleClassified));
     if (err instanceof BrainError) {
       // strengthen-operational-observability task 1.2: the exception is
       // logged under the standardized `err` field (pino's serializer picks

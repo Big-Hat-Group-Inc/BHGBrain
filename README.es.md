@@ -3296,6 +3296,12 @@ BHGBrain expone 12 herramientas MCP. Todas las herramientas validan la entrada c
 }
 ```
 
+Un fallo imprevisto se informa como `INTERNAL`. Es `retryable: false` cuando una
+dependencia externa (Qdrant o el proveedor de embeddings) rechazó la solicitud de forma
+permanente con un HTTP 4xx distinto de `408`/`429`: reintentar la misma llamada no puede
+tener éxito; consulte el evento `tool_error` del log del servidor para ver la causa. Los
+demás fallos imprevistos siguen siendo `retryable: true`.
+
 **Títulos y anotaciones:** cada herramienta declara un `title` legible por humanos y
 `annotations` de comportamiento MCP (`readOnlyHint`, `destructiveHint`,
 `idempotentHint` y `openWorldHint: false` — cada herramienta opera sobre el almacén

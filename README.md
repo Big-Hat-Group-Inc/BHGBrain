@@ -3248,6 +3248,12 @@ BHGBrain exposes 16 MCP tools. All tools validate input with Zod schemas and ret
 }
 ```
 
+An unanticipated failure is reported as `INTERNAL`. It is `retryable: false` when an
+upstream dependency (Qdrant or the embedding provider) permanently rejected the request
+with an HTTP 4xx other than `408`/`429` — retrying the same call cannot succeed; check
+the server log's `tool_error` event for the cause. Other unanticipated failures stay
+`retryable: true`.
+
 **Titles and annotations:** every tool declares a human-readable `title` and MCP
 behavioral `annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`, and
 `openWorldHint: false` — every tool operates on the local store, never an open

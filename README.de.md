@@ -3299,6 +3299,12 @@ BHGBrain stellt 12 MCP-Tools bereit. Alle Tools validieren Eingaben mit Zod-Sche
 }
 ```
 
+Ein unerwarteter Fehler wird als `INTERNAL` gemeldet. Er ist `retryable: false`, wenn
+eine nachgelagerte Abhängigkeit (Qdrant oder der Embedding-Anbieter) die Anfrage dauerhaft
+mit einem HTTP-4xx-Status außer `408`/`429` abgelehnt hat — ein erneuter Versuch desselben
+Aufrufs kann nicht gelingen; die Ursache steht im `tool_error`-Ereignis des Serverlogs.
+Andere unerwartete Fehler bleiben `retryable: true`.
+
 **Titel und Annotationen:** Jedes Tool deklariert einen menschenlesbaren `title` und
 MCP-Verhaltens-`annotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint` und
 `openWorldHint: false` — jedes Tool arbeitet auf dem lokalen Speicher, niemals auf

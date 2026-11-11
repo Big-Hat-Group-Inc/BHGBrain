@@ -3076,6 +3076,10 @@ BHGBrain 暴露 12 个 MCP 工具。所有工具使用 Zod schema 验证输入�
 }
 ```
 
+意外故障以 `INTERNAL` 报告。当上游依赖（Qdrant 或嵌入提供方）以 `408`/`429` 以外的
+HTTP 4xx 永久拒绝请求时，它为 `retryable: false`——重试同一调用不可能成功；原因请查看
+服务器日志中的 `tool_error` 事件。其他意外故障仍为 `retryable: true`。
+
 **标题与标注：** 每个工具都声明了一个人类可读的 `title` 以及 MCP 行为
 `annotations`（`readOnlyHint`、`destructiveHint`、`idempotentHint` 与
 `openWorldHint: false`——每个工具都只操作本地存储，从不涉及开放的外部域）。

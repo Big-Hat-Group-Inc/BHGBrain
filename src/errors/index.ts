@@ -91,6 +91,37 @@ export function classifyResidualLockError(err: unknown): unknown {
 }
 
 /**
+ * fix-non-default-collection-writes (BIG-928): an otherwise-unclassified
+ * error that carries a definite 4xx HTTP status from an upstream dependency
+ * (the Qdrant client's `ApiError`, an embedding SDK's API error, ...) is a
+ * permanent rejection — re-sending the same call cannot succeed. Without
+ * this, handleTool's generic fallback reported it as `INTERNAL` with
+ * `retryable: true`, inviting callers to retry a failure that will never
+ * clear. 408 (timeout) and 429 (rate limit) are genuinely transient and stay
+ * unclassified, as does any `BrainError` (already classified on purpose).
+ *
+ * The client-facing message names only the status — the upstream body can
+ * name internal resources (e.g. Qdrant collection names), so it stays in the
+ * server log via `cause`, consistent with the generic fallback never echoing
+ * a raw error message to callers.
+ */
+export function classifyPermanentDependencyError(err: unknown): unknown {
+  if (err instanceof BrainError || !(err instanceof Error)) return err;
+  const status = (err as { status?: unknown }).status;
+  if (typeof status !== 'number' || status < 400 || status > 499 || status === 408 || status === 429) {
+    return err;
+  }
+  const classified = new BrainError(
+    'INTERNAL',
+    `An upstream dependency rejected the request (HTTP ${status}). Retrying the same call will not ` +
+    'succeed; see the server log (event "tool_error") for the underlying cause.',
+    false,
+  );
+  classified.cause = err;
+  return classified;
+}
+
+/**
  * Canonical mapping from a classified error code to its REST HTTP status —
  * the single source every transport-facing adapter (REST's route handlers
  * and error middleware, and `isErrorEnvelope` below) shares, so a status

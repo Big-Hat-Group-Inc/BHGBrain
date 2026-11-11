@@ -3311,6 +3311,12 @@ BHGBrain expose 12 outils MCP. Tous les outils valident les entrées avec des sc
 }
 ```
 
+Une défaillance imprévue est signalée comme `INTERNAL`. Elle est `retryable: false`
+lorsqu'une dépendance en amont (Qdrant ou le fournisseur d'embeddings) a rejeté la requête
+de façon permanente avec un HTTP 4xx autre que `408`/`429` : relancer le même appel ne
+peut pas réussir ; consultez l'événement `tool_error` du journal du serveur pour la cause.
+Les autres défaillances imprévues restent `retryable: true`.
+
 **Titres et annotations :** chaque outil déclare un `title` lisible par l'humain et
 des `annotations` de comportement MCP (`readOnlyHint`, `destructiveHint`,
 `idempotentHint` et `openWorldHint: false` — chaque outil opère sur le stockage

@@ -1449,3 +1449,157 @@ describe('QdrantStore operational/health timeouts against a stalled endpoint (bo
     });
   }, 10_000);
 });
+
+// fix-non-default-collection-writes (BIG-928): every test above that covers a
+// missing collection fakes the error as a plain `Error` whose *message* says
+// "doesn't exist". The real `@qdrant/js-client-rest` never produces that: a
+// non-2xx response surfaces as the fetcher's `ApiError`, whose `message` is
+// only the HTTP status text ("Not Found") and whose Qdrant explanation lives
+// in `data.status.error`. These tests drive the *real* client against a
+// minimal in-process Qdrant stand-in so the adapter's error classification is
+// checked against the shape production actually sees.
+describe('QdrantStore against the real client (fix-non-default-collection-writes)', () => {
+  interface FakeQdrantOptions {
+    /** Respond to every request with this raw 404 body instead of emulating Qdrant (a proxy/ingress 404). */
+    routeWide404Body?: string;
+  }
+
+  async function withFakeQdrant<T>(
+    fn: (url: string, collections: Set<string>) => Promise<T>,
+    options: FakeQdrantOptions = {},
+  ): Promise<T> {
+    const { createServer } = await import('node:http');
+    const collections = new Set<string>();
+    const server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+      req.on('end', () => {
+        const send = (status: number, payload: unknown): void => {
+          res.writeHead(status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(payload));
+        };
+        const ok = (result: unknown): void => send(200, { result, status: 'ok', time: 0.0001 });
+
+        if (options.routeWide404Body !== undefined) {
+          res.writeHead(404, { 'content-type': 'text/html' });
+          res.end(options.routeWide404Body);
+          return;
+        }
+
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        if (url.pathname === '/') {
+          ok(undefined);
+          return;
+        }
+        const match = /^\/collections\/([^/]+)(\/.*)?$/.exec(url.pathname);
+        if (!match) {
+          send(404, { status: { error: `Not found: ${url.pathname}` }, time: 0 });
+          return;
+        }
+        const name = decodeURIComponent(match[1]!);
+        const rest = match[2] ?? '';
+        const missing = (): void => send(404, {
+          status: { error: `Not found: Collection \`${name}\` doesn't exist!` },
+          time: 0.0001,
+        });
+
+        if (rest === '' && req.method === 'PUT') {
+          collections.add(name);
+          ok(true);
+          return;
+        }
+        if (!collections.has(name)) {
+          missing();
+          return;
+        }
+        if (rest === '' && req.method === 'GET') {
+          ok({ status: 'green', points_count: 0, config: {} });
+        } else if (rest === '/index') {
+          ok({ operation_id: 1, status: 'completed' });
+        } else if (rest === '/points') {
+          ok({ operation_id: 1, status: 'completed' });
+        } else if (rest === '/points/query') {
+          ok({ points: [] });
+        } else {
+          send(404, { status: { error: `Not found: ${url.pathname}` }, time: 0 });
+        }
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+    try {
+      return await fn(`http://127.0.0.1:${port}`, collections);
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  }
+
+  function realClientStore(url: string, logger?: { warn: Mock }): QdrantStore {
+    const config = {
+      embedding: { dimensions: 3 },
+      qdrant: {
+        mode: 'external',
+        external_url: url,
+        api_key_env: null,
+        operation_timeout_ms: 5000,
+        health_timeout_ms: 2000,
+        fanout: { max_collections: 25, concurrency: 5, per_target_limit: 50 },
+      },
+      defaults: { namespace: 'global', collection: 'general' },
+    } as unknown as BrainConfig;
+    return new QdrantStore(config, undefined, logger);
+  }
+
+  it.each([
+    ['a new namespace without a slash', 'profile', 'general'],
+    ['a new namespace with a slash', 'projects/shipwin32', 'general'],
+    ['a new collection in the default namespace', 'global', 'diagnostic'],
+  ])('treats a missing collection as no near-duplicates for %s', async (_label, namespace, collection) => {
+    await withFakeQdrant(async (url) => {
+      const warn = vi.fn();
+      const store = realClientStore(url, { warn });
+      await expect(store.searchSimilar(namespace, collection, [1, 0, 0], 5)).resolves.toEqual([]);
+      expect(warn).not.toHaveBeenCalled();
+    });
+  }, 10_000);
+
+  it('completes the remember sequence (dedup check, then first upsert) into a collection that does not exist yet', async () => {
+    await withFakeQdrant(async (url, collections) => {
+      const store = realClientStore(url);
+      // Pipeline order: similarity check first, then the write.
+      await expect(store.searchSimilar('profile', 'general', [1, 0, 0], 5)).resolves.toEqual([]);
+      await expect(store.upsert('profile', 'general', '00000000-0000-4000-8000-000000000001', [1, 0, 0], {}))
+        .resolves.toBeUndefined();
+      expect(collections.has('bhgbrain_profile_general')).toBe(true);
+      // Once created, the collection is queryable normally.
+      await expect(store.searchSimilar('profile', 'general', [1, 0, 0], 5)).resolves.toEqual([]);
+    });
+  }, 10_000);
+
+  it('reports healthy when the probed default collection does not exist yet', async () => {
+    await withFakeQdrant(async (url) => {
+      const store = realClientStore(url);
+      await expect(store.healthCheck()).resolves.toBe(true);
+    });
+  }, 10_000);
+
+  it('returns no results from an explicit-collection search of a missing collection', async () => {
+    await withFakeQdrant(async (url) => {
+      const store = realClientStore(url);
+      await expect(store.search('profile', 'general', [1, 0, 0], 5)).resolves.toEqual([]);
+    });
+  }, 10_000);
+
+  // bound-qdrant-http-runtime task 1.3 must still hold with the real client: a
+  // 404 whose body does not name a missing Qdrant collection/point (a proxy or
+  // ingress error page, a wrong base URL) is a real failure, not "empty".
+  it('still propagates a route-wide 404 that does not come from Qdrant', async () => {
+    await withFakeQdrant(async (url) => {
+      const store = realClientStore(url, { warn: vi.fn() });
+      await expect(store.searchSimilar('profile', 'general', [1, 0, 0], 5)).rejects.toMatchObject({ status: 404 });
+      await expect(store.healthCheck()).rejects.toMatchObject({ status: 404 });
+    }, { routeWide404Body: '<html><body>404 page not found</body></html>' });
+  }, 10_000);
+});
