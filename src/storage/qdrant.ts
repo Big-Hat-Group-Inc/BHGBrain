@@ -81,6 +81,19 @@ function encodeCollectionNameSegment(value: string): string {
 }
 
 /**
+ * Qdrant's own phrasing for a missing object (matched against lowercased
+ * text): a missing collection is "Collection `x` doesn't exist!", a missing
+ * point is "No point with id <id> found". Deliberately phrase-level, so an
+ * endpoint-level 404 that merely mentions a `/collections/...` path (which
+ * contains "not found" and "collection" but never "doesn't exist") is not
+ * mistaken for a missing collection.
+ */
+const QDRANT_MISSING_OBJECT_PATTERNS: readonly RegExp[] = [
+  /\b(?:doesn't|does not) exist\b/,
+  /\bno point with id\b[^\n]*\bfound\b/,
+];
+
+/**
  * Qdrant's own error text for a failed request, as carried by the real
  * client's `ApiError` (`data.status.error` from Qdrant's JSON error body —
  * the error's `message` is only the HTTP status text). Returns `''` when the
@@ -861,6 +874,13 @@ export class QdrantStore {
    * Found)\nRaw response content:\n...") is only produced for non-error
    * statuses the middleware doesn't accept, but its embedded body is still
    * honoured via `message` for safety.
+   *
+   * The text must carry one of Qdrant's own missing-object phrases (see
+   * `QDRANT_MISSING_OBJECT_PATTERNS`) — not merely the words "not found" and
+   * "collection"/"point" somewhere, which an endpoint-level 404 such as
+   * "Not found: /collections/x/points/query" (a misrouted or unavailable
+   * route) also contains. Swallowing that would hide a routing failure and
+   * let writes skip deduplication (PR #24 review).
    */
   private isNotFoundError(err: unknown): boolean {
     if (!err || typeof err !== 'object') return false;
@@ -872,8 +892,7 @@ export class QdrantStore {
     const is404 = status === 404 || message.includes('(not found)') || message.includes('404 ');
     if (!is404) return false;
     const detail = `${message}\n${qdrantErrorDetail(err).toLowerCase()}`;
-    return detail.includes('does not exist') || detail.includes('doesn\'t exist') ||
-      (detail.includes('not found') && (detail.includes('collection') || detail.includes('point')));
+    return QDRANT_MISSING_OBJECT_PATTERNS.some(pattern => pattern.test(detail));
   }
 
   private isAlreadyExistsError(err: unknown): boolean {

@@ -1462,6 +1462,8 @@ describe('QdrantStore against the real client (fix-non-default-collection-writes
   interface FakeQdrantOptions {
     /** Respond to every request with this raw 404 body instead of emulating Qdrant (a proxy/ingress 404). */
     routeWide404Body?: string;
+    /** Respond to every request with a Qdrant-style JSON 404 that names only the request path (a misrouted endpoint). */
+    endpointJson404?: boolean;
   }
 
   async function withFakeQdrant<T>(
@@ -1483,6 +1485,11 @@ describe('QdrantStore against the real client (fix-non-default-collection-writes
         if (options.routeWide404Body !== undefined) {
           res.writeHead(404, { 'content-type': 'text/html' });
           res.end(options.routeWide404Body);
+          return;
+        }
+
+        if (options.endpointJson404) {
+          send(404, { status: { error: `Not found: ${new URL(req.url ?? '/', 'http://localhost').pathname}` }, time: 0 });
           return;
         }
 
@@ -1602,4 +1609,32 @@ describe('QdrantStore against the real client (fix-non-default-collection-writes
       await expect(store.healthCheck()).rejects.toMatchObject({ status: 404 });
     }, { routeWide404Body: '<html><body>404 page not found</body></html>' });
   }, 10_000);
+
+  // PR #24 review: a JSON 404 whose text only names the request path
+  // ("Not found: /collections/<name>/points/query") contains the words "not
+  // found" and "collection" but does not say a collection is missing. It must
+  // still fail, or a misrouted query endpoint would silently disable dedup.
+  it('still propagates an endpoint-level JSON 404 that only names the request path', async () => {
+    await withFakeQdrant(async (url) => {
+      const store = realClientStore(url, { warn: vi.fn() });
+      await expect(store.searchSimilar('global', 'general', [1, 0, 0], 5)).rejects.toMatchObject({ status: 404 });
+      await expect(store.search('global', 'general', [1, 0, 0], 5)).rejects.toMatchObject({ status: 404 });
+      await expect(store.healthCheck()).rejects.toMatchObject({ status: 404 });
+    }, { endpointJson404: true });
+  }, 10_000);
+
+  it("treats Qdrant's missing-point 404 as an idempotent delete", async () => {
+    const client: MockClient = {
+      getCollections: vi.fn<QdrantClient['getCollections']>(),
+      query: vi.fn<QdrantClient['query']>(),
+      delete: vi.fn<QdrantClient['delete']>(async () => {
+        throw Object.assign(new Error('Not Found'), {
+          status: 404,
+          data: { status: { error: 'Not found: No point with id 00000000-0000-4000-8000-000000000001 found' } },
+        });
+      }),
+    };
+    const store = createStore(client);
+    await expect(store.delete('global', 'general', '00000000-0000-4000-8000-000000000001')).resolves.toBeUndefined();
+  });
 });
