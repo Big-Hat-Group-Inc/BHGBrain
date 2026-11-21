@@ -445,8 +445,8 @@ Do this on every device that should use the brain.
      --header "Authorization: Bearer <token>"
    ```
 
-   **Clients configured with JSON** (Claude Desktop connectors, OpenClaw /
-   mcporter, and others that support Streamable HTTP; see README §
+   **Clients configured with JSON** that support Streamable HTTP directly
+   (OpenClaw / mcporter and others; see README §
    [MCP Client Configuration](../README.md#mcp-client-configuration)):
 
    ```json
@@ -460,6 +460,30 @@ Do this on every device that should use the brain.
      }
    }
    ```
+
+   **Clients that only launch local (stdio) servers**, such as Claude Desktop's
+   `claude_desktop_config.json`, can reach the server through a local
+   stdio-to-HTTP bridge such as [`mcp-remote`](https://www.npmjs.com/package/mcp-remote).
+   The bridge runs on the device, so it can use the tailnet:
+
+   ```json
+   {
+     "mcpServers": {
+       "bhgbrain": {
+         "command": "npx",
+         "args": ["mcp-remote", "http://bhgbrain:3721/mcp", "--allow-http",
+                  "--header", "Authorization:${AUTH_HEADER}"],
+         "env": { "AUTH_HEADER": "Bearer <token>" }
+       }
+     }
+   }
+   ```
+
+   > **Cloud-hosted connectors can't reach this server.** Remote MCP
+   > "connectors" added in a web or mobile chat app (for example claude.ai
+   > custom connectors) connect from the vendor's cloud, which isn't on your
+   > tailnet. That's the price of keeping the server off the internet. Only
+   > clients running on your own tailnet devices can use it.
 
    **Scripts and the REST API:**
 
