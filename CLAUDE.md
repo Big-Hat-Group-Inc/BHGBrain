@@ -142,5 +142,10 @@ hardcoding the target list as a literal in the script body over passing it via `
 - `Dockerfile` / `docker-compose.yml` / `docker-entrypoint.sh` — container deployment.
   Container defaults bind differently from the loopback-only local default; check
   `secure-container-default-binding` before touching them.
+- `docs/deploy-azure-vm-tailscale.md` + `deploy/azure-vm/docker-compose.yml` — the
+  user-facing guide for a single shared server on an Azure VM reached over Tailscale
+  (linked from every README's Docker section). Keep it in step with changes to the
+  container, env vars, health endpoints, auth, or rate limiting. Its compose file must
+  keep the API on `127.0.0.1` and Qdrant unpublished.
 - `codeaudit/`, `Research/`, `temp_stage/`, `checklist.md` — historical/working notes,
   not authoritative. Prefer the code and `openspec/changes/` over anything in them.
