@@ -4058,6 +4058,10 @@ docker build -t bhgbrain .
 
 该镜像使用基于 `node:22-slim` 的多阶段构建（最终大小约 200MB）。健康检查使用 Node.js 原生的 `fetch()`——无需 `curl`。
 
+### 使用 Tailscale 的 Azure 虚拟机
+
+如需在 Azure Linux 虚拟机上运行一个共享服务器，让您的设备通过 [Tailscale](https://tailscale.com) tailnet 私密访问，且不向互联网开放任何入站端口，请参阅 **[docs/deploy-azure-vm-tailscale.md](docs/deploy-azure-vm-tailscale.md)**（英文指南）。其中涵盖创建虚拟机、安装 Docker 和 Tailscale、适用于该布局的 compose 文件（[`deploy/azure-vm/docker-compose.yml`](deploy/azure-vm/docker-compose.yml)）、Tailscale 访问规则、连接各设备的 MCP 客户端，以及日常运维（重新部署、备份、令牌轮换）。
+
 ---
 
 ## 升级

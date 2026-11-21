@@ -4357,6 +4357,10 @@ docker build -t bhgbrain .
 
 L'image utilise un build multi-étapes sur `node:22-slim` (~200 Mo en taille finale). Le healthcheck utilise le `fetch()` natif de Node.js — `curl` n'est pas requis.
 
+### VM Azure avec Tailscale
+
+Pour exécuter un serveur partagé unique sur une VM Linux Azure que vos appareils atteignent de façon privée via un tailnet [Tailscale](https://tailscale.com), sans aucun port entrant ouvert sur Internet, suivez **[docs/deploy-azure-vm-tailscale.md](docs/deploy-azure-vm-tailscale.md)** (guide en anglais). Il couvre la création de la VM, l'installation de Docker et de Tailscale, un fichier compose adapté à cette disposition ([`deploy/azure-vm/docker-compose.yml`](deploy/azure-vm/docker-compose.yml)), les règles d'accès Tailscale, la connexion du client MCP de chaque appareil et l'exploitation courante (redéploiements, sauvegardes, rotation du jeton).
+
 ---
 
 ## Mise à jour

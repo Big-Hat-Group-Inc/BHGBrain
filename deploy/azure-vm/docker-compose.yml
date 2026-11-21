@@ -1,0 +1,59 @@
+# BHGBrain on a single Linux VM, reached privately over Tailscale.
+#
+# Used by docs/deploy-azure-vm-tailscale.md. Expected host layout:
+#
+#   /opt/bhgbrain/
+#   ├── docker-compose.yml   <- copy of this file
+#   ├── .env                 <- secrets (chmod 600), see the guide
+#   ├── src/                 <- git clone of the BHGBrain repo (build context)
+#   ├── data/                <- SQLite, config.json, backups, token (owned by uid 1000)
+#   └── qdrant/              <- Qdrant storage
+#
+# Differences from the repo-root docker-compose.yml:
+#   * builds from ./src so a `git pull` + `up --build` redeploys;
+#   * bind mounts instead of named volumes, so the data is plain files on the
+#     host that are easy to find, back up, and copy;
+#   * Qdrant always runs (no profile) and publishes NO port at all. Only the
+#     bhgbrain container can reach it, over the compose network;
+#   * a fixed BHGBRAIN_DEVICE_ID, because a container's default hostname is
+#     its random container id.
+#
+# The API is published on host loopback only. `tailscale serve` on the host
+# forwards tailnet traffic to it. Never change this to "3721:3721" or
+# "0.0.0.0:3721:3721".
+
+services:
+  bhgbrain:
+    build: ./src
+    image: bhgbrain:local
+    ports:
+      - "127.0.0.1:3721:3721"
+    volumes:
+      - ./data:/data
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      BHGBRAIN_QDRANT_MODE: external
+      BHGBRAIN_QDRANT_URL: http://qdrant:6333
+      BHGBRAIN_DEVICE_ID: bhgbrain-vm
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+
+  qdrant:
+    # Pinned for reproducible deploys. BHGBrain needs Qdrant >= 1.10 (see the
+    # README's Prerequisites). Read the Qdrant release notes before you bump it.
+    image: qdrant/qdrant:v1.19.0
+    volumes:
+      - ./qdrant:/qdrant/storage
+    # Plain TCP check through bash's /dev/tcp, so the check doesn't depend on
+    # curl being present in the Qdrant image.
+    healthcheck:
+      test: ["CMD", "bash", "-c", ":> /dev/tcp/127.0.0.1/6333"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
