@@ -500,9 +500,25 @@ device sharing a Qdrant) for this. That setup is for running several separate
 servers.
 
 **Headless machines** (CI runners, build agents, a shared lab PC) shouldn't sign
-in as a person. Give them a tag such as `tag:bhgbrain-client`, add it to the
-`src` of the port-3721 grant, and join them with a tagged auth key, just as you
-did for the VM.
+in as a person. Give them their own tag. Tailscale only lets you apply a tag
+that is defined under `tagOwners`, so add three things to the policy file:
+
+```jsonc
+"tagOwners": {
+  "tag:bhgbrain":        ["group:bhgbrain-admins"],
+  "tag:bhgbrain-client": ["group:bhgbrain-admins"],   // new
+},
+
+"grants": [
+  // Add the client tag to the src of the existing port-3721 grant.
+  {"src": ["group:bhgbrain-users", "tag:bhgbrain-client"], "dst": ["tag:bhgbrain"], "ip": ["tcp:3721"]},
+  // ...
+],
+```
+
+Then create a tagged auth key for `tag:bhgbrain-client` (as in
+[2.2](#22-create-a-one-time-auth-key-for-the-vm)) and join each headless
+machine with it, just as you did for the VM.
 
 ---
 
@@ -515,7 +531,7 @@ did for the VM.
 | **Remove one device** (lost or retired) | Admin console → **Machines** → the device → **Remove**. It can no longer reach the VM at all. |
 | **Remove a person** | Remove them from `group:bhgbrain-users` (and from the tailnet, if appropriate), then **rotate the token**. They know the shared token. |
 | **Suspect the token leaked** | Rotate the token (below). Tailscale rules still block anyone off the tailnet, so a leaked token is exploitable only from a device that already has access. |
-| **Share with someone outside your tailnet** | Use Tailscale [machine sharing](https://tailscale.com/kb/1084/sharing) to share `bhgbrain` with their account, and give them the token. |
+| **Share with someone outside your tailnet** | Use Tailscale [machine sharing](https://tailscale.com/kb/1084/sharing) to share `bhgbrain` with their account. Your tailnet's policy still applies to them, and they aren't in `group:bhgbrain-users`, so also add their email address (or `autogroup:shared`, which covers everyone you share machines with) to the `src` of the port-3721 grant. Then give them the token. |
 | **See who can reach the server** | Admin console → **Access controls → Preview rules** for `tag:bhgbrain`, or `tailscale status` on the VM. |
 
 **Rotate the bearer token:**
